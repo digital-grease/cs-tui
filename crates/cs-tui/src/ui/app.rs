@@ -280,41 +280,44 @@ impl App {
 
     fn render(&self, frame: &mut ratatui::Frame<'_>) {
         let full_area = frame.area();
+
         if self.screen.is_login() {
             if let Screen::Login(s) = &self.screen {
                 s.render(frame, full_area, &self.theme);
             }
-            return;
+        } else {
+            let layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Min(1)])
+                .split(full_area);
+            let tab_area = layout[0];
+            let screen_area = layout[1];
+
+            // Show the root-of-current-stack in the tab bar (defaulting to Feed
+            // if we somehow arrive here without one set).
+            let current = self.current_root.unwrap_or(RootKind::Feed);
+            render_tab_bar(frame, tab_area, current, self.unread_count, &self.theme);
+
+            match &self.screen {
+                Screen::Login(s) => s.render(frame, screen_area, &self.theme),
+                Screen::Feed(s) => s.render(frame, screen_area, &self.theme),
+                Screen::Notifications(s) => s.render(frame, screen_area, &self.theme),
+                Screen::Bookmarks(s) => s.render(frame, screen_area, &self.theme),
+                Screen::Topics(s) => s.render(frame, screen_area, &self.theme),
+                Screen::TopicFeed(s) => s.render(frame, screen_area, &self.theme),
+                Screen::PostDetail(s) => s.render(frame, screen_area, &self.theme),
+                Screen::Profile(s) => s.render(frame, screen_area, &self.theme),
+                Screen::EditProfile(s) => s.render(frame, screen_area, &self.theme),
+                Screen::Compose(s) => s.render(frame, screen_area, &self.theme),
+                Screen::Journal(s) => s.render(frame, screen_area, &self.theme),
+                Screen::Settings(s) => s.render(frame, screen_area, &self.theme),
+            }
         }
 
-        let layout = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(1)])
-            .split(full_area);
-        let tab_area = layout[0];
-        let screen_area = layout[1];
-
-        // Show the root-of-current-stack in the tab bar (defaulting to Feed if
-        // we somehow arrive here without one set).
-        let current = self.current_root.unwrap_or(RootKind::Feed);
-        render_tab_bar(frame, tab_area, current, self.unread_count, &self.theme);
-
-        match &self.screen {
-            Screen::Login(s) => s.render(frame, screen_area, &self.theme),
-            Screen::Feed(s) => s.render(frame, screen_area, &self.theme),
-            Screen::Notifications(s) => s.render(frame, screen_area, &self.theme),
-            Screen::Bookmarks(s) => s.render(frame, screen_area, &self.theme),
-            Screen::Topics(s) => s.render(frame, screen_area, &self.theme),
-            Screen::TopicFeed(s) => s.render(frame, screen_area, &self.theme),
-            Screen::PostDetail(s) => s.render(frame, screen_area, &self.theme),
-            Screen::Profile(s) => s.render(frame, screen_area, &self.theme),
-            Screen::EditProfile(s) => s.render(frame, screen_area, &self.theme),
-            Screen::Compose(s) => s.render(frame, screen_area, &self.theme),
-            Screen::Journal(s) => s.render(frame, screen_area, &self.theme),
-            Screen::Settings(s) => s.render(frame, screen_area, &self.theme),
-        }
-
-        // Overlay menu (always drawn last so it sits on top of the screen).
+        // Overlay menu — always drawn last so it sits on top of ANY screen,
+        // including login. (Previously the login branch returned early and
+        // skipped this, so opening the menu there left keystrokes routed to an
+        // undrawn menu and the UI looked frozen.)
         if let Some(menu) = &self.menu {
             menu.render(frame, full_area, &self.theme);
         }
@@ -1754,5 +1757,48 @@ fn first_line(s: &str) -> String {
     } else {
         let truncated: String = line.chars().take(99).collect();
         format!("{truncated}…")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Flatten a rendered test buffer into one string for substring assertions.
+    fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
+        buf.content.iter().map(|c| c.symbol()).collect()
+    }
+
+    fn test_app() -> App {
+        let client = cs_api::Client::new().expect("client builds");
+        App::with_theme(client, "you@example.com".into(), Theme::by_name("cyber"))
+    }
+
+    fn render_to_string(app: &App) -> String {
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal.draw(|f| app.render(f)).expect("draw");
+        buffer_text(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn menu_overlay_is_drawn_over_the_login_screen() {
+        // Regression: opening the Esc menu on the login screen used to be
+        // skipped by an early return in render(), so keystrokes routed to an
+        // invisible menu and the UI appeared frozen.
+        let mut app = test_app();
+        assert!(app.screen.is_login());
+        app.menu = Some(MenuOverlay::build(false, false));
+        let text = render_to_string(&app);
+        assert!(text.contains("menu"), "menu title not drawn: {text:?}");
+        assert!(text.contains("Quit"), "Quit item not drawn");
+        assert!(text.contains("Cancel"), "Cancel item not drawn");
+    }
+
+    #[test]
+    fn login_screen_without_menu_draws_no_menu_chrome() {
+        let app = test_app();
+        let text = render_to_string(&app);
+        assert!(!text.contains("Cancel"), "menu chrome leaked with no menu open");
     }
 }
