@@ -4,8 +4,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use cs_api::{
-    Bookmark, Client, Entry, Follow, FollowsDirection, Note, NoteRevision, Notification,
-    NotificationsFilter, ProfileUpdate, Reply, Settings, SettingsUpdate, Topic, User,
+    Bookmark, Client, Entry, Follow, FollowsDirection, Guild, GuildMembership, GuildThread, Note,
+    NoteRevision, Notification, NotificationsFilter, ProfileUpdate, Reply, Settings, SettingsUpdate,
+    Topic, User,
 };
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::DefaultTerminal;
@@ -15,6 +16,8 @@ use super::bookmarks::{BookmarksIntent, BookmarksScreen};
 use super::compose::{launch_editor, ComposeIntent, ComposeKind, ComposeScreen};
 use super::edit_profile::{EditProfileIntent, EditProfileScreen};
 use super::feed::{FeedIntent, FeedScreen};
+use super::guild_detail::{GuildIntent, GuildScreen, GuildTab};
+use super::guilds::{GuildsIntent, GuildsScreen};
 use super::journal::{JournalIntent, JournalScreen};
 use super::login::{LoginIntent, LoginScreen};
 use super::menu::{MenuIntent, MenuOverlay};
@@ -90,6 +93,28 @@ pub enum BgEvent {
     NoteDeleted,
     SettingsLoaded(Result<Settings, String>),
     SettingsSaved(Result<Settings, String>),
+    GuildsInitial(Result<(Vec<Guild>, Option<String>), String>),
+    GuildsMore(Result<(Vec<Guild>, Option<String>), String>),
+    GuildInfo {
+        slug: String,
+        result: Result<Guild, String>,
+    },
+    GuildThreadsInitial {
+        slug: String,
+        result: Result<(Vec<GuildThread>, Option<String>), String>,
+    },
+    GuildThreadsMore {
+        slug: String,
+        result: Result<(Vec<GuildThread>, Option<String>), String>,
+    },
+    GuildMembersInitial {
+        slug: String,
+        result: Result<(Vec<GuildMembership>, Option<String>), String>,
+    },
+    GuildMembersMore {
+        slug: String,
+        result: Result<(Vec<GuildMembership>, Option<String>), String>,
+    },
 }
 
 #[allow(clippy::large_enum_variant)] // Boxing isn't worth the indirection here.
@@ -106,6 +131,8 @@ pub enum Screen {
     Compose(ComposeScreen),
     Journal(JournalScreen),
     Settings(SettingsScreen),
+    Guilds(GuildsScreen),
+    Guild(GuildScreen),
 }
 
 impl Screen {
@@ -228,6 +255,26 @@ enum Action {
     SettingsSubmit {
         update: Box<SettingsUpdate>,
     },
+    GuildsRefresh,
+    GuildsMore {
+        cursor: Option<String>,
+    },
+    GuildOpen {
+        slug: String,
+    },
+    GuildRefresh {
+        slug: String,
+        tab: GuildTab,
+    },
+    GuildLoadMore {
+        slug: String,
+        tab: GuildTab,
+        cursor: Option<String>,
+    },
+    GuildSelectTab {
+        slug: String,
+        tab: GuildTab,
+    },
 }
 
 pub struct App {
@@ -325,6 +372,8 @@ impl App {
                 Screen::Compose(s) => s.render(frame, screen_area, &self.theme),
                 Screen::Journal(s) => s.render(frame, screen_area, &self.theme),
                 Screen::Settings(s) => s.render(frame, screen_area, &self.theme),
+                Screen::Guilds(s) => s.render(frame, screen_area, &self.theme),
+                Screen::Guild(s) => s.render(frame, screen_area, &self.theme),
             }
         }
 
@@ -632,6 +681,40 @@ impl App {
                 EditProfileIntent::Submit { update } => Action::SubmitEditProfile { update },
                 EditProfileIntent::None => Action::None,
             },
+            Screen::Guilds(s) => match s.handle_key(key) {
+                GuildsIntent::Quit => Action::Quit,
+                GuildsIntent::Refresh => Action::GuildsRefresh,
+                GuildsIntent::LoadMore => Action::GuildsMore {
+                    cursor: s.next_cursor.clone(),
+                },
+                GuildsIntent::OpenSelected { slug } => Action::GuildOpen { slug },
+                GuildsIntent::None => Action::None,
+            },
+            Screen::Guild(s) => match s.handle_key(key) {
+                GuildIntent::Quit => Action::Quit,
+                GuildIntent::Back => Action::PopScreen,
+                GuildIntent::Refresh => Action::GuildRefresh {
+                    slug: s.slug.clone(),
+                    tab: s.tab,
+                },
+                GuildIntent::LoadMore => Action::GuildLoadMore {
+                    slug: s.slug.clone(),
+                    tab: s.tab,
+                    cursor: match s.tab {
+                        GuildTab::Threads => s.threads_cursor.clone(),
+                        GuildTab::Members => s.members_cursor.clone(),
+                    },
+                },
+                GuildIntent::SelectTab(tab) => Action::GuildSelectTab {
+                    slug: s.slug.clone(),
+                    tab,
+                },
+                GuildIntent::OpenThread { post_id } => Action::OpenPostDetailById {
+                    post_id,
+                    highlight_reply_id: None,
+                },
+                GuildIntent::None => Action::None,
+            },
         };
 
         // Phase 2: apply the action with full mutable access to self.
@@ -849,6 +932,17 @@ impl App {
             }
             Action::SettingsSubmit { update } => {
                 self.spawn_settings_save(*update);
+            }
+            Action::GuildsRefresh => self.spawn_guilds_initial(),
+            Action::GuildsMore { cursor } => self.spawn_guilds_more(cursor),
+            Action::GuildOpen { slug } => {
+                self.push_screen(Screen::Guild(GuildScreen::new(slug.clone())));
+                self.spawn_guild_open(slug);
+            }
+            Action::GuildRefresh { slug, tab } => self.spawn_guild_tab_initial(&slug, tab),
+            Action::GuildSelectTab { slug, tab } => self.spawn_guild_tab_initial(&slug, tab),
+            Action::GuildLoadMore { slug, tab, cursor } => {
+                self.spawn_guild_tab_more(&slug, tab, cursor)
             }
         }
     }
@@ -1164,6 +1258,51 @@ impl App {
                     }
                 }
             },
+            BgEvent::GuildsInitial(result) => {
+                if let Screen::Guilds(s) = &mut self.screen {
+                    s.apply_initial(result);
+                }
+            }
+            BgEvent::GuildsMore(result) => {
+                if let Screen::Guilds(s) = &mut self.screen {
+                    s.apply_more(result);
+                }
+            }
+            BgEvent::GuildInfo { slug, result } => {
+                if let Screen::Guild(s) = &mut self.screen {
+                    if s.slug == slug {
+                        s.apply_guild(result);
+                    }
+                }
+            }
+            BgEvent::GuildThreadsInitial { slug, result } => {
+                if let Screen::Guild(s) = &mut self.screen {
+                    if s.slug == slug {
+                        s.apply_threads_initial(result);
+                    }
+                }
+            }
+            BgEvent::GuildThreadsMore { slug, result } => {
+                if let Screen::Guild(s) = &mut self.screen {
+                    if s.slug == slug {
+                        s.apply_threads_more(result);
+                    }
+                }
+            }
+            BgEvent::GuildMembersInitial { slug, result } => {
+                if let Screen::Guild(s) = &mut self.screen {
+                    if s.slug == slug {
+                        s.apply_members_initial(result);
+                    }
+                }
+            }
+            BgEvent::GuildMembersMore { slug, result } => {
+                if let Screen::Guild(s) = &mut self.screen {
+                    if s.slug == slug {
+                        s.apply_members_more(result);
+                    }
+                }
+            }
         }
     }
 
@@ -1243,6 +1382,10 @@ impl App {
             RootKind::Settings => {
                 self.screen = Screen::Settings(SettingsScreen::new());
                 self.spawn_settings_load();
+            }
+            RootKind::Guilds => {
+                self.screen = Screen::Guilds(GuildsScreen::new());
+                self.spawn_guilds_initial();
             }
         }
     }
@@ -1409,6 +1552,90 @@ impl App {
                 .await
                 .map_err(|e| e.to_string());
             let _ = tx.send(BgEvent::TopicFeedMore { slug, result });
+        });
+    }
+
+    fn spawn_guilds_initial(&self) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client.list_guilds(None, None).await.map_err(|e| e.to_string());
+            let _ = tx.send(BgEvent::GuildsInitial(result));
+        });
+    }
+
+    fn spawn_guilds_more(&self, cursor: Option<String>) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .list_guilds(cursor.as_deref(), None)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(BgEvent::GuildsMore(result));
+        });
+    }
+
+    /// Open a guild: fetch its header/membership and the first page of threads.
+    fn spawn_guild_open(&self, slug: String) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        let info_slug = slug.clone();
+        tokio::spawn(async move {
+            let result = client.get_guild(&info_slug).await.map_err(|e| e.to_string());
+            let _ = tx.send(BgEvent::GuildInfo {
+                slug: info_slug,
+                result,
+            });
+        });
+        self.spawn_guild_tab_initial(&slug, GuildTab::Threads);
+    }
+
+    fn spawn_guild_tab_initial(&self, slug: &str, tab: GuildTab) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        let slug = slug.to_string();
+        tokio::spawn(async move {
+            match tab {
+                GuildTab::Threads => {
+                    let result = client
+                        .list_guild_threads(&slug, None, None)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(BgEvent::GuildThreadsInitial { slug, result });
+                }
+                GuildTab::Members => {
+                    let result = client
+                        .list_guild_members(&slug, None, None)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(BgEvent::GuildMembersInitial { slug, result });
+                }
+            }
+        });
+    }
+
+    fn spawn_guild_tab_more(&self, slug: &str, tab: GuildTab, cursor: Option<String>) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        let slug = slug.to_string();
+        tokio::spawn(async move {
+            match tab {
+                GuildTab::Threads => {
+                    let result = client
+                        .list_guild_threads(&slug, cursor.as_deref(), None)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(BgEvent::GuildThreadsMore { slug, result });
+                }
+                GuildTab::Members => {
+                    let result = client
+                        .list_guild_members(&slug, cursor.as_deref(), None)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(BgEvent::GuildMembersMore { slug, result });
+                }
+            }
         });
     }
 
