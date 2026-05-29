@@ -475,13 +475,26 @@ impl App {
         // profile-edit field, or a settings field (Settings binds 4/6 itself)
         // would navigate away and discard the in-progress input.
         if !self.screen.accepts_text_input() {
-            if let KeyCode::Char(c) = key.code {
-                if let Some(target) = RootKind::from_shortcut(c) {
-                    if self.current_root != Some(target) {
-                        self.goto_root(target);
-                        return;
+            match key.code {
+                KeyCode::Tab => {
+                    let next = self.current_root.unwrap_or(RootKind::Feed).next();
+                    self.goto_root(next);
+                    return;
+                }
+                KeyCode::BackTab => {
+                    let prev = self.current_root.unwrap_or(RootKind::Feed).prev();
+                    self.goto_root(prev);
+                    return;
+                }
+                KeyCode::Char(c) => {
+                    if let Some(target) = RootKind::from_shortcut(c) {
+                        if self.current_root != Some(target) {
+                            self.goto_root(target);
+                            return;
+                        }
                     }
                 }
+                _ => {}
             }
         }
 

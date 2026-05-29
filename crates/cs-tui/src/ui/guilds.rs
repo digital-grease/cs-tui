@@ -179,9 +179,10 @@ impl Default for GuildsScreen {
 }
 
 fn guild_item<'a>(g: &'a Guild, theme: &Theme) -> ListItem<'a> {
-    let icon = g.icon.as_deref().unwrap_or("•");
+    // The API's `icon` is an icon *identifier* (e.g. "arrows-maximize"), not a
+    // glyph, so it's not rendered as text.
     let header = Line::from(vec![
-        Span::styled(format!("{icon} {}", g.name), theme.accent_style()),
+        Span::styled(g.name.clone(), theme.accent_style()),
         Span::styled(
             format!("  #{} · {} members", g.slug, g.member_count),
             theme.muted_style(),
