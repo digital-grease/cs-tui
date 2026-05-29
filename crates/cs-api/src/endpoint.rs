@@ -1,6 +1,6 @@
 //! Endpoint keys for rate-limiter accounting. One variant per documented endpoint.
 //!
-//! Rate-limit values come from `docs/api-v0.3.6.md`. Where the consolidated table
+//! Rate-limit values come from `docs/api-v0.4.md`. Where the consolidated table
 //! and the per-endpoint section disagree, the lower (more restrictive) value is
 //! used so the client cannot self-trigger 429s.
 use crate::rate_limit::RateLimit;

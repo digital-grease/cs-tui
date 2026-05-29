@@ -1,6 +1,6 @@
-//! Async Rust client for the cyberspace.online API (v0.3.7).
+//! Async Rust client for the cyberspace.online API (v0.4).
 //!
-//! Authoritative spec: `docs/api-v0.3.7.md` at the repo root.
+//! Authoritative spec: `docs/api-v0.4.md` at the repo root.
 #![deny(rust_2018_idioms)]
 
 mod auth;
@@ -40,7 +40,7 @@ pub use topics::Topic;
 pub use types::{Attachment, Entry, Reply};
 pub use users::User;
 
-pub const API_VERSION: &str = "v0.3.7";
+pub const API_VERSION: &str = "v0.4";
 pub const DEFAULT_BASE_URL: &str = "https://api.cyberspace.online";
 
 #[cfg(test)]
@@ -49,7 +49,7 @@ mod tests {
 
     #[test]
     fn constants_present() {
-        assert_eq!(API_VERSION, "v0.3.7");
+        assert_eq!(API_VERSION, "v0.4");
         assert!(DEFAULT_BASE_URL.starts_with("https://"));
     }
 }
