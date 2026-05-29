@@ -384,7 +384,7 @@ impl ComposeScreen {
             Line::from(Span::styled(msg.clone(), theme.error_style()))
         } else {
             Line::from(Span::styled(
-                "tab/shift+tab focus · space toggle · enter or ctrl+s submit · esc menu",
+                "tab/shift+tab focus · space toggle · enter or ctrl+s submit · esc cancel",
                 theme.muted_style(),
             ))
         };
