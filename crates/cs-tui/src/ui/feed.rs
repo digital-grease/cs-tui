@@ -215,10 +215,25 @@ fn entry_item<'a>(entry: &'a Entry, theme: &Theme) -> ListItem<'a> {
         Span::styled(format!(" · {when}{topics}{counts}"), theme.muted_style()),
     ]);
 
-    let snippet = first_line_truncated(&entry.content, 200);
-    let body = Line::from(Span::styled(snippet, theme.base()));
+    let mut lines = vec![header];
 
-    ListItem::new(vec![header, body, Line::from("")])
+    // v0.3.7: surface the entry title (when set) on its own line above the
+    // content snippet. Skipped for None/whitespace-only titles.
+    if let Some(title) = entry.title.as_deref() {
+        let title = title.trim();
+        if !title.is_empty() {
+            lines.push(Line::from(Span::styled(
+                first_line_truncated(title, 200),
+                theme.accent_style(),
+            )));
+        }
+    }
+
+    let snippet = first_line_truncated(&entry.content, 200);
+    lines.push(Line::from(Span::styled(snippet, theme.base())));
+    lines.push(Line::from(""));
+
+    ListItem::new(lines)
 }
 
 fn first_line_truncated(s: &str, max: usize) -> String {
@@ -297,6 +312,55 @@ mod tests {
             created_at: None,
             deleted: false,
         }
+    }
+
+    fn render_entry_item(entry: &Entry) -> String {
+        use ratatui::widgets::List;
+        let theme = Theme::cyber();
+        let item = entry_item(entry, &theme);
+        let backend = ratatui::backend::TestBackend::new(80, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                f.render_widget(List::new(vec![item]), area);
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn entry_item_renders_title_only_when_present() {
+        let marker = "ZZTITLEMARKER";
+        let mut with = entry("a", "alice", false);
+        with.title = Some(marker.into());
+        assert!(
+            render_entry_item(&with).contains(marker),
+            "title should render in the feed item"
+        );
+
+        let without = entry("a", "alice", false); // title: None
+        assert!(
+            !render_entry_item(&without).contains(marker),
+            "no title line should render when title is None"
+        );
+    }
+
+    #[test]
+    fn entry_item_skips_whitespace_only_title() {
+        let mut e = entry("a", "alice", false);
+        e.title = Some("   ".into());
+        let text = render_entry_item(&e);
+        assert!(
+            text.contains("content of a"),
+            "content snippet still renders"
+        );
     }
 
     #[test]
