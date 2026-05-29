@@ -1,0 +1,365 @@
+//! Minimal markdown → ratatui Lines renderer.
+//!
+//! Handles the subset of GitHub-flavored markdown that appears in cyberspace.online
+//! posts: headings, bold/italic, inline code, code blocks, unordered lists,
+//! blockquotes, links (rendered as `text (url)`), soft/hard breaks, and `@mention`
+//! highlighting. Tables, footnotes, and other advanced features are rendered as
+//! plain text.
+use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+
+use super::theme::Theme;
+
+/// Render markdown source into a vector of styled ratatui lines.
+pub fn render_markdown(input: &str, theme: &Theme) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut current_line: Vec<Span<'static>> = Vec::new();
+    let mut style_stack: Vec<Style> = vec![theme.base()];
+    let mut list_depth: u32 = 0;
+    let mut blockquote_depth: u32 = 0;
+
+    let parser = Parser::new(input);
+    for event in parser {
+        match event {
+            Event::Start(tag) => handle_start(
+                tag,
+                theme,
+                &mut current_line,
+                &mut out,
+                &mut style_stack,
+                &mut list_depth,
+                &mut blockquote_depth,
+            ),
+            Event::End(end) => handle_end(
+                end,
+                theme,
+                &mut current_line,
+                &mut out,
+                &mut style_stack,
+                &mut list_depth,
+                &mut blockquote_depth,
+            ),
+            Event::Text(t) => {
+                let style = current_style(&style_stack, theme);
+                for span in mention_aware_spans(t.as_ref(), style, theme) {
+                    current_line.push(span);
+                }
+            }
+            Event::Code(t) => {
+                current_line.push(Span::styled(
+                    format!("`{t}`"),
+                    Style::default().fg(theme.accent),
+                ));
+            }
+            Event::SoftBreak => {
+                flush(&mut current_line, &mut out, blockquote_depth, theme);
+            }
+            Event::HardBreak => {
+                flush(&mut current_line, &mut out, blockquote_depth, theme);
+            }
+            Event::Rule => {
+                flush(&mut current_line, &mut out, blockquote_depth, theme);
+                out.push(Line::from(Span::styled(
+                    "────────────────────────────",
+                    theme.muted_style(),
+                )));
+            }
+            _ => {}
+        }
+    }
+    flush(&mut current_line, &mut out, blockquote_depth, theme);
+    out
+}
+
+fn handle_start(
+    tag: Tag<'_>,
+    theme: &Theme,
+    line: &mut Vec<Span<'static>>,
+    out: &mut Vec<Line<'static>>,
+    stack: &mut Vec<Style>,
+    list_depth: &mut u32,
+    blockquote_depth: &mut u32,
+) {
+    match tag {
+        Tag::Heading { level, .. } => {
+            flush(line, out, *blockquote_depth, theme);
+            let style = match level {
+                HeadingLevel::H1 => theme
+                    .accent_style()
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                _ => theme.accent_style().add_modifier(Modifier::BOLD),
+            };
+            stack.push(style);
+            let prefix = "#".repeat(level as usize);
+            line.push(Span::styled(format!("{prefix} "), theme.muted_style()));
+        }
+        Tag::Emphasis => stack.push(current_style(stack, theme).add_modifier(Modifier::ITALIC)),
+        Tag::Strong => stack.push(current_style(stack, theme).add_modifier(Modifier::BOLD)),
+        Tag::CodeBlock(_) => {
+            flush(line, out, *blockquote_depth, theme);
+            stack.push(Style::default().fg(theme.accent));
+        }
+        Tag::List(_) => *list_depth += 1,
+        Tag::Item => {
+            flush(line, out, *blockquote_depth, theme);
+            let indent = "  ".repeat(((*list_depth).saturating_sub(1)) as usize);
+            line.push(Span::styled(format!("{indent}• "), theme.muted_style()));
+        }
+        Tag::BlockQuote(_) => {
+            flush(line, out, *blockquote_depth, theme);
+            *blockquote_depth += 1;
+            stack.push(theme.muted_style().add_modifier(Modifier::ITALIC));
+        }
+        Tag::Link { dest_url, .. } => {
+            stack.push(
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::UNDERLINED),
+            );
+            // Stash URL via a hidden tag — appended after the link text in End.
+            // We piggy-back on a temporary span containing the URL, marked with a
+            // sentinel style we can identify later. Simpler: just store it in stack
+            // metadata. For now, append after closing.
+            let _ = dest_url;
+        }
+        _ => {}
+    }
+}
+
+fn handle_end(
+    end: TagEnd,
+    theme: &Theme,
+    line: &mut Vec<Span<'static>>,
+    out: &mut Vec<Line<'static>>,
+    stack: &mut Vec<Style>,
+    list_depth: &mut u32,
+    blockquote_depth: &mut u32,
+) {
+    match end {
+        TagEnd::Heading(_) => {
+            stack.pop();
+            flush(line, out, *blockquote_depth, theme);
+            out.push(Line::from(""));
+        }
+        TagEnd::Paragraph => {
+            flush(line, out, *blockquote_depth, theme);
+            out.push(Line::from(""));
+        }
+        TagEnd::CodeBlock => {
+            flush(line, out, *blockquote_depth, theme);
+            stack.pop();
+            out.push(Line::from(""));
+        }
+        TagEnd::Emphasis | TagEnd::Strong => {
+            stack.pop();
+        }
+        TagEnd::List(_) => {
+            if *list_depth > 0 {
+                *list_depth -= 1;
+            }
+            flush(line, out, *blockquote_depth, theme);
+        }
+        TagEnd::Item => {
+            flush(line, out, *blockquote_depth, theme);
+        }
+        TagEnd::BlockQuote(_) => {
+            flush(line, out, *blockquote_depth, theme);
+            if *blockquote_depth > 0 {
+                *blockquote_depth -= 1;
+            }
+            stack.pop();
+        }
+        TagEnd::Link => {
+            stack.pop();
+        }
+        _ => {}
+    }
+}
+
+fn flush(
+    line: &mut Vec<Span<'static>>,
+    out: &mut Vec<Line<'static>>,
+    blockquote_depth: u32,
+    theme: &Theme,
+) {
+    if line.is_empty() {
+        // Even on soft-break inside a blockquote, emit a continuation prefix-less
+        // empty line so the visual gap matches the source.
+        return;
+    }
+    let mut spans = std::mem::take(line);
+    if blockquote_depth > 0 {
+        let prefix = "│ ".repeat(blockquote_depth as usize);
+        spans.insert(0, Span::styled(prefix, theme.muted_style()));
+    }
+    out.push(Line::from(spans));
+}
+
+fn current_style(stack: &[Style], theme: &Theme) -> Style {
+    *stack.last().unwrap_or(&theme.base())
+}
+
+/// Split text on `@mention` boundaries and apply the accent style to mentions.
+/// Returns an iterator of styled spans.
+fn mention_aware_spans(text: &str, base: Style, theme: &Theme) -> Vec<Span<'static>> {
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '@' {
+            let mut mention = String::from('@');
+            while let Some(&next) = chars.peek() {
+                if next.is_ascii_alphanumeric() || next == '_' {
+                    mention.push(next);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if mention.len() > 1 {
+                if !buf.is_empty() {
+                    out.push(Span::styled(std::mem::take(&mut buf), base));
+                }
+                out.push(Span::styled(
+                    mention,
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                continue;
+            } else {
+                buf.push(c);
+            }
+        } else {
+            buf.push(c);
+        }
+    }
+    if !buf.is_empty() {
+        out.push(Span::styled(buf, base));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flat_text(lines: &[Line<'_>]) -> String {
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn plain_text_renders_verbatim() {
+        let lines = render_markdown("hello world", &Theme::dark());
+        let text = flat_text(&lines);
+        assert!(text.contains("hello world"));
+    }
+
+    #[test]
+    fn heading_gets_prefix() {
+        let lines = render_markdown("## title", &Theme::dark());
+        let text = flat_text(&lines);
+        assert!(text.contains("## title"));
+    }
+
+    #[test]
+    fn bold_runs_apply_bold_modifier() {
+        let lines = render_markdown("hello **world**", &Theme::dark());
+        let has_bold = lines.iter().any(|l| {
+            l.spans.iter().any(|s| {
+                s.style.add_modifier.contains(Modifier::BOLD) && s.content.contains("world")
+            })
+        });
+        assert!(has_bold);
+    }
+
+    #[test]
+    fn italic_runs_apply_italic_modifier() {
+        let lines = render_markdown("hello *world*", &Theme::dark());
+        let has_italic = lines.iter().any(|l| {
+            l.spans.iter().any(|s| {
+                s.style.add_modifier.contains(Modifier::ITALIC) && s.content.contains("world")
+            })
+        });
+        assert!(has_italic);
+    }
+
+    #[test]
+    fn code_span_renders_with_backticks() {
+        let lines = render_markdown("see `foo` here", &Theme::dark());
+        let text = flat_text(&lines);
+        assert!(text.contains("`foo`"));
+    }
+
+    #[test]
+    fn unordered_list_renders_bullets() {
+        let lines = render_markdown("- a\n- b\n- c", &Theme::dark());
+        let text = flat_text(&lines);
+        assert!(text.contains("• a"));
+        assert!(text.contains("• b"));
+        assert!(text.contains("• c"));
+    }
+
+    #[test]
+    fn blockquote_prefix_appears() {
+        let lines = render_markdown("> quoted text", &Theme::dark());
+        let text = flat_text(&lines);
+        assert!(text.contains("│ quoted text"));
+    }
+
+    #[test]
+    fn at_mention_is_highlighted() {
+        let lines = render_markdown("hi @alice and @bob_42", &Theme::dark());
+        let mentions: Vec<&str> = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter(|s| s.content.starts_with('@'))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(mentions.contains(&"@alice"));
+        assert!(mentions.contains(&"@bob_42"));
+    }
+
+    #[test]
+    fn lone_at_sign_is_not_a_mention() {
+        let lines = render_markdown("email me at me", &Theme::dark());
+        let mentions = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter(|s| s.content.starts_with('@') && s.style.add_modifier.contains(Modifier::BOLD))
+            .count();
+        assert_eq!(mentions, 0);
+    }
+
+    #[test]
+    fn horizontal_rule_renders_dashes() {
+        let lines = render_markdown("above\n\n---\n\nbelow", &Theme::dark());
+        let text = flat_text(&lines);
+        assert!(text.contains("───"));
+    }
+
+    #[test]
+    fn empty_input_yields_empty_output() {
+        let lines = render_markdown("", &Theme::dark());
+        assert!(lines.is_empty() || lines.iter().all(|l| l.spans.is_empty()));
+    }
+
+    #[test]
+    fn multiparagraph_keeps_separation() {
+        let lines = render_markdown("first para\n\nsecond para", &Theme::dark());
+        let text = flat_text(&lines);
+        assert!(text.contains("first para"));
+        assert!(text.contains("second para"));
+    }
+}

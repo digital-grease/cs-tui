@@ -1,0 +1,1758 @@
+//! Top-level App state and event loop.
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use crossterm::event::{self, Event, KeyCode};
+use cs_api::{
+    Bookmark, Client, Entry, Follow, FollowsDirection, Note, NoteRevision, Notification,
+    NotificationsFilter, ProfileUpdate, Reply, Settings, SettingsUpdate, Topic, User,
+};
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::DefaultTerminal;
+use tokio::sync::mpsc;
+
+use super::bookmarks::{BookmarksIntent, BookmarksScreen};
+use super::compose::{launch_editor, ComposeIntent, ComposeKind, ComposeScreen};
+use super::edit_profile::{EditProfileIntent, EditProfileScreen};
+use super::feed::{FeedIntent, FeedScreen};
+use super::journal::{JournalIntent, JournalScreen};
+use super::login::{LoginIntent, LoginScreen};
+use super::menu::{MenuIntent, MenuOverlay};
+use super::nav::{render_tab_bar, RootKind};
+use super::notifications::{NotificationsIntent, NotificationsScreen};
+use super::post_detail::{PostDetailIntent, PostDetailScreen};
+use super::profile::{ProfileIntent, ProfileScreen, ProfileTab};
+use super::settings_screen::{SettingsIntent, SettingsScreen};
+use super::theme::Theme;
+use super::topic_feed::{TopicFeedIntent, TopicFeedScreen};
+use super::topics::{TopicsIntent, TopicsScreen};
+use crate::session::Session;
+
+/// Background-task result delivered to the main loop via `mpsc`.
+#[derive(Debug)]
+pub enum BgEvent {
+    LoginResult(Result<String, String>),
+    FeedInitial(Result<(Vec<Entry>, Option<String>), String>),
+    FeedMore(Result<(Vec<Entry>, Option<String>), String>),
+    NotificationsInitial(Result<(Vec<Notification>, Option<String>), String>),
+    NotificationsMore(Result<(Vec<Notification>, Option<String>), String>),
+    NotificationMarkedRead,
+    AllNotificationsMarked,
+    BookmarksInitial(Result<(Vec<Bookmark>, Option<String>), String>),
+    BookmarksMore(Result<(Vec<Bookmark>, Option<String>), String>),
+    BookmarkRemoved,
+    TopicsLoaded(Result<Vec<Topic>, String>),
+    TopicFeedInitial {
+        slug: String,
+        result: Result<(Vec<Entry>, Option<String>), String>,
+    },
+    TopicFeedMore {
+        slug: String,
+        result: Result<(Vec<Entry>, Option<String>), String>,
+    },
+    DetailRepliesInitial(Result<(Vec<Reply>, Option<String>), String>),
+    DetailRepliesMore(Result<(Vec<Reply>, Option<String>), String>),
+    OpenPostDetail {
+        result: Result<Entry, String>,
+        highlight_reply_id: Option<String>,
+    },
+    UnreadCount(u32),
+    ProfileUser(Result<User, String>),
+    ProfilePosts {
+        more: bool,
+        result: Result<(Vec<Entry>, Option<String>), String>,
+    },
+    ProfileReplies {
+        more: bool,
+        result: Result<(Vec<Reply>, Option<String>), String>,
+    },
+    ProfileFollowers {
+        more: bool,
+        result: Result<(Vec<Follow>, Option<String>), String>,
+    },
+    ProfileFollowing {
+        more: bool,
+        result: Result<(Vec<Follow>, Option<String>), String>,
+    },
+    ProfileFollowToggled(Result<Option<String>, String>), // Ok(Some(follow_id)) on follow, Ok(None) on unfollow
+    ProfileUpdated(Result<User, String>),
+    EntryCreated(Result<String, String>),
+    ReplyCreated(Result<String, String>),
+    EntryDeleted(Result<String, String>),
+    NotesInitial(Result<(Vec<Note>, Option<String>), String>),
+    NotesMore(Result<(Vec<Note>, Option<String>), String>),
+    NoteRevisions {
+        note_id: String,
+        result: Result<Vec<NoteRevision>, String>,
+    },
+    NoteCreated(Result<String, String>),
+    NoteUpdated(Result<String, String>),
+    NoteDeleted,
+    SettingsLoaded(Result<Settings, String>),
+    SettingsSaved(Result<Settings, String>),
+}
+
+#[allow(clippy::large_enum_variant)] // Boxing isn't worth the indirection here.
+pub enum Screen {
+    Login(LoginScreen),
+    Feed(FeedScreen),
+    Notifications(NotificationsScreen),
+    Bookmarks(BookmarksScreen),
+    Topics(TopicsScreen),
+    TopicFeed(TopicFeedScreen),
+    PostDetail(PostDetailScreen),
+    Profile(ProfileScreen),
+    EditProfile(EditProfileScreen),
+    Compose(ComposeScreen),
+    Journal(JournalScreen),
+    Settings(SettingsScreen),
+}
+
+impl Screen {
+    fn is_login(&self) -> bool {
+        matches!(self, Screen::Login(_))
+    }
+}
+
+/// Intent captured from a screen before we drop its borrow on `self.screen`.
+enum Action {
+    None,
+    Quit,
+    LoginSubmit {
+        email: String,
+        password: String,
+    },
+    FeedRefresh,
+    FeedMore {
+        cursor: Option<String>,
+    },
+    NotificationsRefresh,
+    NotificationsMore {
+        cursor: Option<String>,
+    },
+    NotificationsMarkOne {
+        notification_id: String,
+    },
+    NotificationsMarkAll,
+    BookmarksRefresh,
+    BookmarksMore {
+        cursor: Option<String>,
+    },
+    BookmarkRemove {
+        bookmark_id: String,
+    },
+    TopicsRefresh,
+    TopicOpen {
+        slug: String,
+    },
+    TopicFeedRefresh {
+        slug: String,
+    },
+    TopicFeedMore {
+        slug: String,
+        cursor: Option<String>,
+    },
+    PostDetailRefreshReplies {
+        post_id: String,
+    },
+    PostDetailMoreReplies {
+        post_id: String,
+        cursor: Option<String>,
+    },
+    OpenPostDetailById {
+        post_id: String,
+        highlight_reply_id: Option<String>,
+    },
+    PopScreen,
+    ProfileSelectTab {
+        tab: ProfileTab,
+        username: String,
+    },
+    ProfileLoadMore {
+        tab: ProfileTab,
+        username: String,
+        user_id: Option<String>,
+        cursor: Option<String>,
+    },
+    ProfileRefresh {
+        tab: ProfileTab,
+        username: String,
+        user_id: Option<String>,
+    },
+    ProfileToggleFollow {
+        user_id: String,
+        follow_id: Option<String>,
+    },
+    ProfileOpenUser {
+        username: String,
+    },
+    OpenEditProfile,
+    SubmitEditProfile {
+        update: Box<ProfileUpdate>,
+    },
+    StartComposeEntry,
+    StartComposeReply {
+        post_id: String,
+        parent_reply_id: Option<String>,
+        prefill: String,
+    },
+    StartComposeNote,
+    StartEditNote {
+        note_id: String,
+        prefill: String,
+        topics: Vec<String>,
+    },
+    ComposeSubmit,
+    DeleteEntry {
+        post_id: String,
+    },
+    JournalRefresh,
+    JournalMore {
+        cursor: Option<String>,
+    },
+    JournalShowRevisions {
+        note_id: String,
+    },
+    DeleteNote {
+        note_id: String,
+    },
+    SettingsSubmit {
+        update: Box<SettingsUpdate>,
+    },
+}
+
+pub struct App {
+    client: Client,
+    theme: Theme,
+    screen: Screen,
+    back_stack: Vec<Screen>,
+    current_root: Option<RootKind>,
+    unread_count: u32,
+    should_quit: bool,
+    bg_tx: mpsc::UnboundedSender<BgEvent>,
+    bg_rx: mpsc::UnboundedReceiver<BgEvent>,
+    /// Open overlay menu, if any (triggered by Esc).
+    menu: Option<MenuOverlay>,
+    /// Email cached for re-displaying on the login screen after logout.
+    last_email: String,
+}
+
+impl App {
+    pub fn with_theme(client: Client, prefill_email: String, theme: Theme) -> Self {
+        let (bg_tx, bg_rx) = mpsc::unbounded_channel();
+        let last_email = prefill_email.clone();
+        Self {
+            client,
+            theme,
+            screen: Screen::Login(LoginScreen::new(prefill_email)),
+            back_stack: Vec::new(),
+            current_root: None,
+            unread_count: 0,
+            should_quit: false,
+            bg_tx,
+            bg_rx,
+            menu: None,
+            last_email,
+        }
+    }
+
+    /// Skip the login screen — used when a valid session was restored at launch.
+    pub fn enter_feed_initial(&mut self) {
+        self.goto_root(RootKind::Feed);
+        self.spawn_unread_count_poller();
+    }
+
+    pub async fn run(mut self, mut terminal: DefaultTerminal) -> Result<()> {
+        while !self.should_quit {
+            terminal.draw(|f| self.render(f)).context("terminal draw")?;
+
+            tokio::select! {
+                ev = next_terminal_event() => {
+                    self.handle_terminal_event(ev?).await;
+                }
+                Some(bg) = self.bg_rx.recv() => {
+                    self.handle_bg_event(bg);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn render(&self, frame: &mut ratatui::Frame<'_>) {
+        let full_area = frame.area();
+        if self.screen.is_login() {
+            if let Screen::Login(s) = &self.screen {
+                s.render(frame, full_area, &self.theme);
+            }
+            return;
+        }
+
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(full_area);
+        let tab_area = layout[0];
+        let screen_area = layout[1];
+
+        // Show the root-of-current-stack in the tab bar (defaulting to Feed if
+        // we somehow arrive here without one set).
+        let current = self.current_root.unwrap_or(RootKind::Feed);
+        render_tab_bar(frame, tab_area, current, self.unread_count, &self.theme);
+
+        match &self.screen {
+            Screen::Login(s) => s.render(frame, screen_area, &self.theme),
+            Screen::Feed(s) => s.render(frame, screen_area, &self.theme),
+            Screen::Notifications(s) => s.render(frame, screen_area, &self.theme),
+            Screen::Bookmarks(s) => s.render(frame, screen_area, &self.theme),
+            Screen::Topics(s) => s.render(frame, screen_area, &self.theme),
+            Screen::TopicFeed(s) => s.render(frame, screen_area, &self.theme),
+            Screen::PostDetail(s) => s.render(frame, screen_area, &self.theme),
+            Screen::Profile(s) => s.render(frame, screen_area, &self.theme),
+            Screen::EditProfile(s) => s.render(frame, screen_area, &self.theme),
+            Screen::Compose(s) => s.render(frame, screen_area, &self.theme),
+            Screen::Journal(s) => s.render(frame, screen_area, &self.theme),
+            Screen::Settings(s) => s.render(frame, screen_area, &self.theme),
+        }
+
+        // Overlay menu (always drawn last so it sits on top of the screen).
+        if let Some(menu) = &self.menu {
+            menu.render(frame, full_area, &self.theme);
+        }
+    }
+
+    async fn handle_terminal_event(&mut self, ev: Event) {
+        let Event::Key(key) = ev else { return };
+        if key.kind != event::KeyEventKind::Press {
+            return;
+        }
+
+        // If the overlay menu is open, route the key there.
+        if let Some(menu) = &mut self.menu {
+            match menu.handle_key(key) {
+                MenuIntent::None => {}
+                MenuIntent::Cancel => self.menu = None,
+                MenuIntent::Back => {
+                    self.menu = None;
+                    self.pop_screen();
+                }
+                MenuIntent::Logout => {
+                    self.menu = None;
+                    self.logout().await;
+                }
+                MenuIntent::Quit => self.should_quit = true,
+            }
+            return;
+        }
+
+        // Esc opens the menu — universal shortcut.
+        if key.code == KeyCode::Esc {
+            let authenticated = !self.screen.is_login();
+            let has_back = !self.back_stack.is_empty();
+            self.menu = Some(MenuOverlay::build(authenticated, has_back));
+            return;
+        }
+
+        // Root hotkeys (1-7) intercept on every authenticated screen. Login
+        // screen ignores them so the password field can accept digits.
+        if !self.screen.is_login() {
+            if let KeyCode::Char(c) = key.code {
+                if let Some(target) = RootKind::from_shortcut(c) {
+                    if self.current_root != Some(target) {
+                        self.goto_root(target);
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Phase 1: derive an Action with a mutable borrow on the active screen.
+        let action = match &mut self.screen {
+            Screen::Login(s) => match s.handle_key(key) {
+                LoginIntent::Submit => Action::LoginSubmit {
+                    email: s.email.trim().to_string(),
+                    password: s.password.clone(),
+                },
+                LoginIntent::Quit => Action::Quit,
+                LoginIntent::None => Action::None,
+            },
+            Screen::Feed(s) => match s.handle_key(key) {
+                FeedIntent::Quit => Action::Quit,
+                FeedIntent::Refresh => Action::FeedRefresh,
+                FeedIntent::LoadMore => Action::FeedMore {
+                    cursor: s.next_cursor.clone(),
+                },
+                FeedIntent::OpenSelected(post_id) => Action::OpenPostDetailById {
+                    post_id,
+                    highlight_reply_id: None,
+                },
+                FeedIntent::Compose => Action::StartComposeEntry,
+                FeedIntent::None => Action::None,
+            },
+            Screen::Notifications(s) => match s.handle_key(key) {
+                NotificationsIntent::Quit => Action::Quit,
+                NotificationsIntent::Refresh => Action::NotificationsRefresh,
+                NotificationsIntent::LoadMore => Action::NotificationsMore {
+                    cursor: s.next_cursor.clone(),
+                },
+                NotificationsIntent::ToggleFilter => Action::NotificationsRefresh,
+                NotificationsIntent::MarkSelectedRead { notification_id } => {
+                    Action::NotificationsMarkOne { notification_id }
+                }
+                NotificationsIntent::MarkAllRead => Action::NotificationsMarkAll,
+                NotificationsIntent::OpenSelected {
+                    post_id,
+                    highlight_reply_id,
+                } => Action::OpenPostDetailById {
+                    post_id,
+                    highlight_reply_id,
+                },
+                NotificationsIntent::None => Action::None,
+            },
+            Screen::Bookmarks(s) => match s.handle_key(key) {
+                BookmarksIntent::Quit => Action::Quit,
+                BookmarksIntent::Refresh => Action::BookmarksRefresh,
+                BookmarksIntent::LoadMore => Action::BookmarksMore {
+                    cursor: s.next_cursor.clone(),
+                },
+                BookmarksIntent::RemoveSelected { bookmark_id } => {
+                    Action::BookmarkRemove { bookmark_id }
+                }
+                BookmarksIntent::OpenSelected {
+                    post_id,
+                    highlight_reply_id,
+                } => Action::OpenPostDetailById {
+                    post_id,
+                    highlight_reply_id,
+                },
+                BookmarksIntent::None => Action::None,
+            },
+            Screen::Topics(s) => match s.handle_key(key) {
+                TopicsIntent::Quit => Action::Quit,
+                TopicsIntent::Refresh => Action::TopicsRefresh,
+                TopicsIntent::OpenSelected { slug } => Action::TopicOpen { slug },
+                TopicsIntent::None => Action::None,
+            },
+            Screen::TopicFeed(s) => match s.handle_key(key) {
+                TopicFeedIntent::Quit => Action::Quit,
+                TopicFeedIntent::Back => Action::PopScreen,
+                TopicFeedIntent::Refresh => Action::TopicFeedRefresh {
+                    slug: s.slug.clone(),
+                },
+                TopicFeedIntent::LoadMore => Action::TopicFeedMore {
+                    slug: s.slug.clone(),
+                    cursor: s.next_cursor.clone(),
+                },
+                TopicFeedIntent::OpenSelected { post_id } => Action::OpenPostDetailById {
+                    post_id,
+                    highlight_reply_id: None,
+                },
+                TopicFeedIntent::None => Action::None,
+            },
+            Screen::PostDetail(s) => match s.handle_key(key) {
+                PostDetailIntent::Quit => Action::Quit,
+                PostDetailIntent::Back => Action::PopScreen,
+                PostDetailIntent::RefreshReplies => Action::PostDetailRefreshReplies {
+                    post_id: s.entry.post_id.clone(),
+                },
+                PostDetailIntent::LoadMoreReplies => Action::PostDetailMoreReplies {
+                    post_id: s.entry.post_id.clone(),
+                    cursor: s.next_replies_cursor.clone(),
+                },
+                PostDetailIntent::Reply => Action::StartComposeReply {
+                    post_id: s.entry.post_id.clone(),
+                    parent_reply_id: None,
+                    prefill: format!(
+                        "> @{}: {}\n\n",
+                        s.entry.author_username,
+                        first_line(&s.entry.content)
+                    ),
+                },
+                PostDetailIntent::DeleteEntryConfirmed => Action::DeleteEntry {
+                    post_id: s.entry.post_id.clone(),
+                },
+                PostDetailIntent::None => Action::None,
+            },
+            Screen::Compose(s) => match s.handle_key(key) {
+                ComposeIntent::Quit => Action::Quit,
+                ComposeIntent::Submit => Action::ComposeSubmit,
+                ComposeIntent::None => Action::None,
+            },
+            Screen::Settings(s) => match s.handle_key(key) {
+                SettingsIntent::Quit => Action::Quit,
+                SettingsIntent::Cancel => Action::PopScreen,
+                SettingsIntent::Submit { update } => Action::SettingsSubmit { update },
+                SettingsIntent::None => Action::None,
+            },
+            Screen::Journal(s) => match s.handle_key(key) {
+                JournalIntent::Quit => Action::Quit,
+                JournalIntent::LoadMore => Action::JournalMore {
+                    cursor: s.next_cursor.clone(),
+                },
+                JournalIntent::Refresh => Action::JournalRefresh,
+                JournalIntent::Compose => Action::StartComposeNote,
+                JournalIntent::EditSelected {
+                    note_id,
+                    content,
+                    topics,
+                } => Action::StartEditNote {
+                    note_id,
+                    prefill: content,
+                    topics,
+                },
+                JournalIntent::DeleteSelected { note_id } => Action::DeleteNote { note_id },
+                JournalIntent::ShowRevisions { note_id } => {
+                    Action::JournalShowRevisions { note_id }
+                }
+                JournalIntent::HideRevisions => {
+                    // The screen already toggled `mode` back to Current; no spawn needed.
+                    Action::None
+                }
+                JournalIntent::None => Action::None,
+            },
+            Screen::Profile(s) => match s.handle_key(key) {
+                ProfileIntent::Quit => Action::Quit,
+                ProfileIntent::Back => Action::PopScreen,
+                ProfileIntent::SelectTab(tab) => {
+                    let username = s
+                        .username
+                        .clone()
+                        .or_else(|| s.user.as_ref().map(|u| u.username.clone()))
+                        .unwrap_or_default();
+                    Action::ProfileSelectTab { tab, username }
+                }
+                ProfileIntent::LoadMoreCurrentTab => {
+                    let username = s
+                        .username
+                        .clone()
+                        .or_else(|| s.user.as_ref().map(|u| u.username.clone()))
+                        .unwrap_or_default();
+                    let user_id = s.user.as_ref().map(|u| u.id.clone());
+                    let cursor = match s.tab {
+                        ProfileTab::Info => None,
+                        ProfileTab::Posts => s.posts.next_cursor.clone(),
+                        ProfileTab::Replies => s.replies.next_cursor.clone(),
+                        ProfileTab::Followers => s.followers.next_cursor.clone(),
+                        ProfileTab::Following => s.following.next_cursor.clone(),
+                    };
+                    Action::ProfileLoadMore {
+                        tab: s.tab,
+                        username,
+                        user_id,
+                        cursor,
+                    }
+                }
+                ProfileIntent::RefreshCurrentTab => {
+                    let username = s
+                        .username
+                        .clone()
+                        .or_else(|| s.user.as_ref().map(|u| u.username.clone()))
+                        .unwrap_or_default();
+                    let user_id = s.user.as_ref().map(|u| u.id.clone());
+                    Action::ProfileRefresh {
+                        tab: s.tab,
+                        username,
+                        user_id,
+                    }
+                }
+                ProfileIntent::ToggleFollow => {
+                    if let Some(u) = &s.user {
+                        Action::ProfileToggleFollow {
+                            user_id: u.id.clone(),
+                            follow_id: u.follow_id.clone(),
+                        }
+                    } else {
+                        Action::None
+                    }
+                }
+                ProfileIntent::EditOwnProfile => Action::OpenEditProfile,
+                ProfileIntent::OpenPost { post_id } => Action::OpenPostDetailById {
+                    post_id,
+                    highlight_reply_id: None,
+                },
+                ProfileIntent::OpenReply { post_id, reply_id } => Action::OpenPostDetailById {
+                    post_id,
+                    highlight_reply_id: Some(reply_id),
+                },
+                ProfileIntent::OpenUser { username } => Action::ProfileOpenUser { username },
+                ProfileIntent::None => Action::None,
+            },
+            Screen::EditProfile(s) => match s.handle_key(key) {
+                EditProfileIntent::Quit => Action::Quit,
+                EditProfileIntent::Cancel => Action::PopScreen,
+                EditProfileIntent::Submit { update } => Action::SubmitEditProfile { update },
+                EditProfileIntent::None => Action::None,
+            },
+        };
+
+        // Phase 2: apply the action with full mutable access to self.
+        match action {
+            Action::None => {}
+            Action::Quit => self.should_quit = true,
+            Action::LoginSubmit { email, password } => self.spawn_login(email, password),
+            Action::FeedRefresh => self.spawn_feed_initial(),
+            Action::FeedMore { cursor } => self.spawn_feed_more(cursor),
+            Action::NotificationsRefresh => {
+                let filter = if let Screen::Notifications(s) = &self.screen {
+                    s.filter
+                } else {
+                    NotificationsFilter::All
+                };
+                self.spawn_notifications_initial(filter);
+            }
+            Action::NotificationsMore { cursor } => {
+                let filter = if let Screen::Notifications(s) = &self.screen {
+                    s.filter
+                } else {
+                    NotificationsFilter::All
+                };
+                self.spawn_notifications_more(filter, cursor);
+            }
+            Action::NotificationsMarkOne { notification_id } => {
+                if let Screen::Notifications(s) = &mut self.screen {
+                    s.mark_local(&notification_id);
+                }
+                self.unread_count = self.unread_count.saturating_sub(1);
+                self.spawn_mark_notification_read(notification_id);
+            }
+            Action::NotificationsMarkAll => {
+                if let Screen::Notifications(s) = &mut self.screen {
+                    s.mark_all_local();
+                }
+                self.unread_count = 0;
+                self.spawn_mark_all_notifications_read();
+            }
+            Action::BookmarksRefresh => self.spawn_bookmarks_initial(),
+            Action::BookmarksMore { cursor } => self.spawn_bookmarks_more(cursor),
+            Action::BookmarkRemove { bookmark_id } => {
+                if let Screen::Bookmarks(s) = &mut self.screen {
+                    s.remove_local(&bookmark_id);
+                }
+                self.spawn_delete_bookmark(bookmark_id);
+            }
+            Action::TopicsRefresh => self.spawn_topics_load(),
+            Action::TopicOpen { slug } => {
+                let new_screen = Screen::TopicFeed(TopicFeedScreen::new(slug.clone()));
+                self.push_screen(new_screen);
+                self.spawn_topic_feed_initial(&slug);
+            }
+            Action::TopicFeedRefresh { slug } => self.spawn_topic_feed_initial(&slug),
+            Action::TopicFeedMore { slug, cursor } => self.spawn_topic_feed_more(&slug, cursor),
+            Action::PostDetailRefreshReplies { post_id } => {
+                self.spawn_detail_replies_initial(&post_id);
+            }
+            Action::PostDetailMoreReplies { post_id, cursor } => {
+                self.spawn_detail_replies_more(&post_id, cursor);
+            }
+            Action::OpenPostDetailById {
+                post_id,
+                highlight_reply_id,
+            } => {
+                // Fast path: if the entry is already in the current Feed, use it.
+                if let Screen::Feed(s) = &self.screen {
+                    if let Some(entry) = s.entries.iter().find(|e| e.post_id == post_id).cloned() {
+                        let id = entry.post_id.clone();
+                        let mut screen = PostDetailScreen::new(entry);
+                        screen.highlight_reply_id = highlight_reply_id;
+                        self.push_screen(Screen::PostDetail(screen));
+                        self.spawn_detail_replies_initial(&id);
+                        return;
+                    }
+                }
+                if let Screen::TopicFeed(s) = &self.screen {
+                    if let Some(entry) = s.entries.iter().find(|e| e.post_id == post_id).cloned() {
+                        let id = entry.post_id.clone();
+                        let mut screen = PostDetailScreen::new(entry);
+                        screen.highlight_reply_id = highlight_reply_id;
+                        self.push_screen(Screen::PostDetail(screen));
+                        self.spawn_detail_replies_initial(&id);
+                        return;
+                    }
+                }
+                // Slow path: fetch entry first.
+                self.spawn_open_post_detail_by_id(post_id, highlight_reply_id);
+            }
+            Action::PopScreen => self.pop_screen(),
+            Action::ProfileSelectTab { tab, username } => {
+                self.spawn_profile_tab_fetch(tab, username, None, None);
+            }
+            Action::ProfileLoadMore {
+                tab,
+                username,
+                user_id,
+                cursor,
+            } => {
+                self.spawn_profile_tab_fetch(tab, username, user_id, cursor);
+            }
+            Action::ProfileRefresh {
+                tab,
+                username,
+                user_id,
+            } => {
+                if let Screen::Profile(s) = &mut self.screen {
+                    match tab {
+                        ProfileTab::Info => s.loading_user = true,
+                        ProfileTab::Posts => {
+                            s.posts.loading = true;
+                            s.posts.items.clear();
+                            s.posts.next_cursor = None;
+                        }
+                        ProfileTab::Replies => {
+                            s.replies.loading = true;
+                            s.replies.items.clear();
+                            s.replies.next_cursor = None;
+                        }
+                        ProfileTab::Followers => {
+                            s.followers.loading = true;
+                            s.followers.items.clear();
+                            s.followers.next_cursor = None;
+                        }
+                        ProfileTab::Following => {
+                            s.following.loading = true;
+                            s.following.items.clear();
+                            s.following.next_cursor = None;
+                        }
+                    }
+                }
+                self.spawn_profile_tab_fetch(tab, username, user_id, None);
+            }
+            Action::ProfileToggleFollow { user_id, follow_id } => {
+                if let Screen::Profile(s) = &mut self.screen {
+                    s.follow_action_pending = true;
+                }
+                self.spawn_toggle_follow(user_id, follow_id);
+            }
+            Action::ProfileOpenUser { username } => {
+                let mut screen = ProfileScreen::new_for(username.clone());
+                screen.is_self = false;
+                screen.is_root = false;
+                self.push_screen(Screen::Profile(screen));
+                self.spawn_profile_user(username);
+            }
+            Action::OpenEditProfile => {
+                if let Screen::Profile(s) = &self.screen {
+                    if let Some(u) = &s.user {
+                        let screen = EditProfileScreen::from_user(u);
+                        self.push_screen(Screen::EditProfile(screen));
+                    }
+                }
+            }
+            Action::SubmitEditProfile { update } => {
+                self.spawn_update_own_profile(*update);
+            }
+            Action::StartComposeEntry => {
+                self.start_compose(ComposeKind::NewEntry, String::new())
+                    .await;
+            }
+            Action::StartComposeReply {
+                post_id,
+                parent_reply_id,
+                prefill,
+            } => {
+                self.start_compose(
+                    ComposeKind::Reply {
+                        post_id,
+                        parent_reply_id,
+                    },
+                    prefill,
+                )
+                .await;
+            }
+            Action::ComposeSubmit => {
+                self.spawn_compose_submit();
+            }
+            Action::DeleteEntry { post_id } => {
+                self.spawn_delete_entry(post_id);
+            }
+            Action::StartComposeNote => {
+                self.start_compose(ComposeKind::NewNote, String::new())
+                    .await;
+            }
+            Action::StartEditNote {
+                note_id,
+                prefill,
+                topics,
+            } => {
+                self.start_compose_note_edit(note_id, prefill, topics).await;
+            }
+            Action::JournalRefresh => {
+                if let Screen::Journal(s) = &mut self.screen {
+                    s.notes.clear();
+                    s.next_cursor = None;
+                    s.selected = 0;
+                    s.loading = true;
+                    s.error = None;
+                }
+                self.spawn_notes_initial();
+            }
+            Action::JournalMore { cursor } => self.spawn_notes_more(cursor),
+            Action::JournalShowRevisions { note_id } => {
+                if let Screen::Journal(s) = &mut self.screen {
+                    s.loading_revisions = true;
+                }
+                self.spawn_note_revisions(note_id);
+            }
+            Action::DeleteNote { note_id } => {
+                if let Screen::Journal(s) = &mut self.screen {
+                    s.remove_local(&note_id);
+                }
+                self.spawn_delete_note(note_id);
+            }
+            Action::SettingsSubmit { update } => {
+                self.spawn_settings_save(*update);
+            }
+        }
+    }
+
+    fn handle_bg_event(&mut self, ev: BgEvent) {
+        match ev {
+            BgEvent::LoginResult(Ok(email)) => {
+                let tokens = block_on(self.client.tokens());
+                let session = Session {
+                    tokens,
+                    email: email.clone(),
+                };
+                if let Err(e) = session.save() {
+                    tracing::warn!(error = %e, "session save failed");
+                }
+                self.last_email = email;
+                self.enter_feed_initial();
+            }
+            BgEvent::LoginResult(Err(msg)) => {
+                if let Screen::Login(s) = &mut self.screen {
+                    s.finish_submit(Err(msg));
+                }
+            }
+            BgEvent::FeedInitial(result) => {
+                if let Screen::Feed(s) = &mut self.screen {
+                    s.apply_initial(result);
+                }
+            }
+            BgEvent::FeedMore(result) => {
+                if let Screen::Feed(s) = &mut self.screen {
+                    s.apply_more(result);
+                }
+            }
+            BgEvent::NotificationsInitial(result) => {
+                if let Screen::Notifications(s) = &mut self.screen {
+                    s.apply_initial(result);
+                }
+            }
+            BgEvent::NotificationsMore(result) => {
+                if let Screen::Notifications(s) = &mut self.screen {
+                    s.apply_more(result);
+                }
+            }
+            BgEvent::NotificationMarkedRead | BgEvent::AllNotificationsMarked => {
+                // Server confirmed the mark; local UI already updated optimistically.
+                // Refresh unread count to converge on truth.
+                self.spawn_unread_count_once();
+            }
+            BgEvent::BookmarksInitial(result) => {
+                if let Screen::Bookmarks(s) = &mut self.screen {
+                    s.apply_initial(result);
+                }
+            }
+            BgEvent::BookmarksMore(result) => {
+                if let Screen::Bookmarks(s) = &mut self.screen {
+                    s.apply_more(result);
+                }
+            }
+            BgEvent::BookmarkRemoved => {
+                // Local state already removed optimistically.
+            }
+            BgEvent::TopicsLoaded(result) => {
+                if let Screen::Topics(s) = &mut self.screen {
+                    s.apply(result);
+                }
+            }
+            BgEvent::TopicFeedInitial { slug, result } => {
+                if let Screen::TopicFeed(s) = &mut self.screen {
+                    if s.slug == slug {
+                        s.apply_initial(result);
+                    }
+                }
+            }
+            BgEvent::TopicFeedMore { slug, result } => {
+                if let Screen::TopicFeed(s) = &mut self.screen {
+                    if s.slug == slug {
+                        s.apply_more(result);
+                    }
+                }
+            }
+            BgEvent::DetailRepliesInitial(result) => {
+                if let Screen::PostDetail(s) = &mut self.screen {
+                    s.apply_replies_initial(result);
+                }
+            }
+            BgEvent::DetailRepliesMore(result) => {
+                if let Screen::PostDetail(s) = &mut self.screen {
+                    s.apply_replies_more(result);
+                }
+            }
+            BgEvent::OpenPostDetail {
+                result,
+                highlight_reply_id,
+            } => match result {
+                Ok(entry) => {
+                    let id = entry.post_id.clone();
+                    let mut screen = PostDetailScreen::new(entry);
+                    screen.highlight_reply_id = highlight_reply_id;
+                    self.push_screen(Screen::PostDetail(screen));
+                    self.spawn_detail_replies_initial(&id);
+                }
+                Err(msg) => {
+                    tracing::warn!(error = msg, "open-post-detail fetch failed");
+                }
+            },
+            BgEvent::UnreadCount(n) => {
+                self.unread_count = n;
+            }
+            BgEvent::ProfileUser(result) => {
+                if let Screen::Profile(s) = &mut self.screen {
+                    s.apply_user(result);
+                    // If the user just loaded and we're on a non-Info tab, kick off its fetch.
+                    if let Some(u) = s.user.clone() {
+                        let username = u.username.clone();
+                        let user_id = Some(u.id.clone());
+                        let tab = s.tab;
+                        if tab != ProfileTab::Info {
+                            self.spawn_profile_tab_fetch(tab, username, user_id, None);
+                        }
+                    }
+                }
+            }
+            BgEvent::ProfilePosts { more, result } => {
+                if let Screen::Profile(s) = &mut self.screen {
+                    if more {
+                        s.posts.apply_more(result);
+                    } else {
+                        s.posts.apply_initial(result);
+                    }
+                }
+            }
+            BgEvent::ProfileReplies { more, result } => {
+                if let Screen::Profile(s) = &mut self.screen {
+                    if more {
+                        s.replies.apply_more(result);
+                    } else {
+                        s.replies.apply_initial(result);
+                    }
+                }
+            }
+            BgEvent::ProfileFollowers { more, result } => {
+                if let Screen::Profile(s) = &mut self.screen {
+                    if more {
+                        s.followers.apply_more(result);
+                    } else {
+                        s.followers.apply_initial(result);
+                    }
+                }
+            }
+            BgEvent::ProfileFollowing { more, result } => {
+                if let Screen::Profile(s) = &mut self.screen {
+                    if more {
+                        s.following.apply_more(result);
+                    } else {
+                        s.following.apply_initial(result);
+                    }
+                }
+            }
+            BgEvent::ProfileFollowToggled(result) => {
+                if let Screen::Profile(s) = &mut self.screen {
+                    s.follow_action_pending = false;
+                    match result {
+                        Ok(new_follow_id) => {
+                            if let Some(u) = &mut s.user {
+                                if let Some(fid) = new_follow_id {
+                                    u.follow_id = Some(fid);
+                                    u.is_following = Some(true);
+                                    u.followers_count =
+                                        u.followers_count.map(|c| c.saturating_add(1));
+                                } else {
+                                    u.follow_id = None;
+                                    u.is_following = Some(false);
+                                    u.followers_count =
+                                        u.followers_count.map(|c| c.saturating_sub(1));
+                                }
+                            }
+                        }
+                        Err(msg) => {
+                            tracing::warn!(error = msg, "follow toggle failed");
+                            s.user_error = Some(msg);
+                        }
+                    }
+                }
+            }
+            BgEvent::ProfileUpdated(result) => match result {
+                Ok(u) => {
+                    if matches!(self.screen, Screen::EditProfile(_)) {
+                        self.pop_screen();
+                    }
+                    if let Screen::Profile(p) = &mut self.screen {
+                        p.user = Some(u);
+                        p.loading_user = false;
+                        p.user_error = None;
+                    }
+                }
+                Err(msg) => {
+                    if let Screen::EditProfile(s) = &mut self.screen {
+                        s.finish_submit(Err(msg));
+                    }
+                }
+            },
+            BgEvent::EntryCreated(result) => match result {
+                Ok(_new_post_id) => {
+                    if matches!(self.screen, Screen::Compose(_)) {
+                        self.pop_screen();
+                    }
+                    // If the underlying screen is the feed, refresh it.
+                    if matches!(self.screen, Screen::Feed(_)) {
+                        self.spawn_feed_initial();
+                    }
+                }
+                Err(msg) => {
+                    if let Screen::Compose(s) = &mut self.screen {
+                        s.finish_submit(Err(msg));
+                    }
+                }
+            },
+            BgEvent::ReplyCreated(result) => match result {
+                Ok(_new_reply_id) => {
+                    if matches!(self.screen, Screen::Compose(_)) {
+                        self.pop_screen();
+                    }
+                    // If the underlying screen is a PostDetail, refresh replies.
+                    if let Screen::PostDetail(d) = &self.screen {
+                        let post_id = d.entry.post_id.clone();
+                        self.spawn_detail_replies_initial(&post_id);
+                    }
+                }
+                Err(msg) => {
+                    if let Screen::Compose(s) = &mut self.screen {
+                        s.finish_submit(Err(msg));
+                    }
+                }
+            },
+            BgEvent::EntryDeleted(result) => match result {
+                Ok(_post_id) => {
+                    if matches!(self.screen, Screen::PostDetail(_)) {
+                        self.pop_screen();
+                    }
+                    if matches!(self.screen, Screen::Feed(_)) {
+                        self.spawn_feed_initial();
+                    }
+                }
+                Err(msg) => {
+                    if let Screen::PostDetail(s) = &mut self.screen {
+                        s.error = Some(format!("delete failed: {msg}"));
+                    }
+                }
+            },
+            BgEvent::NotesInitial(result) => {
+                if let Screen::Journal(s) = &mut self.screen {
+                    s.apply_initial(result);
+                }
+            }
+            BgEvent::NotesMore(result) => {
+                if let Screen::Journal(s) = &mut self.screen {
+                    s.apply_more(result);
+                }
+            }
+            BgEvent::NoteRevisions { note_id, result } => {
+                if let Screen::Journal(s) = &mut self.screen {
+                    s.apply_revisions(note_id, result);
+                }
+            }
+            BgEvent::NoteCreated(result) => match result {
+                Ok(_) => {
+                    if matches!(self.screen, Screen::Compose(_)) {
+                        self.pop_screen();
+                    }
+                    if matches!(self.screen, Screen::Journal(_)) {
+                        self.spawn_notes_initial();
+                    }
+                }
+                Err(msg) => {
+                    if let Screen::Compose(s) = &mut self.screen {
+                        s.finish_submit(Err(msg));
+                    }
+                }
+            },
+            BgEvent::NoteUpdated(result) => match result {
+                Ok(_) => {
+                    if matches!(self.screen, Screen::Compose(_)) {
+                        self.pop_screen();
+                    }
+                    if matches!(self.screen, Screen::Journal(_)) {
+                        self.spawn_notes_initial();
+                    }
+                }
+                Err(msg) => {
+                    if let Screen::Compose(s) = &mut self.screen {
+                        s.finish_submit(Err(msg));
+                    }
+                }
+            },
+            BgEvent::NoteDeleted => {
+                // Already removed optimistically; no further action.
+            }
+            BgEvent::SettingsLoaded(result) => {
+                if let Screen::Settings(s) = &mut self.screen {
+                    s.apply_loaded(result);
+                }
+            }
+            BgEvent::SettingsSaved(result) => match result {
+                Ok(s) => {
+                    if let Screen::Settings(screen) = &mut self.screen {
+                        screen.apply_loaded(Ok(s));
+                        screen.finish_submit(Ok(()));
+                    }
+                }
+                Err(msg) => {
+                    if let Screen::Settings(screen) = &mut self.screen {
+                        screen.finish_submit(Err(msg));
+                    }
+                }
+            },
+        }
+    }
+
+    // Navigation helpers ------------------------------------------------------
+
+    fn push_screen(&mut self, new: Screen) {
+        let prev = std::mem::replace(&mut self.screen, new);
+        self.back_stack.push(prev);
+    }
+
+    fn pop_screen(&mut self) {
+        if let Some(prev) = self.back_stack.pop() {
+            self.screen = prev;
+        }
+        // Pop from the bottom of the stack (a root screen) is a no-op now;
+        // the user picks Quit explicitly from the menu instead.
+    }
+
+    /// Clear session state and return to the login screen. Used by the menu's
+    /// `Logout` action (also reachable when an API call repeatedly fails and the
+    /// user wants to bail).
+    async fn logout(&mut self) {
+        self.client.clear_tokens().await;
+        if let Err(e) = crate::session::Session::clear() {
+            tracing::warn!(error = %e, "session clear failed");
+        }
+        self.back_stack.clear();
+        self.current_root = None;
+        self.unread_count = 0;
+        let email = self.last_email.clone();
+        self.screen = Screen::Login(LoginScreen::new(email));
+    }
+
+    fn goto_root(&mut self, target: RootKind) {
+        self.back_stack.clear();
+        self.current_root = Some(target);
+        match target {
+            RootKind::Feed => {
+                self.screen = Screen::Feed(FeedScreen::new());
+                self.spawn_feed_initial();
+            }
+            RootKind::Notifications => {
+                let mut s = NotificationsScreen::new();
+                s.filter = NotificationsFilter::All;
+                self.screen = Screen::Notifications(s);
+                self.spawn_notifications_initial(NotificationsFilter::All);
+            }
+            RootKind::Bookmarks => {
+                self.screen = Screen::Bookmarks(BookmarksScreen::new());
+                self.spawn_bookmarks_initial();
+            }
+            RootKind::Topics => {
+                self.screen = Screen::Topics(TopicsScreen::new());
+                self.spawn_topics_load();
+            }
+            RootKind::Profile => {
+                self.screen = Screen::Profile(ProfileScreen::new_own());
+                self.spawn_profile_user_me();
+            }
+            RootKind::Journal => {
+                self.screen = Screen::Journal(JournalScreen::new());
+                self.spawn_notes_initial();
+            }
+            RootKind::Settings => {
+                self.screen = Screen::Settings(SettingsScreen::new());
+                self.spawn_settings_load();
+            }
+        }
+    }
+
+    // Spawn helpers -----------------------------------------------------------
+
+    fn spawn_login(&self, email: String, password: String) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .login(&email, &password)
+                .await
+                .map(|_| email)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(BgEvent::LoginResult(result));
+        });
+    }
+
+    fn spawn_feed_initial(&self) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .list_entries(None, None)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(BgEvent::FeedInitial(result));
+        });
+    }
+
+    fn spawn_feed_more(&self, cursor: Option<String>) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .list_entries(cursor.as_deref(), None)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(BgEvent::FeedMore(result));
+        });
+    }
+
+    fn spawn_notifications_initial(&self, filter: NotificationsFilter) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .list_notifications(None, None, filter, &[])
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(BgEvent::NotificationsInitial(result));
+        });
+    }
+
+    fn spawn_notifications_more(&self, filter: NotificationsFilter, cursor: Option<String>) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .list_notifications(cursor.as_deref(), None, filter, &[])
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(BgEvent::NotificationsMore(result));
+        });
+    }
+
+    fn spawn_mark_notification_read(&self, notification_id: String) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            match client.mark_notification_read(&notification_id).await {
+                Ok(()) => {
+                    let _ = tx.send(BgEvent::NotificationMarkedRead);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, notification_id, "mark_notification_read failed");
+                }
+            }
+        });
+    }
+
+    fn spawn_mark_all_notifications_read(&self) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            match client.mark_all_notifications_read().await {
+                Ok(_) => {
+                    let _ = tx.send(BgEvent::AllNotificationsMarked);
+                }
+                Err(e) => tracing::warn!(error = %e, "mark_all_notifications_read failed"),
+            }
+        });
+    }
+
+    fn spawn_bookmarks_initial(&self) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .list_bookmarks(None, None)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(BgEvent::BookmarksInitial(result));
+        });
+    }
+
+    fn spawn_bookmarks_more(&self, cursor: Option<String>) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .list_bookmarks(cursor.as_deref(), None)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(BgEvent::BookmarksMore(result));
+        });
+    }
+
+    fn spawn_delete_bookmark(&self, bookmark_id: String) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            match client.delete_bookmark(&bookmark_id).await {
+                Ok(()) => {
+                    let _ = tx.send(BgEvent::BookmarkRemoved);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, bookmark_id, "delete_bookmark failed");
+                }
+            }
+        });
+    }
+
+    fn spawn_topics_load(&self) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client.list_topics().await.map_err(|e| e.to_string());
+            let _ = tx.send(BgEvent::TopicsLoaded(result));
+        });
+    }
+
+    fn spawn_topic_feed_initial(&self, slug: &str) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        let slug = slug.to_string();
+        tokio::spawn(async move {
+            let result = client
+                .list_topic_posts(&slug, None, None)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(BgEvent::TopicFeedInitial { slug, result });
+        });
+    }
+
+    fn spawn_topic_feed_more(&self, slug: &str, cursor: Option<String>) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        let slug = slug.to_string();
+        tokio::spawn(async move {
+            let result = client
+                .list_topic_posts(&slug, cursor.as_deref(), None)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(BgEvent::TopicFeedMore { slug, result });
+        });
+    }
+
+    fn spawn_detail_replies_initial(&self, post_id: &str) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        let post_id = post_id.to_string();
+        tokio::spawn(async move {
+            let result = client
+                .list_replies(&post_id, None, None)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(BgEvent::DetailRepliesInitial(result));
+        });
+    }
+
+    fn spawn_detail_replies_more(&self, post_id: &str, cursor: Option<String>) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        let post_id = post_id.to_string();
+        tokio::spawn(async move {
+            let result = client
+                .list_replies(&post_id, cursor.as_deref(), None)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(BgEvent::DetailRepliesMore(result));
+        });
+    }
+
+    fn spawn_open_post_detail_by_id(&self, post_id: String, highlight_reply_id: Option<String>) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client.get_entry(&post_id).await.map_err(|e| e.to_string());
+            let _ = tx.send(BgEvent::OpenPostDetail {
+                result,
+                highlight_reply_id,
+            });
+        });
+    }
+
+    fn spawn_unread_count_once(&self) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            match client.unread_notification_count().await {
+                Ok(n) => {
+                    let _ = tx.send(BgEvent::UnreadCount(n));
+                }
+                Err(e) => tracing::debug!(error = %e, "unread_count one-shot failed"),
+            }
+        });
+    }
+
+    fn spawn_profile_user_me(&self) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client.get_own_profile().await.map_err(|e| e.to_string());
+            let _ = tx.send(BgEvent::ProfileUser(result));
+        });
+    }
+
+    fn spawn_profile_user(&self, username: String) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .get_profile(&username)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(BgEvent::ProfileUser(result));
+        });
+    }
+
+    fn spawn_profile_tab_fetch(
+        &self,
+        tab: ProfileTab,
+        username: String,
+        user_id: Option<String>,
+        cursor: Option<String>,
+    ) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        let more = cursor.is_some();
+        tokio::spawn(async move {
+            match tab {
+                ProfileTab::Info => {} // Info uses the User fetch.
+                ProfileTab::Posts => {
+                    let result = client
+                        .list_user_posts(&username, cursor.as_deref(), None)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(BgEvent::ProfilePosts { more, result });
+                }
+                ProfileTab::Replies => {
+                    let result = client
+                        .list_user_replies(&username, cursor.as_deref(), None)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(BgEvent::ProfileReplies { more, result });
+                }
+                ProfileTab::Followers => {
+                    let result = client
+                        .list_follows(
+                            FollowsDirection::Followers,
+                            user_id.as_deref(),
+                            cursor.as_deref(),
+                            None,
+                        )
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(BgEvent::ProfileFollowers { more, result });
+                }
+                ProfileTab::Following => {
+                    let result = client
+                        .list_follows(
+                            FollowsDirection::Following,
+                            user_id.as_deref(),
+                            cursor.as_deref(),
+                            None,
+                        )
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(BgEvent::ProfileFollowing { more, result });
+                }
+            }
+        });
+    }
+
+    fn spawn_toggle_follow(&self, user_id: String, follow_id: Option<String>) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            if let Some(fid) = follow_id {
+                // Currently following — unfollow.
+                let result = client
+                    .unfollow(&fid)
+                    .await
+                    .map(|()| None)
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(BgEvent::ProfileFollowToggled(result));
+            } else {
+                // Not following — follow.
+                let result = client
+                    .follow_user(&user_id)
+                    .await
+                    .map(Some)
+                    .map_err(|e| e.to_string());
+                let _ = tx.send(BgEvent::ProfileFollowToggled(result));
+            }
+        });
+    }
+
+    fn spawn_update_own_profile(&self, update: ProfileUpdate) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .update_own_profile(&update)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(BgEvent::ProfileUpdated(result));
+        });
+    }
+
+    /// Launch $EDITOR on a tempfile (synchronously, off the runtime thread),
+    /// then push a `Compose` screen with the resulting content. Empty content
+    /// cancels the flow.
+    async fn start_compose(&mut self, kind: ComposeKind, prefill: String) {
+        let initial = if prefill.is_empty() {
+            String::new()
+        } else {
+            prefill
+        };
+        let editor_result = tokio::task::spawn_blocking(move || launch_editor(&initial, ".md"))
+            .await
+            .map_err(|e| format!("editor task panicked: {e}"))
+            .and_then(|r| r.map_err(|e| e.to_string()));
+
+        let content = match editor_result {
+            Ok(c) => c,
+            Err(msg) => {
+                tracing::warn!(error = %msg, "compose: editor failed");
+                return;
+            }
+        };
+        if content.trim().is_empty() {
+            tracing::debug!("compose: empty content, cancelled");
+            return;
+        }
+        let screen = ComposeScreen::new(kind, content);
+        self.push_screen(Screen::Compose(screen));
+    }
+
+    fn spawn_compose_submit(&self) {
+        let (kind, content, title, topics, is_public, is_nsfw) = match &self.screen {
+            Screen::Compose(s) => (
+                s.kind.clone(),
+                s.content.clone(),
+                s.title_to_send(),
+                s.parse_topics(),
+                s.is_public,
+                s.is_nsfw,
+            ),
+            _ => return,
+        };
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            match kind {
+                ComposeKind::NewEntry => {
+                    let result = client
+                        .create_entry(
+                            &content,
+                            title.as_deref(),
+                            None,
+                            &topics,
+                            is_public,
+                            is_nsfw,
+                        )
+                        .await
+                        .map(|created| created.post_id)
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(BgEvent::EntryCreated(result));
+                }
+                ComposeKind::Reply {
+                    post_id,
+                    parent_reply_id,
+                } => {
+                    let result = client
+                        .create_reply(&post_id, &content, parent_reply_id.as_deref())
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(BgEvent::ReplyCreated(result));
+                }
+                ComposeKind::NewNote => {
+                    let result = client
+                        .create_note(&content, &topics)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(BgEvent::NoteCreated(result));
+                }
+                ComposeKind::UpdateNote { note_id } => {
+                    let result = client
+                        .update_note(&note_id, &content, &topics)
+                        .await
+                        .map(|()| note_id)
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(BgEvent::NoteUpdated(result));
+                }
+            }
+        });
+    }
+
+    fn spawn_delete_entry(&self, post_id: String) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .delete_entry(&post_id)
+                .await
+                .map(|()| post_id)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(BgEvent::EntryDeleted(result));
+        });
+    }
+
+    async fn start_compose_note_edit(
+        &mut self,
+        note_id: String,
+        prefill: String,
+        topics: Vec<String>,
+    ) {
+        let editor_result = tokio::task::spawn_blocking(move || launch_editor(&prefill, ".md"))
+            .await
+            .map_err(|e| format!("editor task panicked: {e}"))
+            .and_then(|r| r.map_err(|e| e.to_string()));
+        let content = match editor_result {
+            Ok(c) => c,
+            Err(msg) => {
+                tracing::warn!(error = %msg, "compose-note-edit: editor failed");
+                return;
+            }
+        };
+        if content.trim().is_empty() {
+            return;
+        }
+        let mut screen = ComposeScreen::new(ComposeKind::UpdateNote { note_id }, content);
+        screen.topics_input = topics.join(", ");
+        self.push_screen(Screen::Compose(screen));
+    }
+
+    fn spawn_notes_initial(&self) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .list_notes(None, None)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(BgEvent::NotesInitial(result));
+        });
+    }
+
+    fn spawn_notes_more(&self, cursor: Option<String>) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .list_notes(cursor.as_deref(), None)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(BgEvent::NotesMore(result));
+        });
+    }
+
+    fn spawn_note_revisions(&self, note_id: String) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .list_note_revisions(&note_id, None, None)
+                .await
+                .map(|(items, _cursor)| items)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(BgEvent::NoteRevisions { note_id, result });
+        });
+    }
+
+    fn spawn_settings_load(&self) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client.get_settings().await.map_err(|e| e.to_string());
+            let _ = tx.send(BgEvent::SettingsLoaded(result));
+        });
+    }
+
+    fn spawn_settings_save(&self, update: SettingsUpdate) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .update_settings(&update)
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(BgEvent::SettingsSaved(result));
+        });
+    }
+
+    fn spawn_delete_note(&self, note_id: String) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            match client.delete_note(&note_id).await {
+                Ok(()) => {
+                    let _ = tx.send(BgEvent::NoteDeleted);
+                }
+                Err(e) => tracing::warn!(error = %e, note_id, "delete_note failed"),
+            }
+        });
+    }
+
+    fn spawn_unread_count_poller(&self) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            // Brief settle delay so the initial render lands before the first poll.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            loop {
+                match client.unread_notification_count().await {
+                    Ok(n) => {
+                        if tx.send(BgEvent::UnreadCount(n)).is_err() {
+                            return; // app gone
+                        }
+                    }
+                    Err(e) => tracing::debug!(error = %e, "unread_count poll failed"),
+                }
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+    }
+}
+
+/// Read the next terminal event by yielding the current task and polling
+/// crossterm on a blocking thread (so the tokio runtime stays responsive).
+async fn next_terminal_event() -> Result<Event> {
+    tokio::task::spawn_blocking(event::read)
+        .await
+        .context("event-read task panicked")?
+        .context("event-read failed")
+}
+
+/// Block on a future from within the App run-loop task. Safe here because
+/// `Client::tokens()` only reads a `RwLock` — it does not itself await on
+/// anything that would re-enter the runtime.
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+}
+
+fn first_line(s: &str) -> String {
+    let line = s.lines().next().unwrap_or("").trim();
+    if line.chars().count() <= 100 {
+        line.to_string()
+    } else {
+        let truncated: String = line.chars().take(99).collect();
+        format!("{truncated}…")
+    }
+}
