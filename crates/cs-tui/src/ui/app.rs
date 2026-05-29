@@ -2,7 +2,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode};
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use cs_api::{
     Bookmark, Client, Entry, Follow, FollowsDirection, Note, NoteRevision, Notification,
     NotificationsFilter, ProfileUpdate, Reply, Settings, SettingsUpdate, Topic, User,
@@ -111,6 +111,15 @@ pub enum Screen {
 impl Screen {
     fn is_login(&self) -> bool {
         matches!(self, Screen::Login(_))
+    }
+
+    /// Screens with inline text entry, where printable keys (like `?`) must
+    /// reach the focused field rather than triggering global shortcuts.
+    fn accepts_text_input(&self) -> bool {
+        matches!(
+            self,
+            Screen::Login(_) | Screen::Compose(_) | Screen::EditProfile(_) | Screen::Settings(_)
+        )
     }
 }
 
@@ -234,6 +243,8 @@ pub struct App {
     bg_rx: mpsc::UnboundedReceiver<BgEvent>,
     /// Open overlay menu, if any (triggered by Esc).
     menu: Option<MenuOverlay>,
+    /// Whether the `?` help overlay is currently shown.
+    help: bool,
     /// Email cached for re-displaying on the login screen after logout.
     last_email: String,
 }
@@ -254,6 +265,7 @@ impl App {
             bg_tx,
             bg_rx,
             menu: None,
+            help: false,
             last_email,
         }
     }
@@ -323,11 +335,24 @@ impl App {
         if let Some(menu) = &self.menu {
             menu.render(frame, full_area, &self.theme);
         }
+        if self.help {
+            super::help::render(frame, full_area, &self.theme);
+        }
     }
 
     async fn handle_terminal_event(&mut self, ev: Event) {
         let Event::Key(key) = ev else { return };
         if key.kind != event::KeyEventKind::Press {
+            return;
+        }
+
+        // The help overlay swallows the next key to dismiss (Ctrl+C still quits).
+        if self.help {
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                self.should_quit = true;
+            } else {
+                self.help = false;
+            }
             return;
         }
 
@@ -366,6 +391,12 @@ impl App {
                 has_back,
                 self.theme_kind.name(),
             ));
+            return;
+        }
+
+        // `?` opens the help overlay, except where a screen captures text input.
+        if key.code == KeyCode::Char('?') && !self.screen.accepts_text_input() {
+            self.help = true;
             return;
         }
 
@@ -1827,5 +1858,35 @@ mod tests {
         let app = test_app();
         let text = render_to_string(&app);
         assert!(!text.contains("Cancel"), "menu chrome leaked with no menu open");
+    }
+
+    fn key_event(code: KeyCode) -> Event {
+        Event::Key(crossterm::event::KeyEvent::new(code, KeyModifiers::empty()))
+    }
+
+    #[tokio::test]
+    async fn question_mark_toggles_help_on_read_screens() {
+        let mut app = test_app();
+        app.screen = Screen::Feed(FeedScreen::new()); // not a text-input screen
+        app.handle_terminal_event(key_event(KeyCode::Char('?'))).await;
+        assert!(app.help, "? should open help on the feed");
+        app.handle_terminal_event(key_event(KeyCode::Char('j'))).await;
+        assert!(!app.help, "any key should dismiss help");
+    }
+
+    #[tokio::test]
+    async fn question_mark_is_text_on_the_login_screen() {
+        let mut app = test_app(); // starts on Login (text input)
+        app.handle_terminal_event(key_event(KeyCode::Char('?'))).await;
+        assert!(!app.help, "? must not open help while typing into login");
+    }
+
+    #[test]
+    fn help_overlay_renders_over_a_screen() {
+        let mut app = test_app();
+        app.help = true;
+        let text = render_to_string(&app);
+        assert!(text.contains("help"), "help title not drawn");
+        assert!(text.contains("Sections"), "help body not drawn");
     }
 }
