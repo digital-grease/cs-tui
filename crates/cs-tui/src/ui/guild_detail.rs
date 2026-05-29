@@ -2,7 +2,7 @@
 //! pressing Enter on the guilds index. Enter on a thread opens it in the post
 //! detail view. (Join/leave and thread composition land in a follow-up.)
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use cs_api::{Guild, GuildMembership, GuildRole, GuildThread};
+use cs_api::{Guild, GuildMembership, GuildRole, GuildThread, JoinedGuild};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
@@ -29,6 +29,10 @@ pub enum GuildIntent {
     SelectTab(GuildTab),
     /// Open the selected thread in the post-detail view.
     OpenThread { post_id: String },
+    /// Join this guild.
+    Join,
+    /// Leave this guild.
+    Leave,
     Quit,
     None,
 }
@@ -47,6 +51,8 @@ pub struct GuildScreen {
     pub members_selected: usize,
     pub members_loaded: bool,
     pub loading: bool,
+    /// True while a join/leave request is in flight (prevents double-submit).
+    pub action_pending: bool,
     pub error: Option<String>,
 }
 
@@ -65,6 +71,7 @@ impl GuildScreen {
             members_selected: 0,
             members_loaded: false,
             loading: true,
+            action_pending: false,
             error: None,
         }
     }
@@ -121,6 +128,27 @@ impl GuildScreen {
             }
             KeyCode::Char('l') | KeyCode::Right | KeyCode::Tab => {
                 return self.select_tab(GuildTab::Members);
+            }
+            KeyCode::Char('J') => {
+                let can_join =
+                    self.guild.as_ref().is_some_and(|g| !g.is_member) && !self.action_pending;
+                if can_join {
+                    self.action_pending = true;
+                    return GuildIntent::Join;
+                }
+                return GuildIntent::None;
+            }
+            KeyCode::Char('L') => {
+                let can_leave = self
+                    .guild
+                    .as_ref()
+                    .is_some_and(|g| g.is_member && g.role != Some(GuildRole::Founder))
+                    && !self.action_pending;
+                if can_leave {
+                    self.action_pending = true;
+                    return GuildIntent::Leave;
+                }
+                return GuildIntent::None;
             }
             _ => {}
         }
@@ -240,6 +268,36 @@ impl GuildScreen {
         }
     }
 
+    pub fn apply_joined(&mut self, result: Result<JoinedGuild, String>) {
+        self.action_pending = false;
+        match result {
+            Ok(j) => {
+                if let Some(g) = &mut self.guild {
+                    g.is_member = true;
+                    g.role = j.role.or(Some(GuildRole::Member));
+                    g.member_count = g.member_count.saturating_add(1);
+                }
+                self.error = None;
+            }
+            Err(msg) => self.error = Some(msg),
+        }
+    }
+
+    pub fn apply_left(&mut self, result: Result<String, String>) {
+        self.action_pending = false;
+        match result {
+            Ok(_) => {
+                if let Some(g) = &mut self.guild {
+                    g.is_member = false;
+                    g.role = None;
+                    g.member_count = g.member_count.saturating_sub(1);
+                }
+                self.error = None;
+            }
+            Err(msg) => self.error = Some(msg),
+        }
+    }
+
     pub fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         let name = self.guild.as_ref().map(|g| g.name.as_str()).unwrap_or(&self.slug);
         let block = Block::default()
@@ -276,12 +334,21 @@ impl GuildScreen {
             self.render_list(frame, layout[2], theme);
         }
 
-        let status = match self.tab {
-            GuildTab::Threads => "h/l tabs · j/k · enter open · n next · r refresh · esc menu",
-            GuildTab::Members => "h/l tabs · j/k · n next · r refresh · esc menu",
+        let base = match self.tab {
+            GuildTab::Threads => "h/l tabs · j/k · enter open · n next · r refresh",
+            GuildTab::Members => "h/l tabs · j/k · n next · r refresh",
+        };
+        let action = match &self.guild {
+            _ if self.action_pending => " · working…",
+            Some(g) if !g.is_member => " · J join",
+            Some(g) if g.is_member && g.role != Some(GuildRole::Founder) => " · L leave",
+            _ => "",
         };
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(status, theme.muted_style()))),
+            Paragraph::new(Line::from(Span::styled(
+                format!("{base}{action} · esc menu"),
+                theme.muted_style(),
+            ))),
             layout[3],
         );
     }
@@ -547,5 +614,72 @@ mod tests {
         s.handle_key(key(KeyCode::Char('j')));
         s.handle_key(key(KeyCode::Char('j')));
         assert_eq!(s.threads_selected, 2);
+    }
+
+    fn with_guild(is_member: bool, role: Option<GuildRole>) -> GuildScreen {
+        let mut s = GuildScreen::new("owls".into());
+        s.guild = Some(Guild {
+            id: "g1".into(),
+            slug: "owls".into(),
+            member_count: 5,
+            is_member,
+            role,
+            ..Default::default()
+        });
+        s
+    }
+
+    #[test]
+    fn j_requests_join_only_when_not_a_member() {
+        let mut s = with_guild(false, None);
+        assert_eq!(s.handle_key(key(KeyCode::Char('J'))), GuildIntent::Join);
+        assert!(s.action_pending);
+
+        let mut member = with_guild(true, Some(GuildRole::Member));
+        assert_eq!(member.handle_key(key(KeyCode::Char('J'))), GuildIntent::None);
+    }
+
+    #[test]
+    fn l_requests_leave_for_member_but_not_founder() {
+        let mut member = with_guild(true, Some(GuildRole::Member));
+        assert_eq!(member.handle_key(key(KeyCode::Char('L'))), GuildIntent::Leave);
+
+        let mut founder = with_guild(true, Some(GuildRole::Founder));
+        assert_eq!(founder.handle_key(key(KeyCode::Char('L'))), GuildIntent::None);
+    }
+
+    #[test]
+    fn apply_joined_sets_membership_and_bumps_count() {
+        let mut s = with_guild(false, None);
+        s.action_pending = true;
+        s.apply_joined(Ok(JoinedGuild {
+            guild_id: "g1".into(),
+            role: Some(GuildRole::Member),
+        }));
+        assert!(!s.action_pending);
+        let g = s.guild.unwrap();
+        assert!(g.is_member);
+        assert_eq!(g.role, Some(GuildRole::Member));
+        assert_eq!(g.member_count, 6);
+    }
+
+    #[test]
+    fn apply_left_clears_membership_and_drops_count() {
+        let mut s = with_guild(true, Some(GuildRole::Member));
+        s.apply_left(Ok("g1".into()));
+        let g = s.guild.unwrap();
+        assert!(!g.is_member);
+        assert!(g.role.is_none());
+        assert_eq!(g.member_count, 4);
+    }
+
+    #[test]
+    fn join_error_surfaces_and_clears_pending() {
+        let mut s = with_guild(false, None);
+        s.action_pending = true;
+        s.apply_joined(Err("api Conflict (409): already in a guild".into()));
+        assert!(!s.action_pending);
+        assert!(s.error.is_some());
+        assert!(!s.guild.unwrap().is_member);
     }
 }

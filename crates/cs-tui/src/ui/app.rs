@@ -4,9 +4,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use cs_api::{
-    Bookmark, Client, Entry, Follow, FollowsDirection, Guild, GuildMembership, GuildThread, Note,
-    NoteRevision, Notification, NotificationsFilter, ProfileUpdate, Reply, Settings, SettingsUpdate,
-    Topic, User,
+    Bookmark, Client, Entry, Follow, FollowsDirection, Guild, GuildMembership, GuildThread,
+    JoinedGuild, Note, NoteRevision, Notification, NotificationsFilter, ProfileUpdate, Reply,
+    Settings, SettingsUpdate, Topic, User,
 };
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::DefaultTerminal;
@@ -114,6 +114,14 @@ pub enum BgEvent {
     GuildMembersMore {
         slug: String,
         result: Result<(Vec<GuildMembership>, Option<String>), String>,
+    },
+    GuildJoined {
+        slug: String,
+        result: Result<JoinedGuild, String>,
+    },
+    GuildLeft {
+        slug: String,
+        result: Result<String, String>,
     },
 }
 
@@ -274,6 +282,12 @@ enum Action {
     GuildSelectTab {
         slug: String,
         tab: GuildTab,
+    },
+    GuildJoin {
+        slug: String,
+    },
+    GuildLeave {
+        slug: String,
     },
 }
 
@@ -713,6 +727,12 @@ impl App {
                     post_id,
                     highlight_reply_id: None,
                 },
+                GuildIntent::Join => Action::GuildJoin {
+                    slug: s.slug.clone(),
+                },
+                GuildIntent::Leave => Action::GuildLeave {
+                    slug: s.slug.clone(),
+                },
                 GuildIntent::None => Action::None,
             },
         };
@@ -944,6 +964,8 @@ impl App {
             Action::GuildLoadMore { slug, tab, cursor } => {
                 self.spawn_guild_tab_more(&slug, tab, cursor)
             }
+            Action::GuildJoin { slug } => self.spawn_guild_join(slug),
+            Action::GuildLeave { slug } => self.spawn_guild_leave(slug),
         }
     }
 
@@ -1303,6 +1325,20 @@ impl App {
                     }
                 }
             }
+            BgEvent::GuildJoined { slug, result } => {
+                if let Screen::Guild(s) = &mut self.screen {
+                    if s.slug == slug {
+                        s.apply_joined(result);
+                    }
+                }
+            }
+            BgEvent::GuildLeft { slug, result } => {
+                if let Screen::Guild(s) = &mut self.screen {
+                    if s.slug == slug {
+                        s.apply_left(result);
+                    }
+                }
+            }
         }
     }
 
@@ -1636,6 +1672,24 @@ impl App {
                     let _ = tx.send(BgEvent::GuildMembersMore { slug, result });
                 }
             }
+        });
+    }
+
+    fn spawn_guild_join(&self, slug: String) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client.join_guild(&slug).await.map_err(|e| e.to_string());
+            let _ = tx.send(BgEvent::GuildJoined { slug, result });
+        });
+    }
+
+    fn spawn_guild_leave(&self, slug: String) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client.leave_guild(&slug).await.map_err(|e| e.to_string());
+            let _ = tx.send(BgEvent::GuildLeft { slug, result });
         });
     }
 
