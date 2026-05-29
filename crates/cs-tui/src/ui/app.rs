@@ -23,7 +23,7 @@ use super::notifications::{NotificationsIntent, NotificationsScreen};
 use super::post_detail::{PostDetailIntent, PostDetailScreen};
 use super::profile::{ProfileIntent, ProfileScreen, ProfileTab};
 use super::settings_screen::{SettingsIntent, SettingsScreen};
-use super::theme::Theme;
+use super::theme::{Theme, ThemeKind};
 use super::topic_feed::{TopicFeedIntent, TopicFeedScreen};
 use super::topics::{TopicsIntent, TopicsScreen};
 use crate::session::Session;
@@ -224,6 +224,7 @@ enum Action {
 pub struct App {
     client: Client,
     theme: Theme,
+    theme_kind: ThemeKind,
     screen: Screen,
     back_stack: Vec<Screen>,
     current_root: Option<RootKind>,
@@ -238,12 +239,13 @@ pub struct App {
 }
 
 impl App {
-    pub fn with_theme(client: Client, prefill_email: String, theme: Theme) -> Self {
+    pub fn with_theme(client: Client, prefill_email: String, theme_kind: ThemeKind) -> Self {
         let (bg_tx, bg_rx) = mpsc::unbounded_channel();
         let last_email = prefill_email.clone();
         Self {
             client,
-            theme,
+            theme: theme_kind.theme(),
+            theme_kind,
             screen: Screen::Login(LoginScreen::new(prefill_email)),
             back_stack: Vec::new(),
             current_root: None,
@@ -342,6 +344,14 @@ impl App {
                     self.menu = None;
                     self.logout().await;
                 }
+                MenuIntent::CycleTheme => {
+                    self.cycle_theme();
+                    // Keep the menu open with a refreshed label so the user can
+                    // cycle repeatedly and watch the palette change live.
+                    if let Some(menu) = &mut self.menu {
+                        menu.refresh_theme_label(self.theme_kind.name());
+                    }
+                }
                 MenuIntent::Quit => self.should_quit = true,
             }
             return;
@@ -351,7 +361,11 @@ impl App {
         if key.code == KeyCode::Esc {
             let authenticated = !self.screen.is_login();
             let has_back = !self.back_stack.is_empty();
-            self.menu = Some(MenuOverlay::build(authenticated, has_back));
+            self.menu = Some(MenuOverlay::build(
+                authenticated,
+                has_back,
+                self.theme_kind.name(),
+            ));
             return;
         }
 
@@ -1150,6 +1164,19 @@ impl App {
         self.screen = Screen::Login(LoginScreen::new(email));
     }
 
+    /// Advance to the next theme palette, apply it live, and persist the choice
+    /// to local prefs so it survives restarts. A failed save is non-fatal.
+    fn cycle_theme(&mut self) {
+        self.theme_kind = self.theme_kind.next();
+        self.theme = self.theme_kind.theme();
+        let prefs = crate::prefs::Prefs {
+            theme: Some(self.theme_kind.name().to_string()),
+        };
+        if let Err(e) = prefs.save() {
+            tracing::warn!(error = %e, "theme prefs save failed");
+        }
+    }
+
     fn goto_root(&mut self, target: RootKind) {
         self.back_stack.clear();
         self.current_root = Some(target);
@@ -1771,7 +1798,7 @@ mod tests {
 
     fn test_app() -> App {
         let client = cs_api::Client::new().expect("client builds");
-        App::with_theme(client, "you@example.com".into(), Theme::by_name("cyber"))
+        App::with_theme(client, "you@example.com".into(), ThemeKind::Cyber)
     }
 
     fn render_to_string(app: &App) -> String {
@@ -1788,7 +1815,7 @@ mod tests {
         // invisible menu and the UI appeared frozen.
         let mut app = test_app();
         assert!(app.screen.is_login());
-        app.menu = Some(MenuOverlay::build(false, false));
+        app.menu = Some(MenuOverlay::build(false, false, "cyber"));
         let text = render_to_string(&app);
         assert!(text.contains("menu"), "menu title not drawn: {text:?}");
         assert!(text.contains("Quit"), "Quit item not drawn");

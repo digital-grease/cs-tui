@@ -2,11 +2,13 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use cs_api::Client;
 
+mod prefs;
 mod session;
 mod ui;
 
+use prefs::Prefs;
 use session::Session;
-use ui::{theme::Theme, App};
+use ui::{theme::ThemeKind, App};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "TUI client for cyberspace.online")]
@@ -15,9 +17,10 @@ struct Cli {
     #[arg(long, env = "CS_TUI_API_BASE")]
     api_base: Option<String>,
 
-    /// Color theme: cyber (default), c64, vt320, or dark.
-    #[arg(long, env = "CS_TUI_THEME", default_value = "cyber")]
-    theme: String,
+    /// Color theme: cyber (default), c64, vt320, or dark. Overrides the saved
+    /// preference for this run; the theme is also remembered between runs.
+    #[arg(long, env = "CS_TUI_THEME")]
+    theme: Option<String>,
 
     /// Run against the in-memory mock client (no network). Not yet implemented.
     #[arg(long)]
@@ -57,9 +60,16 @@ async fn main() -> Result<()> {
         }
     }
 
-    let theme = Theme::by_name(&cli.theme);
+    // Precedence: explicit --theme/$CS_TUI_THEME > saved prefs > default.
+    let prefs = Prefs::load();
+    let theme_kind = cli
+        .theme
+        .as_deref()
+        .or(prefs.theme.as_deref())
+        .map(ThemeKind::from_name)
+        .unwrap_or(ThemeKind::Cyber);
     let terminal = ratatui::init();
-    let mut app = App::with_theme(client, prefill_email, theme);
+    let mut app = App::with_theme(client, prefill_email, theme_kind);
     if has_session {
         app.enter_feed_initial();
     }

@@ -15,17 +15,20 @@ use super::theme::Theme;
 pub enum MenuItem {
     Back,
     Logout,
+    /// Cycle the color palette. Carries the current theme name for its label.
+    Theme(&'static str),
     Quit,
     Cancel,
 }
 
 impl MenuItem {
-    fn label(self) -> &'static str {
+    fn label(self) -> String {
         match self {
-            Self::Back => "Back  (close this screen)",
-            Self::Logout => "Logout  (clear session, return to login)",
-            Self::Quit => "Quit  (exit cs-tui)",
-            Self::Cancel => "Cancel  (close menu, stay here)",
+            Self::Back => "Back  (close this screen)".to_string(),
+            Self::Logout => "Logout  (clear session, return to login)".to_string(),
+            Self::Theme(name) => format!("Theme: {name}  (cycle palette)"),
+            Self::Quit => "Quit  (exit cs-tui)".to_string(),
+            Self::Cancel => "Cancel  (close menu, stay here)".to_string(),
         }
     }
 }
@@ -35,6 +38,7 @@ pub enum MenuIntent {
     Cancel,
     Back,
     Logout,
+    CycleTheme,
     Quit,
     None,
 }
@@ -51,7 +55,7 @@ impl MenuOverlay {
     /// - `has_back` is true when there's a child screen above a root (so "Back"
     ///   is a meaningful action).
     /// - `authenticated` is true after a successful login (so "Logout" is real).
-    pub fn build(authenticated: bool, has_back: bool) -> Self {
+    pub fn build(authenticated: bool, has_back: bool, theme_name: &'static str) -> Self {
         let mut items = Vec::new();
         if has_back {
             items.push(MenuItem::Back);
@@ -59,9 +63,20 @@ impl MenuOverlay {
         if authenticated {
             items.push(MenuItem::Logout);
         }
+        items.push(MenuItem::Theme(theme_name));
         items.push(MenuItem::Quit);
         items.push(MenuItem::Cancel);
         Self { items, selected: 0 }
+    }
+
+    /// Replace the Theme item's label in place, preserving the current
+    /// selection so the menu can stay open while the user cycles palettes.
+    pub fn refresh_theme_label(&mut self, name: &'static str) {
+        for it in &mut self.items {
+            if matches!(it, MenuItem::Theme(_)) {
+                *it = MenuItem::Theme(name);
+            }
+        }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> MenuIntent {
@@ -90,6 +105,7 @@ impl MenuOverlay {
                     return match item {
                         MenuItem::Back => MenuIntent::Back,
                         MenuItem::Logout => MenuIntent::Logout,
+                        MenuItem::Theme(_) => MenuIntent::CycleTheme,
                         MenuItem::Quit => MenuIntent::Quit,
                         MenuItem::Cancel => MenuIntent::Cancel,
                     };
@@ -104,6 +120,7 @@ impl MenuOverlay {
                             return match item {
                                 MenuItem::Back => MenuIntent::Back,
                                 MenuItem::Logout => MenuIntent::Logout,
+                                MenuItem::Theme(_) => MenuIntent::CycleTheme,
                                 MenuItem::Quit => MenuIntent::Quit,
                                 MenuItem::Cancel => MenuIntent::Cancel,
                             };
@@ -135,19 +152,16 @@ impl MenuOverlay {
         let inner = block.inner(card);
         frame.render_widget(block, card);
 
-        // Reserve the bottom row for a hint.
-        let list_area = Rect::new(
-            inner.x,
-            inner.y,
-            inner.width,
-            inner.height.saturating_sub(1),
-        );
-        let hint_area = Rect::new(
-            inner.x,
-            inner.y + inner.height.saturating_sub(1),
-            inner.width,
-            1,
-        );
+        // Reserve a bottom hint row only when there's room beyond the items, so
+        // on short terminals the items win the available space. The selected
+        // item still scrolls into view via ListState if the list is clipped.
+        let show_hint = inner.height > self.items.len() as u16;
+        let list_h = if show_hint {
+            inner.height.saturating_sub(1)
+        } else {
+            inner.height
+        };
+        let list_area = Rect::new(inner.x, inner.y, inner.width, list_h);
 
         let items: Vec<ListItem<'_>> = self
             .items
@@ -168,11 +182,14 @@ impl MenuOverlay {
         state.select(Some(self.selected.min(self.items.len().saturating_sub(1))));
         frame.render_stateful_widget(list, list_area, &mut state);
 
-        let hint = Paragraph::new(Line::from(Span::styled(
-            "j/k or 1-4 · enter select · esc dismiss",
-            theme.muted_style(),
-        )));
-        frame.render_widget(hint, hint_area);
+        if show_hint {
+            let hint_area = Rect::new(inner.x, inner.y + list_h, inner.width, 1);
+            let hint = Paragraph::new(Line::from(Span::styled(
+                "j/k or number · enter select · esc dismiss",
+                theme.muted_style(),
+            )));
+            frame.render_widget(hint, hint_area);
+        }
     }
 }
 
@@ -191,28 +208,37 @@ mod tests {
     }
 
     #[test]
-    fn unauthenticated_root_menu_has_quit_and_cancel_only() {
-        let m = MenuOverlay::build(false, false);
-        assert_eq!(m.items, vec![MenuItem::Quit, MenuItem::Cancel]);
+    fn unauthenticated_root_menu_has_theme_quit_cancel() {
+        let m = MenuOverlay::build(false, false, "cyber");
+        assert_eq!(
+            m.items,
+            vec![MenuItem::Theme("cyber"), MenuItem::Quit, MenuItem::Cancel]
+        );
     }
 
     #[test]
-    fn authenticated_root_menu_has_logout_quit_cancel() {
-        let m = MenuOverlay::build(true, false);
+    fn authenticated_root_menu_has_logout_theme_quit_cancel() {
+        let m = MenuOverlay::build(true, false, "cyber");
         assert_eq!(
             m.items,
-            vec![MenuItem::Logout, MenuItem::Quit, MenuItem::Cancel]
+            vec![
+                MenuItem::Logout,
+                MenuItem::Theme("cyber"),
+                MenuItem::Quit,
+                MenuItem::Cancel
+            ]
         );
     }
 
     #[test]
     fn child_screen_menu_offers_back_first() {
-        let m = MenuOverlay::build(true, true);
+        let m = MenuOverlay::build(true, true, "cyber");
         assert_eq!(
             m.items,
             vec![
                 MenuItem::Back,
                 MenuItem::Logout,
+                MenuItem::Theme("cyber"),
                 MenuItem::Quit,
                 MenuItem::Cancel
             ]
@@ -221,13 +247,13 @@ mod tests {
 
     #[test]
     fn esc_dismisses_menu() {
-        let mut m = MenuOverlay::build(true, true);
+        let mut m = MenuOverlay::build(true, true, "cyber");
         assert_eq!(m.handle_key(key(KeyCode::Esc)), MenuIntent::Cancel);
     }
 
     #[test]
     fn ctrl_c_quits() {
-        let mut m = MenuOverlay::build(true, false);
+        let mut m = MenuOverlay::build(true, false, "cyber");
         let k = KeyEvent {
             code: KeyCode::Char('c'),
             modifiers: KeyModifiers::CONTROL,
@@ -239,36 +265,94 @@ mod tests {
 
     #[test]
     fn enter_on_back_emits_back() {
-        let mut m = MenuOverlay::build(true, true);
+        let mut m = MenuOverlay::build(true, true, "cyber");
         // Back is item 0.
         assert_eq!(m.handle_key(key(KeyCode::Enter)), MenuIntent::Back);
     }
 
     #[test]
     fn enter_on_logout_emits_logout() {
-        let mut m = MenuOverlay::build(true, false);
+        let mut m = MenuOverlay::build(true, false, "cyber");
         // Logout is item 0 when not pushed.
         assert_eq!(m.handle_key(key(KeyCode::Enter)), MenuIntent::Logout);
     }
 
     #[test]
+    fn enter_on_theme_emits_cycle_theme() {
+        // Unauthenticated root: [Theme, Quit, Cancel] — Theme is item 0.
+        let mut m = MenuOverlay::build(false, false, "cyber");
+        assert_eq!(m.handle_key(key(KeyCode::Enter)), MenuIntent::CycleTheme);
+    }
+
+    #[test]
     fn j_advances_then_enter_picks() {
-        let mut m = MenuOverlay::build(true, true);
+        let mut m = MenuOverlay::build(true, true, "cyber");
         m.handle_key(key(KeyCode::Char('j'))); // Logout
         assert_eq!(m.handle_key(key(KeyCode::Enter)), MenuIntent::Logout);
     }
 
     #[test]
     fn digit_picks_directly() {
-        let mut m = MenuOverlay::build(true, true);
-        // 4 = Cancel
-        assert_eq!(m.handle_key(key(KeyCode::Char('4'))), MenuIntent::Cancel);
+        // [Back(1), Logout(2), Theme(3), Quit(4), Cancel(5)]
+        let mut m = MenuOverlay::build(true, true, "cyber");
+        assert_eq!(m.handle_key(key(KeyCode::Char('3'))), MenuIntent::CycleTheme);
+        assert_eq!(m.handle_key(key(KeyCode::Char('5'))), MenuIntent::Cancel);
     }
 
     #[test]
     fn out_of_range_digit_is_no_op() {
-        let mut m = MenuOverlay::build(false, false);
-        // Only 2 items; pressing 9 does nothing.
+        let mut m = MenuOverlay::build(false, false, "cyber");
+        // Only 3 items; pressing 9 does nothing.
         assert_eq!(m.handle_key(key(KeyCode::Char('9'))), MenuIntent::None);
+    }
+
+    #[test]
+    fn refresh_theme_label_swaps_name_and_keeps_selection() {
+        let mut m = MenuOverlay::build(false, false, "cyber");
+        assert_eq!(m.items[0], MenuItem::Theme("cyber"));
+        let before = m.selected;
+        m.refresh_theme_label("c64");
+        assert_eq!(m.items[0], MenuItem::Theme("c64"));
+        assert_eq!(m.selected, before, "selection should be preserved");
+    }
+
+    fn render_to_string(m: &MenuOverlay, w: u16, h: u16) -> String {
+        let theme = Theme::cyber();
+        let backend = ratatui::backend::TestBackend::new(w, h);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                m.render(f, area, &theme);
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn short_terminal_shows_all_items_and_drops_hint() {
+        // 5 items; a 7-row terminal leaves inner height == item count, so the
+        // hint is dropped and every item (incl. the last) still renders.
+        let m = MenuOverlay::build(true, true, "cyber");
+        let text = render_to_string(&m, 60, 7);
+        assert!(text.contains("Back"), "first item missing");
+        assert!(text.contains("Cancel"), "last item clipped on short terminal");
+        assert!(
+            !text.contains("enter select"),
+            "hint should be dropped when space is tight"
+        );
+    }
+
+    #[test]
+    fn tall_terminal_shows_hint() {
+        let m = MenuOverlay::build(true, true, "cyber");
+        let text = render_to_string(&m, 60, 24);
+        assert!(text.contains("enter select"), "hint should show with room");
     }
 }

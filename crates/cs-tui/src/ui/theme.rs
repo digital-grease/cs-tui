@@ -69,17 +69,6 @@ impl Theme {
         }
     }
 
-    /// Look up a theme by name (case-insensitive). Unknown names fall back to
-    /// `cyber`.
-    pub fn by_name(name: &str) -> Self {
-        match name.to_lowercase().as_str() {
-            "c64" => Self::c64(),
-            "vt320" => Self::vt320(),
-            "dark" => Self::dark(),
-            _ => Self::cyber(),
-        }
-    }
-
     pub fn base(&self) -> Style {
         Style::default().fg(self.foreground).bg(self.background)
     }
@@ -109,27 +98,86 @@ impl Default for Theme {
     }
 }
 
+/// The selectable palettes, in the order the Esc-menu "cycle" steps through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeKind {
+    Cyber,
+    C64,
+    Vt320,
+    Dark,
+}
+
+impl ThemeKind {
+    /// All palettes, in cycle order.
+    pub const ALL: [ThemeKind; 4] = [Self::Cyber, Self::C64, Self::Vt320, Self::Dark];
+
+    /// Stable lowercase name — matches the `--theme` flag and the persisted
+    /// prefs value.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Cyber => "cyber",
+            Self::C64 => "c64",
+            Self::Vt320 => "vt320",
+            Self::Dark => "dark",
+        }
+    }
+
+    /// Parse a name (case-insensitive); unknown names fall back to `Cyber`.
+    pub fn from_name(name: &str) -> Self {
+        match name.to_lowercase().as_str() {
+            "c64" => Self::C64,
+            "vt320" => Self::Vt320,
+            "dark" => Self::Dark,
+            _ => Self::Cyber,
+        }
+    }
+
+    /// Resolve to the concrete palette.
+    pub fn theme(self) -> Theme {
+        match self {
+            Self::Cyber => Theme::cyber(),
+            Self::C64 => Theme::c64(),
+            Self::Vt320 => Theme::vt320(),
+            Self::Dark => Theme::dark(),
+        }
+    }
+
+    /// The next palette in cycle order, wrapping back to the first.
+    pub fn next(self) -> Self {
+        let idx = Self::ALL.iter().position(|&k| k == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn by_name_returns_cyber_by_default() {
-        let t = Theme::by_name("anything-unknown");
-        assert_eq!(t.accent, Theme::cyber().accent);
-    }
-
-    #[test]
-    fn by_name_resolves_known_themes() {
-        assert_eq!(Theme::by_name("c64").accent, Theme::c64().accent);
-        assert_eq!(Theme::by_name("vt320").accent, Theme::vt320().accent);
-        assert_eq!(Theme::by_name("CYBER").accent, Theme::cyber().accent);
-        assert_eq!(Theme::by_name("Dark").accent, Theme::dark().accent);
-    }
-
-    #[test]
     fn default_is_cyber() {
         let t = Theme::default();
         assert_eq!(t.accent, Theme::cyber().accent);
+    }
+
+    #[test]
+    fn theme_kind_names_round_trip() {
+        for k in ThemeKind::ALL {
+            assert_eq!(ThemeKind::from_name(k.name()), k);
+        }
+        assert_eq!(ThemeKind::from_name("CYBER"), ThemeKind::Cyber);
+        assert_eq!(ThemeKind::from_name("unknown"), ThemeKind::Cyber);
+    }
+
+    #[test]
+    fn theme_kind_next_cycles_and_wraps() {
+        assert_eq!(ThemeKind::Cyber.next(), ThemeKind::C64);
+        assert_eq!(ThemeKind::C64.next(), ThemeKind::Vt320);
+        assert_eq!(ThemeKind::Vt320.next(), ThemeKind::Dark);
+        assert_eq!(ThemeKind::Dark.next(), ThemeKind::Cyber);
+    }
+
+    #[test]
+    fn theme_kind_resolves_to_matching_palette() {
+        assert_eq!(ThemeKind::C64.theme().accent, Theme::c64().accent);
     }
 }
