@@ -18,10 +18,25 @@ pub fn render_markdown(input: &str, theme: &Theme) -> Vec<Line<'static>> {
     let mut style_stack: Vec<Style> = vec![theme.base()];
     let mut list_depth: u32 = 0;
     let mut blockquote_depth: u32 = 0;
+    // While inside an image tag, the alt text is replaced by the placeholder.
+    let mut image_alt_skip = false;
 
     let parser = Parser::new(input);
     for event in parser {
         match event {
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                // Images can't flow inline in text; mark them with a tagged
+                // placeholder. (Actual graphics rendering, where the terminal
+                // supports it, is handled outside the line renderer.)
+                current_line.push(Span::styled(
+                    format!("[image] {dest_url}"),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::UNDERLINED),
+                ));
+                image_alt_skip = true;
+            }
+            Event::End(TagEnd::Image) => image_alt_skip = false,
             Event::Start(tag) => handle_start(
                 tag,
                 theme,
@@ -40,6 +55,10 @@ pub fn render_markdown(input: &str, theme: &Theme) -> Vec<Line<'static>> {
                 &mut list_depth,
                 &mut blockquote_depth,
             ),
+            Event::Text(t) if image_alt_skip => {
+                // Alt text is already represented by the placeholder.
+                let _ = t;
+            }
             Event::Text(t) => {
                 let style = current_style(&style_stack, theme);
                 for span in mention_aware_spans(t.as_ref(), style, theme) {
@@ -347,6 +366,16 @@ mod tests {
         let lines = render_markdown("above\n\n---\n\nbelow", &Theme::dark());
         let text = flat_text(&lines);
         assert!(text.contains("───"));
+    }
+
+    #[test]
+    fn image_renders_as_tagged_placeholder() {
+        let lines = render_markdown("![a cat](https://x/cat.png)", &Theme::dark());
+        let text = flat_text(&lines);
+        assert!(text.contains("[image]"), "should be tagged: {text:?}");
+        assert!(text.contains("https://x/cat.png"), "should keep the url");
+        // Alt text is replaced by the placeholder, not rendered separately.
+        assert!(!text.contains("a cat"));
     }
 
     #[test]
