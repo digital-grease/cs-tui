@@ -2,7 +2,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
 use super::theme::Theme;
@@ -94,7 +94,7 @@ impl LoginScreen {
         match result {
             Ok(()) => self.error = None,
             Err(msg) => {
-                self.error = Some(msg);
+                self.error = Some(humanize_login_error(&msg));
                 self.password.clear();
                 self.focused = Field::Password;
             }
@@ -155,15 +155,18 @@ impl LoginScreen {
                 theme.accent_style(),
             )))
             .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
         } else if let Some(msg) = &self.error {
             Paragraph::new(Line::from(Span::styled(msg.clone(), theme.error_style())))
                 .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true })
         } else {
             Paragraph::new(Line::from(Span::styled(
-                "tab to switch · enter to submit · esc to quit",
+                "tab to switch · enter to submit · esc for menu",
                 theme.muted_style(),
             )))
             .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true })
         };
         frame.render_widget(status, layout[6]);
     }
@@ -185,6 +188,30 @@ fn input_line<'a>(value: &'a str, theme: &Theme) -> Paragraph<'a> {
         Span::styled("█", theme.accent_style()),
     ]);
     Paragraph::new(line)
+}
+
+/// Turn a raw API/transport error string into a concise, actionable message for
+/// the login form. Recognized cases are rewritten; anything else is shown as-is.
+///
+/// Matching is on the stringified error (our own `ApiError` `Display` text plus
+/// any server `message`), so it tolerates the exact wording prod uses for each
+/// condition rather than depending on a specific error code.
+fn humanize_login_error(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("verif") {
+        // Undocumented prod behavior: login is refused until the email is
+        // verified. Resending isn't possible from a rejected login (that needs
+        // an id_token no failed login issues), so point at the email link.
+        "Email not verified. Open the verification link in your inbox, then log in again."
+            .to_string()
+    } else if lower.contains("rate limited") || lower.contains("too many") {
+        "Too many attempts. Wait a moment, then try again.".to_string()
+    } else if lower.contains("unauthorized") || lower.contains("(401)") || lower.contains("credential")
+    {
+        "Incorrect email or password.".to_string()
+    } else {
+        raw.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -289,5 +316,59 @@ mod tests {
         s.submitting = true;
         s.handle_key(key(KeyCode::Char('x')));
         assert_eq!(s.email, "a@b");
+    }
+
+    #[test]
+    fn humanize_detects_unverified_email_regardless_of_wording() {
+        // Whatever wording/code prod uses, the substring "verif" drives it.
+        for raw in [
+            "api Unknown (403): email not verified",
+            "api Forbidden (403): Email Not Verified",
+            "EMAIL_NOT_VERIFIED",
+        ] {
+            assert!(
+                humanize_login_error(raw).starts_with("Email not verified"),
+                "expected verification guidance for {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn humanize_maps_unauthorized_to_bad_credentials() {
+        assert_eq!(
+            humanize_login_error("unauthorized — token missing, invalid, or expired"),
+            "Incorrect email or password."
+        );
+        assert_eq!(
+            humanize_login_error("api Unauthorized (401): INVALID_LOGIN_CREDENTIALS"),
+            "Incorrect email or password."
+        );
+    }
+
+    #[test]
+    fn humanize_maps_rate_limited() {
+        assert_eq!(
+            humanize_login_error("rate limited; retry after 30s"),
+            "Too many attempts. Wait a moment, then try again."
+        );
+    }
+
+    #[test]
+    fn humanize_passes_through_unrecognized_errors() {
+        assert_eq!(humanize_login_error("nope"), "nope");
+        assert_eq!(
+            humanize_login_error("transport: connection refused"),
+            "transport: connection refused"
+        );
+    }
+
+    #[test]
+    fn finish_submit_humanizes_verification_error() {
+        let mut s = LoginScreen::new("a@b".into());
+        s.password = "pw".into();
+        s.submitting = true;
+        s.finish_submit(Err("api Unknown (403): email not verified".into()));
+        assert!(s.error.as_deref().unwrap().starts_with("Email not verified"));
+        assert_eq!(s.password, "");
     }
 }
