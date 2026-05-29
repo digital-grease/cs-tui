@@ -3,6 +3,7 @@ pub mod bookmarks;
 pub mod compose;
 pub mod edit_profile;
 pub mod feed;
+pub mod help;
 pub mod journal;
 pub mod login;
 pub mod markdown;
