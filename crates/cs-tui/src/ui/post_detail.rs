@@ -166,17 +166,17 @@ impl PostDetailScreen {
         let status_text = if self.confirming_delete {
             "really delete this post? y=yes, any other key=cancel".to_string()
         } else if self.loading_replies && self.replies.is_empty() {
-            "loading replies… · esc menu · j/k scroll".to_string()
+            "loading replies… · esc back · j/k scroll".to_string()
         } else if let Some(msg) = &self.error {
-            format!("error: {msg} · esc menu · r retry")
+            format!("error: {msg} · esc back · r retry")
         } else if self.next_replies_cursor.is_some() {
             format!(
-                "{} replies · more — n · esc menu · j/k scroll · R reply · d delete (own) · r refresh",
+                "{} replies · more — n · esc back · j/k scroll · R reply · d delete (own) · r refresh",
                 self.replies.len()
             )
         } else {
             format!(
-                "{} replies · end · esc menu · j/k scroll · R reply · d delete (own) · r refresh",
+                "{} replies · end · esc back · j/k scroll · R reply · d delete (own) · r refresh",
                 self.replies.len()
             )
         };

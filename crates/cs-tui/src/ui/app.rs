@@ -378,7 +378,14 @@ impl App {
             // Show the root-of-current-stack in the tab bar (defaulting to Feed
             // if we somehow arrive here without one set).
             let current = self.current_root.unwrap_or(RootKind::Feed);
-            render_tab_bar(frame, tab_area, current, self.unread_count, &self.theme);
+            render_tab_bar(
+                frame,
+                tab_area,
+                current,
+                self.unread_count,
+                !self.back_stack.is_empty(),
+                &self.theme,
+            );
 
             match &self.screen {
                 Screen::Login(s) => s.render(frame, screen_area, &self.theme),
@@ -452,15 +459,16 @@ impl App {
             return;
         }
 
-        // Esc opens the menu — universal shortcut.
+        // Esc is the reflexive "back": pop to the previous screen when there is
+        // one; on a top-level section (nothing to pop) it opens the overlay menu.
         if key.code == KeyCode::Esc {
-            let authenticated = !self.screen.is_login();
-            let has_back = !self.back_stack.is_empty();
-            self.menu = Some(MenuOverlay::build(
-                authenticated,
-                has_back,
-                self.theme_kind.name(),
-            ));
+            if self.back_stack.is_empty() {
+                let authenticated = !self.screen.is_login();
+                self.menu =
+                    Some(MenuOverlay::build(authenticated, false, self.theme_kind.name()));
+            } else {
+                self.pop_screen();
+            }
             return;
         }
 

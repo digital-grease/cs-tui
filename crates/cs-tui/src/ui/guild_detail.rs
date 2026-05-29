@@ -355,7 +355,7 @@ impl GuildScreen {
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                format!("{base}{action} · esc menu"),
+                format!("{base}{action} · esc back"),
                 theme.muted_style(),
             ))),
             layout[3],

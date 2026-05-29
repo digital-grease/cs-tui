@@ -146,6 +146,7 @@ pub fn render_tab_bar(
     area: Rect,
     current: RootKind,
     unread_count: u32,
+    can_go_back: bool,
     theme: &Theme,
 ) {
     let kinds = RootKind::all();
@@ -164,7 +165,11 @@ pub fn render_tab_bar(
     let sep_w = TAB_SEP.chars().count();
     let total = widths.iter().sum::<usize>() + sep_w * widths.len().saturating_sub(1);
     let avail = area.width as usize;
-    let hint = "    esc menu";
+    let hint = if can_go_back {
+        "    esc back · ? help"
+    } else {
+        "    esc menu · ? help"
+    };
     let hint_w = hint.chars().count();
     let cur = kinds.iter().position(|k| *k == current).unwrap_or(0);
 
