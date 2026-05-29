@@ -400,9 +400,11 @@ impl App {
             return;
         }
 
-        // Root hotkeys (1-7) intercept on every authenticated screen. Login
-        // screen ignores them so the password field can accept digits.
-        if !self.screen.is_login() {
+        // Root hotkeys (1-7) switch sections, but only on screens that don't
+        // capture text: otherwise a digit typed into a compose title/topic, a
+        // profile-edit field, or a settings field (Settings binds 4/6 itself)
+        // would navigate away and discard the in-progress input.
+        if !self.screen.accepts_text_input() {
             if let KeyCode::Char(c) = key.code {
                 if let Some(target) = RootKind::from_shortcut(c) {
                     if self.current_root != Some(target) {
@@ -1888,5 +1890,29 @@ mod tests {
         let text = render_to_string(&app);
         assert!(text.contains("help"), "help title not drawn");
         assert!(text.contains("Sections"), "help body not drawn");
+    }
+
+    #[tokio::test]
+    async fn digit_keys_navigate_from_read_screens() {
+        let mut app = test_app();
+        app.screen = Screen::Feed(FeedScreen::new());
+        app.current_root = Some(RootKind::Feed);
+        app.handle_terminal_event(key_event(KeyCode::Char('2'))).await;
+        assert!(
+            matches!(app.screen, Screen::Notifications(_)),
+            "2 should switch to notifications from a read screen"
+        );
+    }
+
+    #[tokio::test]
+    async fn digit_keys_do_not_navigate_away_from_text_input_screens() {
+        let mut app = test_app();
+        app.screen = Screen::Settings(SettingsScreen::new());
+        app.current_root = Some(RootKind::Settings);
+        app.handle_terminal_event(key_event(KeyCode::Char('2'))).await;
+        assert!(
+            matches!(app.screen, Screen::Settings(_)),
+            "a digit on a text-input screen must reach the screen, not navigate"
+        );
     }
 }
