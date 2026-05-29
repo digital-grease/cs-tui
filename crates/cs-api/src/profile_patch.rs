@@ -99,8 +99,8 @@ impl ProfileUpdate {
     /// Returns `Err(message)` describing the first violation, or `Ok(())`.
     pub fn validate(&self) -> std::result::Result<(), String> {
         if let Patch::Set(s) = &self.bio {
-            if s.chars().count() > 127 {
-                return Err("bio must be ≤127 characters".into());
+            if s.chars().count() > 640 {
+                return Err("bio must be ≤640 characters".into());
             }
         }
         if let Patch::Set(s) = &self.display_name {
@@ -225,11 +225,18 @@ mod tests {
 
     #[test]
     fn bio_length_validated() {
-        let p = ProfileUpdate {
-            bio: Patch::Set("x".repeat(128)),
+        // v0.4 caps bio at 640 chars.
+        let ok = ProfileUpdate {
+            bio: Patch::Set("x".repeat(640)),
             ..Default::default()
         };
-        assert!(p.validate().is_err());
+        assert!(ok.validate().is_ok());
+
+        let too_long = ProfileUpdate {
+            bio: Patch::Set("x".repeat(641)),
+            ..Default::default()
+        };
+        assert!(too_long.validate().is_err());
     }
 
     #[test]
