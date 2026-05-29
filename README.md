@@ -16,7 +16,7 @@ Early development. Most of the documented v0.3.7 REST surface is implemented; li
 - **Bookmarks**, **Topics**, and per-topic feeds
 - **Profiles** (info / posts / replies / followers / following) with follow & unfollow
 - **Compose** posts and replies via your `$EDITOR`; delete your own entries
-- **Guilds** — browse member groups and their threads/members
+- **Guilds** — browse member groups, view threads/members, join/leave, and post threads
 - **Journal** (private notes) with revision history
 - **Settings** round-trip that preserves fields the client doesn't model
 - Markdown rendering with `@mention` highlighting
