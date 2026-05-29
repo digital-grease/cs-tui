@@ -10,6 +10,7 @@ use cs_api::{
 };
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::DefaultTerminal;
+use ratatui_image::picker::Picker;
 use tokio::sync::mpsc;
 
 use super::bookmarks::{BookmarksIntent, BookmarksScreen};
@@ -126,6 +127,11 @@ pub enum BgEvent {
     GuildThreadCreated {
         slug: String,
         result: Result<String, String>,
+    },
+    ImageFetched {
+        post_id: String,
+        url: String,
+        result: Result<Vec<u8>, String>,
     },
 }
 
@@ -313,6 +319,9 @@ pub struct App {
     menu: Option<MenuOverlay>,
     /// Whether the `?` help overlay is currently shown.
     help: bool,
+    /// Terminal image protocol picker, if the terminal supports graphics.
+    /// `None` disables image rendering (the text placeholder is shown instead).
+    picker: Option<Picker>,
     /// Email cached for re-displaying on the login screen after logout.
     last_email: String,
 }
@@ -334,8 +343,15 @@ impl App {
             bg_rx,
             menu: None,
             help: false,
+            picker: None,
             last_email,
         }
+    }
+
+    /// Install the terminal image picker (detected at startup). `None` leaves
+    /// image rendering disabled.
+    pub fn set_image_picker(&mut self, picker: Option<Picker>) {
+        self.picker = picker;
     }
 
     /// Skip the login screen — used when a valid session was restored at launch.
@@ -834,21 +850,13 @@ impl App {
                 // Fast path: if the entry is already in the current Feed, use it.
                 if let Screen::Feed(s) = &self.screen {
                     if let Some(entry) = s.entries.iter().find(|e| e.post_id == post_id).cloned() {
-                        let id = entry.post_id.clone();
-                        let mut screen = PostDetailScreen::new(entry);
-                        screen.highlight_reply_id = highlight_reply_id;
-                        self.push_screen(Screen::PostDetail(screen));
-                        self.spawn_detail_replies_initial(&id);
+                        self.enter_post_detail(entry, highlight_reply_id);
                         return;
                     }
                 }
                 if let Screen::TopicFeed(s) = &self.screen {
                     if let Some(entry) = s.entries.iter().find(|e| e.post_id == post_id).cloned() {
-                        let id = entry.post_id.clone();
-                        let mut screen = PostDetailScreen::new(entry);
-                        screen.highlight_reply_id = highlight_reply_id;
-                        self.push_screen(Screen::PostDetail(screen));
-                        self.spawn_detail_replies_initial(&id);
+                        self.enter_post_detail(entry, highlight_reply_id);
                         return;
                     }
                 }
@@ -1094,13 +1102,7 @@ impl App {
                 result,
                 highlight_reply_id,
             } => match result {
-                Ok(entry) => {
-                    let id = entry.post_id.clone();
-                    let mut screen = PostDetailScreen::new(entry);
-                    screen.highlight_reply_id = highlight_reply_id;
-                    self.push_screen(Screen::PostDetail(screen));
-                    self.spawn_detail_replies_initial(&id);
-                }
+                Ok(entry) => self.enter_post_detail(entry, highlight_reply_id),
                 Err(msg) => {
                     tracing::warn!(error = msg, "open-post-detail fetch failed");
                 }
@@ -1394,6 +1396,23 @@ impl App {
                         s.finish_submit(Err(msg));
                     }
                 }
+            },
+            BgEvent::ImageFetched {
+                post_id,
+                url,
+                result,
+            } => match result {
+                Ok(bytes) => {
+                    if let (Some(picker), Screen::PostDetail(s)) = (&self.picker, &self.screen) {
+                        if s.entry.post_id == post_id {
+                            match image::load_from_memory(&bytes) {
+                                Ok(img) => s.set_image(picker.new_resize_protocol(img)),
+                                Err(e) => tracing::debug!(error = %e, url, "image decode failed"),
+                            }
+                        }
+                    }
+                }
+                Err(msg) => tracing::debug!(error = msg, url, "image fetch failed"),
             },
         }
     }
@@ -1783,6 +1802,37 @@ impl App {
             let _ = tx.send(BgEvent::OpenPostDetail {
                 result,
                 highlight_reply_id,
+            });
+        });
+    }
+
+    /// Push a post-detail screen for `entry`, load its replies, and (when the
+    /// terminal supports graphics) start fetching its first image.
+    fn enter_post_detail(&mut self, entry: Entry, highlight_reply_id: Option<String>) {
+        let id = entry.post_id.clone();
+        let first_image = if self.picker.is_some() {
+            super::images::entry_image_urls(&entry).into_iter().next()
+        } else {
+            None
+        };
+        let mut screen = PostDetailScreen::new(entry);
+        screen.highlight_reply_id = highlight_reply_id;
+        self.push_screen(Screen::PostDetail(screen));
+        self.spawn_detail_replies_initial(&id);
+        if let Some(url) = first_image {
+            self.spawn_fetch_image(id, url);
+        }
+    }
+
+    fn spawn_fetch_image(&self, post_id: String, url: String) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client.fetch_image(&url).await.map_err(|e| e.to_string());
+            let _ = tx.send(BgEvent::ImageFetched {
+                post_id,
+                url,
+                result,
             });
         });
     }

@@ -1,10 +1,14 @@
 //! Post detail screen — entry header + content + scrollable replies (oldest first).
+use std::cell::RefCell;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use cs_api::{Entry, Reply};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
+use ratatui_image::protocol::StatefulProtocol;
+use ratatui_image::StatefulImage;
 use time::OffsetDateTime;
 
 use super::markdown::render_markdown;
@@ -27,7 +31,6 @@ pub enum PostDetailIntent {
     None,
 }
 
-#[derive(Debug)]
 pub struct PostDetailScreen {
     pub entry: Entry,
     pub replies: Vec<Reply>,
@@ -39,6 +42,10 @@ pub struct PostDetailScreen {
     pub highlight_reply_id: Option<String>,
     /// Two-step delete: first `d` arms confirmation; `y` confirms.
     pub confirming_delete: bool,
+    /// First image of the post, decoded into a terminal-graphics protocol once
+    /// fetched (only on terminals that support images). `RefCell` because the
+    /// stateful image widget mutates while rendering, and render takes `&self`.
+    pub image: RefCell<Option<StatefulProtocol>>,
 }
 
 impl PostDetailScreen {
@@ -52,7 +59,14 @@ impl PostDetailScreen {
             scroll: 0,
             highlight_reply_id: None,
             confirming_delete: false,
+            image: RefCell::new(None),
         }
+    }
+
+    /// Store a decoded image protocol for rendering. Called on the UI thread
+    /// after the image bytes are fetched and decoded.
+    pub fn set_image(&self, protocol: StatefulProtocol) {
+        *self.image.borrow_mut() = Some(protocol);
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> PostDetailIntent {
@@ -161,7 +175,26 @@ impl PostDetailScreen {
         let para = Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((self.scroll, 0));
-        frame.render_widget(para, body_area);
+
+        // When an image is loaded, reserve a strip at the top of the body for it
+        // and flow the text below. Terminals without graphics never reach here
+        // (no protocol is ever built) and just see the text.
+        let mut img = self.image.borrow_mut();
+        match img.as_mut() {
+            Some(proto) if body_area.height > 4 => {
+                let img_h = (body_area.height / 2).clamp(1, 20);
+                let img_area = Rect::new(body_area.x, body_area.y, body_area.width, img_h);
+                let text_area = Rect::new(
+                    body_area.x,
+                    body_area.y + img_h,
+                    body_area.width,
+                    body_area.height - img_h,
+                );
+                frame.render_stateful_widget(StatefulImage::<StatefulProtocol>::new(), img_area, proto);
+                frame.render_widget(para, text_area);
+            }
+            _ => frame.render_widget(para, body_area),
+        }
 
         let status_text = if self.confirming_delete {
             "really delete this post? y=yes, any other key=cancel".to_string()

@@ -5,7 +5,7 @@ members = ["crates/cs-api", "crates/cs-tui"]
 [workspace.package]
 version = "0.0.1"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.81"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/digital-grease/cs-tui"
 authors = ["digitalgrease"]
@@ -33,6 +33,8 @@ tracing-appender = "0.2"
 # TUI
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
+ratatui-image = { version = "8", default-features = false, features = ["crossterm"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 
 # Markdown
 pulldown-cmark = { version = "0.12", default-features = false }

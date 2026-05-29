@@ -20,6 +20,7 @@ Early development. Most of the documented v0.3.7 REST surface is implemented; li
 - **Journal** (private notes) with revision history
 - **Settings** round-trip that preserves fields the client doesn't model
 - Markdown rendering with `@mention` highlighting
+- Inline image rendering in post detail on graphics-capable terminals (Kitty/iTerm2/Sixel); `[image] url` placeholder elsewhere
 - Four themes (`cyber`, `c64`, `vt320`, `dark`), switchable at runtime
 - Per-endpoint rate limiting and one-shot token refresh on 401
 
@@ -30,7 +31,7 @@ cargo build --release
 ./target/release/cs-tui --help
 ```
 
-Requires Rust 1.80+ (stable channel; see `rust-toolchain.toml`).
+Requires Rust 1.81+ (stable channel; see `rust-toolchain.toml`).
 
 ## Usage
 

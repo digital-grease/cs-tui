@@ -68,8 +68,13 @@ async fn main() -> Result<()> {
         .or(prefs.theme.as_deref())
         .map(ThemeKind::from_name)
         .unwrap_or(ThemeKind::Cyber);
+    // Detect terminal image-graphics support before entering the alternate
+    // screen (the query reads/writes stdio). `None` → images aren't rendered.
+    let picker = ratatui_image::picker::Picker::from_query_stdio().ok();
+
     let terminal = ratatui::init();
     let mut app = App::with_theme(client, prefill_email, theme_kind);
+    app.set_image_picker(picker);
     if has_session {
         app.enter_feed_initial();
     }
