@@ -6,6 +6,7 @@ pub mod feed;
 pub mod guild_detail;
 pub mod guilds;
 pub mod help;
+pub mod images;
 pub mod journal;
 pub mod login;
 pub mod markdown;

@@ -16,6 +16,8 @@ use crate::DEFAULT_BASE_URL;
 
 const DEFAULT_USER_AGENT: &str = concat!("cs-tui/", env!("CARGO_PKG_VERSION"));
 const MAX_429_RETRIES: u32 = 3;
+/// Cap on image downloads (guards against absurd payloads).
+const MAX_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Async HTTP client for the cyberspace.online REST API.
 ///
@@ -317,6 +319,23 @@ impl Client {
 
             return Err(parse_error_body(status, &bytes));
         }
+    }
+
+    /// Download raw bytes from an arbitrary image URL. Deliberately
+    /// **unauthenticated**: image URLs in posts may point at third-party hosts,
+    /// so the bearer token must never be attached. The response size is capped.
+    pub async fn fetch_image(&self, url: &str) -> Result<Vec<u8>> {
+        let resp = self.inner.http.get(url).send().await?.error_for_status()?;
+        if let Some(len) = resp.content_length() {
+            if len > MAX_IMAGE_BYTES {
+                return Err(ApiError::Config(format!("image too large ({len} bytes)")));
+            }
+        }
+        let bytes = resp.bytes().await?;
+        if bytes.len() as u64 > MAX_IMAGE_BYTES {
+            return Err(ApiError::Config("image too large".into()));
+        }
+        Ok(bytes.to_vec())
     }
 }
 
