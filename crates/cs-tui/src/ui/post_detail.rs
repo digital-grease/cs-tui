@@ -198,6 +198,17 @@ impl PostDetailScreen {
         } else {
             format!(" · #{}", self.entry.topics.join(" #"))
         };
+        // v0.3.7: lead with the entry title (when set) as a headline above the
+        // author/metadata line. Skipped for None/whitespace-only titles.
+        if let Some(title) = self.entry.title.as_deref() {
+            let title = title.trim();
+            if !title.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    title.to_string(),
+                    theme.accent_style(),
+                )));
+            }
+        }
         lines.push(Line::from(vec![
             Span::styled(
                 format!("@{}", self.entry.author_username),
@@ -340,6 +351,37 @@ mod tests {
             created_at: None,
             deleted: false,
         }
+    }
+
+    fn body_text(s: &PostDetailScreen) -> Vec<String> {
+        let theme = Theme::cyber();
+        s.compose_body(&theme)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|sp| sp.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn compose_body_leads_with_title_when_present() {
+        let mut e = entry("p1");
+        e.title = Some("Headline Here".into());
+        let lines = body_text(&PostDetailScreen::new(e));
+        assert_eq!(lines[0], "Headline Here", "title should be the first line");
+    }
+
+    #[test]
+    fn compose_body_omits_title_when_none() {
+        let lines = body_text(&PostDetailScreen::new(entry("p1"))); // title: None
+        assert!(
+            lines[0].starts_with("@alice"),
+            "without a title the first line is the author header, got {:?}",
+            lines[0]
+        );
     }
 
     #[test]
