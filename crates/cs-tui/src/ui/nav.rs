@@ -95,8 +95,52 @@ impl RootKind {
     }
 }
 
+const TAB_SEP: &str = " │ ";
+
+fn styled_token(text: &str, active: bool, theme: &Theme) -> Span<'static> {
+    let style = if active {
+        theme.accent_style()
+    } else {
+        theme.muted_style()
+    };
+    Span::styled(text.to_string(), style)
+}
+
+/// Choose a contiguous window of section indices to show so that `current`
+/// stays visible within `avail` columns. Returns `(lo, hi, clipped_left,
+/// clipped_right)`; the window is `lo..hi`. Grows rightward first so upcoming
+/// sections are revealed as you tab forward, then leftward near the end.
+fn tab_window(widths: &[usize], sep_w: usize, cur: usize, avail: usize) -> (usize, usize, bool, bool) {
+    let len = widths.len();
+    if len == 0 {
+        return (0, 0, false, false);
+    }
+    let cur = cur.min(len - 1);
+    // Leave room for the ‹ / › scroll markers.
+    let budget = avail.saturating_sub(4);
+    let mut lo = cur;
+    let mut hi = cur + 1;
+    let mut used = widths[cur];
+    loop {
+        let can_right = hi < len && used + sep_w + widths[hi] <= budget;
+        let can_left = lo > 0 && used + sep_w + widths[lo - 1] <= budget;
+        if can_right {
+            used += sep_w + widths[hi];
+            hi += 1;
+        } else if can_left {
+            lo -= 1;
+            used += sep_w + widths[lo];
+        } else {
+            break;
+        }
+    }
+    (lo, hi, lo > 0, hi < len)
+}
+
 /// Render the top tab bar. `current` is highlighted; `unread_count` (>0) shows
-/// next to the notifications tab.
+/// next to the notifications tab. When the full bar doesn't fit, it scrolls
+/// horizontally to keep the current section in view, marking clipped ends with
+/// `‹`/`›`.
 pub fn render_tab_bar(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -104,29 +148,50 @@ pub fn render_tab_bar(
     unread_count: u32,
     theme: &Theme,
 ) {
+    let kinds = RootKind::all();
+    let tokens: Vec<String> = kinds
+        .iter()
+        .map(|k| {
+            let badge = if *k == RootKind::Notifications && unread_count > 0 {
+                format!(" ({unread_count})")
+            } else {
+                String::new()
+            };
+            format!("{}·{}{}", k.shortcut(), k.label(), badge)
+        })
+        .collect();
+    let widths: Vec<usize> = tokens.iter().map(|t| t.chars().count()).collect();
+    let sep_w = TAB_SEP.chars().count();
+    let total = widths.iter().sum::<usize>() + sep_w * widths.len().saturating_sub(1);
+    let avail = area.width as usize;
+    let hint = "    esc menu";
+    let hint_w = hint.chars().count();
+    let cur = kinds.iter().position(|k| *k == current).unwrap_or(0);
+
+    // Window of sections to show, and whether to append the hint.
+    let (lo, hi, clip_l, clip_r) = if total <= avail {
+        (0, tokens.len(), false, false)
+    } else {
+        tab_window(&widths, sep_w, cur, avail)
+    };
+    let with_hint = total + hint_w <= avail;
+
     let mut spans: Vec<Span<'_>> = Vec::new();
-    for (i, kind) in RootKind::all().iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::styled(" │ ", theme.muted_style()));
-        }
-        let active = current == *kind;
-        let style = if active {
-            theme.accent_style()
-        } else {
-            theme.muted_style()
-        };
-        let badge = if *kind == RootKind::Notifications && unread_count > 0 {
-            format!(" ({unread_count})")
-        } else {
-            String::new()
-        };
-        spans.push(Span::styled(
-            format!("{}·{}{}", kind.shortcut(), kind.label(), badge),
-            style,
-        ));
+    if clip_l {
+        spans.push(Span::styled("‹ ", theme.muted_style()));
     }
-    spans.push(Span::styled("    ", theme.muted_style()));
-    spans.push(Span::styled("esc menu", theme.muted_style()));
+    for (offset, token) in tokens[lo..hi].iter().enumerate() {
+        if offset > 0 {
+            spans.push(Span::styled(TAB_SEP, theme.muted_style()));
+        }
+        spans.push(styled_token(token, lo + offset == cur, theme));
+    }
+    if clip_r {
+        spans.push(Span::styled(" ›", theme.muted_style()));
+    }
+    if with_hint {
+        spans.push(Span::styled(hint, theme.muted_style()));
+    }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
@@ -162,5 +227,33 @@ mod tests {
         assert_eq!(RootKind::Guilds.next(), RootKind::Feed); // wraps
         assert_eq!(RootKind::Feed.prev(), RootKind::Guilds); // wraps
         assert_eq!(RootKind::Notifications.prev(), RootKind::Feed);
+    }
+
+    #[test]
+    fn tab_window_shows_all_when_it_fits() {
+        let widths = vec![5usize; 4];
+        let (lo, hi, l, r) = tab_window(&widths, 3, 2, 1000);
+        assert_eq!((lo, hi), (0, 4));
+        assert!(!l && !r);
+    }
+
+    #[test]
+    fn tab_window_keeps_current_visible_when_narrow() {
+        let widths = vec![10usize; 8];
+        for cur in 0..8 {
+            let (lo, hi, clip_l, clip_r) = tab_window(&widths, 3, cur, 40);
+            assert!(lo <= cur && cur < hi, "current {cur} must be in {lo}..{hi}");
+            assert!(hi - lo < 8, "should be a partial window when narrow");
+            assert_eq!(clip_l, lo > 0);
+            assert_eq!(clip_r, hi < 8);
+        }
+    }
+
+    #[test]
+    fn tab_window_marks_both_ends_when_scrolled_to_middle() {
+        let widths = vec![10usize; 8];
+        let (lo, hi, clip_l, clip_r) = tab_window(&widths, 3, 4, 30);
+        assert!(lo <= 4 && 4 < hi);
+        assert!(clip_l && clip_r, "middle window should clip both ends");
     }
 }
