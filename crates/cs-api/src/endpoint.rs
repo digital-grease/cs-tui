@@ -66,6 +66,15 @@ pub enum EndpointKey {
     // Settings
     SettingsGet,
     SettingsUpdate,
+
+    // Guilds (v0.4)
+    GuildsList,
+    GuildsGet,
+    GuildsMembersList,
+    GuildsThreadsList,
+    GuildsThreadsCreate,
+    GuildsJoin,
+    GuildsLeave,
 }
 
 impl EndpointKey {
@@ -76,7 +85,9 @@ impl EndpointKey {
         use EndpointKey::{
             AuthCheckUsername, AuthLogin, AuthRefresh, AuthRegister, AuthResendVerification,
             BookmarksCreate, BookmarksDelete, BookmarksList, EntriesCreate, EntriesDelete,
-            EntriesGet, EntriesList, FollowsCreate, FollowsDelete, FollowsList, NotesCreate,
+            EntriesGet, EntriesList, FollowsCreate, FollowsDelete, FollowsList, GuildsGet,
+            GuildsJoin, GuildsLeave, GuildsList, GuildsMembersList, GuildsThreadsCreate,
+            GuildsThreadsList, NotesCreate,
             NotesDelete, NotesGet, NotesGetRevision, NotesList, NotesListRevisions, NotesUpdate,
             NotificationsList, NotificationsMarkAllRead, NotificationsMarkRead,
             NotificationsUnreadCount, RepliesCreate, RepliesDelete, RepliesGet, RepliesList,
@@ -120,6 +131,13 @@ impl EndpointKey {
             | NotesDelete
             | NotificationsMarkRead
             | NotificationsMarkAllRead => RateLimit::none(),
+
+            // Guilds (v0.4) — per-endpoint sections + § Anti-Scraping table.
+            GuildsList | GuildsMembersList => RateLimit::per_minute(30),
+            GuildsThreadsList => RateLimit::per_minute(45),
+            GuildsGet => RateLimit::none(),
+            GuildsThreadsCreate => RateLimit::with_day(2, 15),
+            GuildsJoin | GuildsLeave => RateLimit::with_day(3, 15),
         }
     }
 }

@@ -60,11 +60,7 @@ impl Client {
     ) -> Result<CreatedEntry> {
         validate_content_topics(content, topics)?;
         if let Some(t) = title {
-            if t.chars().count() > MAX_TITLE_LEN {
-                return Err(ApiError::Config(format!(
-                    "title exceeds {MAX_TITLE_LEN} characters"
-                )));
-            }
+            validate_title(t)?;
         }
         if let Some(s) = slug {
             validate_slug(s)?;
@@ -127,7 +123,17 @@ pub struct CreatedEntry {
     pub title: Option<String>,
 }
 
-fn validate_slug(s: &str) -> Result<()> {
+/// Title length check, shared with guild-thread creation.
+pub(crate) fn validate_title(title: &str) -> Result<()> {
+    if title.chars().count() > MAX_TITLE_LEN {
+        return Err(ApiError::Config(format!(
+            "title exceeds {MAX_TITLE_LEN} characters"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_slug(s: &str) -> Result<()> {
     if s.is_empty() {
         return Err(ApiError::Config("slug cannot be empty".into()));
     }
@@ -157,7 +163,7 @@ fn validate_slug(s: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_content_topics(content: &str, topics: &[String]) -> Result<()> {
+pub(crate) fn validate_content_topics(content: &str, topics: &[String]) -> Result<()> {
     if content.trim().is_empty() {
         return Err(ApiError::Config("content cannot be empty".into()));
     }
