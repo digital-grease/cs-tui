@@ -142,12 +142,18 @@ impl LoginScreen {
 
         let email_label = labeled("email", self.focused == Field::Email, theme);
         frame.render_widget(email_label, layout[0]);
-        frame.render_widget(input_line(&self.email, theme), layout[1]);
+        frame.render_widget(
+            input_line(&self.email, self.focused == Field::Email, theme),
+            layout[1],
+        );
 
         let pw_label = labeled("password", self.focused == Field::Password, theme);
         frame.render_widget(pw_label, layout[3]);
         let masked: String = "•".repeat(self.password.chars().count());
-        frame.render_widget(input_line(&masked, theme), layout[4]);
+        frame.render_widget(
+            input_line(&masked, self.focused == Field::Password, theme),
+            layout[4],
+        );
 
         let status = if self.submitting {
             Paragraph::new(Line::from(Span::styled(
@@ -181,13 +187,14 @@ fn labeled<'a>(text: &'a str, focused: bool, theme: &Theme) -> Paragraph<'a> {
     Paragraph::new(Line::from(Span::styled(text, style)))
 }
 
-fn input_line<'a>(value: &'a str, theme: &Theme) -> Paragraph<'a> {
-    // Caret rendered as trailing block; not a true cursor (Phase 7 polish).
-    let line = Line::from(vec![
-        Span::styled(value, theme.base()),
-        Span::styled("█", theme.accent_style()),
-    ]);
-    Paragraph::new(line)
+fn input_line<'a>(value: &'a str, focused: bool, theme: &Theme) -> Paragraph<'a> {
+    // Caret rendered as a trailing block on the focused field only; a visual
+    // marker, not a true terminal cursor (Phase 7 polish).
+    let mut spans = vec![Span::styled(value, theme.base())];
+    if focused {
+        spans.push(Span::styled("█", theme.accent_style()));
+    }
+    Paragraph::new(Line::from(spans))
 }
 
 /// Turn a raw API/transport error string into a concise, actionable message for
@@ -370,5 +377,32 @@ mod tests {
         s.finish_submit(Err("api Unknown (403): email not verified".into()));
         assert!(s.error.as_deref().unwrap().starts_with("Email not verified"));
         assert_eq!(s.password, "");
+    }
+
+    #[test]
+    fn only_the_focused_field_renders_a_caret() {
+        // Regression: both fields used to draw the caret block at once.
+        let s = LoginScreen::new("a@b".into()); // focus starts on Email
+        let theme = Theme::cyber();
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                s.render(f, area, &theme);
+            })
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert_eq!(
+            text.matches('█').count(),
+            1,
+            "exactly one caret should render (focused field only)"
+        );
     }
 }
