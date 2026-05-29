@@ -38,15 +38,31 @@ impl RootKind {
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            Self::Feed => "feed",
-            Self::Notifications => "notif",
-            Self::Bookmarks => "bookm",
-            Self::Topics => "topic",
-            Self::Profile => "me",
-            Self::Journal => "journ",
-            Self::Settings => "sett",
-            Self::Guilds => "guild",
+            Self::Feed => "Feed",
+            Self::Notifications => "Notifications",
+            Self::Bookmarks => "Bookmarks",
+            Self::Topics => "Topics",
+            Self::Profile => "Profile",
+            Self::Journal => "Journal",
+            Self::Settings => "Settings",
+            Self::Guilds => "Guilds",
         }
+    }
+
+    /// The next section in tab-cycle order (wraps around).
+    #[must_use]
+    pub fn next(self) -> Self {
+        let all = Self::all();
+        let i = all.iter().position(|k| *k == self).unwrap_or(0);
+        all[(i + 1) % all.len()]
+    }
+
+    /// The previous section in tab-cycle order (wraps around).
+    #[must_use]
+    pub fn prev(self) -> Self {
+        let all = Self::all();
+        let i = all.iter().position(|k| *k == self).unwrap_or(0);
+        all[(i + all.len() - 1) % all.len()]
     }
 
     #[must_use]
@@ -134,9 +150,17 @@ mod tests {
     }
 
     #[test]
-    fn labels_are_short() {
+    fn labels_are_nonempty() {
         for kind in RootKind::all() {
-            assert!(kind.label().len() <= 6, "label {:?} too long", kind.label());
+            assert!(!kind.label().is_empty());
         }
+    }
+
+    #[test]
+    fn next_and_prev_cycle_and_wrap() {
+        assert_eq!(RootKind::Feed.next(), RootKind::Notifications);
+        assert_eq!(RootKind::Guilds.next(), RootKind::Feed); // wraps
+        assert_eq!(RootKind::Feed.prev(), RootKind::Guilds); // wraps
+        assert_eq!(RootKind::Notifications.prev(), RootKind::Feed);
     }
 }

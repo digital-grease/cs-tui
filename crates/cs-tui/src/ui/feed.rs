@@ -172,7 +172,7 @@ impl FeedScreen {
         } else {
             let items: Vec<ListItem<'_>> = visible_indices
                 .iter()
-                .map(|i| entry_item(&self.entries[*i], theme))
+                .map(|i| entry_item(&self.entries[*i], list_area.width, theme))
                 .collect();
             let list = List::new(items)
                 .highlight_style(theme.accent_style())
@@ -195,7 +195,7 @@ impl Default for FeedScreen {
     }
 }
 
-fn entry_item<'a>(entry: &'a Entry, theme: &Theme) -> ListItem<'a> {
+fn entry_item<'a>(entry: &'a Entry, width: u16, theme: &Theme) -> ListItem<'a> {
     let when = entry
         .created_at
         .map(format_timestamp_relative)
@@ -231,7 +231,11 @@ fn entry_item<'a>(entry: &'a Entry, theme: &Theme) -> ListItem<'a> {
 
     let snippet = first_line_truncated(&entry.content, 200);
     lines.push(Line::from(Span::styled(snippet, theme.base())));
-    lines.push(Line::from(""));
+
+    // Rule between posts so it's clear where one ends and the next begins.
+    // `width - 2` accounts for the list's highlight-symbol gutter.
+    let rule = "─".repeat(width.saturating_sub(2).max(1) as usize);
+    lines.push(Line::from(Span::styled(rule, theme.muted_style())));
 
     ListItem::new(lines)
 }
@@ -317,7 +321,7 @@ mod tests {
     fn render_entry_item(entry: &Entry) -> String {
         use ratatui::widgets::List;
         let theme = Theme::cyber();
-        let item = entry_item(entry, &theme);
+        let item = entry_item(entry, 80, &theme);
         let backend = ratatui::backend::TestBackend::new(80, 10);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal

@@ -125,10 +125,10 @@ impl GuildScreen {
         }
         // Tab switching is allowed even while a tab is loading.
         match key.code {
-            KeyCode::Char('h') | KeyCode::Left | KeyCode::BackTab => {
+            KeyCode::Char('h') | KeyCode::Left => {
                 return self.select_tab(GuildTab::Threads);
             }
-            KeyCode::Char('l') | KeyCode::Right | KeyCode::Tab => {
+            KeyCode::Char('l') | KeyCode::Right => {
                 return self.select_tab(GuildTab::Members);
             }
             KeyCode::Char('J') => {
@@ -373,13 +373,8 @@ impl GuildScreen {
                 } else {
                     ""
                 };
-                format!(
-                    "{} #{} · {} members{}",
-                    g.icon.as_deref().unwrap_or("•"),
-                    g.slug,
-                    g.member_count,
-                    membership
-                )
+                // `icon` is an identifier string, not a glyph — don't render it.
+                format!("#{} · {} members{}", g.slug, g.member_count, membership)
             }
             None => format!("#{}", self.slug),
         };
