@@ -23,6 +23,7 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
 clap = { workspace = true }
 directories = { workspace = true }
 pulldown-cmark = { workspace = true }
