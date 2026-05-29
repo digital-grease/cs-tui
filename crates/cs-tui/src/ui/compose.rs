@@ -29,23 +29,29 @@ pub enum ComposeKind {
     UpdateNote {
         note_id: String,
     },
+    /// A new thread in a guild's forum.
+    GuildThread {
+        guild_slug: String,
+    },
 }
 
 impl ComposeKind {
     fn has_topics(&self) -> bool {
         matches!(
             self,
-            Self::NewEntry | Self::NewNote | Self::UpdateNote { .. }
+            Self::NewEntry | Self::NewNote | Self::UpdateNote { .. } | Self::GuildThread { .. }
         )
     }
 
+    /// Public/NSFW flags apply to top-level entries only — not guild threads,
+    /// replies, or notes.
     fn has_visibility_toggles(&self) -> bool {
         matches!(self, Self::NewEntry)
     }
 
-    /// Title (v0.3.7+) is only valid on top-level entries.
+    /// Titles are valid on top-level entries and guild threads.
     fn has_title(&self) -> bool {
-        matches!(self, Self::NewEntry)
+        matches!(self, Self::NewEntry | Self::GuildThread { .. })
     }
 }
 
@@ -149,6 +155,7 @@ impl ComposeScreen {
                 ConfirmField::Nsfw,
             ],
             ComposeKind::NewNote | ComposeKind::UpdateNote { .. } => &[ConfirmField::Topics],
+            ComposeKind::GuildThread { .. } => &[ConfirmField::Title, ConfirmField::Topics],
             ComposeKind::Reply { .. } => &[],
         };
         if order.is_empty() {
@@ -238,6 +245,9 @@ impl ComposeScreen {
             ComposeKind::Reply { post_id, .. } => format!(" cs-tui • reply to {post_id} "),
             ComposeKind::NewNote => " cs-tui • new note ".to_string(),
             ComposeKind::UpdateNote { note_id } => format!(" cs-tui • edit note {note_id} "),
+            ComposeKind::GuildThread { guild_slug } => {
+                format!(" cs-tui • new thread in {guild_slug} ")
+            }
         };
         let block = Block::default()
             .borders(Borders::ALL)

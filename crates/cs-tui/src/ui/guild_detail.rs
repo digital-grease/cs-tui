@@ -33,6 +33,8 @@ pub enum GuildIntent {
     Join,
     /// Leave this guild.
     Leave,
+    /// Compose a new thread in this guild (members only).
+    Compose,
     Quit,
     None,
 }
@@ -147,6 +149,12 @@ impl GuildScreen {
                 if can_leave {
                     self.action_pending = true;
                     return GuildIntent::Leave;
+                }
+                return GuildIntent::None;
+            }
+            KeyCode::Char('c') => {
+                if self.guild.as_ref().is_some_and(|g| g.is_member) {
+                    return GuildIntent::Compose;
                 }
                 return GuildIntent::None;
             }
@@ -341,8 +349,9 @@ impl GuildScreen {
         let action = match &self.guild {
             _ if self.action_pending => " · working…",
             Some(g) if !g.is_member => " · J join",
-            Some(g) if g.is_member && g.role != Some(GuildRole::Founder) => " · L leave",
-            _ => "",
+            Some(g) if g.role != Some(GuildRole::Founder) => " · c new · L leave",
+            Some(_) => " · c new",
+            None => "",
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
@@ -681,5 +690,19 @@ mod tests {
         assert!(!s.action_pending);
         assert!(s.error.is_some());
         assert!(!s.guild.unwrap().is_member);
+    }
+
+    #[test]
+    fn c_requests_compose_only_for_members() {
+        let mut member = with_guild(true, Some(GuildRole::Member));
+        assert_eq!(
+            member.handle_key(key(KeyCode::Char('c'))),
+            GuildIntent::Compose
+        );
+        let mut outsider = with_guild(false, None);
+        assert_eq!(
+            outsider.handle_key(key(KeyCode::Char('c'))),
+            GuildIntent::None
+        );
     }
 }

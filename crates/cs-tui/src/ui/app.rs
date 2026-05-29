@@ -123,6 +123,10 @@ pub enum BgEvent {
         slug: String,
         result: Result<String, String>,
     },
+    GuildThreadCreated {
+        slug: String,
+        result: Result<String, String>,
+    },
 }
 
 #[allow(clippy::large_enum_variant)] // Boxing isn't worth the indirection here.
@@ -287,6 +291,9 @@ enum Action {
         slug: String,
     },
     GuildLeave {
+        slug: String,
+    },
+    GuildComposeThread {
         slug: String,
     },
 }
@@ -733,6 +740,9 @@ impl App {
                 GuildIntent::Leave => Action::GuildLeave {
                     slug: s.slug.clone(),
                 },
+                GuildIntent::Compose => Action::GuildComposeThread {
+                    slug: s.slug.clone(),
+                },
                 GuildIntent::None => Action::None,
             },
         };
@@ -966,6 +976,10 @@ impl App {
             }
             Action::GuildJoin { slug } => self.spawn_guild_join(slug),
             Action::GuildLeave { slug } => self.spawn_guild_leave(slug),
+            Action::GuildComposeThread { slug } => {
+                self.start_compose(ComposeKind::GuildThread { guild_slug: slug }, String::new())
+                    .await;
+            }
         }
     }
 
@@ -1339,6 +1353,27 @@ impl App {
                     }
                 }
             }
+            BgEvent::GuildThreadCreated { slug, result } => match result {
+                Ok(_post_id) => {
+                    if matches!(self.screen, Screen::Compose(_)) {
+                        self.pop_screen();
+                    }
+                    // If we're back on the guild that got the thread, reload it.
+                    let on_guild = matches!(&self.screen, Screen::Guild(s) if s.slug == slug);
+                    if on_guild {
+                        if let Screen::Guild(s) = &mut self.screen {
+                            s.tab = GuildTab::Threads;
+                            s.loading = true;
+                        }
+                        self.spawn_guild_tab_initial(&slug, GuildTab::Threads);
+                    }
+                }
+                Err(msg) => {
+                    if let Screen::Compose(s) = &mut self.screen {
+                        s.finish_submit(Err(msg));
+                    }
+                }
+            },
         }
     }
 
@@ -1940,6 +1975,17 @@ impl App {
                         .map(|()| note_id)
                         .map_err(|e| e.to_string());
                     let _ = tx.send(BgEvent::NoteUpdated(result));
+                }
+                ComposeKind::GuildThread { guild_slug } => {
+                    let result = client
+                        .create_guild_thread(&guild_slug, &content, title.as_deref(), None, &topics)
+                        .await
+                        .map(|created| created.post_id)
+                        .map_err(|e| e.to_string());
+                    let _ = tx.send(BgEvent::GuildThreadCreated {
+                        slug: guild_slug,
+                        result,
+                    });
                 }
             }
         });
