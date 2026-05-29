@@ -1,6 +1,6 @@
 [package]
 name = "cs-api"
-description = "Rust client for the cyberspace.online API (v0.3.6)"
+description = "Rust client for the cyberspace.online API (v0.4)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

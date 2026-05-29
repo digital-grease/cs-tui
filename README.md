@@ -1,8 +1,8 @@
 # cs-tui
 
-A terminal client for [cyberspace.online](https://cyberspace.online), targeting the v0.3.7 API.
+A terminal client for [cyberspace.online](https://cyberspace.online), targeting the v0.4 API.
 
-Personal, human-driven client. Per the [Cyberspace API terms](docs/api-v0.3.7.md): no scraping, no bots, no LLM-driven agents. This is software you drive with your own keystrokes.
+Personal, human-driven client. Per the [Cyberspace API terms](docs/api-v0.4.md): no scraping, no bots, no LLM-driven agents. This is software you drive with your own keystrokes.
 
 ## Status
 
@@ -91,7 +91,7 @@ remembered between runs.
 |---|---|
 | `crates/cs-api/` | HTTP client + types for the Cyberspace REST API |
 | `crates/cs-tui/` | Ratatui application (binary) |
-| `docs/api-v0.3.7.md` | Authoritative API specification (do not modify) |
+| `docs/api-v0.4.md` | Authoritative API specification (do not modify) |
 
 ## License
 
