@@ -17,6 +17,7 @@ pub enum RootKind {
     Profile,
     Journal,
     Settings,
+    Guilds,
 }
 
 impl RootKind {
@@ -30,6 +31,7 @@ impl RootKind {
             Self::Profile,
             Self::Journal,
             Self::Settings,
+            Self::Guilds,
         ]
     }
 
@@ -43,6 +45,7 @@ impl RootKind {
             Self::Profile => "me",
             Self::Journal => "journ",
             Self::Settings => "sett",
+            Self::Guilds => "guild",
         }
     }
 
@@ -56,6 +59,7 @@ impl RootKind {
             Self::Profile => '5',
             Self::Journal => '6',
             Self::Settings => '7',
+            Self::Guilds => '8',
         }
     }
 
@@ -69,6 +73,7 @@ impl RootKind {
             '5' => Some(Self::Profile),
             '6' => Some(Self::Journal),
             '7' => Some(Self::Settings),
+            '8' => Some(Self::Guilds),
             _ => None,
         }
     }

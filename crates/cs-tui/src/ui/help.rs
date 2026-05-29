@@ -23,6 +23,7 @@ const SECTIONS: &[Row] = &[
     Row { keys: "5", desc: "Profile" },
     Row { keys: "6", desc: "Journal" },
     Row { keys: "7", desc: "Settings" },
+    Row { keys: "8", desc: "Guilds" },
 ];
 
 const GLOBAL: &[Row] = &[

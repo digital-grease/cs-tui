@@ -16,6 +16,7 @@ Early development. Most of the documented v0.3.7 REST surface is implemented; li
 - **Bookmarks**, **Topics**, and per-topic feeds
 - **Profiles** (info / posts / replies / followers / following) with follow & unfollow
 - **Compose** posts and replies via your `$EDITOR`; delete your own entries
+- **Guilds** — browse member groups and their threads/members
 - **Journal** (private notes) with revision history
 - **Settings** round-trip that preserves fields the client doesn't model
 - Markdown rendering with `@mention` highlighting
@@ -55,7 +56,7 @@ log out.
 
 | Key | Action |
 |---|---|
-| `1`–`7` | Switch section: Feed · Notifications · Bookmarks · Topics · Profile · Journal · Settings |
+| `1`–`8` | Switch section: Feed · Notifications · Bookmarks · Topics · Profile · Journal · Settings · Guilds |
 | `j`/`k` or `↑`/`↓` | Move down / up |
 | `g`/`G` or `Home`/`End` | Jump to top / bottom |
 | `Enter` | Open / select |
