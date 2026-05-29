@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = ["crates/cs-api", "crates/cs-tui"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/digital-grease/cs-tui"
+authors = ["digitalgrease"]
+
+[workspace.dependencies]
+# HTTP + async
+tokio = { version = "1.41", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "fs", "signal"] }
+tokio-util = { version = "0.7", default-features = false, features = ["io"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "gzip"] }
+url = "2.5"
+base64 = "0.22"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Errors + tracing
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# TUI
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+
+# Markdown
+pulldown-cmark = { version = "0.12", default-features = false }
+
+# CLI + config
+clap = { version = "4.5", features = ["derive", "env"] }
+directories = "5"
+
+# Time
+time = { version = "0.3", features = ["formatting", "parsing", "macros", "serde"] }
+
+# Crate-internal
+cs-api = { path = "crates/cs-api" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
