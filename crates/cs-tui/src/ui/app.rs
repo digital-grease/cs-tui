@@ -361,17 +361,26 @@ impl App {
     }
 
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> Result<()> {
+        terminal.draw(|f| self.render(f)).context("terminal draw")?;
         while !self.should_quit {
-            terminal.draw(|f| self.render(f)).context("terminal draw")?;
-
             tokio::select! {
-                ev = next_terminal_event() => {
-                    self.handle_terminal_event(ev?).await;
+                evs = next_terminal_events() => {
+                    // Drain the whole burst (a terminal can emit a flurry of
+                    // sequences on refocus — focus events, capability-query
+                    // responses) before redrawing, so the UI stays responsive
+                    // instead of rendering once per buffered event.
+                    for ev in evs? {
+                        self.handle_terminal_event(ev).await;
+                        if self.should_quit {
+                            break;
+                        }
+                    }
                 }
                 Some(bg) = self.bg_rx.recv() => {
                     self.handle_bg_event(bg);
                 }
             }
+            terminal.draw(|f| self.render(f)).context("terminal draw")?;
         }
         Ok(())
     }
@@ -2192,13 +2201,20 @@ impl App {
     }
 }
 
-/// Read the next terminal event by yielding the current task and polling
-/// crossterm on a blocking thread (so the tokio runtime stays responsive).
-async fn next_terminal_event() -> Result<Event> {
-    tokio::task::spawn_blocking(event::read)
-        .await
-        .context("event-read task panicked")?
-        .context("event-read failed")
+/// Read the next terminal event (blocking on a worker thread so the tokio
+/// runtime stays responsive), then drain any further immediately-available
+/// events without blocking. Returning the whole batch lets the run loop process
+/// a burst of sequences in one wake instead of one render cycle per event.
+async fn next_terminal_events() -> Result<Vec<Event>> {
+    tokio::task::spawn_blocking(|| -> Result<Vec<Event>> {
+        let mut events = vec![event::read()?];
+        while event::poll(Duration::ZERO)? {
+            events.push(event::read()?);
+        }
+        Ok(events)
+    })
+    .await
+    .context("event-read task panicked")?
 }
 
 /// Block on a future from within the App run-loop task. Safe here because

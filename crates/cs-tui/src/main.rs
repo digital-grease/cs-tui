@@ -26,9 +26,14 @@ struct Cli {
     #[arg(long)]
     mock: bool,
 
-    /// Verbose tracing to stderr (RUST_LOG-compatible).
+    /// Verbose tracing to the log file (RUST_LOG-compatible).
     #[arg(long)]
     debug: bool,
+
+    /// Skip terminal image-graphics detection and rendering. Avoids the one-time
+    /// startup capability query, for a faster launch.
+    #[arg(long)]
+    no_images: bool,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -70,14 +75,20 @@ async fn main() -> Result<()> {
         .unwrap_or(ThemeKind::Cyber);
     // Detect terminal image-graphics support before entering the alternate
     // screen (the query reads/writes stdio). `None` → images aren't rendered.
-    let picker = match ratatui_image::picker::Picker::from_query_stdio() {
-        Ok(p) => {
-            tracing::info!(protocol = ?p.protocol_type(), "terminal image graphics detected");
-            Some(p)
-        }
-        Err(e) => {
-            tracing::info!(error = %e, "no terminal image graphics; using [image] placeholders");
-            None
+    // `--no-images` skips the query entirely (one-time cost; faster startup).
+    let picker = if cli.no_images {
+        tracing::info!("image rendering disabled (--no-images)");
+        None
+    } else {
+        match ratatui_image::picker::Picker::from_query_stdio() {
+            Ok(p) => {
+                tracing::info!(protocol = ?p.protocol_type(), "terminal image graphics detected");
+                Some(p)
+            }
+            Err(e) => {
+                tracing::info!(error = %e, "no terminal image graphics; using [image] placeholders");
+                None
+            }
         }
     };
 
