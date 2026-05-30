@@ -98,10 +98,29 @@ async fn main() -> Result<()> {
     if has_session {
         app.enter_feed_initial();
     }
+    // Button + SGR mouse reporting, but NOT motion tracking: the scroll wheel
+    // yields one event per notch (mapped to one step) without flooding events on
+    // mouse movement. Native text selection still works via Shift+drag.
+    set_mouse_scroll_reporting(true);
     let run_result = app.run(terminal).await;
+    set_mouse_scroll_reporting(false);
     ratatui::restore();
 
     run_result
+}
+
+/// Toggle xterm button + SGR mouse reporting (modes 1000/1006). Crossterm's
+/// `EnableMouseCapture` also enables motion tracking, which we don't want.
+fn set_mouse_scroll_reporting(on: bool) {
+    use std::io::Write;
+    let seq: &[u8] = if on {
+        b"\x1b[?1000h\x1b[?1006h"
+    } else {
+        b"\x1b[?1006l\x1b[?1000l"
+    };
+    let mut out = std::io::stdout();
+    let _ = out.write_all(seq);
+    let _ = out.flush();
 }
 
 fn init_tracing(verbose: bool) {

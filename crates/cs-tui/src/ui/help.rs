@@ -29,7 +29,7 @@ const SECTIONS: &[Row] = &[
 const GLOBAL: &[Row] = &[
     Row { keys: "Esc", desc: "back — or the menu on a top-level section" },
     Row { keys: "Backspace", desc: "back" },
-    Row { keys: "Tab / S-Tab", desc: "next / previous section" },
+    Row { keys: "Tab / ← →", desc: "next / previous section" },
     Row { keys: "?", desc: "this help" },
     Row { keys: "Ctrl+C", desc: "quit" },
 ];

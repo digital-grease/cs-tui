@@ -443,10 +443,18 @@ impl App {
     }
 
     async fn handle_terminal_event(&mut self, ev: Event) {
-        let Event::Key(key) = ev else { return };
-        if key.kind != event::KeyEventKind::Press {
-            return;
-        }
+        let key = match ev {
+            Event::Key(k) if k.kind == event::KeyEventKind::Press => k,
+            // Mouse wheel → one selection step per notch. Button+scroll reporting
+            // is enabled in main; motion tracking is not, so the mouse doesn't
+            // flood events when moved.
+            Event::Mouse(m) => match m.kind {
+                event::MouseEventKind::ScrollDown => synthetic_key(KeyCode::Down),
+                event::MouseEventKind::ScrollUp => synthetic_key(KeyCode::Up),
+                _ => return,
+            },
+            _ => return,
+        };
 
         // The help overlay swallows the next key to dismiss (Ctrl+C still quits).
         if self.help {
@@ -509,12 +517,12 @@ impl App {
         // would navigate away and discard the in-progress input.
         if !self.screen.accepts_text_input() {
             match key.code {
-                KeyCode::Tab => {
+                KeyCode::Tab | KeyCode::Right => {
                     let next = self.current_root.unwrap_or(RootKind::Feed).next();
                     self.goto_root(next);
                     return;
                 }
-                KeyCode::BackTab => {
+                KeyCode::BackTab | KeyCode::Left => {
                     let prev = self.current_root.unwrap_or(RootKind::Feed).prev();
                     self.goto_root(prev);
                     return;
@@ -2215,6 +2223,12 @@ async fn next_terminal_events() -> Result<Vec<Event>> {
     })
     .await
     .context("event-read task panicked")?
+}
+
+/// Build a synthetic key-press event (used to translate mouse-wheel scrolls into
+/// the same one-step navigation as the arrow keys).
+fn synthetic_key(code: KeyCode) -> event::KeyEvent {
+    event::KeyEvent::new(code, KeyModifiers::empty())
 }
 
 /// Block on a future from within the App run-loop task. Safe here because
