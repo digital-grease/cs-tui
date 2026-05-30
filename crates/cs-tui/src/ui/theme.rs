@@ -13,6 +13,8 @@ pub struct Theme {
     #[allow(dead_code)]
     pub success: Color,
     pub error: Color,
+    /// Caution accent — drives the rate-limit toast (and any future warnings).
+    pub warning: Color,
     pub border: Color,
 }
 
@@ -26,6 +28,7 @@ impl Theme {
             accent: Color::LightGreen,
             success: Color::Green,
             error: Color::LightRed,
+            warning: Color::LightYellow,
             border: Color::Green,
         }
     }
@@ -39,6 +42,7 @@ impl Theme {
             accent: Color::Indexed(159),     // pale cyan
             success: Color::LightCyan,
             error: Color::LightRed,
+            warning: Color::Indexed(227), // light yellow
             border: Color::Indexed(75),
         }
     }
@@ -52,6 +56,7 @@ impl Theme {
             accent: Color::Indexed(220),     // bright amber
             success: Color::Yellow,
             error: Color::LightRed,
+            warning: Color::Indexed(214), // amber
             border: Color::Indexed(94),
         }
     }
@@ -65,6 +70,7 @@ impl Theme {
             accent: Color::LightGreen,
             success: Color::Green,
             error: Color::LightRed,
+            warning: Color::LightYellow,
             border: Color::DarkGray,
         }
     }
@@ -85,6 +91,12 @@ impl Theme {
 
     pub fn error_style(&self) -> Style {
         Style::default().fg(self.error).add_modifier(Modifier::BOLD)
+    }
+
+    pub fn warning_style(&self) -> Style {
+        Style::default()
+            .fg(self.warning)
+            .add_modifier(Modifier::BOLD)
     }
 
     pub fn border_style(&self) -> Style {

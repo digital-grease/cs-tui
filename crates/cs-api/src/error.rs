@@ -85,6 +85,25 @@ impl ApiError {
                 }
         )
     }
+
+    /// A transport/network-layer failure (DNS, connection refused, TLS, timeout)
+    /// — i.e. we never got an HTTP response. Distinct from an error *status*
+    /// returned by the server, which means we're online.
+    #[must_use]
+    pub fn is_transport(&self) -> bool {
+        matches!(self, Self::Transport(_))
+    }
+
+    /// The server-advertised wait before retrying, when this is a rate-limit
+    /// error that carried a `Retry-After`. `None` for every other error and for
+    /// rate-limit errors with no retry hint.
+    #[must_use]
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        match self {
+            Self::RateLimited { retry_after_secs } => Some(*retry_after_secs),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -107,5 +126,40 @@ mod tests {
     fn http_status_mapping() {
         assert_eq!(ErrorCode::Unauthorized.http_status(), 401);
         assert_eq!(ErrorCode::RateLimited.http_status(), 429);
+    }
+
+    #[test]
+    fn retry_after_only_set_for_rate_limited() {
+        assert_eq!(
+            ApiError::RateLimited { retry_after_secs: 30 }.retry_after_secs(),
+            Some(30)
+        );
+        assert_eq!(ApiError::Unauthorized.retry_after_secs(), None);
+        assert_eq!(
+            ApiError::Api {
+                code: ErrorCode::RateLimited,
+                message: "slow down".into(),
+                status: 429,
+            }
+            .retry_after_secs(),
+            None,
+            "the envelope-coded form carries no retry hint"
+        );
+    }
+
+    #[test]
+    fn classification_helpers_partition_variants() {
+        let rl = ApiError::RateLimited { retry_after_secs: 5 };
+        assert!(rl.is_rate_limited() && !rl.is_transport() && !rl.is_unauthorized());
+
+        let un = ApiError::Unauthorized;
+        assert!(un.is_unauthorized() && !un.is_transport() && !un.is_rate_limited());
+
+        let nf = ApiError::Api {
+            code: ErrorCode::NotFound,
+            message: "missing".into(),
+            status: 404,
+        };
+        assert!(!nf.is_transport() && !nf.is_unauthorized() && !nf.is_rate_limited());
     }
 }

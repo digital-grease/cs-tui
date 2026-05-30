@@ -17,6 +17,7 @@ pub mod post_detail;
 pub mod profile;
 pub mod settings_screen;
 pub mod theme;
+pub mod toast;
 pub mod topic_feed;
 pub mod topics;
 
