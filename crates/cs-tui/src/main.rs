@@ -70,7 +70,16 @@ async fn main() -> Result<()> {
         .unwrap_or(ThemeKind::Cyber);
     // Detect terminal image-graphics support before entering the alternate
     // screen (the query reads/writes stdio). `None` → images aren't rendered.
-    let picker = ratatui_image::picker::Picker::from_query_stdio().ok();
+    let picker = match ratatui_image::picker::Picker::from_query_stdio() {
+        Ok(p) => {
+            tracing::info!(protocol = ?p.protocol_type(), "terminal image graphics detected");
+            Some(p)
+        }
+        Err(e) => {
+            tracing::info!(error = %e, "no terminal image graphics; using [image] placeholders");
+            None
+        }
+    };
 
     let terminal = ratatui::init();
     let mut app = App::with_theme(client, prefill_email, theme_kind);

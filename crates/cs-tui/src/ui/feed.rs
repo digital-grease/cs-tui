@@ -229,7 +229,7 @@ fn entry_item<'a>(entry: &'a Entry, width: u16, theme: &Theme) -> ListItem<'a> {
         }
     }
 
-    let snippet = first_line_truncated(&entry.content, 200);
+    let snippet = super::markdown::content_preview(&entry.content, 200);
     lines.push(Line::from(Span::styled(snippet, theme.base())));
 
     // Rule between posts so it's clear where one ends and the next begins.

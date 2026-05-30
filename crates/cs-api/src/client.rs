@@ -325,7 +325,16 @@ impl Client {
     /// **unauthenticated**: image URLs in posts may point at third-party hosts,
     /// so the bearer token must never be attached. The response size is capped.
     pub async fn fetch_image(&self, url: &str) -> Result<Vec<u8>> {
-        let resp = self.inner.http.get(url).send().await?.error_for_status()?;
+        let mut req = self.inner.http.get(url);
+        // Attach auth only for cyberspace-owned hosts (e.g. bunker.cyberspace.online),
+        // where uploads may be gated. Never send the token to third-party hosts.
+        if is_cyberspace_url(url) {
+            let token = self.tokens().await.id_token;
+            if !token.is_empty() {
+                req = req.bearer_auth(token);
+            }
+        }
+        let resp = req.send().await?.error_for_status()?;
         if let Some(len) = resp.content_length() {
             if len > MAX_IMAGE_BYTES {
                 return Err(ApiError::Config(format!("image too large ({len} bytes)")));
@@ -337,6 +346,16 @@ impl Client {
         }
         Ok(bytes.to_vec())
     }
+}
+
+/// Whether a URL points at a cyberspace.online-owned host (so it's safe to
+/// attach the bearer token).
+fn is_cyberspace_url(url: &str) -> bool {
+    Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        .map(|h| h == "cyberspace.online" || h.ends_with(".cyberspace.online"))
+        .unwrap_or(false)
 }
 
 fn parse_retry_after(resp: &reqwest::Response) -> Option<Duration> {
