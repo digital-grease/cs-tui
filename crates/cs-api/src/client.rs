@@ -311,10 +311,28 @@ impl Client {
                 continue;
             }
 
+            // A 429 that survives our retries is surfaced as the dedicated
+            // `RateLimited` variant carrying the server's wait hint, so the UI
+            // can show a retry countdown. Parse the header before the response is
+            // consumed by `bytes()`.
+            let retry_after = if status == StatusCode::TOO_MANY_REQUESTS {
+                Some(
+                    parse_retry_after(&resp)
+                        .unwrap_or_else(|| backoff_delay(attempt))
+                        .as_secs(),
+                )
+            } else {
+                None
+            };
+
             let bytes = resp.bytes().await?.to_vec();
 
             if status.is_success() {
                 return Ok(bytes);
+            }
+
+            if let Some(retry_after_secs) = retry_after {
+                return Err(ApiError::RateLimited { retry_after_secs });
             }
 
             return Err(parse_error_body(status, &bytes));

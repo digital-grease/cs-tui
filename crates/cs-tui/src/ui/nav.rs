@@ -140,13 +140,15 @@ fn tab_window(widths: &[usize], sep_w: usize, cur: usize, avail: usize) -> (usiz
 /// Render the top tab bar. `current` is highlighted; `unread_count` (>0) shows
 /// next to the notifications tab. When the full bar doesn't fit, it scrolls
 /// horizontally to keep the current section in view, marking clipped ends with
-/// `‹`/`›`.
+/// `‹`/`›`. When `offline` is set, a red marker replaces the right-hand hint so
+/// the connection loss is always visible.
 pub fn render_tab_bar(
     frame: &mut Frame<'_>,
     area: Rect,
     current: RootKind,
     unread_count: u32,
     can_go_back: bool,
+    offline: bool,
     theme: &Theme,
 ) {
     let kinds = RootKind::all();
@@ -194,10 +196,23 @@ pub fn render_tab_bar(
     if clip_r {
         spans.push(Span::styled(" ›", theme.muted_style()));
     }
-    if with_hint {
+    if with_hint && !offline {
         spans.push(Span::styled(hint, theme.muted_style()));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+
+    // A dropped connection is the most important thing on the bar, so it's
+    // painted as a right-aligned overlay *over* the tabs — guaranteeing it shows
+    // even when the tab list already fills the width.
+    if offline {
+        let marker = " ⚠ offline ";
+        let mw = (marker.chars().count() as u16).min(area.width);
+        let mrect = Rect::new(area.x + area.width - mw, area.y, mw, 1);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(marker, theme.error_style()))),
+            mrect,
+        );
+    }
 }
 
 #[cfg(test)]

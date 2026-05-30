@@ -1,17 +1,19 @@
 //! Top-level App state and event loop.
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use cs_api::{
-    Bookmark, Client, Entry, Follow, FollowsDirection, Guild, GuildMembership, GuildThread,
-    JoinedGuild, Note, NoteRevision, Notification, NotificationsFilter, ProfileUpdate, Reply,
-    Settings, SettingsUpdate, Topic, User,
+    ApiError, Bookmark, Client, Entry, Follow, FollowsDirection, Guild, GuildMembership,
+    GuildThread, JoinedGuild, Note, NoteRevision, Notification, NotificationsFilter, ProfileUpdate,
+    Reply, Settings, SettingsUpdate, Topic, User,
 };
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::DefaultTerminal;
 use ratatui_image::picker::Picker;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
+use tokio::time::MissedTickBehavior;
 
 use super::bookmarks::{BookmarksIntent, BookmarksScreen};
 use super::compose::{launch_editor, ComposeIntent, ComposeKind, ComposeScreen};
@@ -28,13 +30,36 @@ use super::post_detail::{PostDetailIntent, PostDetailScreen};
 use super::profile::{ProfileIntent, ProfileScreen, ProfileTab};
 use super::settings_screen::{SettingsIntent, SettingsScreen};
 use super::theme::{Theme, ThemeKind};
+use super::toast::Toast;
 use super::topic_feed::{TopicFeedIntent, TopicFeedScreen};
 use super::topics::{TopicsIntent, TopicsScreen};
 use crate::session::Session;
 
+/// Connectivity / auth signal distilled from a background `ApiError`, delivered
+/// out-of-band via [`BgEvent::ApiSignal`]. This is the typed side-channel that
+/// lets the main loop react to network/session conditions centrally — driving
+/// the offline indicator, the rate-limit toast, and session-expiry logout —
+/// without every screen re-deriving them from an error string. The per-screen
+/// `Result<_, String>` path is left untouched; this rides alongside it.
+#[derive(Debug, Clone, Copy)]
+pub enum ApiSignal {
+    /// A transport failure — we never reached the server.
+    Offline,
+    /// The server answered but rate-limited us; carries its retry hint.
+    RateLimited { retry_after_secs: u64 },
+    /// A 401 outlived the client's refresh-once, so the session is dead.
+    SessionExpired,
+    /// The server answered normally (or with a non-transport error) — proof
+    /// we're online; clears any offline state.
+    Online,
+}
+
 /// Background-task result delivered to the main loop via `mpsc`.
 #[derive(Debug)]
 pub enum BgEvent {
+    /// Out-of-band connectivity/auth signal (see [`ApiSignal`]); rides alongside
+    /// the per-screen result events below.
+    ApiSignal(ApiSignal),
     LoginResult(Result<String, String>),
     FeedInitial(Result<(Vec<Entry>, Option<String>), String>),
     FeedMore(Result<(Vec<Entry>, Option<String>), String>),
@@ -324,6 +349,23 @@ pub struct App {
     picker: Option<Picker>,
     /// Email cached for re-displaying on the login screen after logout.
     last_email: String,
+    /// Whether the last network attempt hit a transport error (no server
+    /// reachable). Surfaced as a tab-bar marker; cleared once any call reaches
+    /// the server again (heartbeat poll or a server-origin response).
+    offline: bool,
+    /// Active transient toast (currently the rate-limit countdown), if any.
+    toast: Option<Toast>,
+    /// Set when a background call proves the session is dead; the run loop
+    /// performs the (async) logout and seeds this reason on the login screen.
+    pending_logout: Option<String>,
+    /// Wakes the unread-count poller early when we go offline, so the offline
+    /// marker clears promptly once the connection returns (instead of waiting
+    /// out the poller's current sleep).
+    offline_notify: Arc<Notify>,
+    /// Whether the single long-lived unread-count poller has been spawned. It
+    /// outlives logout (idling on the login screen) so re-login reuses it
+    /// instead of stacking duplicates.
+    poller_started: bool,
 }
 
 impl App {
@@ -345,6 +387,11 @@ impl App {
             help: false,
             picker: None,
             last_email,
+            offline: false,
+            toast: None,
+            pending_logout: None,
+            offline_notify: Arc::new(Notify::new()),
+            poller_started: false,
         }
     }
 
@@ -357,10 +404,24 @@ impl App {
     /// Skip the login screen — used when a valid session was restored at launch.
     pub fn enter_feed_initial(&mut self) {
         self.goto_root(RootKind::Feed);
-        self.spawn_unread_count_poller();
+        if self.poller_started {
+            // A poller from a previous session is still alive (it idled on the
+            // login screen). Reusing it — rather than spawning a duplicate on
+            // every re-login — keeps exactly one heartbeat; nudge it to re-poll
+            // now with the fresh tokens.
+            self.offline_notify.notify_one();
+        } else {
+            self.spawn_unread_count_poller();
+            self.poller_started = true;
+        }
     }
 
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> Result<()> {
+        // 1s heartbeat that only fires while a toast is up (see the guarded
+        // select arm); it animates the countdown without waking an idle TUI.
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
         terminal.draw(|f| self.render(f)).context("terminal draw")?;
         while !self.should_quit {
             tokio::select! {
@@ -379,7 +440,14 @@ impl App {
                 Some(bg) = self.bg_rx.recv() => {
                     self.handle_bg_event(bg);
                 }
+                _ = ticker.tick(), if self.toast.is_some() => {
+                    self.tick_toast();
+                }
             }
+            // A background call may have proven the session dead; logging out
+            // needs an await, so it happens here rather than in the sync bg
+            // handler.
+            self.apply_pending_logout().await;
             terminal.draw(|f| self.render(f)).context("terminal draw")?;
         }
         Ok(())
@@ -409,6 +477,7 @@ impl App {
                 current,
                 self.unread_count,
                 !self.back_stack.is_empty(),
+                self.offline,
                 &self.theme,
             );
 
@@ -428,6 +497,11 @@ impl App {
                 Screen::Guilds(s) => s.render(frame, screen_area, &self.theme),
                 Screen::Guild(s) => s.render(frame, screen_area, &self.theme),
             }
+        }
+
+        // Transient toast sits above the screen but below the modal overlays.
+        if let Some(toast) = &self.toast {
+            super::toast::render(frame, full_area, toast, &self.theme);
         }
 
         // Overlay menu — always drawn last so it sits on top of ANY screen,
@@ -1031,6 +1105,7 @@ impl App {
 
     fn handle_bg_event(&mut self, ev: BgEvent) {
         match ev {
+            BgEvent::ApiSignal(signal) => self.handle_api_signal(signal),
             BgEvent::LoginResult(Ok(email)) => {
                 let tokens = block_on(self.client.tokens());
                 let session = Session {
@@ -1041,6 +1116,7 @@ impl App {
                     tracing::warn!(error = %e, "session save failed");
                 }
                 self.last_email = email;
+                self.offline = false;
                 self.enter_feed_initial();
             }
             BgEvent::LoginResult(Err(msg)) => {
@@ -1125,6 +1201,8 @@ impl App {
                 }
             },
             BgEvent::UnreadCount(n) => {
+                // A successful poll doubles as an online heartbeat.
+                self.offline = false;
                 self.unread_count = n;
             }
             BgEvent::ProfileUser(result) => {
@@ -1460,8 +1538,64 @@ impl App {
         self.back_stack.clear();
         self.current_root = None;
         self.unread_count = 0;
+        self.offline = false;
+        self.toast = None;
         let email = self.last_email.clone();
         self.screen = Screen::Login(LoginScreen::new(email));
+    }
+
+    /// React to a connectivity/auth signal distilled from a background error
+    /// (see [`ApiSignal`]). This is the single funnel the three reliability
+    /// behaviors hang off of.
+    fn handle_api_signal(&mut self, signal: ApiSignal) {
+        match signal {
+            ApiSignal::Offline => {
+                // Only nudge the poller on the online→offline *transition*. The
+                // poller emits Offline itself on each failed retry, so notifying
+                // on every signal would defeat its 5s backoff and busy-loop a
+                // down connection. The first transition (often from another
+                // task's request) wakes it to start fast-checking; from there it
+                // self-paces until a poll succeeds and clears the marker.
+                if !self.offline {
+                    self.offline = true;
+                    self.offline_notify.notify_one();
+                }
+            }
+            ApiSignal::Online => self.offline = false,
+            ApiSignal::RateLimited { retry_after_secs } => {
+                // Getting a rate-limit *response* proves we're online.
+                self.offline = false;
+                self.toast = Some(Toast::rate_limited(retry_after_secs));
+            }
+            ApiSignal::SessionExpired => {
+                // Ignore once we're already on login (we've logged out), so a
+                // burst of in-flight 401s doesn't loop.
+                if !self.screen.is_login() {
+                    self.pending_logout =
+                        Some("Session expired — please sign in again.".to_string());
+                }
+            }
+        }
+    }
+
+    /// Expire the active toast once its countdown elapses. Driven by the 1s
+    /// ticker while a toast is shown.
+    fn tick_toast(&mut self) {
+        if self.toast.as_ref().is_some_and(Toast::is_expired) {
+            self.toast = None;
+        }
+    }
+
+    /// If a background call proved the session is dead, log out and surface the
+    /// reason on the login screen. Runs in the async loop because `logout`
+    /// awaits; the sync bg handler only sets `pending_logout`.
+    async fn apply_pending_logout(&mut self) {
+        if let Some(reason) = self.pending_logout.take() {
+            self.logout().await;
+            if let Screen::Login(s) = &mut self.screen {
+                s.error = Some(reason);
+            }
+        }
     }
 
     /// Advance to the next theme palette, apply it live, and persist the choice
@@ -1528,7 +1662,7 @@ impl App {
                 .login(&email, &password)
                 .await
                 .map(|_| email)
-                .map_err(|e| e.to_string());
+                .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::LoginResult(result));
         });
     }
@@ -1540,7 +1674,7 @@ impl App {
             let result = client
                 .list_entries(None, None)
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::FeedInitial(result));
         });
     }
@@ -1552,7 +1686,7 @@ impl App {
             let result = client
                 .list_entries(cursor.as_deref(), None)
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::FeedMore(result));
         });
     }
@@ -1564,7 +1698,7 @@ impl App {
             let result = client
                 .list_notifications(None, None, filter, &[])
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::NotificationsInitial(result));
         });
     }
@@ -1576,7 +1710,7 @@ impl App {
             let result = client
                 .list_notifications(cursor.as_deref(), None, filter, &[])
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::NotificationsMore(result));
         });
     }
@@ -1590,7 +1724,8 @@ impl App {
                     let _ = tx.send(BgEvent::NotificationMarkedRead);
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, notification_id, "mark_notification_read failed");
+                    let msg = note_api_err(&tx, e);
+                    tracing::warn!(error = %msg, notification_id, "mark_notification_read failed");
                 }
             }
         });
@@ -1604,7 +1739,10 @@ impl App {
                 Ok(_) => {
                     let _ = tx.send(BgEvent::AllNotificationsMarked);
                 }
-                Err(e) => tracing::warn!(error = %e, "mark_all_notifications_read failed"),
+                Err(e) => {
+                    let msg = note_api_err(&tx, e);
+                    tracing::warn!(error = %msg, "mark_all_notifications_read failed");
+                }
             }
         });
     }
@@ -1616,7 +1754,7 @@ impl App {
             let result = client
                 .list_bookmarks(None, None)
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::BookmarksInitial(result));
         });
     }
@@ -1628,7 +1766,7 @@ impl App {
             let result = client
                 .list_bookmarks(cursor.as_deref(), None)
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::BookmarksMore(result));
         });
     }
@@ -1642,7 +1780,8 @@ impl App {
                     let _ = tx.send(BgEvent::BookmarkRemoved);
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, bookmark_id, "delete_bookmark failed");
+                    let msg = note_api_err(&tx, e);
+                    tracing::warn!(error = %msg, bookmark_id, "delete_bookmark failed");
                 }
             }
         });
@@ -1652,7 +1791,7 @@ impl App {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
-            let result = client.list_topics().await.map_err(|e| e.to_string());
+            let result = client.list_topics().await.map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::TopicsLoaded(result));
         });
     }
@@ -1665,7 +1804,7 @@ impl App {
             let result = client
                 .list_topic_posts(&slug, None, None)
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::TopicFeedInitial { slug, result });
         });
     }
@@ -1678,7 +1817,7 @@ impl App {
             let result = client
                 .list_topic_posts(&slug, cursor.as_deref(), None)
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::TopicFeedMore { slug, result });
         });
     }
@@ -1687,7 +1826,7 @@ impl App {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
-            let result = client.list_guilds(None, None).await.map_err(|e| e.to_string());
+            let result = client.list_guilds(None, None).await.map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::GuildsInitial(result));
         });
     }
@@ -1699,7 +1838,7 @@ impl App {
             let result = client
                 .list_guilds(cursor.as_deref(), None)
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::GuildsMore(result));
         });
     }
@@ -1710,7 +1849,7 @@ impl App {
         let tx = self.bg_tx.clone();
         let info_slug = slug.clone();
         tokio::spawn(async move {
-            let result = client.get_guild(&info_slug).await.map_err(|e| e.to_string());
+            let result = client.get_guild(&info_slug).await.map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::GuildInfo {
                 slug: info_slug,
                 result,
@@ -1729,14 +1868,14 @@ impl App {
                     let result = client
                         .list_guild_threads(&slug, None, None)
                         .await
-                        .map_err(|e| e.to_string());
+                        .map_err(|e| note_api_err(&tx, e));
                     let _ = tx.send(BgEvent::GuildThreadsInitial { slug, result });
                 }
                 GuildTab::Members => {
                     let result = client
                         .list_guild_members(&slug, None, None)
                         .await
-                        .map_err(|e| e.to_string());
+                        .map_err(|e| note_api_err(&tx, e));
                     let _ = tx.send(BgEvent::GuildMembersInitial { slug, result });
                 }
             }
@@ -1753,14 +1892,14 @@ impl App {
                     let result = client
                         .list_guild_threads(&slug, cursor.as_deref(), None)
                         .await
-                        .map_err(|e| e.to_string());
+                        .map_err(|e| note_api_err(&tx, e));
                     let _ = tx.send(BgEvent::GuildThreadsMore { slug, result });
                 }
                 GuildTab::Members => {
                     let result = client
                         .list_guild_members(&slug, cursor.as_deref(), None)
                         .await
-                        .map_err(|e| e.to_string());
+                        .map_err(|e| note_api_err(&tx, e));
                     let _ = tx.send(BgEvent::GuildMembersMore { slug, result });
                 }
             }
@@ -1771,7 +1910,7 @@ impl App {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
-            let result = client.join_guild(&slug).await.map_err(|e| e.to_string());
+            let result = client.join_guild(&slug).await.map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::GuildJoined { slug, result });
         });
     }
@@ -1780,7 +1919,7 @@ impl App {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
-            let result = client.leave_guild(&slug).await.map_err(|e| e.to_string());
+            let result = client.leave_guild(&slug).await.map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::GuildLeft { slug, result });
         });
     }
@@ -1793,7 +1932,7 @@ impl App {
             let result = client
                 .list_replies(&post_id, None, None)
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::DetailRepliesInitial(result));
         });
     }
@@ -1806,7 +1945,7 @@ impl App {
             let result = client
                 .list_replies(&post_id, cursor.as_deref(), None)
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::DetailRepliesMore(result));
         });
     }
@@ -1815,7 +1954,7 @@ impl App {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
-            let result = client.get_entry(&post_id).await.map_err(|e| e.to_string());
+            let result = client.get_entry(&post_id).await.map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::OpenPostDetail {
                 result,
                 highlight_reply_id,
@@ -1862,7 +2001,10 @@ impl App {
                 Ok(n) => {
                     let _ = tx.send(BgEvent::UnreadCount(n));
                 }
-                Err(e) => tracing::debug!(error = %e, "unread_count one-shot failed"),
+                Err(e) => {
+                    let msg = note_api_err(&tx, e);
+                    tracing::debug!(error = %msg, "unread_count one-shot failed");
+                }
             }
         });
     }
@@ -1871,7 +2013,7 @@ impl App {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
-            let result = client.get_own_profile().await.map_err(|e| e.to_string());
+            let result = client.get_own_profile().await.map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::ProfileUser(result));
         });
     }
@@ -1883,7 +2025,7 @@ impl App {
             let result = client
                 .get_profile(&username)
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::ProfileUser(result));
         });
     }
@@ -1905,14 +2047,14 @@ impl App {
                     let result = client
                         .list_user_posts(&username, cursor.as_deref(), None)
                         .await
-                        .map_err(|e| e.to_string());
+                        .map_err(|e| note_api_err(&tx, e));
                     let _ = tx.send(BgEvent::ProfilePosts { more, result });
                 }
                 ProfileTab::Replies => {
                     let result = client
                         .list_user_replies(&username, cursor.as_deref(), None)
                         .await
-                        .map_err(|e| e.to_string());
+                        .map_err(|e| note_api_err(&tx, e));
                     let _ = tx.send(BgEvent::ProfileReplies { more, result });
                 }
                 ProfileTab::Followers => {
@@ -1924,7 +2066,7 @@ impl App {
                             None,
                         )
                         .await
-                        .map_err(|e| e.to_string());
+                        .map_err(|e| note_api_err(&tx, e));
                     let _ = tx.send(BgEvent::ProfileFollowers { more, result });
                 }
                 ProfileTab::Following => {
@@ -1936,7 +2078,7 @@ impl App {
                             None,
                         )
                         .await
-                        .map_err(|e| e.to_string());
+                        .map_err(|e| note_api_err(&tx, e));
                     let _ = tx.send(BgEvent::ProfileFollowing { more, result });
                 }
             }
@@ -1953,7 +2095,7 @@ impl App {
                     .unfollow(&fid)
                     .await
                     .map(|()| None)
-                    .map_err(|e| e.to_string());
+                    .map_err(|e| note_api_err(&tx, e));
                 let _ = tx.send(BgEvent::ProfileFollowToggled(result));
             } else {
                 // Not following — follow.
@@ -1961,7 +2103,7 @@ impl App {
                     .follow_user(&user_id)
                     .await
                     .map(Some)
-                    .map_err(|e| e.to_string());
+                    .map_err(|e| note_api_err(&tx, e));
                 let _ = tx.send(BgEvent::ProfileFollowToggled(result));
             }
         });
@@ -1974,7 +2116,7 @@ impl App {
             let result = client
                 .update_own_profile(&update)
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::ProfileUpdated(result));
         });
     }
@@ -2036,7 +2178,7 @@ impl App {
                         )
                         .await
                         .map(|created| created.post_id)
-                        .map_err(|e| e.to_string());
+                        .map_err(|e| note_api_err(&tx, e));
                     let _ = tx.send(BgEvent::EntryCreated(result));
                 }
                 ComposeKind::Reply {
@@ -2046,14 +2188,14 @@ impl App {
                     let result = client
                         .create_reply(&post_id, &content, parent_reply_id.as_deref())
                         .await
-                        .map_err(|e| e.to_string());
+                        .map_err(|e| note_api_err(&tx, e));
                     let _ = tx.send(BgEvent::ReplyCreated(result));
                 }
                 ComposeKind::NewNote => {
                     let result = client
                         .create_note(&content, &topics)
                         .await
-                        .map_err(|e| e.to_string());
+                        .map_err(|e| note_api_err(&tx, e));
                     let _ = tx.send(BgEvent::NoteCreated(result));
                 }
                 ComposeKind::UpdateNote { note_id } => {
@@ -2061,7 +2203,7 @@ impl App {
                         .update_note(&note_id, &content, &topics)
                         .await
                         .map(|()| note_id)
-                        .map_err(|e| e.to_string());
+                        .map_err(|e| note_api_err(&tx, e));
                     let _ = tx.send(BgEvent::NoteUpdated(result));
                 }
                 ComposeKind::GuildThread { guild_slug } => {
@@ -2069,7 +2211,7 @@ impl App {
                         .create_guild_thread(&guild_slug, &content, title.as_deref(), None, &topics)
                         .await
                         .map(|created| created.post_id)
-                        .map_err(|e| e.to_string());
+                        .map_err(|e| note_api_err(&tx, e));
                     let _ = tx.send(BgEvent::GuildThreadCreated {
                         slug: guild_slug,
                         result,
@@ -2087,7 +2229,7 @@ impl App {
                 .delete_entry(&post_id)
                 .await
                 .map(|()| post_id)
-                .map_err(|e| e.to_string());
+                .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::EntryDeleted(result));
         });
     }
@@ -2124,7 +2266,7 @@ impl App {
             let result = client
                 .list_notes(None, None)
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::NotesInitial(result));
         });
     }
@@ -2136,7 +2278,7 @@ impl App {
             let result = client
                 .list_notes(cursor.as_deref(), None)
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::NotesMore(result));
         });
     }
@@ -2149,7 +2291,7 @@ impl App {
                 .list_note_revisions(&note_id, None, None)
                 .await
                 .map(|(items, _cursor)| items)
-                .map_err(|e| e.to_string());
+                .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::NoteRevisions { note_id, result });
         });
     }
@@ -2158,7 +2300,7 @@ impl App {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
-            let result = client.get_settings().await.map_err(|e| e.to_string());
+            let result = client.get_settings().await.map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::SettingsLoaded(result));
         });
     }
@@ -2170,7 +2312,7 @@ impl App {
             let result = client
                 .update_settings(&update)
                 .await
-                .map_err(|e| e.to_string());
+                .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::SettingsSaved(result));
         });
     }
@@ -2183,7 +2325,10 @@ impl App {
                 Ok(()) => {
                     let _ = tx.send(BgEvent::NoteDeleted);
                 }
-                Err(e) => tracing::warn!(error = %e, note_id, "delete_note failed"),
+                Err(e) => {
+                    let msg = note_api_err(&tx, e);
+                    tracing::warn!(error = %msg, note_id, "delete_note failed");
+                }
             }
         });
     }
@@ -2191,19 +2336,40 @@ impl App {
     fn spawn_unread_count_poller(&self) {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
+        let wake = self.offline_notify.clone();
         tokio::spawn(async move {
             // Brief settle delay so the initial render lands before the first poll.
             tokio::time::sleep(Duration::from_secs(3)).await;
+            // Doubles as a connectivity / session heartbeat: a successful poll
+            // clears the offline marker, while a failure is funnelled through
+            // `note_api_err` exactly like every instrumented request — so a
+            // transport drop raises the offline marker and a terminal 401 logs
+            // an *idle* user out (the poller is their only traffic). While
+            // offline we poll faster (5s vs 60s), and a `wake` notification cuts
+            // the sleep short so the marker clears promptly on reconnect.
             loop {
-                match client.unread_notification_count().await {
+                let next_delay = match client.unread_notification_count().await {
                     Ok(n) => {
                         if tx.send(BgEvent::UnreadCount(n)).is_err() {
                             return; // app gone
                         }
+                        60
                     }
-                    Err(e) => tracing::debug!(error = %e, "unread_count poll failed"),
+                    Err(e) => {
+                        let transport = e.is_transport();
+                        let msg = note_api_err(&tx, e);
+                        tracing::debug!(error = %msg, "unread_count poll failed");
+                        if transport {
+                            5
+                        } else {
+                            60
+                        }
+                    }
+                };
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_secs(next_delay)) => {}
+                    () = wake.notified() => {}
                 }
-                tokio::time::sleep(Duration::from_secs(60)).await;
             }
         });
     }
@@ -2236,6 +2402,30 @@ fn synthetic_key(code: KeyCode) -> event::KeyEvent {
 /// anything that would re-enter the runtime.
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
     tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
+}
+
+/// Classify a background `ApiError`, emit the matching [`ApiSignal`] to the main
+/// loop, and flatten the error to its display string for the per-screen path.
+/// This replaces the bare `.map_err(|e| note_api_err(&tx, e))` at every authenticated
+/// API spawn site, so connectivity/auth conditions reach the central funnel
+/// without disturbing any screen's `Result<_, String>` handling.
+fn note_api_err(tx: &mpsc::UnboundedSender<BgEvent>, e: ApiError) -> String {
+    let signal = if e.is_transport() {
+        ApiSignal::Offline
+    } else if e.is_rate_limited() {
+        ApiSignal::RateLimited {
+            retry_after_secs: e.retry_after_secs().unwrap_or(5),
+        }
+    } else if e.is_unauthorized() {
+        // Any 401 that reaches us has already outlived the client's
+        // refresh-once, so the session is genuinely dead.
+        ApiSignal::SessionExpired
+    } else {
+        // A server-origin error (404, validation, …) still proves we're online.
+        ApiSignal::Online
+    };
+    let _ = tx.send(BgEvent::ApiSignal(signal));
+    e.to_string()
 }
 
 fn first_line(s: &str) -> String {
@@ -2342,5 +2532,114 @@ mod tests {
             matches!(app.screen, Screen::Settings(_)),
             "a digit on a text-input screen must reach the screen, not navigate"
         );
+    }
+
+    // --- Phase 7.3: reliability signals -------------------------------------
+
+    fn drain_signal(rx: &mut mpsc::UnboundedReceiver<BgEvent>) -> ApiSignal {
+        match rx.try_recv() {
+            Ok(BgEvent::ApiSignal(s)) => s,
+            other => panic!("expected an ApiSignal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn note_api_err_classifies_and_preserves_message() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        // Rate limited → carries the retry hint; the display string still flows
+        // through to the per-screen path unchanged.
+        let msg = note_api_err(&tx, ApiError::RateLimited { retry_after_secs: 12 });
+        assert!(msg.contains("retry after 12s"), "display string lost: {msg}");
+        assert!(matches!(
+            drain_signal(&mut rx),
+            ApiSignal::RateLimited { retry_after_secs: 12 }
+        ));
+
+        // Unauthorized → terminal session-expiry (refresh already failed upstream).
+        let _ = note_api_err(&tx, ApiError::Unauthorized);
+        assert!(matches!(drain_signal(&mut rx), ApiSignal::SessionExpired));
+
+        // A server-origin error proves we're online.
+        let _ = note_api_err(&tx, ApiError::NotImplemented);
+        assert!(matches!(drain_signal(&mut rx), ApiSignal::Online));
+    }
+
+    #[test]
+    fn offline_signal_toggles_indicator() {
+        let mut app = test_app();
+        app.handle_api_signal(ApiSignal::Offline);
+        assert!(app.offline);
+        app.handle_api_signal(ApiSignal::Online);
+        assert!(!app.offline);
+    }
+
+    #[test]
+    fn rate_limited_signal_shows_toast_and_is_online() {
+        let mut app = test_app();
+        app.offline = true;
+        app.handle_api_signal(ApiSignal::RateLimited { retry_after_secs: 8 });
+        assert!(app.toast.is_some(), "rate-limit signal should raise a toast");
+        assert!(!app.offline, "a rate-limit response proves we're online");
+    }
+
+    #[test]
+    fn unread_count_event_clears_offline() {
+        let mut app = test_app();
+        app.offline = true;
+        app.handle_bg_event(BgEvent::UnreadCount(4));
+        assert!(!app.offline, "a successful poll is an online heartbeat");
+        assert_eq!(app.unread_count, 4);
+    }
+
+    #[test]
+    fn session_expiry_arms_logout_only_when_authenticated() {
+        // On the login screen the signal is a no-op (we're already logged out).
+        let mut app = test_app();
+        assert!(app.screen.is_login());
+        app.handle_api_signal(ApiSignal::SessionExpired);
+        assert!(app.pending_logout.is_none());
+
+        // On an authenticated screen it arms a logout carrying a reason.
+        app.screen = Screen::Feed(FeedScreen::new());
+        app.handle_api_signal(ApiSignal::SessionExpired);
+        assert!(app
+            .pending_logout
+            .as_deref()
+            .is_some_and(|r| r.contains("expired")));
+    }
+
+    #[test]
+    fn offline_marker_renders_in_tab_bar() {
+        let mut app = test_app();
+        app.screen = Screen::Feed(FeedScreen::new());
+        app.current_root = Some(RootKind::Feed);
+        app.offline = true;
+        let text = render_to_string(&app);
+        assert!(
+            text.contains("offline"),
+            "offline marker missing from tab bar: {text:?}"
+        );
+    }
+
+    #[test]
+    fn rate_limit_toast_renders_over_a_screen() {
+        let mut app = test_app();
+        app.screen = Screen::Feed(FeedScreen::new());
+        app.current_root = Some(RootKind::Feed);
+        app.toast = Some(Toast::rate_limited(10));
+        let text = render_to_string(&app);
+        assert!(
+            text.contains("rate limited"),
+            "toast text missing: {text:?}"
+        );
+    }
+
+    #[test]
+    fn tick_does_not_clear_a_live_toast() {
+        let mut app = test_app();
+        app.toast = Some(Toast::rate_limited(30));
+        app.tick_toast();
+        assert!(app.toast.is_some(), "a live toast must survive a tick");
     }
 }
