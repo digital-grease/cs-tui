@@ -473,7 +473,7 @@ fn thread_item<'a>(t: &'a GuildThread, theme: &Theme) -> ListItem<'a> {
         }
     }
     lines.push(Line::from(Span::styled(
-        first_line_truncated(&e.content, 200),
+        super::markdown::content_preview(&e.content, 200),
         theme.base(),
     )));
     lines.push(Line::from(""));

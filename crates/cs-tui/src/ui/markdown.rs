@@ -24,12 +24,13 @@ pub fn render_markdown(input: &str, theme: &Theme) -> Vec<Line<'static>> {
     let parser = Parser::new(input);
     for event in parser {
         match event {
-            Event::Start(Tag::Image { dest_url, .. }) => {
-                // Images can't flow inline in text; mark them with a tagged
-                // placeholder. (Actual graphics rendering, where the terminal
-                // supports it, is handled outside the line renderer.)
+            Event::Start(Tag::Image { .. }) => {
+                // Images can't flow inline in text; leave a short marker. The
+                // actual image is rendered above the text (post detail) on
+                // terminals that support graphics; the URL is intentionally not
+                // inlined — it's long and the image itself is shown.
                 current_line.push(Span::styled(
-                    format!("[image] {dest_url}"),
+                    "[image]",
                     Style::default()
                         .fg(theme.accent)
                         .add_modifier(Modifier::UNDERLINED),
@@ -89,6 +90,35 @@ pub fn render_markdown(input: &str, theme: &Theme) -> Vec<Line<'static>> {
     }
     flush(&mut current_line, &mut out, blockquote_depth, theme);
     out
+}
+
+/// A single-line plain-text preview of post content for list views: markdown is
+/// flattened to text, image links are dropped, whitespace is collapsed, and the
+/// result is truncated. Image-only posts preview as `[image]`.
+pub fn content_preview(content: &str, max: usize) -> String {
+    let mut text = String::new();
+    let mut in_image = false;
+    for ev in Parser::new(content) {
+        match ev {
+            Event::Start(Tag::Image { .. }) => in_image = true,
+            Event::End(TagEnd::Image) => in_image = false,
+            Event::Text(t) | Event::Code(t) if !in_image => text.push_str(&t),
+            Event::SoftBreak | Event::HardBreak | Event::End(TagEnd::Paragraph) => {
+                text.push(' ');
+            }
+            _ => {}
+        }
+    }
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return "[image]".to_string();
+    }
+    if collapsed.chars().count() <= max {
+        collapsed
+    } else {
+        let truncated: String = collapsed.chars().take(max.saturating_sub(1)).collect();
+        format!("{truncated}…")
+    }
 }
 
 fn handle_start(
@@ -373,9 +403,27 @@ mod tests {
         let lines = render_markdown("![a cat](https://x/cat.png)", &Theme::dark());
         let text = flat_text(&lines);
         assert!(text.contains("[image]"), "should be tagged: {text:?}");
-        assert!(text.contains("https://x/cat.png"), "should keep the url");
+        assert!(!text.contains("https://x/cat.png"), "url no longer inlined");
         // Alt text is replaced by the placeholder, not rendered separately.
         assert!(!text.contains("a cat"));
+    }
+
+    #[test]
+    fn content_preview_drops_images_and_collapses_whitespace() {
+        let p = content_preview("![alt](https://x/a.png)\n\nThe knight took her hand.", 200);
+        assert_eq!(p, "The knight took her hand.");
+    }
+
+    #[test]
+    fn content_preview_falls_back_for_image_only_post() {
+        assert_eq!(content_preview("![alt](https://x/a.png)", 200), "[image]");
+    }
+
+    #[test]
+    fn content_preview_truncates() {
+        let p = content_preview(&"x ".repeat(200), 10);
+        assert!(p.chars().count() <= 10);
+        assert!(p.ends_with('…'));
     }
 
     #[test]

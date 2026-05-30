@@ -206,19 +206,9 @@ fn entry_item<'a>(entry: &'a Entry, theme: &Theme) -> ListItem<'a> {
         Span::styled(format!("@{}", entry.author_username), theme.accent_style()),
         Span::styled(format!(" · {when}{counts}"), theme.muted_style()),
     ]);
-    let snippet = first_line_truncated(&entry.content, 200);
+    let snippet = super::markdown::content_preview(&entry.content, 200);
     let body = Line::from(Span::styled(snippet, theme.base()));
     ListItem::new(vec![header, body, Line::from("")])
-}
-
-fn first_line_truncated(s: &str, max: usize) -> String {
-    let first = s.lines().next().unwrap_or("").trim();
-    if first.chars().count() <= max {
-        first.to_string()
-    } else {
-        let truncated: String = first.chars().take(max - 1).collect();
-        format!("{truncated}…")
-    }
 }
 
 fn format_timestamp_relative(t: OffsetDateTime) -> String {
