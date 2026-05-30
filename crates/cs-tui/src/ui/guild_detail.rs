@@ -125,10 +125,10 @@ impl GuildScreen {
         }
         // Tab switching is allowed even while a tab is loading.
         match key.code {
-            KeyCode::Char('h') | KeyCode::Left => {
+            KeyCode::Char('h') => {
                 return self.select_tab(GuildTab::Threads);
             }
-            KeyCode::Char('l') | KeyCode::Right => {
+            KeyCode::Char('l') => {
                 return self.select_tab(GuildTab::Members);
             }
             KeyCode::Char('J') => {
