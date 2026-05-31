@@ -1,5 +1,5 @@
 //! Top-level App state and event loop.
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -73,8 +73,13 @@ pub enum BgEvent {
     BookmarkRemoved,
     /// Result of bookmarking a post from the feed / post detail.
     BookmarkCreated(Result<String, String>),
-    TopicsLoaded(Result<(Vec<Topic>, Option<String>), String>),
-    TopicsMore(Result<(Vec<Topic>, Option<String>), String>),
+    /// A page from the background topics warm-up. `complete` is true on the last
+    /// page (or when the fill gives up); `epoch` guards against a superseded run.
+    TopicsPrefetched {
+        epoch: u64,
+        topics: Vec<Topic>,
+        complete: bool,
+    },
     TopicFeedInitial {
         slug: String,
         result: Result<(Vec<Entry>, Option<String>), String>,
@@ -231,9 +236,6 @@ enum Action {
         bookmark_id: String,
     },
     TopicsRefresh,
-    TopicsLoadMore {
-        cursor: Option<String>,
-    },
     TopicOpen {
         slug: String,
     },
@@ -391,11 +393,16 @@ pub struct App {
     /// otherwise skip cells (e.g. the background fill) it believes unchanged,
     /// leaving the editor's blank screen showing through.
     force_clear: bool,
-    /// The complete topics list, cached for the session once fully loaded (so
-    /// revisiting the topics section — and searching it — doesn't re-fetch every
-    /// page each time). Populated when a load completes with no further cursor;
-    /// cleared by an explicit refresh (`r`).
-    topics_cache: Option<Vec<Topic>>,
+    /// Session cache of the topics list, warmed in the background from login by
+    /// a gentle paginated fill (the topics section can run to thousands, so we
+    /// trickle them in rather than blocking a search on loading every page). The
+    /// topics screen is a pure view over this; search filters it.
+    topics_cache: Vec<Topic>,
+    /// Whether the background warm-up has loaded every topic.
+    topics_complete: bool,
+    /// Bumped on refresh to invalidate the in-flight warm-up task (its remaining
+    /// pages are discarded by epoch check) before a fresh one starts.
+    topics_epoch: Arc<AtomicU64>,
 }
 
 impl App {
@@ -424,7 +431,9 @@ impl App {
             poller_started: false,
             input_paused: Arc::new(AtomicBool::new(false)),
             force_clear: false,
-            topics_cache: None,
+            topics_cache: Vec::new(),
+            topics_complete: false,
+            topics_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -447,6 +456,10 @@ impl App {
             self.spawn_unread_count_poller();
             self.poller_started = true;
         }
+        // The topics warm-up IS re-spawned every login: logout cleared the cache
+        // and bumped the epoch, so this starts a fresh fill for the new session
+        // (and the epoch bump means any prior run's pages are already discarded).
+        self.spawn_topics_prefetch();
     }
 
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> Result<()> {
@@ -777,9 +790,6 @@ impl App {
             Screen::Topics(s) => match s.handle_key(key) {
                 TopicsIntent::Quit => Action::Quit,
                 TopicsIntent::Refresh => Action::TopicsRefresh,
-                TopicsIntent::LoadMore => Action::TopicsLoadMore {
-                    cursor: s.next_cursor.clone(),
-                },
                 TopicsIntent::OpenSelected { slug } => Action::TopicOpen { slug },
                 TopicsIntent::None => Action::None,
             },
@@ -1027,10 +1037,15 @@ impl App {
                 self.spawn_delete_bookmark(bookmark_id);
             }
             Action::TopicsRefresh => {
-                self.topics_cache = None; // force fresh data
-                self.spawn_topics_load();
+                // Invalidate the running warm-up, clear the cache, and re-warm.
+                self.topics_epoch.fetch_add(1, Ordering::SeqCst);
+                self.topics_cache.clear();
+                self.topics_complete = false;
+                if let Screen::Topics(s) = &mut self.screen {
+                    s.set_topics(Vec::new(), false);
+                }
+                self.spawn_topics_prefetch();
             }
-            Action::TopicsLoadMore { cursor } => self.spawn_topics_more(cursor),
             Action::TopicOpen { slug } => {
                 let new_screen = Screen::TopicFeed(TopicFeedScreen::new(slug.clone()));
                 self.push_screen(new_screen);
@@ -1281,17 +1296,21 @@ impl App {
                     Err(msg) => Toast::warning(format!("bookmark failed: {}", first_line(&msg))),
                 });
             }
-            BgEvent::TopicsLoaded(result) => {
-                if let Screen::Topics(s) = &mut self.screen {
-                    s.apply_initial(result);
+            BgEvent::TopicsPrefetched {
+                epoch,
+                topics,
+                complete,
+            } => {
+                // Ignore pages from a warm-up that a refresh has superseded.
+                if epoch == self.topics_epoch.load(Ordering::SeqCst) {
+                    self.topics_cache.extend(topics);
+                    if complete {
+                        self.topics_complete = true;
+                    }
+                    if let Screen::Topics(s) = &mut self.screen {
+                        s.set_topics(self.topics_cache.clone(), self.topics_complete);
+                    }
                 }
-                self.after_topics_load();
-            }
-            BgEvent::TopicsMore(result) => {
-                if let Screen::Topics(s) = &mut self.screen {
-                    s.apply_more(result);
-                }
-                self.after_topics_load();
             }
             BgEvent::TopicFeedInitial { slug, result } => {
                 if let Screen::TopicFeed(s) = &mut self.screen {
@@ -1666,6 +1685,12 @@ impl App {
         self.unread_count = 0;
         self.offline = false;
         self.toast = None;
+        // Invalidate the topics warm-up: bump the epoch so any in-flight prefetch
+        // bails (and its pages are dropped) instead of 401-spinning, and drop the
+        // cache so the next login re-warms fresh rather than showing stale data.
+        self.topics_epoch.fetch_add(1, Ordering::SeqCst);
+        self.topics_cache.clear();
+        self.topics_complete = false;
         let email = self.last_email.clone();
         self.screen = Screen::Login(LoginScreen::new(email));
     }
@@ -1701,29 +1726,6 @@ impl App {
                         Some("Session expired — please sign in again.".to_string());
                 }
             }
-        }
-    }
-
-    /// Run after a topics page is applied: cache the full list once it's
-    /// complete (no further cursor), and — while the search box is open — keep
-    /// pulling the remaining pages so the filter sees every topic.
-    fn after_topics_load(&mut self) {
-        let (complete, chase) = if let Screen::Topics(s) = &self.screen {
-            if s.next_cursor.is_none() {
-                (Some(s.items.clone()), None)
-            } else if s.is_filtering() {
-                (None, s.next_cursor.clone())
-            } else {
-                (None, None)
-            }
-        } else {
-            (None, None)
-        };
-        if let Some(items) = complete {
-            self.topics_cache = Some(items);
-        }
-        if let Some(cursor) = chase {
-            self.spawn_topics_more(Some(cursor));
         }
     }
 
@@ -1779,16 +1781,11 @@ impl App {
                 self.spawn_bookmarks_initial();
             }
             RootKind::Topics => {
+                // Pure view over the background-warmed cache (it keeps filling
+                // while open via `TopicsPrefetched`); the screen never fetches.
                 let mut s = TopicsScreen::new();
-                if let Some(cached) = &self.topics_cache {
-                    // Full list already loaded this session — show it instantly
-                    // (no cursor → no re-fetch, and search is immediate).
-                    s.apply_initial(Ok((cached.clone(), None)));
-                    self.screen = Screen::Topics(s);
-                } else {
-                    self.screen = Screen::Topics(s);
-                    self.spawn_topics_load();
-                }
+                s.set_topics(self.topics_cache.clone(), self.topics_complete);
+                self.screen = Screen::Topics(s);
             }
             RootKind::Profile => {
                 self.screen = Screen::Profile(ProfileScreen::new_own());
@@ -1956,27 +1953,60 @@ impl App {
         });
     }
 
-    fn spawn_topics_load(&self) {
+    /// Warm the topics cache in the background: page through every topic with a
+    /// gentle trickle so a later search covers them all without a foreground
+    /// load. Self-paced and rate-limited; resumes through transient errors and
+    /// gives up after a sustained outage (a manual refresh re-warms). Its pages
+    /// carry the current epoch so a refresh can discard a superseded run.
+    fn spawn_topics_prefetch(&self) {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
+        let epoch_arc = self.topics_epoch.clone();
+        let my_epoch = epoch_arc.load(Ordering::SeqCst);
         tokio::spawn(async move {
-            let result = client
-                .list_topics(None, Some(50))
-                .await
-                .map_err(|e| note_api_err(&tx, e));
-            let _ = tx.send(BgEvent::TopicsLoaded(result));
-        });
-    }
-
-    fn spawn_topics_more(&self, cursor: Option<String>) {
-        let client = self.client.clone();
-        let tx = self.bg_tx.clone();
-        tokio::spawn(async move {
-            let result = client
-                .list_topics(cursor.as_deref(), Some(50))
-                .await
-                .map_err(|e| note_api_err(&tx, e));
-            let _ = tx.send(BgEvent::TopicsMore(result));
+            // Settle so the warm-up doesn't compete with the initial feed load.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let mut cursor: Option<String> = None;
+            let mut errors: u32 = 0;
+            loop {
+                if epoch_arc.load(Ordering::SeqCst) != my_epoch {
+                    return; // superseded by a refresh
+                }
+                match client.list_topics(cursor.as_deref(), Some(50)).await {
+                    Ok((topics, next)) => {
+                        errors = 0;
+                        let complete = next.is_none();
+                        let sent = tx.send(BgEvent::TopicsPrefetched {
+                            epoch: my_epoch,
+                            topics,
+                            complete,
+                        });
+                        if sent.is_err() || complete {
+                            return; // app gone, or all pages loaded
+                        }
+                        cursor = next;
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    Err(e) => {
+                        if tx.is_closed() {
+                            return; // app gone — don't keep retrying
+                        }
+                        errors += 1;
+                        tracing::debug!(error = %e, "topics prefetch page failed");
+                        if errors >= 10 {
+                            // Sustained failure (likely offline): stop the
+                            // "loading…" hint with what we have; `r` retries.
+                            let _ = tx.send(BgEvent::TopicsPrefetched {
+                                epoch: my_epoch,
+                                topics: Vec::new(),
+                                complete: true,
+                            });
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                }
+            }
         });
     }
 
@@ -2908,26 +2938,45 @@ mod tests {
     }
 
     #[test]
-    fn topics_cache_populates_on_complete_load_and_revisit_skips_fetch() {
+    fn topics_prefetch_fills_cache_and_revisit_uses_it() {
         let mut app = test_app();
         app.screen = Screen::Topics(TopicsScreen::new());
         app.current_root = Some(RootKind::Topics);
-        let topics = vec![
-            Topic { slug: "music".into(), post_count: 5 },
-            Topic { slug: "linux".into(), post_count: 9 },
-        ];
-        // A load with no further cursor is the complete list → it's cached.
-        app.handle_bg_event(BgEvent::TopicsLoaded(Ok((topics, None))));
-        assert_eq!(app.topics_cache.as_ref().map(Vec::len), Some(2));
+        let epoch = app.topics_epoch.load(Ordering::SeqCst);
 
-        // Revisiting topics fills the screen from the cache: loaded, no cursor,
-        // no fetch needed.
+        // First warm-up page (not complete): cache grows, screen updates live.
+        app.handle_bg_event(BgEvent::TopicsPrefetched {
+            epoch,
+            topics: vec![Topic { slug: "music".into(), post_count: 5 }],
+            complete: false,
+        });
+        assert_eq!(app.topics_cache.len(), 1);
+        assert!(!app.topics_complete);
+
+        // Final page: completes the cache.
+        app.handle_bg_event(BgEvent::TopicsPrefetched {
+            epoch,
+            topics: vec![Topic { slug: "linux".into(), post_count: 9 }],
+            complete: true,
+        });
+        assert_eq!(app.topics_cache.len(), 2);
+        assert!(app.topics_complete);
+
+        // A stale page from a superseded run (wrong epoch) is ignored.
+        app.handle_bg_event(BgEvent::TopicsPrefetched {
+            epoch: epoch.wrapping_add(99),
+            topics: vec![Topic { slug: "ghost".into(), post_count: 1 }],
+            complete: false,
+        });
+        assert_eq!(app.topics_cache.len(), 2, "stale-epoch page must be dropped");
+
+        // Revisiting topics fills the screen from the cache — no loading, no fetch.
         app.goto_root(RootKind::Topics);
         match &app.screen {
             Screen::Topics(s) => {
-                assert!(!s.loading, "a cache hit must not show loading");
+                assert!(!s.loading);
+                assert!(s.complete);
                 assert_eq!(s.items.len(), 2);
-                assert!(s.next_cursor.is_none());
             }
             _ => panic!("expected the Topics screen"),
         }
