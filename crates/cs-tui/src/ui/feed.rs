@@ -70,6 +70,12 @@ impl FeedScreen {
             {
                 self.selected += 1;
             }
+            // At the bottom of the loaded list, scrolling down pulls the next
+            // page automatically (no need to know about `n`).
+            KeyCode::Char('j') | KeyCode::Down if self.next_cursor.is_some() => {
+                self.loading = true;
+                return FeedIntent::LoadMore;
+            }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.selected = self.selected.saturating_sub(1);
             }
@@ -270,10 +276,10 @@ fn format_timestamp_relative(t: OffsetDateTime) -> String {
 
 fn status_line<'a>(s: &'a FeedScreen, theme: &Theme) -> Paragraph<'a> {
     let text = if s.loading {
-        "loading… · j/k navigate · enter open · n next page · r refresh · esc menu".to_string()
+        "loading… · j/k navigate · enter open · r refresh · esc menu".to_string()
     } else if s.next_cursor.is_some() {
         format!(
-            "{} entries · more available — press n · j/k navigate · enter open · r refresh · esc menu",
+            "{} entries · scroll down for more · j/k navigate · enter open · r refresh · esc menu",
             s.entries.len()
         )
     } else {
@@ -450,6 +456,31 @@ mod tests {
         s.next_cursor = None;
         let intent = s.handle_key(key(KeyCode::Char('n')));
         assert_eq!(intent, FeedIntent::None);
+    }
+
+    #[test]
+    fn j_at_bottom_auto_loads_next_page() {
+        let mut s = FeedScreen::new();
+        s.apply_initial(Ok((
+            vec![entry("a", "a", false), entry("b", "b", false)],
+            Some("next".into()),
+        )));
+        // Move to the last entry, then one more `j` paginates instead of stalling.
+        s.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(s.selected, 1);
+        let intent = s.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(intent, FeedIntent::LoadMore);
+        assert!(s.loading);
+    }
+
+    #[test]
+    fn j_at_bottom_without_cursor_does_nothing() {
+        let mut s = FeedScreen::new();
+        s.apply_initial(Ok((vec![entry("a", "a", false)], None)));
+        let intent = s.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(intent, FeedIntent::None);
+        assert_eq!(s.selected, 0);
+        assert!(!s.loading);
     }
 
     #[test]
