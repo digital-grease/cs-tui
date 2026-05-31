@@ -1,4 +1,5 @@
 //! Top-level App state and event loop.
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -375,6 +376,10 @@ pub struct App {
     /// outlives logout (idling on the login screen) so re-login reuses it
     /// instead of stacking duplicates.
     poller_started: bool,
+    /// When set, the input reader thread stops touching crossterm so an external
+    /// `$EDITOR` owns the terminal exclusively (otherwise the reader steals the
+    /// editor's keystrokes, which then replay onto the TUI when it exits).
+    input_paused: Arc<AtomicBool>,
 }
 
 impl App {
@@ -401,6 +406,7 @@ impl App {
             pending_logout: None,
             offline_notify: Arc::new(Notify::new()),
             poller_started: false,
+            input_paused: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -440,12 +446,37 @@ impl App {
         // notification read fires two bg events, orphaning two readers). A
         // single reader has nothing to orphan; events queue in the channel and
         // are drained below.
+        //
+        // The reader uses `poll` + a pause flag rather than a bare blocking
+        // `read()` so that while an external `$EDITOR` owns the terminal it makes
+        // NO crossterm calls — otherwise it competes with the editor for stdin,
+        // dropping the editor's keystrokes and replaying them onto the TUI on
+        // exit.
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Event>();
-        std::thread::spawn(move || {
-            while let Ok(ev) = event::read() {
-                if input_tx.send(ev).is_err() {
-                    break; // run loop gone
+        let input_paused = self.input_paused.clone();
+        std::thread::spawn(move || loop {
+            if input_paused.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            match event::poll(Duration::from_millis(50)) {
+                Ok(true) => {
+                    // An editor may have grabbed the terminal between the poll
+                    // and now — leave the pending event for it.
+                    if input_paused.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    match event::read() {
+                        Ok(ev) => {
+                            if input_tx.send(ev).is_err() {
+                                break; // run loop gone
+                            }
+                        }
+                        Err(_) => break,
+                    }
                 }
+                Ok(false) => {} // poll timeout — loop and re-check the pause flag
+                Err(_) => break,
             }
         });
 
@@ -2182,16 +2213,26 @@ impl App {
     /// Launch $EDITOR on a tempfile (synchronously, off the runtime thread),
     /// then push a `Compose` screen with the resulting content. Empty content
     /// cancels the flow.
+    /// Launch `$EDITOR` on `initial`, pausing the input reader so the editor
+    /// owns the terminal exclusively (otherwise it loses keystrokes that then
+    /// replay onto the TUI). Returns the edited content or an error string.
+    async fn run_editor(&self, initial: String) -> Result<String, String> {
+        self.input_paused.store(true, Ordering::SeqCst);
+        let result = tokio::task::spawn_blocking(move || launch_editor(&initial, ".md"))
+            .await
+            .map_err(|e| format!("editor task panicked: {e}"))
+            .and_then(|r| r.map_err(|e| e.to_string()));
+        self.input_paused.store(false, Ordering::SeqCst);
+        result
+    }
+
     async fn start_compose(&mut self, kind: ComposeKind, prefill: String) {
         let initial = if prefill.is_empty() {
             String::new()
         } else {
             prefill
         };
-        let editor_result = tokio::task::spawn_blocking(move || launch_editor(&initial, ".md"))
-            .await
-            .map_err(|e| format!("editor task panicked: {e}"))
-            .and_then(|r| r.map_err(|e| e.to_string()));
+        let editor_result = self.run_editor(initial).await;
 
         let content = match editor_result {
             Ok(c) => c,
@@ -2298,10 +2339,7 @@ impl App {
         prefill: String,
         topics: Vec<String>,
     ) {
-        let editor_result = tokio::task::spawn_blocking(move || launch_editor(&prefill, ".md"))
-            .await
-            .map_err(|e| format!("editor task panicked: {e}"))
-            .and_then(|r| r.map_err(|e| e.to_string()));
+        let editor_result = self.run_editor(prefill).await;
         let content = match editor_result {
             Ok(c) => c,
             Err(msg) => {
