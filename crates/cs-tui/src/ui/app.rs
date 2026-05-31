@@ -186,10 +186,14 @@ impl Screen {
     /// Screens with inline text entry, where printable keys (like `?`) must
     /// reach the focused field rather than triggering global shortcuts.
     fn accepts_text_input(&self) -> bool {
-        matches!(
-            self,
-            Screen::Login(_) | Screen::Compose(_) | Screen::EditProfile(_) | Screen::Settings(_)
-        )
+        match self {
+            Screen::Login(_) | Screen::Compose(_) | Screen::EditProfile(_) => true,
+            // Settings is a form: only capture global nav keys while a free-text
+            // field is actually being edited, so 1-8 / Tab / ←→ still leave the
+            // screen when a toggle is focused (j/k / ↑↓ move between fields).
+            Screen::Settings(s) => s.is_editing_text(),
+            _ => false,
+        }
     }
 }
 
@@ -2531,13 +2535,60 @@ mod tests {
 
     #[tokio::test]
     async fn digit_keys_do_not_navigate_away_from_text_input_screens() {
+        // Compose is unconditionally text-input: a digit must reach the editor,
+        // not navigate.
         let mut app = test_app();
-        app.screen = Screen::Settings(SettingsScreen::new());
+        app.screen = Screen::Compose(ComposeScreen::new(ComposeKind::NewEntry, String::new()));
+        app.current_root = Some(RootKind::Feed);
+        app.handle_terminal_event(key_event(KeyCode::Char('2'))).await;
+        assert!(
+            matches!(app.screen, Screen::Compose(_)),
+            "a digit on a text-input screen must reach the screen, not navigate"
+        );
+    }
+
+    /// Build a loaded Settings screen focused on the field at `idx`.
+    fn settings_focused(idx: usize) -> Screen {
+        let mut s = SettingsScreen::new();
+        s.apply_loaded(Ok(Settings::default()));
+        s.focused = idx;
+        Screen::Settings(s)
+    }
+
+    #[tokio::test]
+    async fn settings_toggle_lets_section_keys_through() {
+        // On a toggle field (the default), header nav must leave Settings like
+        // any read screen — both digits and ←/→.
+        let mut app = test_app();
+        app.screen = settings_focused(0); // filterNSFW — a Bool field
+        app.current_root = Some(RootKind::Settings);
+        app.handle_terminal_event(key_event(KeyCode::Char('2'))).await;
+        assert!(
+            matches!(app.screen, Screen::Notifications(_)),
+            "a digit on a settings toggle should jump to that section"
+        );
+
+        let mut app = test_app();
+        app.screen = settings_focused(0);
+        app.current_root = Some(RootKind::Settings);
+        app.handle_terminal_event(key_event(KeyCode::Left)).await;
+        assert!(
+            matches!(app.screen, Screen::Journal(_)),
+            "Left on a settings toggle should cycle to the previous section"
+        );
+    }
+
+    #[tokio::test]
+    async fn settings_text_field_captures_digits() {
+        // While editing a free-text settings field, a digit must be typed into
+        // it, not navigate away.
+        let mut app = test_app();
+        app.screen = settings_focused(11); // imagePixelSize — a Text field
         app.current_root = Some(RootKind::Settings);
         app.handle_terminal_event(key_event(KeyCode::Char('2'))).await;
         assert!(
             matches!(app.screen, Screen::Settings(_)),
-            "a digit on a text-input screen must reach the screen, not navigate"
+            "a digit typed into a settings text field must not navigate"
         );
     }
 

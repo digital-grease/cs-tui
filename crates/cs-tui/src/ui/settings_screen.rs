@@ -156,6 +156,18 @@ impl SettingsScreen {
         }
     }
 
+    /// Whether a free-text field is currently focused. Only then must printable
+    /// keys and arrows reach the field instead of triggering global section
+    /// navigation — so on a toggle field the tab bar (1-8, Tab, ←/→) still
+    /// works, while editing a text field is uninterrupted.
+    #[must_use]
+    pub fn is_editing_text(&self) -> bool {
+        self.loaded
+            && FIELDS
+                .get(self.focused)
+                .is_some_and(|f| f.kind == FieldKind::Text)
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> SettingsIntent {
         if self.submitting {
             return SettingsIntent::None;
@@ -333,7 +345,7 @@ impl SettingsScreen {
             format!("error: {msg} · esc to cancel")
         } else {
             format!(
-                "{dirty_count} unsaved · j/k or tab focus · space toggle bool · type to edit text · ctrl+s save · esc cancel"
+                "{dirty_count} unsaved · j/k move · space toggle · type to edit text · 1-8/←→ switch section · ctrl+s save · esc menu"
             )
         };
         frame.render_widget(
