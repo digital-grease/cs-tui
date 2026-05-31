@@ -422,19 +422,42 @@ impl App {
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
+        // One long-lived input reader feeding a channel. The previous approach
+        // spawned a fresh `spawn_blocking(event::read)` per select! iteration;
+        // because a blocking read can't be cancelled, every time a background
+        // event won the select! it orphaned a thread still parked in
+        // `event::read()` that then swallowed the next keystroke — the ~2s
+        // "unresponsive on startup / after an action" lag (marking a
+        // notification read fires two bg events, orphaning two readers). A
+        // single reader has nothing to orphan; events queue in the channel and
+        // are drained below.
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Event>();
+        std::thread::spawn(move || {
+            while let Ok(ev) = event::read() {
+                if input_tx.send(ev).is_err() {
+                    break; // run loop gone
+                }
+            }
+        });
+
         terminal.draw(|f| self.render(f)).context("terminal draw")?;
         while !self.should_quit {
             tokio::select! {
-                evs = next_terminal_events() => {
-                    // Drain the whole burst (a terminal can emit a flurry of
-                    // sequences on refocus — focus events, capability-query
-                    // responses) before redrawing, so the UI stays responsive
-                    // instead of rendering once per buffered event.
-                    for ev in evs? {
-                        self.handle_terminal_event(ev).await;
-                        if self.should_quit {
-                            break;
+                maybe_ev = input_rx.recv() => {
+                    match maybe_ev {
+                        Some(ev) => {
+                            self.handle_terminal_event(ev).await;
+                            // Drain the rest of the burst (focus events,
+                            // capability-query replies) before redrawing, so a
+                            // flurry costs one render, not one per event.
+                            while let Ok(ev) = input_rx.try_recv() {
+                                if self.should_quit {
+                                    break;
+                                }
+                                self.handle_terminal_event(ev).await;
+                            }
                         }
+                        None => self.should_quit = true, // reader thread ended
                     }
                 }
                 Some(bg) = self.bg_rx.recv() => {
@@ -2373,22 +2396,6 @@ impl App {
             }
         });
     }
-}
-
-/// Read the next terminal event (blocking on a worker thread so the tokio
-/// runtime stays responsive), then drain any further immediately-available
-/// events without blocking. Returning the whole batch lets the run loop process
-/// a burst of sequences in one wake instead of one render cycle per event.
-async fn next_terminal_events() -> Result<Vec<Event>> {
-    tokio::task::spawn_blocking(|| -> Result<Vec<Event>> {
-        let mut events = vec![event::read()?];
-        while event::poll(Duration::ZERO)? {
-            events.push(event::read()?);
-        }
-        Ok(events)
-    })
-    .await
-    .context("event-read task panicked")?
 }
 
 /// Build a synthetic key-press event (used to translate mouse-wheel scrolls into
