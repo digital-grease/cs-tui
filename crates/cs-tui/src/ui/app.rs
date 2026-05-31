@@ -380,6 +380,11 @@ pub struct App {
     /// `$EDITOR` owns the terminal exclusively (otherwise the reader steals the
     /// editor's keystrokes, which then replay onto the TUI when it exits).
     input_paused: Arc<AtomicBool>,
+    /// Request a full repaint on the next frame. Set after an external editor
+    /// re-enters the alternate screen, since ratatui's diff renderer would
+    /// otherwise skip cells (e.g. the background fill) it believes unchanged,
+    /// leaving the editor's blank screen showing through.
+    force_clear: bool,
 }
 
 impl App {
@@ -407,6 +412,7 @@ impl App {
             offline_notify: Arc::new(Notify::new()),
             poller_started: false,
             input_paused: Arc::new(AtomicBool::new(false)),
+            force_clear: false,
         }
     }
 
@@ -511,6 +517,10 @@ impl App {
             // needs an await, so it happens here rather than in the sync bg
             // handler.
             self.apply_pending_logout().await;
+            if self.force_clear {
+                terminal.clear().context("terminal clear")?;
+                self.force_clear = false;
+            }
             terminal.draw(|f| self.render(f)).context("terminal draw")?;
         }
         Ok(())
@@ -2216,13 +2226,15 @@ impl App {
     /// Launch `$EDITOR` on `initial`, pausing the input reader so the editor
     /// owns the terminal exclusively (otherwise it loses keystrokes that then
     /// replay onto the TUI). Returns the edited content or an error string.
-    async fn run_editor(&self, initial: String) -> Result<String, String> {
+    async fn run_editor(&mut self, initial: String) -> Result<String, String> {
         self.input_paused.store(true, Ordering::SeqCst);
         let result = tokio::task::spawn_blocking(move || launch_editor(&initial, ".md"))
             .await
             .map_err(|e| format!("editor task panicked: {e}"))
             .and_then(|r| r.map_err(|e| e.to_string()));
         self.input_paused.store(false, Ordering::SeqCst);
+        // The editor re-entered a blank alternate screen; force a full repaint.
+        self.force_clear = true;
         result
     }
 
