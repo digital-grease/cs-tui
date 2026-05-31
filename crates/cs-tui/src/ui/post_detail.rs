@@ -1,5 +1,5 @@
 //! Post detail screen — entry header + content + scrollable replies (oldest first).
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use cs_api::{Entry, Reply};
@@ -38,6 +38,10 @@ pub struct PostDetailScreen {
     pub loading_replies: bool,
     pub error: Option<String>,
     pub scroll: u16,
+    /// Max scroll offset for the current content/viewport, recomputed each
+    /// render (interior-mutable so `render(&self)` can record it). Scroll keys
+    /// clamp to this so the body can't be scrolled off into empty space.
+    pub max_scroll: Cell<u16>,
     /// Optional reply id to highlight (set when arriving from a reply notification).
     pub highlight_reply_id: Option<String>,
     /// Two-step delete: first `d` arms confirmation; `y` confirms.
@@ -57,6 +61,7 @@ impl PostDetailScreen {
             loading_replies: true,
             error: None,
             scroll: 0,
+            max_scroll: Cell::new(0),
             highlight_reply_id: None,
             confirming_delete: false,
             image: RefCell::new(None),
@@ -89,7 +94,16 @@ impl PostDetailScreen {
                 PostDetailIntent::None
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                self.scroll = self.scroll.saturating_add(1);
+                // At the bottom, scrolling down pulls the next page of replies
+                // automatically rather than scrolling into empty space.
+                if self.scroll >= self.max_scroll.get()
+                    && self.next_replies_cursor.is_some()
+                    && !self.loading_replies
+                {
+                    self.loading_replies = true;
+                    return PostDetailIntent::LoadMoreReplies;
+                }
+                self.scroll = self.scroll.saturating_add(1).min(self.max_scroll.get());
                 PostDetailIntent::None
             }
             KeyCode::Char('k') | KeyCode::Up => {
@@ -97,7 +111,7 @@ impl PostDetailScreen {
                 PostDetailIntent::None
             }
             KeyCode::PageDown | KeyCode::Char(' ') => {
-                self.scroll = self.scroll.saturating_add(10);
+                self.scroll = self.scroll.saturating_add(10).min(self.max_scroll.get());
                 PostDetailIntent::None
             }
             KeyCode::PageUp => {
@@ -109,9 +123,7 @@ impl PostDetailScreen {
                 PostDetailIntent::None
             }
             KeyCode::Char('G') | KeyCode::End => {
-                // ratatui's Paragraph clamps scroll to (lines - visible_height),
-                // so saturating to u16::MAX effectively jumps to the end.
-                self.scroll = u16::MAX;
+                self.scroll = self.max_scroll.get();
                 PostDetailIntent::None
             }
             KeyCode::Char('n') if self.next_replies_cursor.is_some() => {
@@ -172,29 +184,61 @@ impl PostDetailScreen {
         let status_area = layout[1];
 
         let lines = self.compose_body(theme);
-        let para = Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((self.scroll, 0));
 
         // When an image is loaded, reserve a strip at the top of the body for it
         // and flow the text below. Terminals without graphics never reach here
         // (no protocol is ever built) and just see the text.
         let mut img = self.image.borrow_mut();
-        match img.as_mut() {
-            Some(proto) if body_area.height > 4 => {
-                let img_h = (body_area.height / 2).clamp(1, 20);
+        let has_image = img.is_some() && body_area.height > 4;
+        let img_h = if has_image {
+            (body_area.height / 2).clamp(1, 20)
+        } else {
+            0
+        };
+        let text_area = Rect::new(
+            body_area.x,
+            body_area.y + img_h,
+            body_area.width,
+            body_area.height - img_h,
+        );
+
+        // Bound the scroll to the wrapped content height so the body can't be
+        // scrolled off into empty space. Count wrapped rows per logical line
+        // (ceil(line width / columns)); close enough to ratatui's word wrap to
+        // keep `j`/`G` from running past the end.
+        let cols = u32::from(text_area.width).max(1);
+        let wrapped_rows: u32 = lines
+            .iter()
+            .map(|l| {
+                let w = l.width() as u32;
+                if w <= cols {
+                    1
+                } else {
+                    // +1 cushions greedy word wrap, which can take one more row
+                    // than ceil(width/cols) when a word won't fit the last
+                    // column — better a blank line at the bottom than an
+                    // unreachable one.
+                    w.div_ceil(cols) + 1
+                }
+            })
+            .sum();
+        let max_scroll = wrapped_rows
+            .saturating_sub(u32::from(text_area.height))
+            .min(u32::from(u16::MAX)) as u16;
+        self.max_scroll.set(max_scroll);
+        let scroll = self.scroll.min(max_scroll);
+
+        let para = Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0));
+
+        if has_image {
+            if let Some(proto) = img.as_mut() {
                 let img_area = Rect::new(body_area.x, body_area.y, body_area.width, img_h);
-                let text_area = Rect::new(
-                    body_area.x,
-                    body_area.y + img_h,
-                    body_area.width,
-                    body_area.height - img_h,
-                );
                 frame.render_stateful_widget(StatefulImage::<StatefulProtocol>::new(), img_area, proto);
-                frame.render_widget(para, text_area);
             }
-            _ => frame.render_widget(para, body_area),
         }
+        frame.render_widget(para, text_area);
 
         let status_text = if self.confirming_delete {
             "really delete this post? y=yes, any other key=cancel".to_string()
@@ -204,7 +248,7 @@ impl PostDetailScreen {
             format!("error: {msg} · esc back · r retry")
         } else if self.next_replies_cursor.is_some() {
             format!(
-                "{} replies · more — n · esc back · j/k scroll · R reply · d delete (own) · r refresh",
+                "{} replies · scroll down for more · esc back · j/k scroll · R reply · d delete (own) · r refresh",
                 self.replies.len()
             )
         } else {
@@ -437,6 +481,7 @@ mod tests {
     #[test]
     fn j_and_k_adjust_scroll_bounded() {
         let mut s = PostDetailScreen::new(entry("p1"));
+        s.max_scroll.set(100); // normally set by render
         s.handle_key(key(KeyCode::Char('j')));
         s.handle_key(key(KeyCode::Char('j')));
         assert_eq!(s.scroll, 2);
@@ -448,11 +493,36 @@ mod tests {
     }
 
     #[test]
-    fn g_jumps_to_top() {
+    fn j_does_not_scroll_past_max() {
+        // The infinite-downward-scroll bug: scroll must clamp to max_scroll.
         let mut s = PostDetailScreen::new(entry("p1"));
-        s.scroll = 50;
+        s.max_scroll.set(3);
+        for _ in 0..10 {
+            s.handle_key(key(KeyCode::Char('j')));
+        }
+        assert_eq!(s.scroll, 3, "scroll must not run past the content");
+    }
+
+    #[test]
+    fn g_jumps_to_top_and_capital_g_to_bottom() {
+        let mut s = PostDetailScreen::new(entry("p1"));
+        s.max_scroll.set(42);
+        s.scroll = 20;
         s.handle_key(key(KeyCode::Char('g')));
         assert_eq!(s.scroll, 0);
+        s.handle_key(key(KeyCode::Char('G')));
+        assert_eq!(s.scroll, 42, "G jumps to the bottom of the content");
+    }
+
+    #[test]
+    fn j_at_bottom_with_more_replies_loads_them() {
+        let mut s = PostDetailScreen::new(entry("p1"));
+        s.loading_replies = false;
+        s.next_replies_cursor = Some("c".into());
+        s.max_scroll.set(0); // content fits; already at the bottom
+        let intent = s.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(intent, PostDetailIntent::LoadMoreReplies);
+        assert!(s.loading_replies);
     }
 
     #[test]
