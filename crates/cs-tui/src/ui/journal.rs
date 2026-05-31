@@ -106,6 +106,11 @@ impl JournalScreen {
             {
                 self.selected += 1;
             }
+            // At the bottom, scrolling down pulls the next page automatically.
+            KeyCode::Char('j') | KeyCode::Down if self.next_cursor.is_some() => {
+                self.loading = true;
+                return JournalIntent::LoadMore;
+            }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.selected = self.selected.saturating_sub(1);
             }
@@ -285,7 +290,7 @@ impl JournalScreen {
             )
         } else if self.next_cursor.is_some() {
             format!(
-                "{} notes · more — n · c compose · e edit · d delete · v revisions · r refresh",
+                "{} notes · scroll down for more · c compose · e edit · d delete · v revisions · r refresh",
                 self.notes.len()
             )
         } else {

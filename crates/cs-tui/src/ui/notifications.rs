@@ -106,6 +106,11 @@ impl NotificationsScreen {
             {
                 self.selected += 1;
             }
+            // At the bottom, scrolling down pulls the next page automatically.
+            KeyCode::Char('j') | KeyCode::Down if self.next_cursor.is_some() => {
+                self.loading = true;
+                return NotificationsIntent::LoadMore;
+            }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.selected = self.selected.saturating_sub(1);
             }
@@ -321,7 +326,7 @@ fn status_line<'a>(s: &'a NotificationsScreen, theme: &Theme) -> Paragraph<'a> {
             .to_string()
     } else if s.next_cursor.is_some() {
         format!(
-            "{} items · more — n · enter open · m mark · M mark-all · f filter · r refresh · esc menu",
+            "{} items · scroll down for more · enter open · m mark · M mark-all · f filter · r refresh · esc menu",
             s.items.len()
         )
     } else {
@@ -400,6 +405,18 @@ mod tests {
         assert_eq!(s.selected, 1);
         s.handle_key(key(KeyCode::Char('j')));
         assert_eq!(s.selected, 1);
+    }
+
+    #[test]
+    fn j_at_bottom_auto_loads() {
+        let mut s = NotificationsScreen::new();
+        s.apply_initial(Ok((
+            vec![notif("a", NotificationType::Poke, None, None)],
+            Some("next".into()),
+        )));
+        let intent = s.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(intent, NotificationsIntent::LoadMore);
+        assert!(s.loading);
     }
 
     #[test]

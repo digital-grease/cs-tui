@@ -59,6 +59,11 @@ impl BookmarksScreen {
             {
                 self.selected += 1;
             }
+            // At the bottom, scrolling down pulls the next page automatically.
+            KeyCode::Char('j') | KeyCode::Down if self.next_cursor.is_some() => {
+                self.loading = true;
+                return BookmarksIntent::LoadMore;
+            }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.selected = self.selected.saturating_sub(1);
             }
@@ -281,7 +286,7 @@ fn status_line<'a>(s: &'a BookmarksScreen, theme: &Theme) -> Paragraph<'a> {
         "loading… · enter open · d remove · n next · r refresh · esc menu".to_string()
     } else if s.next_cursor.is_some() {
         format!(
-            "{} bookmarks · more — n · enter open · d remove · r refresh · esc menu",
+            "{} bookmarks · scroll down for more · enter open · d remove · r refresh · esc menu",
             s.items.len()
         )
     } else {

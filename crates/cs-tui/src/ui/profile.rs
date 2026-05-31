@@ -295,7 +295,11 @@ impl ProfileScreen {
 
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
-                self.advance_selection(target, len);
+                // At the bottom, scrolling down pulls the next page automatically.
+                let moved = self.advance_selection(target, len);
+                if !moved && cursor_present && !loading {
+                    return ProfileIntent::LoadMoreCurrentTab;
+                }
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.retreat_selection(target);
@@ -316,13 +320,18 @@ impl ProfileScreen {
         ProfileIntent::None
     }
 
-    fn advance_selection(&mut self, target: ListTarget, len: usize) {
+    /// Move the selection down one. Returns `true` if it actually moved (i.e.
+    /// we weren't already at the bottom).
+    fn advance_selection(&mut self, target: ListTarget, len: usize) -> bool {
         if len == 0 {
-            return;
+            return false;
         }
         let cur = self.selection_mut(target);
         if *cur < len - 1 {
             *cur += 1;
+            true
+        } else {
+            false
         }
     }
 
@@ -598,7 +607,7 @@ impl ProfileScreen {
         };
         parts.push(nav_hint.into());
         if self.tab != ProfileTab::Info {
-            parts.push("enter open · n next page · r refresh".into());
+            parts.push("enter open · scroll for more · r refresh".into());
         } else if self.is_self {
             parts.push("e edit".into());
         } else {
@@ -791,6 +800,17 @@ mod tests {
         assert_eq!(s.tab, ProfileTab::Replies);
         s.handle_key(key(KeyCode::BackTab));
         assert_eq!(s.tab, ProfileTab::Posts);
+    }
+
+    #[test]
+    fn j_at_bottom_auto_loads_current_tab() {
+        let mut s = ProfileScreen::new_own();
+        s.tab = ProfileTab::Posts;
+        s.posts.loading = false;
+        s.posts.next_cursor = Some("next".into());
+        // At the bottom of the active tab with more available, j paginates it.
+        let intent = s.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(intent, ProfileIntent::LoadMoreCurrentTab);
     }
 
     #[test]

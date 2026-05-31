@@ -52,6 +52,11 @@ impl GuildsScreen {
             {
                 self.selected += 1;
             }
+            // At the bottom, scrolling down pulls the next page automatically.
+            KeyCode::Char('j') | KeyCode::Down if self.next_cursor.is_some() => {
+                self.loading = true;
+                return GuildsIntent::LoadMore;
+            }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.selected = self.selected.saturating_sub(1);
             }
@@ -156,7 +161,7 @@ impl GuildsScreen {
 
         let status = if self.next_cursor.is_some() {
             format!(
-                "{} guilds · more — n · enter open · r refresh · esc menu",
+                "{} guilds · scroll down for more · enter open · r refresh · esc menu",
                 self.items.len()
             )
         } else {
