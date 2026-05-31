@@ -134,7 +134,7 @@ impl TopicsScreen {
 
         let status = Paragraph::new(Line::from(Span::styled(
             format!(
-                "{} topics · j/k navigate · enter open · r refresh · esc menu",
+                "{} topics · enter open · r refresh · esc menu",
                 self.items.len()
             ),
             theme.muted_style(),

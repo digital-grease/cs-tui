@@ -345,7 +345,7 @@ impl SettingsScreen {
             format!("error: {msg} · esc to cancel")
         } else {
             format!(
-                "{dirty_count} unsaved · j/k move · space toggle · type to edit text · 1-8/←→ switch section · ctrl+s save · esc menu"
+                "{dirty_count} unsaved · space toggle · type to edit text · 1-8/←→ switch section · ctrl+s save · esc menu"
             )
         };
         frame.render_widget(

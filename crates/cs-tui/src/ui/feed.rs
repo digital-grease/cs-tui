@@ -17,6 +17,8 @@ pub enum FeedIntent {
     Refresh,
     /// Open the post detail for the selected entry's `post_id`.
     OpenSelected(String),
+    /// Bookmark the selected entry (`post_id`).
+    Bookmark(String),
     /// Start composing a new entry.
     Compose,
     /// Exit the app.
@@ -101,6 +103,13 @@ impl FeedScreen {
             }
             KeyCode::Char('c') => {
                 return FeedIntent::Compose;
+            }
+            KeyCode::Char('b') => {
+                if let Some(idx) = visible.get(self.selected) {
+                    if let Some(entry) = self.entries.get(*idx) {
+                        return FeedIntent::Bookmark(entry.post_id.clone());
+                    }
+                }
             }
             KeyCode::Enter => {
                 if let Some(idx) = visible.get(self.selected) {
@@ -276,15 +285,15 @@ fn format_timestamp_relative(t: OffsetDateTime) -> String {
 
 fn status_line<'a>(s: &'a FeedScreen, theme: &Theme) -> Paragraph<'a> {
     let text = if s.loading {
-        "loading… · j/k navigate · enter open · r refresh · esc menu".to_string()
+        "loading… · enter open · b bookmark · r refresh · esc menu".to_string()
     } else if s.next_cursor.is_some() {
         format!(
-            "{} entries · scroll down for more · j/k navigate · enter open · r refresh · esc menu",
+            "{} entries · scroll down for more · enter open · b bookmark · r refresh · esc menu",
             s.entries.len()
         )
     } else {
         format!(
-            "{} entries · end of feed · j/k navigate · enter open · r refresh · esc menu",
+            "{} entries · end of feed · enter open · b bookmark · r refresh · esc menu",
             s.entries.len()
         )
     };
@@ -430,6 +439,20 @@ mod tests {
         assert_eq!(s.selected, 0);
         s.handle_key(key(KeyCode::Char('k')));
         assert_eq!(s.selected, 0);
+    }
+
+    #[test]
+    fn b_bookmarks_selected_entry() {
+        let mut s = FeedScreen::new();
+        s.apply_initial(Ok((
+            vec![entry("p1", "a", false), entry("p2", "b", false)],
+            None,
+        )));
+        s.selected = 1;
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('b'))),
+            FeedIntent::Bookmark("p2".into())
+        );
     }
 
     #[test]

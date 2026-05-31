@@ -155,8 +155,13 @@ impl ProfileUpdate {
 }
 
 impl Client {
-    /// `PATCH /v1/users/me` — update the authenticated user's profile.
-    /// Returns the updated `User` per the spec convention.
+    /// `PATCH /v1/users/me` — update the authenticated user's profile, returning
+    /// the refreshed `User`.
+    ///
+    /// The live PATCH response is **not** the full `User` the spec implies (it
+    /// omits `username` and other fields), so its body is decoded loosely and
+    /// discarded; the canonical profile is then re-fetched via `GET
+    /// /v1/users/me`, which is the shape the rest of the app already relies on.
     pub async fn update_own_profile(&self, update: &ProfileUpdate) -> Result<crate::users::User> {
         update
             .validate()
@@ -164,14 +169,16 @@ impl Client {
         if update.is_empty() {
             return self.get_own_profile().await;
         }
-        self.request::<crate::users::User, ProfileUpdate>(
-            EndpointKey::UsersUpdateMe,
-            Method::PATCH,
-            "/v1/users/me",
-            &[],
-            Some(update),
-        )
-        .await
+        let _: serde_json::Value = self
+            .request(
+                EndpointKey::UsersUpdateMe,
+                Method::PATCH,
+                "/v1/users/me",
+                &[],
+                Some(update),
+            )
+            .await?;
+        self.get_own_profile().await
     }
 }
 

@@ -26,6 +26,8 @@ pub enum PostDetailIntent {
     RefreshReplies,
     /// Start composing a reply to this post.
     Reply,
+    /// Bookmark this post.
+    Bookmark,
     /// User confirmed deletion of the entry.
     DeleteEntryConfirmed,
     None,
@@ -89,6 +91,7 @@ impl PostDetailScreen {
         match key.code {
             KeyCode::Backspace => PostDetailIntent::Back,
             KeyCode::Char('R') => PostDetailIntent::Reply,
+            KeyCode::Char('b') => PostDetailIntent::Bookmark,
             KeyCode::Char('d') => {
                 self.confirming_delete = true;
                 PostDetailIntent::None
@@ -243,17 +246,17 @@ impl PostDetailScreen {
         let status_text = if self.confirming_delete {
             "really delete this post? y=yes, any other key=cancel".to_string()
         } else if self.loading_replies && self.replies.is_empty() {
-            "loading replies… · esc back · j/k scroll".to_string()
+            "loading replies… · esc back".to_string()
         } else if let Some(msg) = &self.error {
             format!("error: {msg} · esc back · r retry")
         } else if self.next_replies_cursor.is_some() {
             format!(
-                "{} replies · scroll down for more · esc back · j/k scroll · R reply · d delete (own) · r refresh",
+                "{} replies · scroll down for more · esc back · R reply · b bookmark · d delete (own) · r refresh",
                 self.replies.len()
             )
         } else {
             format!(
-                "{} replies · end · esc back · j/k scroll · R reply · d delete (own) · r refresh",
+                "{} replies · end · esc back · R reply · b bookmark · d delete (own) · r refresh",
                 self.replies.len()
             )
         };
@@ -475,6 +478,15 @@ mod tests {
         assert_eq!(
             s.handle_key(key(KeyCode::Backspace)),
             PostDetailIntent::Back
+        );
+    }
+
+    #[test]
+    fn b_emits_bookmark() {
+        let mut s = PostDetailScreen::new(entry("p1"));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('b'))),
+            PostDetailIntent::Bookmark
         );
     }
 
