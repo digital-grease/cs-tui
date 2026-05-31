@@ -156,12 +156,12 @@ impl GuildsScreen {
 
         let status = if self.next_cursor.is_some() {
             format!(
-                "{} guilds · more — n · j/k · enter open · r refresh · esc menu",
+                "{} guilds · more — n · enter open · r refresh · esc menu",
                 self.items.len()
             )
         } else {
             format!(
-                "{} guilds · j/k navigate · enter open · r refresh · esc menu",
+                "{} guilds · enter open · r refresh · esc menu",
                 self.items.len()
             )
         };

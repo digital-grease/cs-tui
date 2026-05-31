@@ -225,9 +225,10 @@ impl ProfileScreen {
             }
         }
 
-        // h/l also cycle tabs.
+        // Tab / Shift+Tab cycle the tabs; h/l are vim aliases. (←/→ are global
+        // section nav, handled before the screen sees them.)
         match key.code {
-            KeyCode::Char('h') | KeyCode::Left => {
+            KeyCode::Char('h') | KeyCode::BackTab => {
                 let i = ProfileTab::ALL
                     .iter()
                     .position(|t| *t == self.tab)
@@ -236,7 +237,7 @@ impl ProfileScreen {
                 self.tab = new;
                 return ProfileIntent::SelectTab(new);
             }
-            KeyCode::Char('l') | KeyCode::Right => {
+            KeyCode::Char('l') | KeyCode::Tab => {
                 let i = ProfileTab::ALL
                     .iter()
                     .position(|t| *t == self.tab)
@@ -589,6 +590,7 @@ impl ProfileScreen {
         if self.follow_action_pending {
             parts.push("follow pending…".into());
         }
+        parts.push("tab tabs".into());
         let nav_hint = if self.is_root {
             "backspace quit · esc menu"
         } else {
@@ -596,7 +598,7 @@ impl ProfileScreen {
         };
         parts.push(nav_hint.into());
         if self.tab != ProfileTab::Info {
-            parts.push("j/k navigate · enter open · n next page · r refresh".into());
+            parts.push("enter open · n next page · r refresh".into());
         } else if self.is_self {
             parts.push("e edit".into());
         } else {
@@ -778,6 +780,17 @@ mod tests {
         assert_eq!(s.tab, ProfileTab::Posts);
         s.handle_key(key(KeyCode::Char('%')));
         assert_eq!(s.tab, ProfileTab::Following);
+    }
+
+    #[test]
+    fn tab_and_shift_tab_cycle_tabs() {
+        let mut s = ProfileScreen::new_own();
+        s.handle_key(key(KeyCode::Tab));
+        assert_eq!(s.tab, ProfileTab::Posts);
+        s.handle_key(key(KeyCode::Tab));
+        assert_eq!(s.tab, ProfileTab::Replies);
+        s.handle_key(key(KeyCode::BackTab));
+        assert_eq!(s.tab, ProfileTab::Posts);
     }
 
     #[test]

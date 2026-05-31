@@ -1,8 +1,9 @@
 //! Transient toast overlay — an auto-dismissing message drawn on top of any
-//! screen. The rate-limit countdown is currently the only producer; the type is
-//! kept general so future confirmations (e.g. "post published") can reuse it.
+//! screen. Producers: the rate-limit countdown (warning) and action
+//! confirmations like "bookmarked" (success).
 use std::time::{Duration, Instant};
 
+use ratatui::style::Style;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
@@ -10,11 +11,20 @@ use ratatui::Frame;
 
 use super::theme::Theme;
 
+#[derive(Debug, Clone, Copy)]
+pub enum ToastKind {
+    /// Positive confirmation (green ✓).
+    Success,
+    /// Caution / failure (amber ⚠).
+    Warning,
+}
+
 #[derive(Debug)]
 pub struct Toast {
     text: String,
     expires_at: Instant,
     countdown: bool,
+    kind: ToastKind,
 }
 
 impl Toast {
@@ -26,6 +36,27 @@ impl Toast {
             text: "rate limited — slow down".to_string(),
             expires_at: Instant::now() + Duration::from_secs(secs),
             countdown: true,
+            kind: ToastKind::Warning,
+        }
+    }
+
+    /// A brief positive confirmation (e.g. "bookmarked").
+    pub fn confirmation(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            expires_at: Instant::now() + Duration::from_secs(2),
+            countdown: false,
+            kind: ToastKind::Success,
+        }
+    }
+
+    /// A brief warning/failure notice that isn't a rate-limit countdown.
+    pub fn warning(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            expires_at: Instant::now() + Duration::from_secs(3),
+            countdown: false,
+            kind: ToastKind::Warning,
         }
     }
 
@@ -42,11 +73,25 @@ impl Toast {
         (d.as_secs() + u64::from(d.subsec_nanos() > 0)).max(1)
     }
 
+    fn glyph(&self) -> &'static str {
+        match self.kind {
+            ToastKind::Success => "✓",
+            ToastKind::Warning => "⚠",
+        }
+    }
+
     fn label(&self) -> String {
         if self.countdown {
-            format!(" ⚠ {} ({}s) ", self.text, self.display_secs())
+            format!(" {} {} ({}s) ", self.glyph(), self.text, self.display_secs())
         } else {
-            format!(" ⚠ {} ", self.text)
+            format!(" {} {} ", self.glyph(), self.text)
+        }
+    }
+
+    fn style(&self, theme: &Theme) -> Style {
+        match self.kind {
+            ToastKind::Success => theme.success_style(),
+            ToastKind::Warning => theme.warning_style(),
         }
     }
 }
@@ -64,13 +109,14 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, toast: &Toast, theme: &Theme) {
     let y = area.y + area.height.saturating_sub(h).saturating_sub(1);
     let rect = Rect::new(x, y, w, h);
 
+    let style = toast.style(theme);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(theme.warning_style())
+        .border_style(style)
         .style(theme.base());
     frame.render_widget(Clear, rect);
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(label, theme.warning_style()))).block(block),
+        Paragraph::new(Line::from(Span::styled(label, style))).block(block),
         rect,
     );
 }
@@ -100,5 +146,18 @@ mod tests {
         let t = Toast::rate_limited(0);
         assert!(!t.is_expired());
         assert_eq!(t.display_secs(), 1);
+    }
+
+    #[test]
+    fn confirmation_and_warning_have_no_countdown() {
+        let c = Toast::confirmation("bookmarked");
+        assert!(!c.is_expired());
+        assert!(c.label().contains("✓"));
+        assert!(c.label().contains("bookmarked"));
+        assert!(!c.label().contains("(1s)"), "confirmation must not count down");
+
+        let w = Toast::warning("bookmark failed");
+        assert!(w.label().contains("⚠"));
+        assert!(w.label().contains("bookmark failed"));
     }
 }

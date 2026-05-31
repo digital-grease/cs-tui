@@ -9,8 +9,7 @@ pub struct Theme {
     pub foreground: Color,
     pub muted: Color,
     pub accent: Color,
-    /// Used by future confirmation toasts (Phase 7.3).
-    #[allow(dead_code)]
+    /// Confirmation toasts (e.g. "bookmarked").
     pub success: Color,
     pub error: Color,
     /// Caution accent — drives the rate-limit toast (and any future warnings).
@@ -96,6 +95,12 @@ impl Theme {
     pub fn warning_style(&self) -> Style {
         Style::default()
             .fg(self.warning)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn success_style(&self) -> Style {
+        Style::default()
+            .fg(self.success)
             .add_modifier(Modifier::BOLD)
     }
 

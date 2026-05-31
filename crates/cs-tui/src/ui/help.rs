@@ -29,7 +29,8 @@ const SECTIONS: &[Row] = &[
 const GLOBAL: &[Row] = &[
     Row { keys: "Esc", desc: "back — or the menu on a top-level section" },
     Row { keys: "Backspace", desc: "back" },
-    Row { keys: "Tab / ← →", desc: "next / previous section" },
+    Row { keys: "1-8 / ← →", desc: "jump to / cycle sections" },
+    Row { keys: "Tab / Shift+Tab", desc: "switch sub-tabs (profile, guild)" },
     Row { keys: "?", desc: "this help" },
     Row { keys: "Ctrl+C", desc: "quit" },
 ];
@@ -42,6 +43,7 @@ const COMMON: &[Row] = &[
     Row { keys: "Enter", desc: "open / select" },
     Row { keys: "r", desc: "refresh" },
     Row { keys: "c", desc: "compose / new" },
+    Row { keys: "b", desc: "bookmark (feed / post)" },
 ];
 
 /// Build the help body. Kept separate from rendering so tests can assert on the

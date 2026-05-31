@@ -317,16 +317,16 @@ fn format_timestamp_relative(t: OffsetDateTime) -> String {
 
 fn status_line<'a>(s: &'a NotificationsScreen, theme: &Theme) -> Paragraph<'a> {
     let text = if s.loading {
-        "loading… · j/k navigate · enter open · m mark · M mark-all · f filter · r refresh · esc menu"
+        "loading… · enter open · m mark · M mark-all · f filter · r refresh · esc menu"
             .to_string()
     } else if s.next_cursor.is_some() {
         format!(
-            "{} items · more — n · j/k · enter open · m mark · M mark-all · f filter · r refresh · esc menu",
+            "{} items · more — n · enter open · m mark · M mark-all · f filter · r refresh · esc menu",
             s.items.len()
         )
     } else {
         format!(
-            "{} items · end · j/k · enter open · m mark · M mark-all · f filter · r refresh · esc menu",
+            "{} items · end · enter open · m mark · M mark-all · f filter · r refresh · esc menu",
             s.items.len()
         )
     };

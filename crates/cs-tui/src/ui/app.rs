@@ -70,6 +70,8 @@ pub enum BgEvent {
     BookmarksInitial(Result<(Vec<Bookmark>, Option<String>), String>),
     BookmarksMore(Result<(Vec<Bookmark>, Option<String>), String>),
     BookmarkRemoved,
+    /// Result of bookmarking a post from the feed / post detail.
+    BookmarkCreated(Result<String, String>),
     TopicsLoaded(Result<Vec<Topic>, String>),
     TopicFeedInitial {
         slug: String,
@@ -274,6 +276,9 @@ enum Action {
         update: Box<ProfileUpdate>,
     },
     StartComposeEntry,
+    BookmarkPost {
+        post_id: String,
+    },
     StartComposeReply {
         post_id: String,
         parent_reply_id: Option<String>,
@@ -612,18 +617,19 @@ impl App {
             return;
         }
 
-        // Root hotkeys (1-7) switch sections, but only on screens that don't
-        // capture text: otherwise a digit typed into a compose title/topic, a
-        // profile-edit field, or a settings field (Settings binds 4/6 itself)
-        // would navigate away and discard the in-progress input.
+        // Section nav: ←/→ cycle and 1-8 jump, but only on screens that don't
+        // capture text (a digit typed into a compose title or settings field
+        // must reach the field, not navigate). Tab is deliberately NOT a section
+        // key — it's reserved for switching sub-tabs within a screen (profile
+        // tabs, guild tabs, settings fields).
         if !self.screen.accepts_text_input() {
             match key.code {
-                KeyCode::Tab | KeyCode::Right => {
+                KeyCode::Right => {
                     let next = self.current_root.unwrap_or(RootKind::Feed).next();
                     self.goto_root(next);
                     return;
                 }
-                KeyCode::BackTab | KeyCode::Left => {
+                KeyCode::Left => {
                     let prev = self.current_root.unwrap_or(RootKind::Feed).prev();
                     self.goto_root(prev);
                     return;
@@ -661,6 +667,7 @@ impl App {
                     highlight_reply_id: None,
                 },
                 FeedIntent::Compose => Action::StartComposeEntry,
+                FeedIntent::Bookmark(post_id) => Action::BookmarkPost { post_id },
                 FeedIntent::None => Action::None,
             },
             Screen::Notifications(s) => match s.handle_key(key) {
@@ -743,6 +750,9 @@ impl App {
                     ),
                 },
                 PostDetailIntent::DeleteEntryConfirmed => Action::DeleteEntry {
+                    post_id: s.entry.post_id.clone(),
+                },
+                PostDetailIntent::Bookmark => Action::BookmarkPost {
                     post_id: s.entry.post_id.clone(),
                 },
                 PostDetailIntent::None => Action::None,
@@ -1053,6 +1063,9 @@ impl App {
                 self.start_compose(ComposeKind::NewEntry, String::new())
                     .await;
             }
+            Action::BookmarkPost { post_id } => {
+                self.spawn_bookmark_post(post_id);
+            }
             Action::StartComposeReply {
                 post_id,
                 parent_reply_id,
@@ -1188,6 +1201,12 @@ impl App {
             }
             BgEvent::BookmarkRemoved => {
                 // Local state already removed optimistically.
+            }
+            BgEvent::BookmarkCreated(result) => {
+                self.toast = Some(match result {
+                    Ok(_) => Toast::confirmation("bookmarked"),
+                    Err(msg) => Toast::warning(format!("bookmark failed: {}", first_line(&msg))),
+                });
             }
             BgEvent::TopicsLoaded(result) => {
                 if let Screen::Topics(s) = &mut self.screen {
@@ -1811,6 +1830,18 @@ impl App {
                     tracing::warn!(error = %msg, bookmark_id, "delete_bookmark failed");
                 }
             }
+        });
+    }
+
+    fn spawn_bookmark_post(&self, post_id: String) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .bookmark_post(&post_id)
+                .await
+                .map_err(|e| note_api_err(&tx, e));
+            let _ = tx.send(BgEvent::BookmarkCreated(result));
         });
     }
 
@@ -2699,5 +2730,15 @@ mod tests {
         app.toast = Some(Toast::rate_limited(30));
         app.tick_toast();
         assert!(app.toast.is_some(), "a live toast must survive a tick");
+    }
+
+    #[test]
+    fn bookmark_result_raises_a_toast() {
+        let mut app = test_app();
+        app.handle_bg_event(BgEvent::BookmarkCreated(Ok("bm1".into())));
+        assert!(app.toast.is_some(), "a successful bookmark should confirm");
+        app.toast = None;
+        app.handle_bg_event(BgEvent::BookmarkCreated(Err("conflict".into())));
+        assert!(app.toast.is_some(), "a failed bookmark should warn");
     }
 }

@@ -280,7 +280,7 @@ impl JournalScreen {
             "really delete this note? y=yes, any other key=cancel".to_string()
         } else if self.mode == DetailMode::Revisions {
             format!(
-                "viewing revisions ({}) · j/k navigate · v or backspace to return",
+                "viewing revisions ({}) · v or backspace to return",
                 self.revisions.len()
             )
         } else if self.next_cursor.is_some() {

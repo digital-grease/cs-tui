@@ -123,13 +123,21 @@ impl GuildScreen {
         if key.code == KeyCode::Backspace {
             return GuildIntent::Back;
         }
-        // Tab switching is allowed even while a tab is loading.
+        // Tab switching is allowed even while a tab is loading. Tab/Shift+Tab
+        // toggle the two tabs; h/l jump directly (vim aliases).
         match key.code {
             KeyCode::Char('h') => {
                 return self.select_tab(GuildTab::Threads);
             }
             KeyCode::Char('l') => {
                 return self.select_tab(GuildTab::Members);
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                let other = match self.tab {
+                    GuildTab::Threads => GuildTab::Members,
+                    GuildTab::Members => GuildTab::Threads,
+                };
+                return self.select_tab(other);
             }
             KeyCode::Char('J') => {
                 let can_join =
@@ -343,8 +351,8 @@ impl GuildScreen {
         }
 
         let base = match self.tab {
-            GuildTab::Threads => "h/l tabs · j/k · enter open · n next · r refresh",
-            GuildTab::Members => "h/l tabs · j/k · n next · r refresh",
+            GuildTab::Threads => "tab tabs · enter open · n next · r refresh",
+            GuildTab::Members => "tab tabs · n next · r refresh",
         };
         let action = match &self.guild {
             _ if self.action_pending => " · working…",
@@ -585,6 +593,17 @@ mod tests {
         s.tab = GuildTab::Members;
         let intent = s.handle_key(key(KeyCode::Char('h'))); // back to Threads (loaded)
         assert_eq!(intent, GuildIntent::None);
+        assert_eq!(s.tab, GuildTab::Threads);
+    }
+
+    #[test]
+    fn tab_toggles_between_tabs() {
+        let mut s = GuildScreen::new("owls".into());
+        s.apply_threads_initial(Ok((vec![thread("p1")], None)));
+        assert_eq!(s.tab, GuildTab::Threads);
+        s.handle_key(key(KeyCode::Tab));
+        assert_eq!(s.tab, GuildTab::Members);
+        s.handle_key(key(KeyCode::Tab));
         assert_eq!(s.tab, GuildTab::Threads);
     }
 

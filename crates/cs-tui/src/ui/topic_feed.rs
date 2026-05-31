@@ -174,15 +174,15 @@ impl TopicFeedScreen {
         }
 
         let status_text = if self.loading {
-            "loading… · j/k · enter open · n next · r refresh · esc back".to_string()
+            "loading… · enter open · n next · r refresh · esc back".to_string()
         } else if self.next_cursor.is_some() {
             format!(
-                "{} entries · more — n · j/k · enter open · r refresh · esc back",
+                "{} entries · more — n · enter open · r refresh · esc back",
                 self.entries.len()
             )
         } else {
             format!(
-                "{} entries · end · j/k · enter open · r refresh · esc back",
+                "{} entries · end · enter open · r refresh · esc back",
                 self.entries.len()
             )
         };

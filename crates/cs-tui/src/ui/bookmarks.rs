@@ -278,15 +278,15 @@ fn format_timestamp_relative(t: OffsetDateTime) -> String {
 
 fn status_line<'a>(s: &'a BookmarksScreen, theme: &Theme) -> Paragraph<'a> {
     let text = if s.loading {
-        "loading… · j/k · enter open · d remove · n next · r refresh · esc menu".to_string()
+        "loading… · enter open · d remove · n next · r refresh · esc menu".to_string()
     } else if s.next_cursor.is_some() {
         format!(
-            "{} bookmarks · more — n · j/k · enter open · d remove · r refresh · esc menu",
+            "{} bookmarks · more — n · enter open · d remove · r refresh · esc menu",
             s.items.len()
         )
     } else {
         format!(
-            "{} bookmarks · end · j/k · enter open · d remove · r refresh · esc menu",
+            "{} bookmarks · end · enter open · d remove · r refresh · esc menu",
             s.items.len()
         )
     };
