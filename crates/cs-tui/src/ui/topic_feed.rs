@@ -65,6 +65,11 @@ impl TopicFeedScreen {
             {
                 self.selected += 1;
             }
+            // At the bottom, scrolling down pulls the next page automatically.
+            KeyCode::Char('j') | KeyCode::Down if self.next_cursor.is_some() => {
+                self.loading = true;
+                return TopicFeedIntent::LoadMore;
+            }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.selected = self.selected.saturating_sub(1);
             }
@@ -174,10 +179,10 @@ impl TopicFeedScreen {
         }
 
         let status_text = if self.loading {
-            "loading… · enter open · n next · r refresh · esc back".to_string()
+            "loading… · enter open · r refresh · esc back".to_string()
         } else if self.next_cursor.is_some() {
             format!(
-                "{} entries · more — n · enter open · r refresh · esc back",
+                "{} entries · scroll down for more · enter open · r refresh · esc back",
                 self.entries.len()
             )
         } else {
@@ -289,5 +294,26 @@ mod tests {
         s.apply_more(Ok((vec![entry("p2")], None)));
         assert_eq!(s.entries.len(), 2);
         assert!(s.next_cursor.is_none());
+    }
+
+    #[test]
+    fn j_at_bottom_auto_loads_next_page() {
+        let mut s = TopicFeedScreen::new("music".into());
+        s.apply_initial(Ok((vec![entry("p1"), entry("p2")], Some("next".into()))));
+        s.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(s.selected, 1);
+        let intent = s.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(intent, TopicFeedIntent::LoadMore);
+        assert!(s.loading);
+    }
+
+    #[test]
+    fn j_at_bottom_without_cursor_does_nothing() {
+        let mut s = TopicFeedScreen::new("music".into());
+        s.apply_initial(Ok((vec![entry("p1")], None)));
+        let intent = s.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(intent, TopicFeedIntent::None);
+        assert_eq!(s.selected, 0);
+        assert!(!s.loading);
     }
 }
