@@ -174,9 +174,19 @@ impl GuildScreen {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
                 let len = self.cur_len();
-                let s = self.cur_sel_mut();
-                if len > 0 && *s < len - 1 {
-                    *s += 1;
+                let at_bottom = {
+                    let s = self.cur_sel_mut();
+                    if len > 0 && *s < len - 1 {
+                        *s += 1;
+                        false
+                    } else {
+                        true
+                    }
+                };
+                // At the bottom, scrolling down pulls the next page automatically.
+                if at_bottom && self.cur_has_more() {
+                    self.loading = true;
+                    return GuildIntent::LoadMore;
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
@@ -351,8 +361,8 @@ impl GuildScreen {
         }
 
         let base = match self.tab {
-            GuildTab::Threads => "tab tabs · enter open · n next · r refresh",
-            GuildTab::Members => "tab tabs · n next · r refresh",
+            GuildTab::Threads => "tab tabs · enter open · scroll for more · r refresh",
+            GuildTab::Members => "tab tabs · scroll for more · r refresh",
         };
         let action = match &self.guild {
             _ if self.action_pending => " · working…",
@@ -605,6 +615,16 @@ mod tests {
         assert_eq!(s.tab, GuildTab::Members);
         s.handle_key(key(KeyCode::Tab));
         assert_eq!(s.tab, GuildTab::Threads);
+    }
+
+    #[test]
+    fn j_at_bottom_auto_loads_current_tab() {
+        let mut s = GuildScreen::new("owls".into());
+        s.apply_threads_initial(Ok((vec![thread("p1")], Some("cur".into()))));
+        // One thread, selection at the bottom, cursor present → j paginates.
+        let intent = s.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(intent, GuildIntent::LoadMore);
+        assert!(s.loading);
     }
 
     #[test]
