@@ -12,11 +12,25 @@ const MAX_PAGE_LIMIT: u32 = 50;
 
 /// A topic record returned by `GET /v1/topics`. The list is sorted by post
 /// count (most popular first).
+///
+/// The spec doesn't document the object's field names. The topic identifier
+/// (used verbatim as `:slug` in `/v1/topics/:slug/posts`, where the spec says
+/// `:slug` is the lowercase topic name) is accepted under several aliases —
+/// `name`/`topic`/`tag` — because live responses use `name`, not `slug`. The
+/// count is likewise tolerant and defaults to 0 if absent.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Topic {
+    #[serde(alias = "name", alias = "topic", alias = "tag")]
     pub slug: String,
-    #[serde(default)]
+    #[serde(
+        default,
+        alias = "count",
+        alias = "entryCount",
+        alias = "entriesCount",
+        alias = "postsCount",
+        alias = "posts"
+    )]
     pub post_count: u32,
 }
 
@@ -73,5 +87,15 @@ mod tests {
         let raw = r#"{"slug":"linux"}"#;
         let t: Topic = serde_json::from_str(raw).unwrap();
         assert_eq!(t.post_count, 0);
+    }
+
+    #[test]
+    fn topic_decodes_name_alias_with_entry_count() {
+        // The live server names the identifier `name` (not `slug`) — the shape
+        // that produced "missing field `slug`" during smoke testing.
+        let raw = r#"{"name":"music","entryCount":42}"#;
+        let t: Topic = serde_json::from_str(raw).unwrap();
+        assert_eq!(t.slug, "music");
+        assert_eq!(t.post_count, 42);
     }
 }

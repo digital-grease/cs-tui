@@ -162,7 +162,7 @@ impl Client {
         let raw = self
             .send_with_refresh(key, method, path, query, body)
             .await?;
-        let env: Data<T> = serde_json::from_slice(&raw)?;
+        let env: Data<T> = decode_body(key, &raw)?;
         Ok(env.data)
     }
 
@@ -181,7 +181,7 @@ impl Client {
         let raw = self
             .send_with_refresh::<()>(key, method, path, query, None)
             .await?;
-        let env: Page<T> = serde_json::from_slice(&raw)?;
+        let env: Page<T> = decode_body(key, &raw)?;
         Ok((env.data, env.cursor))
     }
 
@@ -247,7 +247,7 @@ impl Client {
         B: Serialize + ?Sized,
     {
         let raw = self.send_raw(key, method, path, &[], body, false).await?;
-        let env: Data<T> = serde_json::from_slice(&raw)?;
+        let env: Data<T> = decode_body(key, &raw)?;
         Ok(env.data)
     }
 
@@ -389,6 +389,18 @@ fn backoff_delay(attempt: u32) -> Duration {
     // 1s, 2s, 4s — capped at 30s.
     let secs = 1u64 << attempt.min(5);
     Duration::from_secs(secs.min(30))
+}
+
+/// Decode a response body, logging the raw JSON on failure. Several response
+/// shapes are undocumented in the spec, so when a `serde` field/shape mismatch
+/// surfaces during live testing this puts the actual body in the log
+/// (`RUST_LOG=cs_api=debug`, or the on-disk log) so the wire types can be fixed.
+fn decode_body<T: DeserializeOwned>(key: EndpointKey, raw: &[u8]) -> Result<T> {
+    serde_json::from_slice(raw).map_err(|e| {
+        let snippet: String = String::from_utf8_lossy(raw).chars().take(500).collect();
+        tracing::warn!(endpoint = ?key, error = %e, body = %snippet, "response decode failed");
+        ApiError::Decode(e)
+    })
 }
 
 fn parse_error_body(status: StatusCode, body: &[u8]) -> ApiError {
