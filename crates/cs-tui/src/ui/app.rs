@@ -492,15 +492,19 @@ impl App {
                 maybe_ev = input_rx.recv() => {
                     match maybe_ev {
                         Some(ev) => {
-                            self.handle_terminal_event(ev).await;
-                            // Drain the rest of the burst (focus events,
-                            // capability-query replies) before redrawing, so a
-                            // flurry costs one render, not one per event.
-                            while let Ok(ev) = input_rx.try_recv() {
+                            // Drain the whole burst (focus events, capability
+                            // replies) before redrawing, so a flurry costs one
+                            // render, not one per event; then collapse repeated
+                            // wheel events (see `coalesce_scroll`).
+                            let mut batch = vec![ev];
+                            while let Ok(next) = input_rx.try_recv() {
+                                batch.push(next);
+                            }
+                            for ev in coalesce_scroll(batch) {
+                                self.handle_terminal_event(ev).await;
                                 if self.should_quit {
                                     break;
                                 }
-                                self.handle_terminal_event(ev).await;
                             }
                         }
                         None => self.should_quit = true, // reader thread ended
@@ -2485,6 +2489,36 @@ impl App {
 
 /// Build a synthetic key-press event (used to translate mouse-wheel scrolls into
 /// the same one-step navigation as the arrow keys).
+/// Collapse runs of same-direction mouse-wheel events within one input burst,
+/// keeping the first of each run. Some terminals/compositors emit several wheel
+/// events per physical notch (high-resolution scrolling); without this, one
+/// notch would move the selection by several rows. Distinct notches arrive in
+/// separate bursts and so still register one move each. Non-scroll events pass
+/// through unchanged and break a run.
+fn coalesce_scroll(batch: Vec<Event>) -> Vec<Event> {
+    let mut out = Vec::with_capacity(batch.len());
+    let mut prev_scroll: Option<event::MouseEventKind> = None;
+    for ev in batch {
+        let scroll_kind = match &ev {
+            Event::Mouse(m)
+                if matches!(
+                    m.kind,
+                    event::MouseEventKind::ScrollDown | event::MouseEventKind::ScrollUp
+                ) =>
+            {
+                Some(m.kind)
+            }
+            _ => None,
+        };
+        if scroll_kind.is_some() && scroll_kind == prev_scroll {
+            continue; // repeat from the same physical notch — drop it
+        }
+        prev_scroll = scroll_kind;
+        out.push(ev);
+    }
+    out
+}
+
 fn synthetic_key(code: KeyCode) -> event::KeyEvent {
     event::KeyEvent::new(code, KeyModifiers::empty())
 }
@@ -2790,5 +2824,31 @@ mod tests {
         app.toast = None;
         app.handle_bg_event(BgEvent::BookmarkCreated(Err("conflict".into())));
         assert!(app.toast.is_some(), "a failed bookmark should warn");
+    }
+
+    #[test]
+    fn coalesce_scroll_collapses_same_direction_runs() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let scroll = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::empty(),
+            })
+        };
+        let down = || scroll(MouseEventKind::ScrollDown);
+        let up = || scroll(MouseEventKind::ScrollUp);
+        let keyev = Event::Key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('j'),
+            KeyModifiers::empty(),
+        ));
+
+        // Five wheel events from one physical notch collapse to a single move.
+        assert_eq!(coalesce_scroll(vec![down(), down(), down(), down(), down()]).len(), 1);
+
+        // Direction changes are kept; a key breaks the run and passes through.
+        let out = coalesce_scroll(vec![down(), down(), up(), up(), keyev, down()]);
+        assert_eq!(out.len(), 4, "expected down, up, key, down");
     }
 }
