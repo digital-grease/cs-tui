@@ -73,7 +73,8 @@ pub enum BgEvent {
     BookmarkRemoved,
     /// Result of bookmarking a post from the feed / post detail.
     BookmarkCreated(Result<String, String>),
-    TopicsLoaded(Result<Vec<Topic>, String>),
+    TopicsLoaded(Result<(Vec<Topic>, Option<String>), String>),
+    TopicsMore(Result<(Vec<Topic>, Option<String>), String>),
     TopicFeedInitial {
         slug: String,
         result: Result<(Vec<Entry>, Option<String>), String>,
@@ -228,6 +229,9 @@ enum Action {
         bookmark_id: String,
     },
     TopicsRefresh,
+    TopicsLoadMore {
+        cursor: Option<String>,
+    },
     TopicOpen {
         slug: String,
     },
@@ -756,6 +760,9 @@ impl App {
             Screen::Topics(s) => match s.handle_key(key) {
                 TopicsIntent::Quit => Action::Quit,
                 TopicsIntent::Refresh => Action::TopicsRefresh,
+                TopicsIntent::LoadMore => Action::TopicsLoadMore {
+                    cursor: s.next_cursor.clone(),
+                },
                 TopicsIntent::OpenSelected { slug } => Action::TopicOpen { slug },
                 TopicsIntent::None => Action::None,
             },
@@ -1003,6 +1010,7 @@ impl App {
                 self.spawn_delete_bookmark(bookmark_id);
             }
             Action::TopicsRefresh => self.spawn_topics_load(),
+            Action::TopicsLoadMore { cursor } => self.spawn_topics_more(cursor),
             Action::TopicOpen { slug } => {
                 let new_screen = Screen::TopicFeed(TopicFeedScreen::new(slug.clone()));
                 self.push_screen(new_screen);
@@ -1255,7 +1263,12 @@ impl App {
             }
             BgEvent::TopicsLoaded(result) => {
                 if let Screen::Topics(s) = &mut self.screen {
-                    s.apply(result);
+                    s.apply_initial(result);
+                }
+            }
+            BgEvent::TopicsMore(result) => {
+                if let Screen::Topics(s) = &mut self.screen {
+                    s.apply_more(result);
                 }
             }
             BgEvent::TopicFeedInitial { slug, result } => {
@@ -1894,8 +1907,23 @@ impl App {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
-            let result = client.list_topics().await.map_err(|e| note_api_err(&tx, e));
+            let result = client
+                .list_topics(None, None)
+                .await
+                .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::TopicsLoaded(result));
+        });
+    }
+
+    fn spawn_topics_more(&self, cursor: Option<String>) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .list_topics(cursor.as_deref(), None)
+                .await
+                .map_err(|e| note_api_err(&tx, e));
+            let _ = tx.send(BgEvent::TopicsMore(result));
         });
     }
 
