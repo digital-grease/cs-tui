@@ -35,21 +35,24 @@ pub struct Topic {
 }
 
 impl Client {
-    /// `GET /v1/topics` — all topics, sorted by post count (most popular first).
+    /// `GET /v1/topics` — topics sorted by post count (most popular first).
     ///
-    /// Spec ambiguity: the spec example doesn't show the response wrapper around
-    /// the list. We assume `{ "data": [...] }` (the global envelope). If smoke
-    /// testing reveals `{ "data": { "topics": [...] } }`, switch to a wrapped
-    /// struct here.
-    pub async fn list_topics(&self) -> Result<Vec<Topic>> {
-        self.request::<Vec<Topic>, ()>(
-            EndpointKey::TopicsList,
-            Method::GET,
-            "/v1/topics",
-            &[],
-            None,
-        )
-        .await
+    /// Despite the spec wording ("all topics"), the live endpoint is
+    /// cursor-paginated like the other lists (≈20 per page), so this returns the
+    /// page plus the next cursor. `Page<T>` tolerates a missing/null cursor, so
+    /// a non-paginated server still decodes (with `None`).
+    pub async fn list_topics(
+        &self,
+        cursor: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<(Vec<Topic>, Option<String>)> {
+        let limit = limit.unwrap_or(DEFAULT_PAGE_LIMIT).clamp(1, MAX_PAGE_LIMIT);
+        let mut query: Vec<(&str, String)> = vec![("limit", limit.to_string())];
+        if let Some(c) = cursor {
+            query.push(("cursor", c.to_string()));
+        }
+        self.request_page(EndpointKey::TopicsList, Method::GET, "/v1/topics", &query)
+            .await
     }
 
     /// `GET /v1/topics/:slug/posts` — entries tagged with this topic, newest first.

@@ -11,6 +11,7 @@ use super::theme::Theme;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TopicsIntent {
     Refresh,
+    LoadMore,
     /// Open the topic feed for the selected slug.
     OpenSelected {
         slug: String,
@@ -23,6 +24,7 @@ pub enum TopicsIntent {
 pub struct TopicsScreen {
     pub items: Vec<Topic>,
     pub selected: usize,
+    pub next_cursor: Option<String>,
     pub loading: bool,
     pub error: Option<String>,
 }
@@ -32,6 +34,7 @@ impl TopicsScreen {
         Self {
             items: Vec::new(),
             selected: 0,
+            next_cursor: None,
             loading: true,
             error: None,
         }
@@ -50,6 +53,11 @@ impl TopicsScreen {
             {
                 self.selected += 1;
             }
+            // At the bottom, scrolling down pulls the next page automatically.
+            KeyCode::Char('j') | KeyCode::Down if self.next_cursor.is_some() => {
+                self.loading = true;
+                return TopicsIntent::LoadMore;
+            }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.selected = self.selected.saturating_sub(1);
             }
@@ -57,8 +65,15 @@ impl TopicsScreen {
             KeyCode::Char('G') | KeyCode::End if !self.items.is_empty() => {
                 self.selected = self.items.len() - 1;
             }
+            KeyCode::Char('n') | KeyCode::Char(' ') | KeyCode::PageDown
+                if self.next_cursor.is_some() =>
+            {
+                self.loading = true;
+                return TopicsIntent::LoadMore;
+            }
             KeyCode::Char('r') => {
                 self.items.clear();
+                self.next_cursor = None;
                 self.selected = 0;
                 self.loading = true;
                 self.error = None;
@@ -76,14 +91,27 @@ impl TopicsScreen {
         TopicsIntent::None
     }
 
-    pub fn apply(&mut self, result: Result<Vec<Topic>, String>) {
+    pub fn apply_initial(&mut self, result: Result<(Vec<Topic>, Option<String>), String>) {
         self.loading = false;
         match result {
-            Ok(items) => {
+            Ok((items, cursor)) => {
                 self.items = items;
+                self.next_cursor = cursor;
                 if self.selected >= self.items.len() {
                     self.selected = 0;
                 }
+                self.error = None;
+            }
+            Err(msg) => self.error = Some(msg),
+        }
+    }
+
+    pub fn apply_more(&mut self, result: Result<(Vec<Topic>, Option<String>), String>) {
+        self.loading = false;
+        match result {
+            Ok((mut items, cursor)) => {
+                self.items.append(&mut items);
+                self.next_cursor = cursor;
                 self.error = None;
             }
             Err(msg) => self.error = Some(msg),
@@ -132,9 +160,14 @@ impl TopicsScreen {
             frame.render_stateful_widget(list, layout[0], &mut state);
         }
 
+        let more = if self.next_cursor.is_some() {
+            " · scroll down for more"
+        } else {
+            ""
+        };
         let status = Paragraph::new(Line::from(Span::styled(
             format!(
-                "{} topics · enter open · r refresh · esc menu",
+                "{} topics{more} · enter open · r refresh · esc menu",
                 self.items.len()
             ),
             theme.muted_style(),
@@ -181,15 +214,25 @@ mod tests {
     #[test]
     fn apply_populates() {
         let mut s = TopicsScreen::new();
-        s.apply(Ok(vec![topic("music", 42), topic("linux", 17)]));
+        s.apply_initial(Ok((vec![topic("music", 42), topic("linux", 17)], None)));
         assert!(!s.loading);
         assert_eq!(s.items.len(), 2);
     }
 
     #[test]
+    fn apply_more_appends_and_tracks_cursor() {
+        let mut s = TopicsScreen::new();
+        s.apply_initial(Ok((vec![topic("music", 42)], Some("c1".into()))));
+        assert_eq!(s.next_cursor.as_deref(), Some("c1"));
+        s.apply_more(Ok((vec![topic("linux", 17)], None)));
+        assert_eq!(s.items.len(), 2);
+        assert!(s.next_cursor.is_none());
+    }
+
+    #[test]
     fn enter_emits_open_with_slug() {
         let mut s = TopicsScreen::new();
-        s.apply(Ok(vec![topic("music", 42), topic("linux", 17)]));
+        s.apply_initial(Ok((vec![topic("music", 42), topic("linux", 17)], None)));
         s.selected = 1;
         let intent = s.handle_key(key(KeyCode::Enter));
         assert_eq!(
@@ -203,11 +246,20 @@ mod tests {
     #[test]
     fn j_advances_bounded() {
         let mut s = TopicsScreen::new();
-        s.apply(Ok(vec![topic("a", 1), topic("b", 2), topic("c", 3)]));
+        s.apply_initial(Ok((vec![topic("a", 1), topic("b", 2), topic("c", 3)], None)));
         s.handle_key(key(KeyCode::Char('j')));
         s.handle_key(key(KeyCode::Char('j')));
         s.handle_key(key(KeyCode::Char('j')));
         assert_eq!(s.selected, 2);
+    }
+
+    #[test]
+    fn j_at_bottom_auto_loads() {
+        let mut s = TopicsScreen::new();
+        s.apply_initial(Ok((vec![topic("a", 1)], Some("next".into()))));
+        let intent = s.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(intent, TopicsIntent::LoadMore);
+        assert!(s.loading);
     }
 
     #[test]
