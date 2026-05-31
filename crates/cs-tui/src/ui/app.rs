@@ -196,6 +196,8 @@ impl Screen {
             // field is actually being edited, so 1-8 / Tab / ←→ still leave the
             // screen when a toggle is focused (j/k / ↑↓ move between fields).
             Screen::Settings(s) => s.is_editing_text(),
+            // The topics search box captures printable keys while open.
+            Screen::Topics(s) => s.is_filtering(),
             _ => false,
         }
     }
@@ -389,6 +391,11 @@ pub struct App {
     /// otherwise skip cells (e.g. the background fill) it believes unchanged,
     /// leaving the editor's blank screen showing through.
     force_clear: bool,
+    /// The complete topics list, cached for the session once fully loaded (so
+    /// revisiting the topics section — and searching it — doesn't re-fetch every
+    /// page each time). Populated when a load completes with no further cursor;
+    /// cleared by an explicit refresh (`r`).
+    topics_cache: Option<Vec<Topic>>,
 }
 
 impl App {
@@ -417,6 +424,7 @@ impl App {
             poller_started: false,
             input_paused: Arc::new(AtomicBool::new(false)),
             force_clear: false,
+            topics_cache: None,
         }
     }
 
@@ -645,6 +653,15 @@ impl App {
                 MenuIntent::Quit => self.should_quit = true,
             }
             return;
+        }
+
+        // Esc closes the topics search box first, before its "back/menu" role.
+        if key.code == KeyCode::Esc {
+            if let Screen::Topics(s) = &mut self.screen {
+                if s.clear_filter() {
+                    return;
+                }
+            }
         }
 
         // Esc is the reflexive "back": pop to the previous screen when there is
@@ -1009,7 +1026,10 @@ impl App {
                 }
                 self.spawn_delete_bookmark(bookmark_id);
             }
-            Action::TopicsRefresh => self.spawn_topics_load(),
+            Action::TopicsRefresh => {
+                self.topics_cache = None; // force fresh data
+                self.spawn_topics_load();
+            }
             Action::TopicsLoadMore { cursor } => self.spawn_topics_more(cursor),
             Action::TopicOpen { slug } => {
                 let new_screen = Screen::TopicFeed(TopicFeedScreen::new(slug.clone()));
@@ -1265,11 +1285,13 @@ impl App {
                 if let Screen::Topics(s) = &mut self.screen {
                     s.apply_initial(result);
                 }
+                self.after_topics_load();
             }
             BgEvent::TopicsMore(result) => {
                 if let Screen::Topics(s) = &mut self.screen {
                     s.apply_more(result);
                 }
+                self.after_topics_load();
             }
             BgEvent::TopicFeedInitial { slug, result } => {
                 if let Screen::TopicFeed(s) = &mut self.screen {
@@ -1682,6 +1704,29 @@ impl App {
         }
     }
 
+    /// Run after a topics page is applied: cache the full list once it's
+    /// complete (no further cursor), and — while the search box is open — keep
+    /// pulling the remaining pages so the filter sees every topic.
+    fn after_topics_load(&mut self) {
+        let (complete, chase) = if let Screen::Topics(s) = &self.screen {
+            if s.next_cursor.is_none() {
+                (Some(s.items.clone()), None)
+            } else if s.is_filtering() {
+                (None, s.next_cursor.clone())
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+        if let Some(items) = complete {
+            self.topics_cache = Some(items);
+        }
+        if let Some(cursor) = chase {
+            self.spawn_topics_more(Some(cursor));
+        }
+    }
+
     /// Expire the active toast once its countdown elapses. Driven by the 1s
     /// ticker while a toast is shown.
     fn tick_toast(&mut self) {
@@ -1734,8 +1779,16 @@ impl App {
                 self.spawn_bookmarks_initial();
             }
             RootKind::Topics => {
-                self.screen = Screen::Topics(TopicsScreen::new());
-                self.spawn_topics_load();
+                let mut s = TopicsScreen::new();
+                if let Some(cached) = &self.topics_cache {
+                    // Full list already loaded this session — show it instantly
+                    // (no cursor → no re-fetch, and search is immediate).
+                    s.apply_initial(Ok((cached.clone(), None)));
+                    self.screen = Screen::Topics(s);
+                } else {
+                    self.screen = Screen::Topics(s);
+                    self.spawn_topics_load();
+                }
             }
             RootKind::Profile => {
                 self.screen = Screen::Profile(ProfileScreen::new_own());
@@ -1908,7 +1961,7 @@ impl App {
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
             let result = client
-                .list_topics(None, None)
+                .list_topics(None, Some(50))
                 .await
                 .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::TopicsLoaded(result));
@@ -1920,7 +1973,7 @@ impl App {
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
             let result = client
-                .list_topics(cursor.as_deref(), None)
+                .list_topics(cursor.as_deref(), Some(50))
                 .await
                 .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::TopicsMore(result));
@@ -2852,6 +2905,32 @@ mod tests {
         app.toast = None;
         app.handle_bg_event(BgEvent::BookmarkCreated(Err("conflict".into())));
         assert!(app.toast.is_some(), "a failed bookmark should warn");
+    }
+
+    #[test]
+    fn topics_cache_populates_on_complete_load_and_revisit_skips_fetch() {
+        let mut app = test_app();
+        app.screen = Screen::Topics(TopicsScreen::new());
+        app.current_root = Some(RootKind::Topics);
+        let topics = vec![
+            Topic { slug: "music".into(), post_count: 5 },
+            Topic { slug: "linux".into(), post_count: 9 },
+        ];
+        // A load with no further cursor is the complete list → it's cached.
+        app.handle_bg_event(BgEvent::TopicsLoaded(Ok((topics, None))));
+        assert_eq!(app.topics_cache.as_ref().map(Vec::len), Some(2));
+
+        // Revisiting topics fills the screen from the cache: loaded, no cursor,
+        // no fetch needed.
+        app.goto_root(RootKind::Topics);
+        match &app.screen {
+            Screen::Topics(s) => {
+                assert!(!s.loading, "a cache hit must not show loading");
+                assert_eq!(s.items.len(), 2);
+                assert!(s.next_cursor.is_none());
+            }
+            _ => panic!("expected the Topics screen"),
+        }
     }
 
     #[test]

@@ -44,6 +44,7 @@ const COMMON: &[Row] = &[
     Row { keys: "r", desc: "refresh" },
     Row { keys: "c", desc: "compose / new" },
     Row { keys: "b", desc: "bookmark (feed / post)" },
+    Row { keys: "/", desc: "search (topics)" },
 ];
 
 /// Build the help body. Kept separate from rendering so tests can assert on the

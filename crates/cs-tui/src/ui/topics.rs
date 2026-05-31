@@ -27,6 +27,9 @@ pub struct TopicsScreen {
     pub next_cursor: Option<String>,
     pub loading: bool,
     pub error: Option<String>,
+    /// Active search query (`Some` while the `/` filter box is open). The list
+    /// narrows to slugs containing it (case-insensitive).
+    pub filter: Option<String>,
 }
 
 impl TopicsScreen {
@@ -37,6 +40,40 @@ impl TopicsScreen {
             next_cursor: None,
             loading: true,
             error: None,
+            filter: None,
+        }
+    }
+
+    /// Whether the search box is open (printable keys go to the query).
+    #[must_use]
+    pub fn is_filtering(&self) -> bool {
+        self.filter.is_some()
+    }
+
+    /// Indices into `items` matching the current filter (all when not filtering).
+    fn view(&self) -> Vec<usize> {
+        match &self.filter {
+            Some(q) if !q.is_empty() => {
+                let q = q.to_lowercase();
+                self.items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| t.slug.to_lowercase().contains(&q))
+                    .map(|(i, _)| i)
+                    .collect()
+            }
+            _ => (0..self.items.len()).collect(),
+        }
+    }
+
+    /// Exit the search box, clearing the query. Returns `true` if it was open
+    /// (so the caller can swallow the key that triggered it).
+    pub fn clear_filter(&mut self) -> bool {
+        if self.filter.take().is_some() {
+            self.selected = 0;
+            true
+        } else {
+            false
         }
     }
 
@@ -44,10 +81,56 @@ impl TopicsScreen {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return TopicsIntent::Quit;
         }
+        // Search box open: printable keys edit the query; ↑/↓ + Enter navigate
+        // the narrowed list. (Esc, intercepted by the app, closes the box.)
+        // Checked before the loading guard so you can keep typing while the
+        // remaining pages stream in.
+        if self.filter.is_some() {
+            match key.code {
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(q) = self.filter.as_mut() {
+                        q.push(c);
+                    }
+                    self.selected = 0;
+                }
+                KeyCode::Backspace => {
+                    if let Some(q) = self.filter.as_mut() {
+                        q.pop();
+                    }
+                    self.selected = 0;
+                }
+                KeyCode::Down => {
+                    let n = self.view().len();
+                    if n > 0 && self.selected + 1 < n {
+                        self.selected += 1;
+                    }
+                }
+                KeyCode::Up => self.selected = self.selected.saturating_sub(1),
+                KeyCode::Enter => {
+                    if let Some(&i) = self.view().get(self.selected) {
+                        return TopicsIntent::OpenSelected {
+                            slug: self.items[i].slug.clone(),
+                        };
+                    }
+                }
+                _ => {}
+            }
+            return TopicsIntent::None;
+        }
+
         if self.loading {
             return TopicsIntent::None;
         }
         match key.code {
+            KeyCode::Char('/') => {
+                self.filter = Some(String::new());
+                self.selected = 0;
+                // Pull the remaining pages so search covers every topic, not just
+                // the loaded ones; the chain continues in `handle_bg_event`.
+                if self.next_cursor.is_some() {
+                    return TopicsIntent::LoadMore;
+                }
+            }
             KeyCode::Char('j') | KeyCode::Down
                 if !self.items.is_empty() && self.selected < self.items.len() - 1 =>
             {
@@ -131,6 +214,7 @@ impl TopicsScreen {
             .constraints([Constraint::Min(1), Constraint::Length(1)])
             .split(inner);
 
+        let view = self.view();
         if self.loading && self.items.is_empty() {
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
@@ -144,34 +228,48 @@ impl TopicsScreen {
                 Paragraph::new(Line::from(Span::styled(msg.clone(), theme.error_style()))),
                 layout[0],
             );
-        } else if self.items.is_empty() {
+        } else if view.is_empty() {
+            let msg = if self.is_filtering() {
+                "no matching topics"
+            } else {
+                "no topics"
+            };
             frame.render_widget(
-                Paragraph::new(Line::from(Span::styled("no topics", theme.muted_style()))),
+                Paragraph::new(Line::from(Span::styled(msg, theme.muted_style()))),
                 layout[0],
             );
         } else {
             let items: Vec<ListItem<'_>> =
-                self.items.iter().map(|t| topic_item(t, theme)).collect();
+                view.iter().map(|&i| topic_item(&self.items[i], theme)).collect();
             let list = List::new(items)
                 .highlight_style(theme.accent_style())
                 .highlight_symbol("▌ ");
             let mut state = ListState::default();
-            state.select(Some(self.selected.min(self.items.len().saturating_sub(1))));
+            state.select(Some(self.selected.min(view.len().saturating_sub(1))));
             frame.render_stateful_widget(list, layout[0], &mut state);
         }
 
-        let more = if self.next_cursor.is_some() {
-            " · scroll down for more"
-        } else {
-            ""
-        };
-        let status = Paragraph::new(Line::from(Span::styled(
+        // Status line: a search box when filtering, else the topic count.
+        let status_text = if let Some(q) = &self.filter {
+            let loading_more = self.next_cursor.is_some();
             format!(
-                "{} topics{more} · enter open · r refresh · esc menu",
+                "/{q}█ · {} match{}{} · ↑↓ enter · esc clear",
+                view.len(),
+                if view.len() == 1 { "" } else { "es" },
+                if loading_more { " · loading all…" } else { "" },
+            )
+        } else {
+            let more = if self.next_cursor.is_some() {
+                " · scroll down for more"
+            } else {
+                ""
+            };
+            format!(
+                "{} topics{more} · / search · enter open · r refresh · esc menu",
                 self.items.len()
-            ),
-            theme.muted_style(),
-        )));
+            )
+        };
+        let status = Paragraph::new(Line::from(Span::styled(status_text, theme.muted_style())));
         frame.render_widget(status, layout[1]);
     }
 }
@@ -260,6 +358,59 @@ mod tests {
         let intent = s.handle_key(key(KeyCode::Char('j')));
         assert_eq!(intent, TopicsIntent::LoadMore);
         assert!(s.loading);
+    }
+
+    #[test]
+    fn slash_opens_search_and_filters_to_match() {
+        let mut s = TopicsScreen::new();
+        s.apply_initial(Ok((
+            vec![topic("music", 5), topic("musings", 3), topic("linux", 9)],
+            None,
+        )));
+        // No cursor → `/` opens the box without requesting a load.
+        assert_eq!(s.handle_key(key(KeyCode::Char('/'))), TopicsIntent::None);
+        assert!(s.is_filtering());
+        for c in "mus".chars() {
+            s.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(s.filter.as_deref(), Some("mus"));
+        // Enter opens the first match (music); linux is filtered out.
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            TopicsIntent::OpenSelected {
+                slug: "music".into()
+            }
+        );
+    }
+
+    #[test]
+    fn search_arrows_navigate_matches_and_esc_clears() {
+        let mut s = TopicsScreen::new();
+        s.apply_initial(Ok((vec![topic("music", 5), topic("musings", 3)], None)));
+        s.handle_key(key(KeyCode::Char('/')));
+        for c in "mus".chars() {
+            s.handle_key(key(KeyCode::Char(c)));
+        }
+        s.handle_key(key(KeyCode::Down)); // second match
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            TopicsIntent::OpenSelected {
+                slug: "musings".into()
+            }
+        );
+        assert!(s.clear_filter());
+        assert!(!s.is_filtering());
+        assert!(!s.clear_filter(), "already cleared");
+    }
+
+    #[test]
+    fn slash_with_more_pages_requests_eager_load() {
+        let mut s = TopicsScreen::new();
+        s.apply_initial(Ok((vec![topic("a", 1)], Some("next".into()))));
+        // Opening search with pages remaining asks to pull them so the filter
+        // can see every topic.
+        assert_eq!(s.handle_key(key(KeyCode::Char('/'))), TopicsIntent::LoadMore);
+        assert!(s.is_filtering());
     }
 
     #[test]
