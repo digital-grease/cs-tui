@@ -79,17 +79,19 @@ impl Theme {
         }
     }
 
-    /// Legacy neutral dark theme (no longer the default; kept for tests).
+    /// Neutral slate dark theme — cool grays with a sky-blue accent. The
+    /// deliberate counterpoint to `cyber`'s green-on-black: same dark base, but a
+    /// blue (not green) accent and a gray border, so the two read as distinct.
     pub fn dark() -> Self {
         Self {
             background: Color::Reset,
-            foreground: Color::Gray,
-            muted: Color::DarkGray,
-            accent: Color::LightGreen,
-            success: Color::Green,
-            error: Color::LightRed,
-            warning: Color::LightYellow,
-            border: Color::DarkGray,
+            foreground: Color::Indexed(252), // soft light gray
+            muted: Color::Indexed(245),      // medium gray
+            accent: Color::Indexed(75),      // sky blue
+            success: Color::Indexed(114),    // soft green
+            error: Color::Indexed(203),      // soft red
+            warning: Color::Indexed(215),    // amber
+            border: Color::Indexed(240),     // neutral gray
         }
     }
 
@@ -220,6 +222,15 @@ mod tests {
     #[test]
     fn theme_kind_resolves_to_matching_palette() {
         assert_eq!(ThemeKind::C64.theme().accent, Theme::c64().accent);
+    }
+
+    #[test]
+    fn cyber_and_dark_are_visually_distinct() {
+        // They share a dark base, but must differ where the eye lands first:
+        // accent and border. (They were near-identical before.)
+        let (c, d) = (Theme::cyber(), Theme::dark());
+        assert_ne!(c.accent, d.accent, "accent must differ");
+        assert_ne!(c.border, d.border, "border must differ");
     }
 
     #[test]
