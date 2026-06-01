@@ -2,10 +2,12 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use cs_api::Client;
 
+mod config;
 mod prefs;
 mod session;
 mod ui;
 
+use config::Config;
 use prefs::Prefs;
 use session::Session;
 use ui::{theme::ThemeKind, App};
@@ -17,8 +19,9 @@ struct Cli {
     #[arg(long, env = "CS_TUI_API_BASE")]
     api_base: Option<String>,
 
-    /// Color theme: cyber (default), c64, vt320, or dark. Overrides the saved
-    /// preference for this run; the theme is also remembered between runs.
+    /// Color theme: cyber (default), c64, vt320, dark, or custom (define the
+    /// palette in config.toml). Overrides the saved preference for this run; the
+    /// theme is also remembered between runs.
     #[arg(long, env = "CS_TUI_THEME")]
     theme: Option<String>,
 
@@ -72,14 +75,26 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Precedence: explicit --theme/$CS_TUI_THEME > saved prefs > default.
+    // Drop a commented config template on first run, then load it (custom
+    // palette + default theme).
+    Config::write_template_if_absent();
+    let config = Config::load();
+    let custom_theme = config.custom_theme();
+
+    // Theme precedence: --theme/$CS_TUI_THEME > saved prefs (last cycled) >
+    // config.toml `theme` > cyber.
     let prefs = Prefs::load();
-    let theme_kind = cli
+    let mut theme_kind = cli
         .theme
         .as_deref()
         .or(prefs.theme.as_deref())
+        .or(config.theme.as_deref())
         .map(ThemeKind::from_name)
         .unwrap_or(ThemeKind::Cyber);
+    if theme_kind == ThemeKind::Custom && custom_theme.is_none() {
+        tracing::warn!("theme is \"custom\" but config.toml has no [colors]; using cyber");
+        theme_kind = ThemeKind::Cyber;
+    }
     // Detect terminal image-graphics support before entering the alternate
     // screen (the query reads/writes stdio). `None` → images aren't rendered.
     // `--no-images` skips the query entirely (one-time cost; faster startup).
@@ -100,7 +115,7 @@ async fn main() -> Result<()> {
     };
 
     let terminal = ratatui::init();
-    let mut app = App::with_theme(client, prefill_email, theme_kind);
+    let mut app = App::with_theme(client, prefill_email, theme_kind, custom_theme);
     app.set_image_picker(picker);
     if has_session {
         app.enter_feed_initial();

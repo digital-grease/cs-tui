@@ -351,6 +351,9 @@ pub struct App {
     client: Client,
     theme: Theme,
     theme_kind: ThemeKind,
+    /// User-defined palette from `config.toml`, if any. Enables the `Custom`
+    /// theme in the cycle and resolves `ThemeKind::Custom`.
+    custom_theme: Option<Theme>,
     screen: Screen,
     back_stack: Vec<Screen>,
     current_root: Option<RootKind>,
@@ -406,13 +409,23 @@ pub struct App {
 }
 
 impl App {
-    pub fn with_theme(client: Client, prefill_email: String, theme_kind: ThemeKind) -> Self {
+    pub fn with_theme(
+        client: Client,
+        prefill_email: String,
+        theme_kind: ThemeKind,
+        custom_theme: Option<Theme>,
+    ) -> Self {
         let (bg_tx, bg_rx) = mpsc::unbounded_channel();
         let last_email = prefill_email.clone();
+        let theme = match theme_kind {
+            ThemeKind::Custom => custom_theme.clone().unwrap_or_else(Theme::cyber),
+            k => k.theme(),
+        };
         Self {
             client,
-            theme: theme_kind.theme(),
+            theme,
             theme_kind,
+            custom_theme,
             screen: Screen::Login(LoginScreen::new(prefill_email)),
             back_stack: Vec::new(),
             current_root: None,
@@ -1749,11 +1762,31 @@ impl App {
         }
     }
 
+    /// The palettes the cycle steps through: the built-ins, plus the user's
+    /// `Custom` when `config.toml` defines one.
+    fn available_theme_kinds(&self) -> Vec<ThemeKind> {
+        let mut kinds = ThemeKind::ALL.to_vec();
+        if self.custom_theme.is_some() {
+            kinds.push(ThemeKind::Custom);
+        }
+        kinds
+    }
+
+    /// Resolve a kind to its concrete palette (`Custom` comes from `config.toml`).
+    fn resolve_theme(&self, kind: ThemeKind) -> Theme {
+        match kind {
+            ThemeKind::Custom => self.custom_theme.clone().unwrap_or_else(Theme::cyber),
+            k => k.theme(),
+        }
+    }
+
     /// Advance to the next theme palette, apply it live, and persist the choice
     /// to local prefs so it survives restarts. A failed save is non-fatal.
     fn cycle_theme(&mut self) {
-        self.theme_kind = self.theme_kind.next();
-        self.theme = self.theme_kind.theme();
+        let kinds = self.available_theme_kinds();
+        let idx = kinds.iter().position(|k| *k == self.theme_kind).unwrap_or(0);
+        self.theme_kind = kinds[(idx + 1) % kinds.len()];
+        self.theme = self.resolve_theme(self.theme_kind);
         let prefs = crate::prefs::Prefs {
             theme: Some(self.theme_kind.name().to_string()),
         };
@@ -2686,7 +2719,7 @@ mod tests {
 
     fn test_app() -> App {
         let client = cs_api::Client::new().expect("client builds");
-        App::with_theme(client, "you@example.com".into(), ThemeKind::Cyber)
+        App::with_theme(client, "you@example.com".into(), ThemeKind::Cyber, None)
     }
 
     fn render_to_string(app: &App) -> String {
@@ -2925,6 +2958,29 @@ mod tests {
         app.toast = Some(Toast::rate_limited(30));
         app.tick_toast();
         assert!(app.toast.is_some(), "a live toast must survive a tick");
+    }
+
+    #[test]
+    fn custom_theme_joins_the_cycle_when_configured() {
+        let mut app = test_app();
+        // No custom palette → only the four built-ins.
+        assert_eq!(app.available_theme_kinds().len(), 4);
+        assert!(!app.available_theme_kinds().contains(&ThemeKind::Custom));
+
+        // With a custom palette → Custom is appended and resolves to it.
+        let custom = Theme::dark();
+        app.custom_theme = Some(custom.clone());
+        let kinds = app.available_theme_kinds();
+        assert_eq!(kinds.len(), 5);
+        assert_eq!(kinds.last(), Some(&ThemeKind::Custom));
+        assert_eq!(app.resolve_theme(ThemeKind::Custom).accent, custom.accent);
+
+        // Without one, resolving Custom safely falls back to cyber.
+        app.custom_theme = None;
+        assert_eq!(
+            app.resolve_theme(ThemeKind::Custom).accent,
+            Theme::cyber().accent
+        );
     }
 
     #[test]

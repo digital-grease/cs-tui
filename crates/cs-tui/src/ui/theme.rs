@@ -115,17 +115,21 @@ impl Default for Theme {
     }
 }
 
-/// The selectable palettes, in the order the Esc-menu "cycle" steps through.
+/// The selectable palettes. `Custom` is user-defined (from `config.toml`) and
+/// only offered in the cycle when the config provides one — so it lives outside
+/// the built-in `ALL`; the App resolves and cycles it (see `App::resolve_theme`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThemeKind {
     Cyber,
     C64,
     Vt320,
     Dark,
+    Custom,
 }
 
 impl ThemeKind {
-    /// All palettes, in cycle order.
+    /// The built-in palettes, in cycle order. (`Custom` is appended by the App
+    /// when configured.)
     pub const ALL: [ThemeKind; 4] = [Self::Cyber, Self::C64, Self::Vt320, Self::Dark];
 
     /// Stable lowercase name — matches the `--theme` flag and the persisted
@@ -136,6 +140,7 @@ impl ThemeKind {
             Self::C64 => "c64",
             Self::Vt320 => "vt320",
             Self::Dark => "dark",
+            Self::Custom => "custom",
         }
     }
 
@@ -145,25 +150,23 @@ impl ThemeKind {
             "c64" => Self::C64,
             "vt320" => Self::Vt320,
             "dark" => Self::Dark,
+            "custom" => Self::Custom,
             _ => Self::Cyber,
         }
     }
 
-    /// Resolve to the concrete palette.
+    /// Resolve to the concrete palette. `Custom` has no built-in colors, so it
+    /// falls back to `cyber` here; the App supplies the real custom palette via
+    /// `resolve_theme`.
     pub fn theme(self) -> Theme {
         match self {
-            Self::Cyber => Theme::cyber(),
+            Self::Cyber | Self::Custom => Theme::cyber(),
             Self::C64 => Theme::c64(),
             Self::Vt320 => Theme::vt320(),
             Self::Dark => Theme::dark(),
         }
     }
 
-    /// The next palette in cycle order, wrapping back to the first.
-    pub fn next(self) -> Self {
-        let idx = Self::ALL.iter().position(|&k| k == self).unwrap_or(0);
-        Self::ALL[(idx + 1) % Self::ALL.len()]
-    }
 }
 
 #[cfg(test)]
@@ -177,20 +180,18 @@ mod tests {
     }
 
     #[test]
+    fn custom_kind_round_trips() {
+        assert_eq!(ThemeKind::from_name("custom"), ThemeKind::Custom);
+        assert_eq!(ThemeKind::Custom.name(), "custom");
+    }
+
+    #[test]
     fn theme_kind_names_round_trip() {
         for k in ThemeKind::ALL {
             assert_eq!(ThemeKind::from_name(k.name()), k);
         }
         assert_eq!(ThemeKind::from_name("CYBER"), ThemeKind::Cyber);
         assert_eq!(ThemeKind::from_name("unknown"), ThemeKind::Cyber);
-    }
-
-    #[test]
-    fn theme_kind_next_cycles_and_wraps() {
-        assert_eq!(ThemeKind::Cyber.next(), ThemeKind::C64);
-        assert_eq!(ThemeKind::C64.next(), ThemeKind::Vt320);
-        assert_eq!(ThemeKind::Vt320.next(), ThemeKind::Dark);
-        assert_eq!(ThemeKind::Dark.next(), ThemeKind::Cyber);
     }
 
     #[test]
