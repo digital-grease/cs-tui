@@ -94,7 +94,9 @@ pub fn render_markdown(input: &str, theme: &Theme) -> Vec<Line<'static>> {
 
 /// A single-line plain-text preview of post content for list views: markdown is
 /// flattened to text, image links are dropped, whitespace is collapsed, and the
-/// result is truncated. Image-only posts preview as `[image]`.
+/// result is truncated. Returns empty for image-only / empty posts — list items
+/// flag the presence of an image separately (via `images::has_image`), which
+/// also catches attachment images this can't see.
 pub fn content_preview(content: &str, max: usize) -> String {
     let mut text = String::new();
     let mut in_image = false;
@@ -111,7 +113,7 @@ pub fn content_preview(content: &str, max: usize) -> String {
     }
     let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.is_empty() {
-        return "[image]".to_string();
+        return String::new();
     }
     if collapsed.chars().count() <= max {
         collapsed
@@ -415,8 +417,10 @@ mod tests {
     }
 
     #[test]
-    fn content_preview_falls_back_for_image_only_post() {
-        assert_eq!(content_preview("![alt](https://x/a.png)", 200), "[image]");
+    fn content_preview_is_empty_for_image_only_post() {
+        // The list item flags the image (via images::has_image); the preview
+        // text itself is empty.
+        assert_eq!(content_preview("![alt](https://x/a.png)", 200), "");
     }
 
     #[test]

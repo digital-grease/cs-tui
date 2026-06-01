@@ -473,14 +473,17 @@ fn thread_item<'a>(t: &'a GuildThread, theme: &Theme) -> ListItem<'a> {
         .created_at
         .map(format_timestamp_relative)
         .unwrap_or_default();
-    let header = Line::from(vec![
+    let mut header_spans = vec![
         Span::styled(format!("@{}", e.author_username), theme.accent_style()),
         Span::styled(
             format!(" · {when} · {} replies", e.replies_count),
             theme.muted_style(),
         ),
-    ]);
-    let mut lines = vec![header];
+    ];
+    if super::images::has_image(e) {
+        header_spans.push(Span::styled(" · [image]", theme.accent_style()));
+    }
+    let mut lines = vec![Line::from(header_spans)];
     if let Some(title) = e.title.as_deref() {
         let title = title.trim();
         if !title.is_empty() {
@@ -490,10 +493,10 @@ fn thread_item<'a>(t: &'a GuildThread, theme: &Theme) -> ListItem<'a> {
             )));
         }
     }
-    lines.push(Line::from(Span::styled(
-        super::markdown::content_preview(&e.content, 200),
-        theme.base(),
-    )));
+    let snippet = super::markdown::content_preview(&e.content, 200);
+    if !snippet.is_empty() {
+        lines.push(Line::from(Span::styled(snippet, theme.base())));
+    }
     lines.push(Line::from(""));
     ListItem::new(lines)
 }

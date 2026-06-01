@@ -207,13 +207,20 @@ fn entry_item<'a>(entry: &'a Entry, theme: &Theme) -> ListItem<'a> {
         " · {} replies · {} bookmarks",
         entry.replies_count, entry.bookmarks_count
     );
-    let header = Line::from(vec![
+    let mut header_spans = vec![
         Span::styled(format!("@{}", entry.author_username), theme.accent_style()),
         Span::styled(format!(" · {when}{counts}"), theme.muted_style()),
-    ]);
+    ];
+    if super::images::has_image(entry) {
+        header_spans.push(Span::styled(" · [image]", theme.accent_style()));
+    }
+    let mut lines = vec![Line::from(header_spans)];
     let snippet = super::markdown::content_preview(&entry.content, 200);
-    let body = Line::from(Span::styled(snippet, theme.base()));
-    ListItem::new(vec![header, body, Line::from("")])
+    if !snippet.is_empty() {
+        lines.push(Line::from(Span::styled(snippet, theme.base())));
+    }
+    lines.push(Line::from(""));
+    ListItem::new(lines)
 }
 
 fn format_timestamp_relative(t: OffsetDateTime) -> String {
