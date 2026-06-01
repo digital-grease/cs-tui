@@ -174,15 +174,16 @@ impl FeedScreen {
                 theme.accent_style(),
             )));
             frame.render_widget(para, list_area);
-        } else if let Some(msg) = &self.error {
-            let para = Paragraph::new(Line::from(Span::styled(msg.clone(), theme.error_style())));
-            frame.render_widget(para, list_area);
         } else if visible_indices.is_empty() {
-            let para = Paragraph::new(Line::from(Span::styled(
-                "no entries to show",
-                theme.muted_style(),
-            )));
-            frame.render_widget(para, list_area);
+            // Empty list: distinguish an initial-load failure from genuine
+            // emptiness. (A load-more failure keeps entries, so it never lands
+            // here — it rides the status line instead.)
+            let (text, style) = if let Some(msg) = &self.error {
+                (msg.clone(), theme.error_style())
+            } else {
+                ("no entries to show".to_string(), theme.muted_style())
+            };
+            frame.render_widget(Paragraph::new(Line::from(Span::styled(text, style))), list_area);
         } else {
             let items: Vec<ListItem<'_>> = visible_indices
                 .iter()
@@ -274,6 +275,16 @@ fn first_line_truncated(s: &str, max: usize) -> String {
 }
 
 fn status_line<'a>(s: &'a FeedScreen, theme: &Theme) -> Paragraph<'a> {
+    // A load-more failure with entries already on screen rides the status line so
+    // the feed stays put instead of being replaced by a full-screen error.
+    if !s.loading && !s.entries.is_empty() {
+        if let Some(msg) = &s.error {
+            return Paragraph::new(Line::from(Span::styled(
+                format!("⚠ {msg} · scroll or r to retry"),
+                theme.error_style(),
+            )));
+        }
+    }
     let text = if s.loading {
         "loading… · enter open · b bookmark · r refresh · esc menu".to_string()
     } else if s.next_cursor.is_some() {
@@ -568,6 +579,37 @@ mod tests {
         s.apply_initial(Ok((vec![], None)));
         let intent = s.handle_key(key(KeyCode::Char('q')));
         assert_eq!(intent, FeedIntent::None);
+    }
+
+    fn render_feed_to_string(s: &FeedScreen) -> String {
+        let theme = Theme::cyber();
+        let backend = ratatui::backend::TestBackend::new(80, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| s.render(f, f.area(), &theme))
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn load_more_failure_keeps_the_list_visible() {
+        // Regression: a failed next-page fetch used to replace the whole feed
+        // with a single error line. The list must stay, with the error inline.
+        let mut s = FeedScreen::new();
+        s.apply_initial(Ok((
+            vec![entry("p1", "alice", false), entry("p2", "bob", false)],
+            Some("cur".into()),
+        )));
+        s.apply_more(Err("network blip".into()));
+        let text = render_feed_to_string(&s);
+        assert!(text.contains("@alice"), "list must remain after a load-more error: {text:?}");
+        assert!(text.contains("network blip"), "error should be surfaced inline");
     }
 
     #[test]

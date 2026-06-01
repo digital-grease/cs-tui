@@ -32,6 +32,8 @@ pub struct BookmarksScreen {
     pub next_cursor: Option<String>,
     pub loading: bool,
     pub error: Option<String>,
+    /// Armed by `d` when `confirm_deletes` is set; `y` then confirms.
+    pub confirming_delete: bool,
 }
 
 impl BookmarksScreen {
@@ -42,12 +44,25 @@ impl BookmarksScreen {
             next_cursor: None,
             loading: true,
             error: None,
+            confirming_delete: false,
         }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> BookmarksIntent {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return BookmarksIntent::Quit;
+        }
+        // Two-step delete: `d` arms, then `y` confirms (mirrors journal/post).
+        if self.confirming_delete {
+            self.confirming_delete = false;
+            if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                if let Some(b) = self.items.get(self.selected) {
+                    return BookmarksIntent::RemoveSelected {
+                        bookmark_id: b.bookmark_id.clone(),
+                    };
+                }
+            }
+            return BookmarksIntent::None;
         }
         if self.loading {
             return BookmarksIntent::None;
@@ -86,9 +101,13 @@ impl BookmarksScreen {
             }
             KeyCode::Char('d') | KeyCode::Delete => {
                 if let Some(b) = self.items.get(self.selected) {
-                    return BookmarksIntent::RemoveSelected {
-                        bookmark_id: b.bookmark_id.clone(),
-                    };
+                    if crate::config::get().confirm_deletes {
+                        self.confirming_delete = true;
+                    } else {
+                        return BookmarksIntent::RemoveSelected {
+                            bookmark_id: b.bookmark_id.clone(),
+                        };
+                    }
                 }
             }
             KeyCode::Enter => {
@@ -174,20 +193,9 @@ impl BookmarksScreen {
                 ))),
                 layout[0],
             );
-        } else if let Some(msg) = &self.error {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(msg.clone(), theme.error_style()))),
-                layout[0],
-            );
-        } else if self.items.is_empty() {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    "no bookmarks",
-                    theme.muted_style(),
-                ))),
-                layout[0],
-            );
-        } else {
+        } else if !self.items.is_empty() {
+            // Keep the list visible even if a load-more failed (the error rides
+            // the status line below); only blank the area for an empty load.
             let items: Vec<ListItem<'_>> =
                 self.items.iter().map(|b| bookmark_item(b, theme)).collect();
             let list = List::new(items)
@@ -196,6 +204,19 @@ impl BookmarksScreen {
             let mut state = ListState::default();
             state.select(Some(self.selected.min(self.items.len().saturating_sub(1))));
             frame.render_stateful_widget(list, layout[0], &mut state);
+        } else if let Some(msg) = &self.error {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(msg.clone(), theme.error_style()))),
+                layout[0],
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "no bookmarks",
+                    theme.muted_style(),
+                ))),
+                layout[0],
+            );
         }
 
         let status = status_line(self, theme);
@@ -267,6 +288,22 @@ fn first_line_truncated(s: &str, max: usize) -> String {
 }
 
 fn status_line<'a>(s: &'a BookmarksScreen, theme: &Theme) -> Paragraph<'a> {
+    if s.confirming_delete {
+        return Paragraph::new(Line::from(Span::styled(
+            "really remove this bookmark? y=yes, any other key=cancel",
+            theme.warning_style(),
+        )));
+    }
+    // A load-more failure with items already on screen rides the status line so
+    // the list stays put instead of being replaced by a full-screen error.
+    if !s.loading && !s.items.is_empty() {
+        if let Some(msg) = &s.error {
+            return Paragraph::new(Line::from(Span::styled(
+                format!("⚠ {msg} · scroll or r to retry"),
+                theme.error_style(),
+            )));
+        }
+    }
     let text = if s.loading {
         "loading… · enter open · d remove · n next · r refresh · esc menu".to_string()
     } else if s.next_cursor.is_some() {
@@ -384,16 +421,31 @@ mod tests {
     }
 
     #[test]
-    fn d_removes_selected() {
+    fn d_arms_then_y_confirms_remove() {
         let mut s = BookmarksScreen::new();
         s.apply_initial(Ok((vec![post_bookmark("b1", "p1")], None)));
-        let intent = s.handle_key(key(KeyCode::Char('d')));
+        // With the default confirm_deletes=true, `d` only arms — no delete yet.
+        assert_eq!(s.handle_key(key(KeyCode::Char('d'))), BookmarksIntent::None);
+        assert!(s.confirming_delete);
+        // `y` confirms.
+        let intent = s.handle_key(key(KeyCode::Char('y')));
         assert_eq!(
             intent,
             BookmarksIntent::RemoveSelected {
                 bookmark_id: "b1".into()
             }
         );
+        assert!(!s.confirming_delete);
+    }
+
+    #[test]
+    fn d_then_other_key_cancels_remove() {
+        let mut s = BookmarksScreen::new();
+        s.apply_initial(Ok((vec![post_bookmark("b1", "p1")], None)));
+        s.handle_key(key(KeyCode::Char('d')));
+        assert!(s.confirming_delete);
+        assert_eq!(s.handle_key(key(KeyCode::Char('x'))), BookmarksIntent::None);
+        assert!(!s.confirming_delete, "any other key cancels the confirmation");
     }
 
     #[test]
