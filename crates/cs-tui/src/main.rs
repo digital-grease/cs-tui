@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use cs_api::Client;
@@ -44,6 +46,10 @@ struct Cli {
     /// selection then needs Shift+drag.
     #[arg(long)]
     mouse: bool,
+
+    /// Path to the config file (default: <XDG_CONFIG_HOME>/cs-tui/config.toml).
+    #[arg(long, env = "CS_TUI_CONFIG")]
+    config: Option<PathBuf>,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -56,7 +62,22 @@ async fn main() -> Result<()> {
         anyhow::bail!("--mock flag is not yet implemented (lands in phase 7)");
     }
 
-    let client = build_client(cli.api_base.as_deref()).context("build api client")?;
+    // Config: resolve the path (--config / $CS_TUI_CONFIG override the default),
+    // drop a commented template on first run, then load it and install the
+    // runtime display/behavior prefs.
+    let config_path = cli
+        .config
+        .clone()
+        .or_else(Config::default_path)
+        .unwrap_or_else(|| PathBuf::from("config.toml"));
+    Config::write_template_if_absent(&config_path);
+    let cfg = Config::load_from(&config_path);
+    config::init(cfg.to_runtime());
+    let custom_theme = cfg.custom_theme();
+
+    // API base: --api-base / $CS_TUI_API_BASE > config > built-in default.
+    let api_base = cli.api_base.as_deref().or(cfg.api_base.as_deref());
+    let client = build_client(api_base).context("build api client")?;
 
     let saved = match Session::load() {
         Ok(s) => s,
@@ -75,12 +96,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Drop a commented config template on first run, then load it (custom
-    // palette + default theme).
-    Config::write_template_if_absent();
-    let config = Config::load();
-    let custom_theme = config.custom_theme();
-
     // Theme precedence: --theme/$CS_TUI_THEME > saved prefs (last cycled) >
     // config.toml `theme` > cyber.
     let prefs = Prefs::load();
@@ -88,7 +103,7 @@ async fn main() -> Result<()> {
         .theme
         .as_deref()
         .or(prefs.theme.as_deref())
-        .or(config.theme.as_deref())
+        .or(cfg.theme.as_deref())
         .map(ThemeKind::from_name)
         .unwrap_or(ThemeKind::Cyber);
     if theme_kind == ThemeKind::Custom && custom_theme.is_none() {
@@ -97,9 +112,11 @@ async fn main() -> Result<()> {
     }
     // Detect terminal image-graphics support before entering the alternate
     // screen (the query reads/writes stdio). `None` → images aren't rendered.
-    // `--no-images` skips the query entirely (one-time cost; faster startup).
-    let picker = if cli.no_images {
-        tracing::info!("image rendering disabled (--no-images)");
+    // Skipping the query (config `images = false` or `--no-images`) is also a
+    // faster launch (no one-time capability cost).
+    let render_images = cfg.images.unwrap_or(true) && !cli.no_images;
+    let picker = if !render_images {
+        tracing::info!("image rendering disabled");
         None
     } else {
         match ratatui_image::picker::Picker::from_query_stdio() {
@@ -121,14 +138,16 @@ async fn main() -> Result<()> {
         app.enter_feed_initial();
     }
     // By default we do NOT grab the mouse, so the terminal keeps native
-    // selection (drag to copy) and link handling (click to open). `--mouse`
-    // opts into button + SGR scroll-wheel reporting (no motion tracking, so the
-    // wheel is one event per notch); text selection then needs Shift+drag.
-    if cli.mouse {
+    // selection (drag to copy) and link handling (click to open). `--mouse` or
+    // config `mouse = true` opts into button + SGR scroll-wheel reporting (no
+    // motion tracking, so the wheel is one event per notch); text selection then
+    // needs Shift+drag.
+    let capture_mouse = cli.mouse || cfg.mouse.unwrap_or(false);
+    if capture_mouse {
         set_mouse_scroll_reporting(true);
     }
     let run_result = app.run(terminal).await;
-    if cli.mouse {
+    if capture_mouse {
         set_mouse_scroll_reporting(false);
     }
     ratatui::restore();

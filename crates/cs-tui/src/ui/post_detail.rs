@@ -9,7 +9,6 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::StatefulImage;
-use time::OffsetDateTime;
 
 use super::markdown::render_markdown;
 use super::theme::Theme;
@@ -93,8 +92,12 @@ impl PostDetailScreen {
             KeyCode::Char('R') => PostDetailIntent::Reply,
             KeyCode::Char('b') => PostDetailIntent::Bookmark,
             KeyCode::Char('d') => {
-                self.confirming_delete = true;
-                PostDetailIntent::None
+                if crate::config::get().confirm_deletes {
+                    self.confirming_delete = true;
+                    PostDetailIntent::None
+                } else {
+                    PostDetailIntent::DeleteEntryConfirmed
+                }
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 // At the bottom, scrolling down pulls the next page of replies
@@ -194,7 +197,7 @@ impl PostDetailScreen {
         let mut img = self.image.borrow_mut();
         let has_image = img.is_some() && body_area.height > 4;
         let img_h = if has_image {
-            (body_area.height / 2).clamp(1, 20)
+            (body_area.height / 2).clamp(1, crate::config::get().image_height)
         } else {
             0
         };
@@ -271,7 +274,7 @@ impl PostDetailScreen {
         let when = self
             .entry
             .created_at
-            .map(format_full_timestamp)
+            .map(crate::config::format_absolute)
             .unwrap_or_default();
         let topics = if self.entry.topics.is_empty() {
             String::new()
@@ -335,7 +338,7 @@ impl PostDetailScreen {
             };
             let when = reply
                 .created_at
-                .map(format_full_timestamp)
+                .map(crate::config::format_absolute)
                 .unwrap_or_default();
             let parent = if reply.parent_reply_id.is_some() {
                 " · ↪"
@@ -371,19 +374,6 @@ impl PostDetailScreen {
 
         lines
     }
-}
-
-fn format_full_timestamp(t: OffsetDateTime) -> String {
-    let dt = t.date();
-    let tt = t.time();
-    format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}",
-        dt.year(),
-        u8::from(dt.month()),
-        dt.day(),
-        tt.hour(),
-        tt.minute()
-    )
 }
 
 #[cfg(test)]
