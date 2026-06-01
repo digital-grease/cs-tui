@@ -73,6 +73,7 @@ async fn main() -> Result<()> {
     Config::write_template_if_absent(&config_path);
     let cfg = Config::load_from(&config_path);
     config::init(cfg.to_runtime());
+    config::set_config_path(config_path.clone());
     let custom_theme = cfg.custom_theme();
 
     // API base: --api-base / $CS_TUI_API_BASE > config > built-in default.

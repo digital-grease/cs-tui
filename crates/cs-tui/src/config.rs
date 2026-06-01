@@ -117,6 +117,20 @@ pub fn get() -> &'static Runtime {
     RUNTIME.get_or_init(Runtime::default)
 }
 
+static CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Record the resolved config-file path so the UI can show users where it lives.
+/// Call once at startup, alongside [`init`].
+pub fn set_config_path(path: PathBuf) {
+    let _ = CONFIG_PATH.set(path);
+}
+
+/// The active config-file path, if [`set_config_path`] was called (None in tests).
+#[must_use]
+pub fn config_path() -> Option<&'static Path> {
+    CONFIG_PATH.get().map(PathBuf::as_path)
+}
+
 const TEMPLATE: &str = r##"# cs-tui configuration. Edit and restart cs-tui.
 # This file is never overwritten by the app, so your comments are safe.
 # Every option below is shown commented out at its default; uncomment to change.
