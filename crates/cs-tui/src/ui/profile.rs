@@ -603,7 +603,7 @@ impl ProfileScreen {
         let nav_hint = if self.is_root {
             "backspace quit · esc menu"
         } else {
-            "backspace back · esc menu"
+            "backspace back · esc back"
         };
         parts.push(nav_hint.into());
         if self.tab != ProfileTab::Info {

@@ -34,6 +34,7 @@ pub struct TopicFeedScreen {
     pub next_cursor: Option<String>,
     pub loading: bool,
     pub error: Option<String>,
+    pub include_nsfw: bool,
 }
 
 impl TopicFeedScreen {
@@ -45,7 +46,18 @@ impl TopicFeedScreen {
             next_cursor: None,
             loading: true,
             error: None,
+            include_nsfw: crate::config::get().nsfw,
         }
+    }
+
+    /// Indices of entries currently visible after NSFW filtering.
+    fn visible_indices(&self) -> Vec<usize> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| self.include_nsfw || !e.is_nsfw)
+            .map(|(i, _)| i)
+            .collect()
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> TopicFeedIntent {
@@ -58,9 +70,10 @@ impl TopicFeedScreen {
         if self.loading {
             return TopicFeedIntent::None;
         }
+        let visible = self.visible_indices();
         match key.code {
             KeyCode::Char('j') | KeyCode::Down
-                if !self.entries.is_empty() && self.selected < self.entries.len() - 1 =>
+                if !visible.is_empty() && self.selected < visible.len() - 1 =>
             {
                 self.selected += 1;
             }
@@ -73,8 +86,8 @@ impl TopicFeedScreen {
                 self.selected = self.selected.saturating_sub(1);
             }
             KeyCode::Char('g') | KeyCode::Home => self.selected = 0,
-            KeyCode::Char('G') | KeyCode::End if !self.entries.is_empty() => {
-                self.selected = self.entries.len() - 1;
+            KeyCode::Char('G') | KeyCode::End if !visible.is_empty() => {
+                self.selected = visible.len() - 1;
             }
             KeyCode::Char('n') | KeyCode::Char(' ') | KeyCode::PageDown
                 if self.next_cursor.is_some() =>
@@ -91,10 +104,12 @@ impl TopicFeedScreen {
                 return TopicFeedIntent::Refresh;
             }
             KeyCode::Enter => {
-                if let Some(e) = self.entries.get(self.selected) {
-                    return TopicFeedIntent::OpenSelected {
-                        post_id: e.post_id.clone(),
-                    };
+                if let Some(idx) = visible.get(self.selected) {
+                    if let Some(e) = self.entries.get(*idx) {
+                        return TopicFeedIntent::OpenSelected {
+                            post_id: e.post_id.clone(),
+                        };
+                    }
                 }
             }
             _ => {}
@@ -108,7 +123,7 @@ impl TopicFeedScreen {
             Ok((entries, cursor)) => {
                 self.entries = entries;
                 self.next_cursor = cursor;
-                if self.selected >= self.entries.len() {
+                if self.selected >= self.visible_indices().len() {
                     self.selected = 0;
                 }
                 self.error = None;
@@ -143,6 +158,7 @@ impl TopicFeedScreen {
             .constraints([Constraint::Min(1), Constraint::Length(1)])
             .split(inner);
 
+        let visible = self.visible_indices();
         if self.loading && self.entries.is_empty() {
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
@@ -151,12 +167,25 @@ impl TopicFeedScreen {
                 ))),
                 layout[0],
             );
+        } else if !visible.is_empty() {
+            // Keep the list visible even if a load-more failed (the error rides
+            // the status line below); only blank the area for an empty load.
+            let items: Vec<ListItem<'_>> = visible
+                .iter()
+                .map(|i| entry_item(&self.entries[*i], theme))
+                .collect();
+            let list = List::new(items)
+                .highlight_style(theme.accent_style())
+                .highlight_symbol("▌ ");
+            let mut state = ListState::default();
+            state.select(Some(self.selected.min(visible.len().saturating_sub(1))));
+            frame.render_stateful_widget(list, layout[0], &mut state);
         } else if let Some(msg) = &self.error {
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(msg.clone(), theme.error_style()))),
                 layout[0],
             );
-        } else if self.entries.is_empty() {
+        } else {
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     "no entries in this topic",
@@ -164,20 +193,15 @@ impl TopicFeedScreen {
                 ))),
                 layout[0],
             );
-        } else {
-            let items: Vec<ListItem<'_>> =
-                self.entries.iter().map(|e| entry_item(e, theme)).collect();
-            let list = List::new(items)
-                .highlight_style(theme.accent_style())
-                .highlight_symbol("▌ ");
-            let mut state = ListState::default();
-            state.select(Some(
-                self.selected.min(self.entries.len().saturating_sub(1)),
-            ));
-            frame.render_stateful_widget(list, layout[0], &mut state);
         }
 
-        let status_text = if self.loading {
+        let status_text = if !self.loading && !self.entries.is_empty() && self.error.is_some() {
+            // Non-destructive load-more failure: surface inline, keep the list.
+            format!(
+                "⚠ {} · scroll or r to retry",
+                self.error.as_deref().unwrap_or_default()
+            )
+        } else if self.loading {
             "loading… · enter open · r refresh · esc back".to_string()
         } else if self.next_cursor.is_some() {
             format!(
@@ -190,8 +214,13 @@ impl TopicFeedScreen {
                 self.entries.len()
             )
         };
+        let status_style = if !self.loading && !self.entries.is_empty() && self.error.is_some() {
+            theme.error_style()
+        } else {
+            theme.muted_style()
+        };
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(status_text, theme.muted_style()))),
+            Paragraph::new(Line::from(Span::styled(status_text, status_style))),
             layout[1],
         );
     }
@@ -295,6 +324,27 @@ mod tests {
         let intent = s.handle_key(key(KeyCode::Char('j')));
         assert_eq!(intent, TopicFeedIntent::LoadMore);
         assert!(s.loading);
+    }
+
+    #[test]
+    fn nsfw_entries_hidden_by_default() {
+        let mut s = TopicFeedScreen::new("music".into());
+        let mut nsfw = entry("p2");
+        nsfw.is_nsfw = true;
+        s.apply_initial(Ok((vec![entry("p1"), nsfw, entry("p3")], None)));
+        // Default config nsfw=false → the NSFW entry is filtered out.
+        assert_eq!(s.visible_indices(), vec![0, 2]);
+    }
+
+    #[test]
+    fn enter_opens_visible_entry_skipping_nsfw() {
+        let mut s = TopicFeedScreen::new("music".into());
+        let mut nsfw = entry("p2");
+        nsfw.is_nsfw = true;
+        s.apply_initial(Ok((vec![nsfw, entry("p3")], None)));
+        // selected=0 maps to the first VISIBLE entry (p3), not the hidden p2.
+        let intent = s.handle_key(key(KeyCode::Enter));
+        assert_eq!(intent, TopicFeedIntent::OpenSelected { post_id: "p3".into() });
     }
 
     #[test]

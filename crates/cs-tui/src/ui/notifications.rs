@@ -74,10 +74,15 @@ impl NotificationsScreen {
                 return NotificationsIntent::ToggleFilter;
             }
             KeyCode::Char('m') => {
+                // Only mark when actually unread: marking an already-read item
+                // would burn a rate-limited write and wrongly decrement the
+                // global unread count.
                 if let Some(n) = self.items.get(self.selected) {
-                    return NotificationsIntent::MarkSelectedRead {
-                        notification_id: n.notification_id.clone(),
-                    };
+                    if !n.read {
+                        return NotificationsIntent::MarkSelectedRead {
+                            notification_id: n.notification_id.clone(),
+                        };
+                    }
                 }
             }
             KeyCode::Char('M') => return NotificationsIntent::MarkAllRead,
@@ -204,20 +209,9 @@ impl NotificationsScreen {
                 theme.accent_style(),
             )));
             frame.render_widget(para, layout[0]);
-        } else if let Some(msg) = &self.error {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(msg.clone(), theme.error_style()))),
-                layout[0],
-            );
-        } else if self.items.is_empty() {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    "no notifications",
-                    theme.muted_style(),
-                ))),
-                layout[0],
-            );
-        } else {
+        } else if !self.items.is_empty() {
+            // Keep the list visible even if a load-more failed (the error rides
+            // the status line below); only blank the area for an empty load.
             let items: Vec<ListItem<'_>> = self
                 .items
                 .iter()
@@ -229,6 +223,19 @@ impl NotificationsScreen {
             let mut state = ListState::default();
             state.select(Some(self.selected.min(self.items.len().saturating_sub(1))));
             frame.render_stateful_widget(list, layout[0], &mut state);
+        } else if let Some(msg) = &self.error {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(msg.clone(), theme.error_style()))),
+                layout[0],
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "no notifications",
+                    theme.muted_style(),
+                ))),
+                layout[0],
+            );
         }
 
         let status = status_line(self, theme);
@@ -263,7 +270,11 @@ fn notification_item<'a>(n: &'a Notification, theme: &Theme) -> ListItem<'a> {
         Span::styled(summary, theme.base()),
         Span::styled(format!(" · {when}"), theme.muted_style()),
     ]);
-    ListItem::new(vec![header])
+    let mut lines = vec![header];
+    if !crate::config::get().compact {
+        lines.push(Line::from(""));
+    }
+    ListItem::new(lines)
 }
 
 fn summarize(n: &Notification, actor: &str) -> String {
@@ -302,6 +313,16 @@ fn summarize(n: &Notification, actor: &str) -> String {
 }
 
 fn status_line<'a>(s: &'a NotificationsScreen, theme: &Theme) -> Paragraph<'a> {
+    // A load-more failure with items already on screen rides the status line so
+    // the list stays put instead of being replaced by a full-screen error.
+    if !s.loading && !s.items.is_empty() {
+        if let Some(msg) = &s.error {
+            return Paragraph::new(Line::from(Span::styled(
+                format!("⚠ {msg} · scroll or r to retry"),
+                theme.error_style(),
+            )));
+        }
+    }
     let text = if s.loading {
         "loading… · enter open · m mark · M mark-all · f filter · r refresh · esc menu"
             .to_string()
@@ -442,6 +463,19 @@ mod tests {
                 notification_id: "n1".into()
             }
         );
+    }
+
+    #[test]
+    fn m_on_already_read_is_a_noop() {
+        // Marking an already-read item would waste a rate-limited write and
+        // wrongly decrement the global unread count.
+        let mut s = NotificationsScreen::new();
+        s.apply_initial(Ok((
+            vec![notif("n1", NotificationType::Reply, None, None)],
+            None,
+        )));
+        s.mark_local("n1"); // now read
+        assert_eq!(s.handle_key(key(KeyCode::Char('m'))), NotificationsIntent::None);
     }
 
     #[test]

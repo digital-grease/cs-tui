@@ -88,8 +88,14 @@ pub enum BgEvent {
         slug: String,
         result: Result<(Vec<Entry>, Option<String>), String>,
     },
-    DetailRepliesInitial(Result<(Vec<Reply>, Option<String>), String>),
-    DetailRepliesMore(Result<(Vec<Reply>, Option<String>), String>),
+    DetailRepliesInitial {
+        post_id: String,
+        result: Result<(Vec<Reply>, Option<String>), String>,
+    },
+    DetailRepliesMore {
+        post_id: String,
+        result: Result<(Vec<Reply>, Option<String>), String>,
+    },
     OpenPostDetail {
         result: Result<Entry, String>,
         highlight_reply_id: Option<String>,
@@ -698,6 +704,18 @@ impl App {
             } else {
                 self.pop_screen();
             }
+            return;
+        }
+
+        // Backspace mirrors Esc's "back" globally (so the help overlay can
+        // advertise it honestly), but only where there's somewhere to return to.
+        // It's also a text-delete key, so defer to the focused field on input
+        // screens, and it has no menu role at the top level.
+        if key.code == KeyCode::Backspace
+            && !self.screen.accepts_text_input()
+            && !self.back_stack.is_empty()
+        {
+            self.pop_screen();
             return;
         }
 
@@ -1337,14 +1355,20 @@ impl App {
                     }
                 }
             }
-            BgEvent::DetailRepliesInitial(result) => {
+            BgEvent::DetailRepliesInitial { post_id, result } => {
+                // Guard against a stale reply page landing on a different post
+                // (open A, pop, open B before A's replies arrive).
                 if let Screen::PostDetail(s) = &mut self.screen {
-                    s.apply_replies_initial(result);
+                    if s.entry.post_id == post_id {
+                        s.apply_replies_initial(result);
+                    }
                 }
             }
-            BgEvent::DetailRepliesMore(result) => {
+            BgEvent::DetailRepliesMore { post_id, result } => {
                 if let Screen::PostDetail(s) = &mut self.screen {
-                    s.apply_replies_more(result);
+                    if s.entry.post_id == post_id {
+                        s.apply_replies_more(result);
+                    }
                 }
             }
             BgEvent::OpenPostDetail {
@@ -2178,7 +2202,7 @@ impl App {
                 .list_replies(&post_id, None, None)
                 .await
                 .map_err(|e| note_api_err(&tx, e));
-            let _ = tx.send(BgEvent::DetailRepliesInitial(result));
+            let _ = tx.send(BgEvent::DetailRepliesInitial { post_id, result });
         });
     }
 
@@ -2191,7 +2215,7 @@ impl App {
                 .list_replies(&post_id, cursor.as_deref(), None)
                 .await
                 .map_err(|e| note_api_err(&tx, e));
-            let _ = tx.send(BgEvent::DetailRepliesMore(result));
+            let _ = tx.send(BgEvent::DetailRepliesMore { post_id, result });
         });
     }
 
@@ -2750,6 +2774,78 @@ mod tests {
 
     fn key_event(code: KeyCode) -> Event {
         Event::Key(crossterm::event::KeyEvent::new(code, KeyModifiers::empty()))
+    }
+
+    fn test_entry(post_id: &str) -> cs_api::Entry {
+        cs_api::Entry {
+            post_id: post_id.into(),
+            author_id: "u".into(),
+            author_username: "alice".into(),
+            content: "hi".into(),
+            title: None,
+            slug: None,
+            topics: vec![],
+            replies_count: 0,
+            bookmarks_count: 0,
+            is_public: false,
+            is_nsfw: false,
+            attachments: vec![],
+            created_at: None,
+            deleted: false,
+        }
+    }
+
+    fn test_reply(reply_id: &str, post_id: &str) -> cs_api::Reply {
+        cs_api::Reply {
+            reply_id: reply_id.into(),
+            post_id: post_id.into(),
+            author_id: "u".into(),
+            author_username: "alice".into(),
+            content: "yo".into(),
+            parent_reply_id: None,
+            attachments: vec![],
+            created_at: None,
+            deleted: false,
+        }
+    }
+
+    #[test]
+    fn reply_page_for_a_different_post_is_ignored() {
+        // Regression: a stale reply page (open A, pop, open B before A's replies
+        // arrive) used to land on whatever PostDetail was active.
+        let mut app = test_app();
+        app.screen = Screen::PostDetail(PostDetailScreen::new(test_entry("B")));
+
+        app.handle_bg_event(BgEvent::DetailRepliesInitial {
+            post_id: "A".into(),
+            result: Ok((vec![test_reply("r1", "A")], None)),
+        });
+        let Screen::PostDetail(s) = &app.screen else {
+            panic!("expected PostDetail");
+        };
+        assert!(s.replies.is_empty(), "stale page for post A must not land on B");
+
+        // The matching page for B applies normally.
+        app.handle_bg_event(BgEvent::DetailRepliesInitial {
+            post_id: "B".into(),
+            result: Ok((vec![test_reply("r1", "B")], None)),
+        });
+        let Screen::PostDetail(s) = &app.screen else {
+            panic!("expected PostDetail");
+        };
+        assert_eq!(s.replies.len(), 1, "matching reply page should apply");
+    }
+
+    #[tokio::test]
+    async fn backspace_pops_a_pushed_screen() {
+        let mut app = test_app();
+        app.push_screen(Screen::PostDetail(PostDetailScreen::new(test_entry("p1"))));
+        assert!(matches!(app.screen, Screen::PostDetail(_)));
+        app.handle_terminal_event(key_event(KeyCode::Backspace)).await;
+        assert!(
+            !matches!(app.screen, Screen::PostDetail(_)),
+            "backspace should pop a pushed screen (global back)"
+        );
     }
 
     #[tokio::test]
