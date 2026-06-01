@@ -25,6 +25,19 @@ pub fn entry_image_urls(entry: &Entry) -> Vec<String> {
     urls
 }
 
+/// Whether an entry references any image — a markdown `![](url)` link OR an
+/// image attachment. Cheaper than [`entry_image_urls`]: it short-circuits on the
+/// first image instead of building the deduped list. Used to flag posts with
+/// images in list views (the feed snippet only sees markdown, not attachments).
+#[must_use]
+pub fn has_image(entry: &Entry) -> bool {
+    entry
+        .attachments
+        .iter()
+        .any(|a| matches!(a, Attachment::Image { .. }))
+        || Parser::new(&entry.content).any(|ev| matches!(ev, Event::Start(Tag::Image { .. })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -75,5 +88,22 @@ mod tests {
             }],
         );
         assert!(entry_image_urls(&e).is_empty());
+    }
+
+    #[test]
+    fn has_image_detects_markdown_or_attachment() {
+        // markdown image link in content
+        assert!(has_image(&entry("see ![a](https://x/a.png)", vec![])));
+        // text-only content but an image ATTACHMENT (the case the feed missed)
+        assert!(has_image(&entry(
+            "just text",
+            vec![Attachment::Image {
+                src: "https://x/c.png".into(),
+                width: 0,
+                height: 0,
+            }],
+        )));
+        // neither
+        assert!(!has_image(&entry("no images", vec![])));
     }
 }

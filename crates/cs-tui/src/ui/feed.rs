@@ -225,12 +225,17 @@ fn entry_item<'a>(entry: &'a Entry, width: u16, theme: &Theme) -> ListItem<'a> {
         entry.replies_count, entry.bookmarks_count
     );
 
-    let header = Line::from(vec![
+    let mut header_spans = vec![
         Span::styled(format!("@{}", entry.author_username), theme.accent_style()),
         Span::styled(format!(" · {when}{topics}{counts}"), theme.muted_style()),
-    ]);
+    ];
+    // Flag any image (markdown link OR attachment) — the snippet only sees
+    // markdown, so attachment-only posts would otherwise look image-less.
+    if super::images::has_image(entry) {
+        header_spans.push(Span::styled(" · [image]", theme.accent_style()));
+    }
 
-    let mut lines = vec![header];
+    let mut lines = vec![Line::from(header_spans)];
 
     // v0.3.7: surface the entry title (when set) on its own line above the
     // content snippet. Skipped for None/whitespace-only titles.
@@ -245,7 +250,9 @@ fn entry_item<'a>(entry: &'a Entry, width: u16, theme: &Theme) -> ListItem<'a> {
     }
 
     let snippet = super::markdown::content_preview(&entry.content, 200);
-    lines.push(Line::from(Span::styled(snippet, theme.base())));
+    if !snippet.is_empty() {
+        lines.push(Line::from(Span::styled(snippet, theme.base())));
+    }
 
     // Rule between posts so it's clear where one ends and the next begins.
     // `width - 2` accounts for the list's highlight-symbol gutter.
@@ -369,6 +376,22 @@ mod tests {
             !render_entry_item(&without).contains(marker),
             "no title line should render when title is None"
         );
+    }
+
+    #[test]
+    fn entry_item_flags_an_attachment_image() {
+        // The reported bug: a post with text + an image ATTACHMENT (no markdown
+        // image link) showed no `[image]` tag in the feed, yet rendered an image
+        // on open. It must be flagged now.
+        let mut e = entry("a", "alice", false); // content "content of a"
+        e.attachments = vec![cs_api::Attachment::Image {
+            src: "https://x/a.png".into(),
+            width: 0,
+            height: 0,
+        }];
+        let text = render_entry_item(&e);
+        assert!(text.contains("[image]"), "attachment image must be flagged: {text:?}");
+        assert!(text.contains("content of a"), "text snippet still renders");
     }
 
     #[test]
