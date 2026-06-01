@@ -1,8 +1,8 @@
 use ratatui::style::{Color, Modifier, Style};
 
 /// Visual theme. The default is `cyber` (bright green on black), matching the
-/// retro aesthetic of cyberspace.online. Alternate palettes ship as `c64` and
-/// `vt320`.
+/// retro aesthetic of cyberspace.online. Alternate palettes ship as `c64`,
+/// `vt320`, `dark`, and `vapor`.
 #[derive(Debug, Clone)]
 pub struct Theme {
     pub background: Color,
@@ -57,6 +57,25 @@ impl Theme {
             error: Color::LightRed,
             warning: Color::Indexed(214), // amber
             border: Color::Indexed(94),
+        }
+    }
+
+    /// Vaporwave / cyberpunk neon — hot pink and electric cyan over deep indigo.
+    /// Tuned for readability: body text stays a near-white lavender (high contrast
+    /// on the dark background), so the neon is reserved for accents, borders, and
+    /// status colors. `error` (neon red), `accent` (pink), `success` (mint), and
+    /// `warning` (gold) are kept visibly distinct so a toast's meaning reads at a
+    /// glance. Uses truecolor; modern terminals downsample gracefully.
+    pub fn vapor() -> Self {
+        Self {
+            background: Color::Rgb(0x1a, 0x12, 0x2e), // deep indigo
+            foreground: Color::Rgb(0xf2, 0xec, 0xff), // near-white lavender
+            muted: Color::Rgb(0x9a, 0x8c, 0xc4),      // muted lavender-gray
+            accent: Color::Rgb(0xff, 0x5f, 0xd1),     // hot pink
+            success: Color::Rgb(0x5d, 0xff, 0xbf),    // mint
+            error: Color::Rgb(0xff, 0x3b, 0x6b),      // neon red
+            warning: Color::Rgb(0xff, 0xe1, 0x6b),    // pale gold
+            border: Color::Rgb(0x00, 0xe0, 0xff),     // electric cyan
         }
     }
 
@@ -124,13 +143,15 @@ pub enum ThemeKind {
     C64,
     Vt320,
     Dark,
+    Vapor,
     Custom,
 }
 
 impl ThemeKind {
     /// The built-in palettes, in cycle order. (`Custom` is appended by the App
     /// when configured.)
-    pub const ALL: [ThemeKind; 4] = [Self::Cyber, Self::C64, Self::Vt320, Self::Dark];
+    pub const ALL: [ThemeKind; 5] =
+        [Self::Cyber, Self::C64, Self::Vt320, Self::Dark, Self::Vapor];
 
     /// Stable lowercase name — matches the `--theme` flag and the persisted
     /// prefs value.
@@ -140,6 +161,7 @@ impl ThemeKind {
             Self::C64 => "c64",
             Self::Vt320 => "vt320",
             Self::Dark => "dark",
+            Self::Vapor => "vapor",
             Self::Custom => "custom",
         }
     }
@@ -150,6 +172,7 @@ impl ThemeKind {
             "c64" => Self::C64,
             "vt320" => Self::Vt320,
             "dark" => Self::Dark,
+            "vapor" => Self::Vapor,
             "custom" => Self::Custom,
             _ => Self::Cyber,
         }
@@ -164,9 +187,9 @@ impl ThemeKind {
             Self::C64 => Theme::c64(),
             Self::Vt320 => Theme::vt320(),
             Self::Dark => Theme::dark(),
+            Self::Vapor => Theme::vapor(),
         }
     }
-
 }
 
 #[cfg(test)]
@@ -197,5 +220,26 @@ mod tests {
     #[test]
     fn theme_kind_resolves_to_matching_palette() {
         assert_eq!(ThemeKind::C64.theme().accent, Theme::c64().accent);
+    }
+
+    #[test]
+    fn vapor_is_a_built_in_in_the_cycle() {
+        assert!(ThemeKind::ALL.contains(&ThemeKind::Vapor));
+        assert_eq!(ThemeKind::from_name("vapor"), ThemeKind::Vapor);
+        assert_eq!(ThemeKind::Vapor.name(), "vapor");
+        assert_eq!(ThemeKind::Vapor.theme().accent, Theme::vapor().accent);
+    }
+
+    #[test]
+    fn vapor_keeps_status_colors_distinct() {
+        // Usability: a glance at a toast must distinguish meaning, so the accent
+        // and the three status colors must not collide.
+        let t = Theme::vapor();
+        let slots = [t.accent, t.success, t.error, t.warning];
+        for (i, a) in slots.iter().enumerate() {
+            for b in &slots[i + 1..] {
+                assert_ne!(a, b, "vapor status colors must be distinct");
+            }
+        }
     }
 }

@@ -2961,15 +2961,16 @@ mod tests {
     #[test]
     fn custom_theme_joins_the_cycle_when_configured() {
         let mut app = test_app();
-        // No custom palette → only the four built-ins.
-        assert_eq!(app.available_theme_kinds().len(), 4);
+        // No custom palette → only the built-ins.
+        let built_in = ThemeKind::ALL.len();
+        assert_eq!(app.available_theme_kinds().len(), built_in);
         assert!(!app.available_theme_kinds().contains(&ThemeKind::Custom));
 
         // With a custom palette → Custom is appended and resolves to it.
         let custom = Theme::dark();
         app.custom_theme = Some(custom.clone());
         let kinds = app.available_theme_kinds();
-        assert_eq!(kinds.len(), 5);
+        assert_eq!(kinds.len(), built_in + 1);
         assert_eq!(kinds.last(), Some(&ThemeKind::Custom));
         assert_eq!(app.resolve_theme(ThemeKind::Custom).accent, custom.accent);
 
