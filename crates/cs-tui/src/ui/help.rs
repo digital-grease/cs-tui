@@ -31,6 +31,7 @@ const GLOBAL: &[Row] = &[
     Row { keys: "Backspace", desc: "back" },
     Row { keys: "1-8 / ← →", desc: "jump to / cycle sections" },
     Row { keys: "Tab / Shift+Tab", desc: "switch sub-tabs (profile, guild)" },
+    Row { keys: "mouse", desc: "drag to select/copy · click opens links (run --mouse for wheel scroll)" },
     Row { keys: "?", desc: "this help" },
     Row { keys: "Ctrl+C", desc: "quit" },
 ];

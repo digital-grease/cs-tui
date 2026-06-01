@@ -34,6 +34,13 @@ struct Cli {
     /// startup capability query, for a faster launch.
     #[arg(long)]
     no_images: bool,
+
+    /// Capture the scroll wheel for in-app scrolling. OFF by default so the
+    /// terminal keeps native mouse behavior — drag to select/copy text and
+    /// click to open links. With `--mouse`, the wheel scrolls but text
+    /// selection then needs Shift+drag.
+    #[arg(long)]
+    mouse: bool,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -98,12 +105,17 @@ async fn main() -> Result<()> {
     if has_session {
         app.enter_feed_initial();
     }
-    // Button + SGR mouse reporting, but NOT motion tracking: the scroll wheel
-    // yields one event per notch (mapped to one step) without flooding events on
-    // mouse movement. Native text selection still works via Shift+drag.
-    set_mouse_scroll_reporting(true);
+    // By default we do NOT grab the mouse, so the terminal keeps native
+    // selection (drag to copy) and link handling (click to open). `--mouse`
+    // opts into button + SGR scroll-wheel reporting (no motion tracking, so the
+    // wheel is one event per notch); text selection then needs Shift+drag.
+    if cli.mouse {
+        set_mouse_scroll_reporting(true);
+    }
     let run_result = app.run(terminal).await;
-    set_mouse_scroll_reporting(false);
+    if cli.mouse {
+        set_mouse_scroll_reporting(false);
+    }
     ratatui::restore();
 
     run_result
