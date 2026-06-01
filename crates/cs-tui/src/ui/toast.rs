@@ -40,6 +40,18 @@ impl Toast {
         }
     }
 
+    /// A custom-text countdown toast (e.g. "rate limited — posting in (30s)"),
+    /// clamped to a visible range. Auto-dismisses when the countdown elapses.
+    pub fn countdown(text: impl Into<String>, secs: u64) -> Self {
+        let secs = secs.clamp(1, 120);
+        Self {
+            text: text.into(),
+            expires_at: Instant::now() + Duration::from_secs(secs),
+            countdown: true,
+            kind: ToastKind::Warning,
+        }
+    }
+
     /// A brief positive confirmation (e.g. "bookmarked").
     pub fn confirmation(text: impl Into<String>) -> Self {
         Self {

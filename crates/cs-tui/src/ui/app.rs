@@ -6,9 +6,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use cs_api::{
-    ApiError, Bookmark, Client, Entry, Follow, FollowsDirection, Guild, GuildMembership,
-    GuildThread, JoinedGuild, Note, NoteRevision, Notification, NotificationsFilter, ProfileUpdate,
-    Reply, Settings, SettingsUpdate, Topic, User,
+    ApiError, Bookmark, Client, EndpointKey, Entry, Follow, FollowsDirection, Guild,
+    GuildMembership, GuildThread, JoinedGuild, Note, NoteRevision, Notification, NotificationsFilter,
+    ProfileUpdate, Reply, Settings, SettingsUpdate, Topic, User,
 };
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::DefaultTerminal;
@@ -88,6 +88,10 @@ pub enum BgEvent {
         topics: Vec<Topic>,
         complete: bool,
     },
+    /// The user's followed/muted topic slugs, fetched from settings.
+    TopicPrefsLoaded(Result<(Vec<String>, Vec<String>), String>),
+    /// Result of a follow/mute PATCH; on failure we resync from the server.
+    TopicPrefsSaved(Result<(), String>),
     TopicFeedInitial {
         slug: String,
         result: Result<(Vec<Entry>, Option<String>), String>,
@@ -249,6 +253,12 @@ enum Action {
     },
     TopicsRefresh,
     TopicOpen {
+        slug: String,
+    },
+    ToggleTopicFollow {
+        slug: String,
+    },
+    ToggleTopicMute {
         slug: String,
     },
     TopicFeedRefresh {
@@ -418,6 +428,13 @@ pub struct App {
     /// Bumped on refresh to invalidate the in-flight warm-up task (its remaining
     /// pages are discarded by epoch check) before a fresh one starts.
     topics_epoch: Arc<AtomicU64>,
+    /// The user's followed / muted topic slugs (from settings), used for the
+    /// topics-list markers and the follow/mute toggles. Loaded lazily the first
+    /// time the topics section is opened.
+    topic_follows: Vec<String>,
+    topic_mutes: Vec<String>,
+    /// True once we've fetched the follow/mute prefs (reset to retry on failure).
+    topic_prefs_loaded: bool,
 }
 
 impl App {
@@ -459,6 +476,9 @@ impl App {
             topics_cache: Vec::new(),
             topics_complete: false,
             topics_epoch: Arc::new(AtomicU64::new(0)),
+            topic_follows: Vec::new(),
+            topic_mutes: Vec::new(),
+            topic_prefs_loaded: false,
         }
     }
 
@@ -828,6 +848,8 @@ impl App {
                 TopicsIntent::Quit => Action::Quit,
                 TopicsIntent::Refresh => Action::TopicsRefresh,
                 TopicsIntent::OpenSelected { slug } => Action::TopicOpen { slug },
+                TopicsIntent::ToggleFollow { slug } => Action::ToggleTopicFollow { slug },
+                TopicsIntent::ToggleMute { slug } => Action::ToggleTopicMute { slug },
                 TopicsIntent::None => Action::None,
             },
             Screen::TopicFeed(s) => match s.handle_key(key) {
@@ -1052,6 +1074,9 @@ impl App {
                 self.spawn_notifications_more(filter, cursor);
             }
             Action::NotificationsMarkOne { notification_id } => {
+                if self.block_write_if_offline() {
+                    return;
+                }
                 if let Screen::Notifications(s) = &mut self.screen {
                     s.mark_local(&notification_id);
                 }
@@ -1059,6 +1084,9 @@ impl App {
                 self.spawn_mark_notification_read(notification_id);
             }
             Action::NotificationsMarkAll => {
+                if self.block_write_if_offline() {
+                    return;
+                }
                 if let Screen::Notifications(s) = &mut self.screen {
                     s.mark_all_local();
                 }
@@ -1068,6 +1096,9 @@ impl App {
             Action::BookmarksRefresh => self.spawn_bookmarks_initial(),
             Action::BookmarksMore { cursor } => self.spawn_bookmarks_more(cursor),
             Action::BookmarkRemove { bookmark_id } => {
+                if self.block_write_if_offline() {
+                    return;
+                }
                 if let Screen::Bookmarks(s) = &mut self.screen {
                     s.remove_local(&bookmark_id);
                 }
@@ -1082,11 +1113,46 @@ impl App {
                     s.set_topics(Vec::new(), false);
                 }
                 self.spawn_topics_prefetch();
+                // Refresh the follow/mute prefs too.
+                self.topic_prefs_loaded = true;
+                self.spawn_topic_prefs_load();
             }
             Action::TopicOpen { slug } => {
                 let new_screen = Screen::TopicFeed(TopicFeedScreen::new(slug.clone()));
                 self.push_screen(new_screen);
                 self.spawn_topic_feed_initial(&slug);
+            }
+            Action::ToggleTopicFollow { slug } => {
+                if self.block_write_if_offline() {
+                    return;
+                }
+                // Optimistic toggle; the marker flipping is the feedback. A failed
+                // PATCH resyncs from the server (see TopicPrefsSaved).
+                if self.topic_follows.contains(&slug) {
+                    self.topic_follows.retain(|s| *s != slug);
+                } else {
+                    self.topic_follows.push(slug);
+                }
+                self.push_topic_prefs();
+                self.spawn_save_topic_prefs(SettingsUpdate {
+                    followed_topics: Some(self.topic_follows.clone()),
+                    ..Default::default()
+                });
+            }
+            Action::ToggleTopicMute { slug } => {
+                if self.block_write_if_offline() {
+                    return;
+                }
+                if self.topic_mutes.contains(&slug) {
+                    self.topic_mutes.retain(|s| *s != slug);
+                } else {
+                    self.topic_mutes.push(slug);
+                }
+                self.push_topic_prefs();
+                self.spawn_save_topic_prefs(SettingsUpdate {
+                    muted_topics: Some(self.topic_mutes.clone()),
+                    ..Default::default()
+                });
             }
             Action::TopicFeedRefresh { slug } => self.spawn_topic_feed_initial(&slug),
             Action::TopicFeedMore { slug, cursor } => self.spawn_topic_feed_more(&slug, cursor),
@@ -1161,6 +1227,9 @@ impl App {
                 self.spawn_profile_tab_fetch(tab, username, user_id, None);
             }
             Action::ProfileToggleFollow { user_id, follow_id } => {
+                if self.block_write_if_offline() {
+                    return;
+                }
                 if let Screen::Profile(s) = &mut self.screen {
                     s.follow_action_pending = true;
                 }
@@ -1189,6 +1258,9 @@ impl App {
                     .await;
             }
             Action::BookmarkPost { post_id } => {
+                if self.block_write_if_offline() {
+                    return;
+                }
                 self.spawn_bookmark_post(post_id);
             }
             Action::StartComposeReply {
@@ -1206,6 +1278,7 @@ impl App {
                 .await;
             }
             Action::ComposeSubmit => {
+                self.warn_if_compose_throttled();
                 self.spawn_compose_submit();
             }
             Action::DeleteEntry { post_id } => {
@@ -1376,6 +1449,27 @@ impl App {
                     if let Screen::Topics(s) = &mut self.screen {
                         s.set_topics(self.topics_cache.clone(), self.topics_complete);
                     }
+                }
+            }
+            BgEvent::TopicPrefsLoaded(result) => match result {
+                Ok((follows, mutes)) => {
+                    self.topic_follows = follows;
+                    self.topic_mutes = mutes;
+                    self.topic_prefs_loaded = true;
+                    self.push_topic_prefs();
+                }
+                Err(msg) => {
+                    // Allow a retry next time the section opens / on refresh.
+                    self.topic_prefs_loaded = false;
+                    tracing::warn!(error = %msg, "topic prefs load failed");
+                }
+            },
+            BgEvent::TopicPrefsSaved(result) => {
+                if let Err(msg) = result {
+                    // The optimistic toggle didn't persist — resync from server.
+                    self.warn_toast_unless_signalled("couldn't update topic");
+                    tracing::warn!(error = %msg, "topic prefs save failed");
+                    self.spawn_topic_prefs_load();
                 }
             }
             BgEvent::TopicFeedInitial { slug, result } => {
@@ -1818,6 +1912,44 @@ impl App {
         }
     }
 
+    /// Short-circuit an optimistic write while we know we're offline: give the
+    /// user instant feedback instead of an optimistic flicker that rolls back a
+    /// few seconds later (or a hang until the request times out). Returns true
+    /// when the caller should skip the action.
+    fn block_write_if_offline(&mut self) -> bool {
+        if self.offline {
+            self.toast = Some(Toast::warning("you're offline — try again when reconnected"));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// When a compose submit would block on the client-side write limiter, show
+    /// a visible countdown instead of letting `acquire` hang silently. The post
+    /// still sends once the window opens.
+    fn warn_if_compose_throttled(&mut self) {
+        let (key, verb) = match &self.screen {
+            Screen::Compose(s) => match &s.kind {
+                ComposeKind::NewEntry => (EndpointKey::EntriesCreate, "posting"),
+                ComposeKind::Reply { .. } => (EndpointKey::RepliesCreate, "replying"),
+                ComposeKind::NewNote => (EndpointKey::NotesCreate, "saving"),
+                ComposeKind::UpdateNote { .. } => (EndpointKey::NotesUpdate, "saving"),
+                ComposeKind::GuildThread { .. } => (EndpointKey::GuildsThreadsCreate, "posting"),
+            },
+            _ => return,
+        };
+        let secs = self.client.time_until_writable(key).as_secs();
+        if secs == 0 {
+            return;
+        }
+        self.toast = Some(if secs <= 90 {
+            Toast::countdown(format!("rate limited — {verb} in"), secs)
+        } else {
+            Toast::warning(format!("rate limit reached — try {verb} again later"))
+        });
+    }
+
     /// If a background call proved the session is dead, log out and surface the
     /// reason on the login screen. Runs in the async loop because `logout`
     /// awaits; the sync bg handler only sets `pending_logout`.
@@ -1886,7 +2018,13 @@ impl App {
                 // while open via `TopicsPrefetched`); the screen never fetches.
                 let mut s = TopicsScreen::new();
                 s.set_topics(self.topics_cache.clone(), self.topics_complete);
+                s.set_topic_prefs(self.topic_follows.clone(), self.topic_mutes.clone());
                 self.screen = Screen::Topics(s);
+                // Lazily fetch follow/mute prefs the first time topics is opened.
+                if !self.topic_prefs_loaded {
+                    self.topic_prefs_loaded = true;
+                    self.spawn_topic_prefs_load();
+                }
             }
             RootKind::Profile => {
                 self.screen = Screen::Profile(ProfileScreen::new_own());
@@ -2644,6 +2782,47 @@ impl App {
         });
     }
 
+    /// Push the current follow/mute sets into the topics screen, if it's active.
+    fn push_topic_prefs(&mut self) {
+        if let Screen::Topics(s) = &mut self.screen {
+            s.set_topic_prefs(self.topic_follows.clone(), self.topic_mutes.clone());
+        }
+    }
+
+    /// Fetch the user's followed/muted topic slugs from settings (lazy, once).
+    fn spawn_topic_prefs_load(&self) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .get_settings()
+                .await
+                .map(|s| {
+                    (
+                        s.followed_topics.unwrap_or_default(),
+                        s.muted_topics.unwrap_or_default(),
+                    )
+                })
+                .map_err(|e| note_api_err(&tx, e));
+            let _ = tx.send(BgEvent::TopicPrefsLoaded(result));
+        });
+    }
+
+    /// PATCH a follow/mute change to settings (the optimistic local change was
+    /// already applied; a failure triggers a resync).
+    fn spawn_save_topic_prefs(&self, update: SettingsUpdate) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .update_settings(&update)
+                .await
+                .map(|_| ())
+                .map_err(|e| note_api_err(&tx, e));
+            let _ = tx.send(BgEvent::TopicPrefsSaved(result));
+        });
+    }
+
     fn spawn_delete_note(&self, note_id: String) {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
@@ -2940,6 +3119,67 @@ mod tests {
         assert!(app.toast.is_some(), "a failed removal should warn the user");
     }
 
+    #[tokio::test]
+    async fn toggling_topic_follow_updates_state_optimistically() {
+        let mut app = test_app();
+        let mut s = TopicsScreen::new();
+        s.set_topics(
+            vec![cs_api::Topic {
+                slug: "music".into(),
+                post_count: 1,
+            }],
+            true,
+        );
+        app.screen = Screen::Topics(s);
+        app.current_root = Some(RootKind::Topics);
+
+        app.handle_terminal_event(key_event(KeyCode::Char('f'))).await;
+        assert!(
+            app.topic_follows.iter().any(|s| s == "music"),
+            "follow applied optimistically"
+        );
+
+        app.handle_terminal_event(key_event(KeyCode::Char('f'))).await;
+        assert!(
+            !app.topic_follows.iter().any(|s| s == "music"),
+            "pressing f again unfollows"
+        );
+    }
+
+    #[test]
+    fn topic_prefs_loaded_populates_state() {
+        let mut app = test_app();
+        app.screen = Screen::Topics(TopicsScreen::new());
+        app.handle_bg_event(BgEvent::TopicPrefsLoaded(Ok((
+            vec!["music".into()],
+            vec!["spam".into()],
+        ))));
+        assert_eq!(app.topic_follows, vec!["music".to_string()]);
+        assert_eq!(app.topic_mutes, vec!["spam".to_string()]);
+        assert!(app.topic_prefs_loaded);
+    }
+
+    #[tokio::test]
+    async fn offline_blocks_an_optimistic_write_with_a_toast() {
+        let mut app = test_app();
+        let mut screen = NotificationsScreen::new();
+        screen.apply_initial(Ok((vec![test_notification("n1")], None)));
+        app.screen = Screen::Notifications(screen);
+        app.current_root = Some(RootKind::Notifications);
+        app.unread_count = 3;
+        app.offline = true;
+
+        // `m` on the unread item would normally mark it read optimistically.
+        app.handle_terminal_event(key_event(KeyCode::Char('m'))).await;
+
+        let Screen::Notifications(s) = &app.screen else {
+            panic!("expected Notifications");
+        };
+        assert!(!s.items[0].read, "offline write must not optimistically mark");
+        assert_eq!(app.unread_count, 3, "unread count unchanged while offline");
+        assert!(app.toast.is_some(), "offline write surfaces a toast");
+    }
+
     #[test]
     fn rate_limit_countdown_is_not_clobbered_by_a_failure_event() {
         // The ApiSignal (rate-limit countdown) is queued just ahead of the
@@ -3196,8 +3436,9 @@ mod tests {
         assert!(app.toast.is_some(), "a failed bookmark should warn");
     }
 
-    #[test]
-    fn topics_prefetch_fills_cache_and_revisit_uses_it() {
+    #[tokio::test]
+    async fn topics_prefetch_fills_cache_and_revisit_uses_it() {
+        // tokio runtime needed: revisiting Topics now lazily spawns a prefs load.
         let mut app = test_app();
         app.screen = Screen::Topics(TopicsScreen::new());
         app.current_root = Some(RootKind::Topics);
