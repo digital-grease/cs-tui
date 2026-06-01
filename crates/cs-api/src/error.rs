@@ -104,6 +104,43 @@ impl ApiError {
             _ => None,
         }
     }
+
+    /// A short, human-facing message suitable for a toast or status line —
+    /// unlike `Display`, it omits status codes and Rust error chains. For
+    /// validation/conflict errors the server's own message is usually the most
+    /// helpful text, so it's preserved when present.
+    #[must_use]
+    pub fn user_message(&self) -> String {
+        let server_or = |message: &str, fallback: &str| {
+            let m = message.trim();
+            if m.is_empty() {
+                fallback.to_string()
+            } else {
+                m.to_string()
+            }
+        };
+        match self {
+            Self::Api { code, message, .. } => match code {
+                ErrorCode::ValidationError => server_or(message, "that didn't pass validation"),
+                ErrorCode::Conflict => server_or(message, "that already exists"),
+                ErrorCode::NotFound => "not found".to_string(),
+                ErrorCode::Forbidden => "you're not allowed to do that".to_string(),
+                ErrorCode::Banned => "your account is banned".to_string(),
+                ErrorCode::Unauthorized => "session expired — please sign in again".to_string(),
+                ErrorCode::RateLimited => "rate limited — slow down a moment".to_string(),
+                ErrorCode::InternalError => "the server hit an error — try again".to_string(),
+                ErrorCode::Unknown => server_or(message, "something went wrong"),
+            },
+            Self::RateLimited { retry_after_secs } => {
+                format!("rate limited — retry after {retry_after_secs}s")
+            }
+            Self::Unauthorized => "session expired — please sign in again".to_string(),
+            Self::NotImplemented => "not available yet".to_string(),
+            Self::Transport(_) => "can't reach the server — check your connection".to_string(),
+            Self::Decode(_) => "the server sent something unexpected".to_string(),
+            Self::Config(m) => format!("configuration problem: {m}"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -145,6 +182,42 @@ mod tests {
             None,
             "the envelope-coded form carries no retry hint"
         );
+    }
+
+    #[test]
+    fn user_message_is_friendly_and_keeps_server_detail() {
+        // Transport errors never leak the reqwest chain to users.
+        let t = ApiError::Config("x".into()); // stand-in non-transport
+        assert!(!t.user_message().contains("api "));
+
+        // Validation/conflict keep the server's specific message when present…
+        let v = ApiError::Api {
+            code: ErrorCode::ValidationError,
+            message: "Content cannot be empty".into(),
+            status: 400,
+        };
+        assert_eq!(v.user_message(), "Content cannot be empty");
+
+        // …and fall back to friendly copy when the server said nothing.
+        let v_empty = ApiError::Api {
+            code: ErrorCode::ValidationError,
+            message: String::new(),
+            status: 400,
+        };
+        assert_eq!(v_empty.user_message(), "that didn't pass validation");
+
+        // Status codes / "api CODE (404)" never appear in the user copy.
+        let nf = ApiError::Api {
+            code: ErrorCode::NotFound,
+            message: "x".into(),
+            status: 404,
+        };
+        assert_eq!(nf.user_message(), "not found");
+
+        // Rate-limit keeps the retry hint (and the "retry after Ns" phrasing).
+        assert!(ApiError::RateLimited { retry_after_secs: 12 }
+            .user_message()
+            .contains("retry after 12s"));
     }
 
     #[test]

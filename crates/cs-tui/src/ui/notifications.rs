@@ -178,6 +178,16 @@ impl NotificationsScreen {
         }
     }
 
+    /// Undo a `mark_local` when the server rejected the mark.
+    pub fn unmark_local(&mut self, notification_id: &str) {
+        for n in &mut self.items {
+            if n.notification_id == notification_id {
+                n.read = false;
+                break;
+            }
+        }
+    }
+
     /// Optimistically mark every notification as read in local state.
     pub fn mark_all_local(&mut self) {
         for n in &mut self.items {
