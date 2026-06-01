@@ -21,6 +21,14 @@ pub enum TopicsIntent {
     OpenSelected {
         slug: String,
     },
+    /// Follow/unfollow the selected topic (PATCHes `followedTopics`).
+    ToggleFollow {
+        slug: String,
+    },
+    /// Mute/unmute the selected topic (PATCHes `mutedTopics`).
+    ToggleMute {
+        slug: String,
+    },
     Quit,
     None,
 }
@@ -39,6 +47,11 @@ pub struct TopicsScreen {
     /// Browse selection saved when the search box opens, restored if it's closed
     /// without picking a result — so an aborted `/` doesn't lose your place.
     pre_search_selected: usize,
+    /// Slugs the user follows / mutes (from settings), for markers + filtering.
+    follows: Vec<String>,
+    mutes: Vec<String>,
+    /// When true, the list narrows to followed topics only (the `F` toggle).
+    followed_only: bool,
 }
 
 impl TopicsScreen {
@@ -50,7 +63,35 @@ impl TopicsScreen {
             complete: false,
             filter: None,
             pre_search_selected: 0,
+            follows: Vec::new(),
+            mutes: Vec::new(),
+            followed_only: false,
         }
+    }
+
+    /// Install the user's followed/muted topic slugs (from settings).
+    pub fn set_topic_prefs(&mut self, follows: Vec<String>, mutes: Vec<String>) {
+        self.follows = follows;
+        self.mutes = mutes;
+        let view_len = self.view().len();
+        if view_len > 0 && self.selected >= view_len {
+            self.selected = view_len - 1;
+        }
+    }
+
+    fn is_followed(&self, slug: &str) -> bool {
+        self.follows.iter().any(|s| s == slug)
+    }
+
+    fn is_muted(&self, slug: &str) -> bool {
+        self.mutes.iter().any(|s| s == slug)
+    }
+
+    /// Slug at the current selection (resolved through the active view).
+    fn selected_slug(&self) -> Option<String> {
+        self.view()
+            .get(self.selected)
+            .map(|&i| self.items[i].slug.clone())
     }
 
     /// Push the latest cache snapshot in from the App as the background warm-up
@@ -71,20 +112,26 @@ impl TopicsScreen {
         self.filter.is_some()
     }
 
-    /// Indices into `items` matching the current filter (all when not filtering).
+    /// Indices into `items` matching the active filters: the `/` search query
+    /// and the `F` followed-only toggle (both optional, applied together).
     fn view(&self) -> Vec<usize> {
-        match &self.filter {
-            Some(q) if !q.is_empty() => {
-                let q = q.to_lowercase();
-                self.items
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, t)| t.slug.to_lowercase().contains(&q))
-                    .map(|(i, _)| i)
-                    .collect()
-            }
-            _ => (0..self.items.len()).collect(),
-        }
+        let query = match &self.filter {
+            Some(q) if !q.is_empty() => Some(q.to_lowercase()),
+            _ => None,
+        };
+        self.items
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| {
+                let matches_query = match &query {
+                    Some(q) => t.slug.to_lowercase().contains(q),
+                    None => true,
+                };
+                let matches_followed = !self.followed_only || self.is_followed(&t.slug);
+                matches_query && matches_followed
+            })
+            .map(|(i, _)| i)
+            .collect()
     }
 
     /// Exit the search box, clearing the query and restoring the pre-search
@@ -140,8 +187,10 @@ impl TopicsScreen {
             return TopicsIntent::None;
         }
 
-        // Browse mode — navigate the (possibly still-filling) list.
-        let len = self.items.len();
+        // Browse mode — navigate the (possibly still-filling) list. Bounds and
+        // selection resolve through `view()`, which honors the followed-only
+        // toggle as well as any search query.
+        let len = self.view().len();
         match key.code {
             KeyCode::Char('/') => {
                 // Keep the current selection (empty query shows all), but
@@ -159,15 +208,27 @@ impl TopicsScreen {
             KeyCode::Char('G') | KeyCode::End if len > 0 => {
                 self.selected = len - 1;
             }
+            KeyCode::Char('f') => {
+                if let Some(slug) = self.selected_slug() {
+                    return TopicsIntent::ToggleFollow { slug };
+                }
+            }
+            KeyCode::Char('m') => {
+                if let Some(slug) = self.selected_slug() {
+                    return TopicsIntent::ToggleMute { slug };
+                }
+            }
+            KeyCode::Char('F') => {
+                self.followed_only = !self.followed_only;
+                self.selected = 0;
+            }
             KeyCode::Char('r') => {
                 self.selected = 0;
                 return TopicsIntent::Refresh;
             }
             KeyCode::Enter => {
-                if let Some(t) = self.items.get(self.selected) {
-                    return TopicsIntent::OpenSelected {
-                        slug: t.slug.clone(),
-                    };
+                if let Some(slug) = self.selected_slug() {
+                    return TopicsIntent::OpenSelected { slug };
                 }
             }
             _ => {}
@@ -200,6 +261,8 @@ impl TopicsScreen {
         } else if view.is_empty() {
             let msg = if self.is_filtering() {
                 "no matching topics"
+            } else if self.followed_only {
+                "no followed topics yet — press f on a topic to follow"
             } else {
                 "no topics"
             };
@@ -210,7 +273,10 @@ impl TopicsScreen {
         } else {
             let items: Vec<ListItem<'_>> = view
                 .iter()
-                .map(|&i| topic_item(&self.items[i], theme))
+                .map(|&i| {
+                    let t = &self.items[i];
+                    topic_item(t, self.is_followed(&t.slug), self.is_muted(&t.slug), theme)
+                })
                 .collect();
             let list = List::new(items)
                 .highlight_style(theme.accent_style())
@@ -229,9 +295,14 @@ impl TopicsScreen {
                 view.len(),
                 if view.len() == 1 { "" } else { "es" },
             )
+        } else if self.followed_only {
+            format!(
+                "{} followed{warming} · f unfollow · m mute · F show all · enter open · esc menu",
+                view.len()
+            )
         } else {
             format!(
-                "{} topics{warming} · / search · enter open · r refresh · esc menu",
+                "{} topics{warming} · / search · f follow · m mute · F followed · enter open · esc menu",
                 self.items.len()
             )
         };
@@ -246,12 +317,26 @@ impl Default for TopicsScreen {
     }
 }
 
-fn topic_item<'a>(t: &'a Topic, theme: &Theme) -> ListItem<'a> {
-    let line = Line::from(vec![
-        Span::styled(format!("#{}", t.slug), theme.accent_style()),
-        Span::styled(format!("  ({} posts)", t.post_count), theme.muted_style()),
-    ]);
-    ListItem::new(vec![line])
+fn topic_item<'a>(t: &'a Topic, followed: bool, muted: bool, theme: &Theme) -> ListItem<'a> {
+    let mut spans = Vec::new();
+    if followed {
+        spans.push(Span::styled("★ ", theme.warning_style()));
+    }
+    // A muted topic reads dimmed (its posts are hidden from your feed server-side).
+    let slug_style = if muted {
+        theme.muted_style()
+    } else {
+        theme.accent_style()
+    };
+    spans.push(Span::styled(format!("#{}", t.slug), slug_style));
+    spans.push(Span::styled(
+        format!("  ({} posts)", t.post_count),
+        theme.muted_style(),
+    ));
+    if muted {
+        spans.push(Span::styled(" · muted", theme.muted_style()));
+    }
+    ListItem::new(vec![Line::from(spans)])
 }
 
 #[cfg(test)]
@@ -390,6 +475,79 @@ mod tests {
         assert_eq!(s.selected, 0);
         assert!(s.clear_filter()); // Esc closes the box
         assert_eq!(s.selected, 2, "aborting a search returns to the browse spot");
+    }
+
+    fn render_topics_to_string(s: &TopicsScreen) -> String {
+        let theme = Theme::cyber();
+        let backend = ratatui::backend::TestBackend::new(60, 8);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| s.render(f, f.area(), &theme)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn f_and_m_emit_toggle_intents_for_selected() {
+        let mut s = TopicsScreen::new();
+        s.set_topics(vec![topic("music", 5), topic("linux", 9)], true);
+        s.selected = 1;
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('f'))),
+            TopicsIntent::ToggleFollow {
+                slug: "linux".into()
+            }
+        );
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('m'))),
+            TopicsIntent::ToggleMute {
+                slug: "linux".into()
+            }
+        );
+    }
+
+    #[test]
+    fn capital_f_narrows_to_followed_topics() {
+        let mut s = TopicsScreen::new();
+        s.set_topics(
+            vec![topic("music", 5), topic("linux", 9), topic("art", 3)],
+            true,
+        );
+        s.set_topic_prefs(vec!["linux".into()], vec![]);
+
+        // Followed-only: only #linux remains, so Enter (at index 0) opens it.
+        s.handle_key(key(KeyCode::Char('F')));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            TopicsIntent::OpenSelected {
+                slug: "linux".into()
+            }
+        );
+
+        // Toggle back to all; index 2 is #art.
+        s.handle_key(key(KeyCode::Char('F')));
+        s.selected = 2;
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            TopicsIntent::OpenSelected {
+                slug: "art".into()
+            }
+        );
+    }
+
+    #[test]
+    fn followed_topic_renders_a_star() {
+        let mut s = TopicsScreen::new();
+        s.set_topics(vec![topic("music", 5)], true);
+        s.set_topic_prefs(vec!["music".into()], vec![]);
+        assert!(
+            render_topics_to_string(&s).contains('★'),
+            "a followed topic should show a star marker"
+        );
     }
 
     #[test]

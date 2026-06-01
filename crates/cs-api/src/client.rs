@@ -113,6 +113,15 @@ impl Client {
         &self.inner.base
     }
 
+    /// How long until a request to `key` would be allowed by the client-side
+    /// rate limiter, without consuming a token. Lets the UI show a countdown or
+    /// disable a submit instead of letting `acquire` hang silently. Zero when
+    /// writable now (or the endpoint is unlimited / untouched).
+    #[must_use]
+    pub fn time_until_writable(&self, key: EndpointKey) -> Duration {
+        self.inner.limiter.peek_wait(key)
+    }
+
     /// Returns a clone of the current tokens. Returns the default (empty) tokens
     /// before login.
     pub async fn tokens(&self) -> Tokens {

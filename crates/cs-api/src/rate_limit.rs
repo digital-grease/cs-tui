@@ -73,6 +73,23 @@ impl Bucket {
             Duration::from_secs_f64((1.0 - self.tokens) / self.refill_per_sec)
         }
     }
+
+    /// Token count projected to `now` *without* committing the refill — for a
+    /// read-only wait estimate.
+    fn projected_tokens(&self, now: Instant) -> f64 {
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        (self.tokens + elapsed * self.refill_per_sec).min(self.capacity)
+    }
+
+    /// Non-mutating [`wait_for_one`] evaluated at `now`.
+    fn wait_for_one_at(&self, now: Instant) -> Duration {
+        let tokens = self.projected_tokens(now);
+        if tokens >= 1.0 {
+            Duration::ZERO
+        } else {
+            Duration::from_secs_f64((1.0 - tokens) / self.refill_per_sec)
+        }
+    }
 }
 
 type BucketPair = (Option<Bucket>, Option<Bucket>);
@@ -100,6 +117,26 @@ impl EndpointLimiter {
             }
             tokio::time::sleep(wait).await;
         }
+    }
+
+    /// Non-mutating estimate of the wait until one token is available for `key`,
+    /// without consuming it. Zero if writable now, or if the endpoint is
+    /// unlimited or has never been touched (its bucket starts full).
+    pub fn peek_wait(&self, key: EndpointKey) -> Duration {
+        let buckets = self.buckets.lock().expect("rate-limit mutex poisoned");
+        let Some(entry) = buckets.get(&key) else {
+            return Duration::ZERO;
+        };
+        let now = Instant::now();
+        let wait_min = entry
+            .0
+            .as_ref()
+            .map_or(Duration::ZERO, |b| b.wait_for_one_at(now));
+        let wait_day = entry
+            .1
+            .as_ref()
+            .map_or(Duration::ZERO, |b| b.wait_for_one_at(now));
+        wait_min.max(wait_day)
     }
 
     fn try_take_or_wait(&self, key: EndpointKey) -> Duration {
@@ -155,6 +192,26 @@ mod tests {
         let start = Instant::now();
         limiter.acquire(EndpointKey::AuthLogin).await;
         assert!(start.elapsed() < Duration::from_millis(50));
+    }
+
+    #[tokio::test]
+    async fn peek_wait_estimates_without_consuming() {
+        let limiter = EndpointLimiter::new();
+        // Untouched bucket starts full → writable now.
+        assert_eq!(limiter.peek_wait(EndpointKey::EntriesCreate), Duration::ZERO);
+        // Unlimited endpoints are always writable.
+        assert_eq!(limiter.peek_wait(EndpointKey::AuthLogin), Duration::ZERO);
+
+        // Drain the 2/min bucket.
+        limiter.acquire(EndpointKey::EntriesCreate).await;
+        limiter.acquire(EndpointKey::EntriesCreate).await;
+
+        // Peek reports the wait and, crucially, does NOT consume — so two reads
+        // in a row return the same (non-zero) estimate.
+        let w1 = limiter.peek_wait(EndpointKey::EntriesCreate);
+        let w2 = limiter.peek_wait(EndpointKey::EntriesCreate);
+        assert!(w1 > Duration::from_secs(20), "expected ~30s, got {w1:?}");
+        assert!(w2 > Duration::from_secs(20), "peek must not consume a token");
     }
 
     #[tokio::test]
