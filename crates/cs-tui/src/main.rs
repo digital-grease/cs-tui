@@ -21,9 +21,9 @@ struct Cli {
     #[arg(long, env = "CS_TUI_API_BASE")]
     api_base: Option<String>,
 
-    /// Color theme: cyber (default), c64, vt320, dark, or custom (define the
-    /// palette in config.toml). Overrides the saved preference for this run; the
-    /// theme is also remembered between runs.
+    /// Color theme: cyber (default), c64, vt320, dark, vapor, or custom (define
+    /// the palette in config.toml). Overrides the saved preference for this run;
+    /// the theme is also remembered between runs.
     #[arg(long, env = "CS_TUI_THEME")]
     theme: Option<String>,
 

@@ -138,7 +138,7 @@ const TEMPLATE: &str = r##"# cs-tui configuration. Edit and restart cs-tui.
 
 # ── Appearance ───────────────────────────────────────────────────────────────
 
-# Default theme: cyber | c64 | vt320 | dark | custom
+# Default theme: cyber | c64 | vt320 | dark | vapor | custom
 # (You can also cycle themes at runtime via the Esc menu; that choice is
 #  remembered separately and overrides this on the next launch.)
 #theme = "cyber"
