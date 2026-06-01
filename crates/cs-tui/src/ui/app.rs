@@ -197,12 +197,10 @@ impl Screen {
     fn accepts_text_input(&self) -> bool {
         match self {
             Screen::Login(_) | Screen::Compose(_) | Screen::EditProfile(_) => true,
-            // Settings is a form: only capture global nav keys while a free-text
-            // field is actually being edited, so 1-8 / Tab / ←→ still leave the
-            // screen when a toggle is focused (j/k / ↑↓ move between fields).
-            Screen::Settings(s) => s.is_editing_text(),
             // The topics search box captures printable keys while open.
             Screen::Topics(s) => s.is_filtering(),
+            // Settings has only toggles, cyclable choices, and read-only fields —
+            // no free text — so global nav (1-8 / ←→) always stays active there.
             _ => false,
         }
     }
@@ -710,10 +708,10 @@ impl App {
         }
 
         // Section nav: ←/→ cycle and 1-8 jump, but only on screens that don't
-        // capture text (a digit typed into a compose title or settings field
-        // must reach the field, not navigate). Tab is deliberately NOT a section
-        // key — it's reserved for switching sub-tabs within a screen (profile
-        // tabs, guild tabs, settings fields).
+        // capture text (a digit typed into a compose title must reach the field,
+        // not navigate). Tab is deliberately NOT a section key — it's reserved
+        // for switching sub-tabs within a screen (profile tabs, guild tabs,
+        // settings fields).
         if !self.screen.accepts_text_input() {
             match key.code {
                 KeyCode::Right => {
@@ -2838,16 +2836,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settings_text_field_captures_digits() {
-        // While editing a free-text settings field, a digit must be typed into
-        // it, not navigate away.
+    async fn settings_choice_field_lets_section_keys_through() {
+        // Settings has no free-text fields, so a digit always navigates — even
+        // when a cyclable choice field is focused (space cycles it, not digits).
         let mut app = test_app();
-        app.screen = settings_focused(11); // imagePixelSize — a Text field
+        app.screen = settings_focused(12); // timeDisplayFormat — a Choice field
         app.current_root = Some(RootKind::Settings);
         app.handle_terminal_event(key_event(KeyCode::Char('2'))).await;
         assert!(
-            matches!(app.screen, Screen::Settings(_)),
-            "a digit typed into a settings text field must not navigate"
+            matches!(app.screen, Screen::Notifications(_)),
+            "a digit on a settings choice field should jump to that section"
         );
     }
 

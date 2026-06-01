@@ -12,8 +12,17 @@ use super::theme::Theme;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FieldKind {
     Bool,
-    Text,
+    /// A fixed set of allowed values, cycled in place with space.
+    Choice(&'static [&'static str]),
+    /// A server-managed value shown for reference but not editable here: the API
+    /// documents these as settable yet never enumerates their allowed values,
+    /// and the reference client defers them too, so we never PATCH them.
+    ReadOnly,
 }
+
+/// Allowed values for `timeDisplayFormat` — the one string field with a known,
+/// applied value set. Order defines the space-cycle sequence.
+const TIME_FORMATS: &[&str] = &["datetime", "relative", "unix", "swatch"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FieldSpec {
@@ -76,22 +85,22 @@ const FIELDS: &[FieldSpec] = &[
     FieldSpec {
         key: "iconTheme",
         label: "icon theme",
-        kind: FieldKind::Text,
+        kind: FieldKind::ReadOnly,
     },
     FieldSpec {
         key: "imagePixelSize",
         label: "image pixel size",
-        kind: FieldKind::Text,
+        kind: FieldKind::ReadOnly,
     },
     FieldSpec {
         key: "timeDisplayFormat",
         label: "time display format",
-        kind: FieldKind::Text,
+        kind: FieldKind::Choice(TIME_FORMATS),
     },
     FieldSpec {
         key: "keyboardPreset",
         label: "keyboard preset",
-        kind: FieldKind::Text,
+        kind: FieldKind::ReadOnly,
     },
 ];
 
@@ -156,18 +165,6 @@ impl SettingsScreen {
         }
     }
 
-    /// Whether a free-text field is currently focused. Only then must printable
-    /// keys and arrows reach the field instead of triggering global section
-    /// navigation — so on a toggle field the tab bar (1-8, Tab, ←/→) still
-    /// works, while editing a text field is uninterrupted.
-    #[must_use]
-    pub fn is_editing_text(&self) -> bool {
-        self.loaded
-            && FIELDS
-                .get(self.focused)
-                .is_some_and(|f| f.kind == FieldKind::Text)
-    }
-
     pub fn handle_key(&mut self, key: KeyEvent) -> SettingsIntent {
         if self.submitting {
             return SettingsIntent::None;
@@ -191,19 +188,23 @@ impl SettingsScreen {
                 self.error = None;
             }
             KeyCode::Enter => return self.try_submit(),
-            KeyCode::Char(' ') if FIELDS[self.focused].kind == FieldKind::Bool => {
-                let prev = self.bools[self.focused].unwrap_or(false);
-                self.bools[self.focused] = Some(!prev);
-                self.dirty[self.focused] = true;
-            }
-            KeyCode::Backspace if FIELDS[self.focused].kind == FieldKind::Text => {
-                self.texts[self.focused].pop();
-                self.dirty[self.focused] = true;
-            }
-            KeyCode::Char(c) if FIELDS[self.focused].kind == FieldKind::Text => {
-                self.texts[self.focused].push(c);
-                self.dirty[self.focused] = true;
-            }
+            KeyCode::Char(' ') => match FIELDS[self.focused].kind {
+                FieldKind::Bool => {
+                    let prev = self.bools[self.focused].unwrap_or(false);
+                    self.bools[self.focused] = Some(!prev);
+                    self.dirty[self.focused] = true;
+                }
+                FieldKind::Choice(opts) => {
+                    let cur = self.texts[self.focused].as_str();
+                    let next = opts
+                        .iter()
+                        .position(|o| *o == cur)
+                        .map_or(0, |i| (i + 1) % opts.len());
+                    self.texts[self.focused] = opts[next].to_string();
+                    self.dirty[self.focused] = true;
+                }
+                FieldKind::ReadOnly => {}
+            },
             _ => {}
         }
         SettingsIntent::None
@@ -257,10 +258,9 @@ impl SettingsScreen {
                     notif.poke = self.bools[i];
                     notif_dirty = true;
                 }
-                "iconTheme" => u.icon_theme = Some(self.texts[i].clone()),
-                "imagePixelSize" => u.image_pixel_size = Some(self.texts[i].clone()),
                 "timeDisplayFormat" => u.time_display_format = Some(self.texts[i].clone()),
-                "keyboardPreset" => u.keyboard_preset = Some(self.texts[i].clone()),
+                // iconTheme / imagePixelSize / keyboardPreset are read-only here
+                // (never dirty), so they're intentionally never PATCHed.
                 _ => {}
             }
         }
@@ -280,8 +280,24 @@ impl SettingsScreen {
 
         let layout = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
             .split(inner);
+
+        // Local config-file path — shown regardless of the server-settings load
+        // state so users can always find (and edit) their config.toml.
+        let cfg_path = crate::config::config_path()
+            .map_or_else(|| "(default location)".to_string(), |p| p.display().to_string());
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("config file: ", theme.muted_style()),
+                Span::styled(cfg_path, theme.base()),
+            ])),
+            layout[1],
+        );
 
         if !self.loaded {
             let msg = if let Some(e) = &self.error {
@@ -309,14 +325,18 @@ impl SettingsScreen {
                 let dirty_marker = if self.dirty[i] { "*" } else { " " };
                 let value = match f.kind {
                     FieldKind::Bool => {
-                        let v = self.bools[i].unwrap_or(false);
-                        if v {
+                        if self.bools[i].unwrap_or(false) {
                             "[x]".to_string()
                         } else {
                             "[ ]".to_string()
                         }
                     }
-                    FieldKind::Text => format!("\"{}\"", self.texts[i]),
+                    FieldKind::Choice(_) => format!("‹ {} ›", self.texts[i]),
+                    FieldKind::ReadOnly => {
+                        let v = self.texts[i].as_str();
+                        let shown = if v.is_empty() { "—" } else { v };
+                        format!("{shown}  (read-only)")
+                    }
                 };
                 let style = if i == self.focused {
                     theme.accent_style()
@@ -345,12 +365,12 @@ impl SettingsScreen {
             format!("error: {msg} · esc to cancel")
         } else {
             format!(
-                "{dirty_count} unsaved · space toggle · type to edit text · 1-8/←→ switch section · ctrl+s save · esc menu"
+                "{dirty_count} unsaved · space toggle/cycle · 1-8/←→ section · ctrl+s save · esc menu"
             )
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(status_text, theme.muted_style()))),
-            layout[1],
+            layout[2],
         );
     }
 }
@@ -416,15 +436,46 @@ mod tests {
     }
 
     #[test]
-    fn typing_edits_text_field() {
+    fn space_cycles_choice_field() {
         let mut s = SettingsScreen::new();
-        s.apply_loaded(Ok(Settings::default()));
-        s.focused = 10; // iconTheme
-        s.handle_key(key(KeyCode::Char('c'), KeyModifiers::empty()));
-        s.handle_key(key(KeyCode::Char('6'), KeyModifiers::empty()));
-        s.handle_key(key(KeyCode::Char('4'), KeyModifiers::empty()));
-        assert_eq!(s.texts[10], "c64");
-        assert!(s.dirty[10]);
+        s.apply_loaded(Ok(Settings {
+            time_display_format: Some("datetime".into()),
+            ..Default::default()
+        }));
+        s.focused = 12; // timeDisplayFormat — a Choice field
+        s.handle_key(key(KeyCode::Char(' '), KeyModifiers::empty()));
+        assert_eq!(s.texts[12], "relative"); // datetime → relative
+        assert!(s.dirty[12]);
+        let update = s.build_update();
+        assert_eq!(update.time_display_format.as_deref(), Some("relative"));
+    }
+
+    #[test]
+    fn space_cycle_wraps_and_seeds_unknown_value() {
+        let mut s = SettingsScreen::new();
+        // An unrecognized server value starts the cycle at the first option.
+        s.apply_loaded(Ok(Settings {
+            time_display_format: Some("weird".into()),
+            ..Default::default()
+        }));
+        s.focused = 12;
+        s.handle_key(key(KeyCode::Char(' '), KeyModifiers::empty()));
+        assert_eq!(s.texts[12], "datetime");
+    }
+
+    #[test]
+    fn readonly_field_is_inert_and_never_patched() {
+        let mut s = SettingsScreen::new();
+        s.apply_loaded(Ok(Settings {
+            icon_theme: Some("pixel".into()),
+            ..Default::default()
+        }));
+        s.focused = 10; // iconTheme — read-only
+        s.handle_key(key(KeyCode::Char(' '), KeyModifiers::empty()));
+        s.handle_key(key(KeyCode::Char('x'), KeyModifiers::empty()));
+        assert_eq!(s.texts[10], "pixel"); // unchanged, still shown
+        assert!(!s.dirty[10]);
+        assert!(s.build_update().is_empty());
     }
 
     #[test]
