@@ -67,10 +67,18 @@ pub enum BgEvent {
     NotificationsInitial(Result<(Vec<Notification>, Option<String>), String>),
     NotificationsMore(Result<(Vec<Notification>, Option<String>), String>),
     NotificationMarkedRead,
+    /// A single mark-read failed; roll back the optimistic local change.
+    NotificationMarkFailed {
+        notification_id: String,
+    },
     AllNotificationsMarked,
+    /// Mark-all-read failed; the optimistic "all read" must be resynced.
+    AllNotificationsMarkFailed,
     BookmarksInitial(Result<(Vec<Bookmark>, Option<String>), String>),
     BookmarksMore(Result<(Vec<Bookmark>, Option<String>), String>),
     BookmarkRemoved,
+    /// A bookmark removal failed; the optimistic local removal must be undone.
+    BookmarkRemoveFailed,
     /// Result of bookmarking a post from the feed / post detail.
     BookmarkCreated(Result<String, String>),
     /// A page from the background topics warm-up. `complete` is true on the last
@@ -1306,6 +1314,27 @@ impl App {
                 // Refresh unread count to converge on truth.
                 self.spawn_unread_count_once();
             }
+            BgEvent::NotificationMarkFailed { notification_id } => {
+                // Undo the optimistic mark so the UI matches the server.
+                if let Screen::Notifications(s) = &mut self.screen {
+                    s.unmark_local(&notification_id);
+                }
+                self.unread_count = self.unread_count.saturating_add(1);
+                self.warn_toast_unless_signalled("couldn't mark as read");
+            }
+            BgEvent::AllNotificationsMarkFailed => {
+                // We can't reconstruct which were unread, so resync from server.
+                self.warn_toast_unless_signalled("couldn't mark all as read");
+                let filter = if let Screen::Notifications(s) = &self.screen {
+                    Some(s.filter)
+                } else {
+                    None
+                };
+                if let Some(filter) = filter {
+                    self.spawn_notifications_initial(filter);
+                }
+                self.spawn_unread_count_once();
+            }
             BgEvent::BookmarksInitial(result) => {
                 if let Screen::Bookmarks(s) = &mut self.screen {
                     s.apply_initial(result);
@@ -1318,6 +1347,14 @@ impl App {
             }
             BgEvent::BookmarkRemoved => {
                 // Local state already removed optimistically.
+            }
+            BgEvent::BookmarkRemoveFailed => {
+                // The optimistic removal didn't take; resync the list from server
+                // (we discarded the removed item, so we can't re-insert it).
+                self.warn_toast_unless_signalled("couldn't remove bookmark");
+                if matches!(self.screen, Screen::Bookmarks(_)) {
+                    self.spawn_bookmarks_initial();
+                }
             }
             BgEvent::BookmarkCreated(result) => {
                 self.toast = Some(match result {
@@ -1772,6 +1809,15 @@ impl App {
         }
     }
 
+    /// Show a brief warning toast for a failed action — but don't clobber a more
+    /// specific toast the preceding `ApiSignal` already raised (e.g. the
+    /// rate-limit countdown), which is queued just ahead of the failure event.
+    fn warn_toast_unless_signalled(&mut self, msg: &str) {
+        if self.toast.is_none() {
+            self.toast = Some(Toast::warning(msg.to_string()));
+        }
+    }
+
     /// If a background call proved the session is dead, log out and surface the
     /// reason on the login screen. Runs in the async loop because `logout`
     /// awaits; the sync bg handler only sets `pending_logout`.
@@ -1935,6 +1981,7 @@ impl App {
                 Err(e) => {
                     let msg = note_api_err(&tx, e);
                     tracing::warn!(error = %msg, notification_id, "mark_notification_read failed");
+                    let _ = tx.send(BgEvent::NotificationMarkFailed { notification_id });
                 }
             }
         });
@@ -1951,6 +1998,7 @@ impl App {
                 Err(e) => {
                     let msg = note_api_err(&tx, e);
                     tracing::warn!(error = %msg, "mark_all_notifications_read failed");
+                    let _ = tx.send(BgEvent::AllNotificationsMarkFailed);
                 }
             }
         });
@@ -1991,6 +2039,7 @@ impl App {
                 Err(e) => {
                     let msg = note_api_err(&tx, e);
                     tracing::warn!(error = %msg, bookmark_id, "delete_bookmark failed");
+                    let _ = tx.send(BgEvent::BookmarkRemoveFailed);
                 }
             }
         });
@@ -2717,7 +2766,7 @@ fn note_api_err(tx: &mpsc::UnboundedSender<BgEvent>, e: ApiError) -> String {
         ApiSignal::Online
     };
     let _ = tx.send(BgEvent::ApiSignal(signal));
-    e.to_string()
+    e.user_message()
 }
 
 fn first_line(s: &str) -> String {
@@ -2845,6 +2894,65 @@ mod tests {
         assert!(
             !matches!(app.screen, Screen::PostDetail(_)),
             "backspace should pop a pushed screen (global back)"
+        );
+    }
+
+    fn test_notification(id: &str) -> cs_api::Notification {
+        cs_api::Notification {
+            notification_id: id.into(),
+            kind: cs_api::NotificationType::Reply,
+            read: false,
+            created_at: None,
+            actor: None,
+            target_id: None,
+            target_type: None,
+            reply_id: None,
+            thread_author_username: None,
+            guild_name: None,
+        }
+    }
+
+    #[test]
+    fn mark_failed_rolls_back_read_flag_and_unread_count() {
+        let mut app = test_app();
+        let mut screen = NotificationsScreen::new();
+        screen.apply_initial(Ok((vec![test_notification("n1")], None)));
+        screen.mark_local("n1"); // optimistic read
+        app.screen = Screen::Notifications(screen);
+        app.unread_count = 2; // pretend 3 → 2 was applied optimistically
+
+        app.handle_bg_event(BgEvent::NotificationMarkFailed {
+            notification_id: "n1".into(),
+        });
+
+        let Screen::Notifications(s) = &app.screen else {
+            panic!("expected Notifications");
+        };
+        assert!(!s.items[0].read, "read flag should roll back");
+        assert_eq!(app.unread_count, 3, "unread count should be restored");
+        assert!(app.toast.is_some(), "a warning toast should be shown");
+    }
+
+    #[test]
+    fn bookmark_remove_failed_raises_a_warning_toast() {
+        let mut app = test_app();
+        app.handle_bg_event(BgEvent::BookmarkRemoveFailed);
+        assert!(app.toast.is_some(), "a failed removal should warn the user");
+    }
+
+    #[test]
+    fn rate_limit_countdown_is_not_clobbered_by_a_failure_event() {
+        // The ApiSignal (rate-limit countdown) is queued just ahead of the
+        // failure event; the generic warning must not overwrite it.
+        let mut app = test_app();
+        app.handle_api_signal(ApiSignal::RateLimited {
+            retry_after_secs: 8,
+        });
+        app.handle_bg_event(BgEvent::BookmarkRemoveFailed);
+        let text = render_to_string(&app);
+        assert!(
+            text.contains("rate limited"),
+            "rate-limit countdown should survive the failure event: {text}"
         );
     }
 
