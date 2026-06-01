@@ -458,7 +458,7 @@ impl App {
 
     /// Skip the login screen — used when a valid session was restored at launch.
     pub fn enter_feed_initial(&mut self) {
-        self.goto_root(RootKind::Feed);
+        self.goto_root(crate::config::get().start_section);
         if self.poller_started {
             // A poller from a previous session is still alive (it idled on the
             // login screen). Reusing it — rather than spawning a duplicate on

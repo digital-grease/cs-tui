@@ -5,7 +5,6 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
-use time::OffsetDateTime;
 
 use super::theme::Theme;
 
@@ -251,7 +250,7 @@ fn notification_item<'a>(n: &'a Notification, theme: &Theme) -> ListItem<'a> {
         .unwrap_or("system");
     let when = n
         .created_at
-        .map(format_timestamp_relative)
+        .map(crate::config::format_list_timestamp)
         .unwrap_or_default();
     let unread_marker = if n.read {
         Span::styled("  ", theme.muted_style())
@@ -299,24 +298,6 @@ fn summarize(n: &Notification, actor: &str) -> String {
         AttachmentPermissionRemoved => "attachment permission removed".to_string(),
         SystemBan => "your account has been banned".to_string(),
         Unknown => format!("notification from @{actor}"),
-    }
-}
-
-fn format_timestamp_relative(t: OffsetDateTime) -> String {
-    let now = OffsetDateTime::now_utc();
-    let delta = now - t;
-    let secs = delta.whole_seconds();
-    if secs < 60 {
-        format!("{secs}s ago")
-    } else if secs < 3_600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h ago", secs / 3_600)
-    } else if secs < 30 * 86_400 {
-        format!("{}d ago", secs / 86_400)
-    } else {
-        let dt = t.date();
-        format!("{}-{:02}-{:02}", dt.year(), u8::from(dt.month()), dt.day())
     }
 }
 

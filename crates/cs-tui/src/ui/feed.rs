@@ -5,7 +5,6 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
-use time::OffsetDateTime;
 
 use super::theme::Theme;
 
@@ -44,7 +43,7 @@ impl FeedScreen {
             next_cursor: None,
             loading: true,
             error: None,
-            include_nsfw: false,
+            include_nsfw: crate::config::get().nsfw,
         }
     }
 
@@ -213,7 +212,7 @@ impl Default for FeedScreen {
 fn entry_item<'a>(entry: &'a Entry, width: u16, theme: &Theme) -> ListItem<'a> {
     let when = entry
         .created_at
-        .map(format_timestamp_relative)
+        .map(crate::config::format_list_timestamp)
         .unwrap_or_default();
     let topics = if entry.topics.is_empty() {
         String::new()
@@ -249,15 +248,17 @@ fn entry_item<'a>(entry: &'a Entry, width: u16, theme: &Theme) -> ListItem<'a> {
         }
     }
 
-    let snippet = super::markdown::content_preview(&entry.content, 200);
+    let snippet = super::markdown::content_preview(&entry.content, crate::config::get().preview_length);
     if !snippet.is_empty() {
         lines.push(Line::from(Span::styled(snippet, theme.base())));
     }
 
-    // Rule between posts so it's clear where one ends and the next begins.
-    // `width - 2` accounts for the list's highlight-symbol gutter.
-    let rule = "─".repeat(width.saturating_sub(2).max(1) as usize);
-    lines.push(Line::from(Span::styled(rule, theme.muted_style())));
+    // Rule between posts so it's clear where one ends and the next begins
+    // (omitted in compact mode). `width - 2` accounts for the highlight gutter.
+    if !crate::config::get().compact {
+        let rule = "─".repeat(width.saturating_sub(2).max(1) as usize);
+        lines.push(Line::from(Span::styled(rule, theme.muted_style())));
+    }
 
     ListItem::new(lines)
 }
@@ -269,24 +270,6 @@ fn first_line_truncated(s: &str, max: usize) -> String {
     } else {
         let truncated: String = first_line.chars().take(max - 1).collect();
         format!("{truncated}…")
-    }
-}
-
-fn format_timestamp_relative(t: OffsetDateTime) -> String {
-    let now = OffsetDateTime::now_utc();
-    let delta = now - t;
-    let secs = delta.whole_seconds();
-    if secs < 60 {
-        format!("{secs}s ago")
-    } else if secs < 3_600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h ago", secs / 3_600)
-    } else if secs < 30 * 86_400 {
-        format!("{}d ago", secs / 86_400)
-    } else {
-        let dt = t.date();
-        format!("{}-{:02}-{:02}", dt.year(), u8::from(dt.month()), dt.day())
     }
 }
 

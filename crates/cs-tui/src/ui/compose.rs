@@ -408,9 +408,13 @@ pub enum ComposeError {
 /// the tokio runtime stays responsive — but in practice the editor owns the TTY
 /// while it's open, so no other terminal I/O happens.
 pub fn launch_editor(initial: &str, suffix: &str) -> Result<String, ComposeError> {
-    let editor = std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| "nano".to_string());
+    // Config `editor` wins, then $VISUAL, then $EDITOR, then nano.
+    let editor = crate::config::get()
+        .editor
+        .clone()
+        .or_else(|| std::env::var("VISUAL").ok())
+        .or_else(|| std::env::var("EDITOR").ok())
+        .unwrap_or_else(|| "nano".to_string());
     let path = tmp_compose_path(suffix);
     fs::write(&path, initial)?;
 

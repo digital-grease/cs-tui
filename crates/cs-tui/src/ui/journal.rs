@@ -141,7 +141,13 @@ impl JournalScreen {
                 }
             }
             KeyCode::Char('d') | KeyCode::Delete if self.notes.get(self.selected).is_some() => {
-                self.confirming_delete = true;
+                if crate::config::get().confirm_deletes {
+                    self.confirming_delete = true;
+                } else if let Some(n) = self.notes.get(self.selected) {
+                    return JournalIntent::DeleteSelected {
+                        note_id: n.note_id.clone(),
+                    };
+                }
             }
             KeyCode::Char('v') => {
                 if let Some(n) = self.notes.get(self.selected) {

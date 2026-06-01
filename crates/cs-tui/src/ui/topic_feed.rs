@@ -10,7 +10,6 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
-use time::OffsetDateTime;
 
 use super::theme::Theme;
 
@@ -201,7 +200,7 @@ impl TopicFeedScreen {
 fn entry_item<'a>(entry: &'a Entry, theme: &Theme) -> ListItem<'a> {
     let when = entry
         .created_at
-        .map(format_timestamp_relative)
+        .map(crate::config::format_list_timestamp)
         .unwrap_or_default();
     let counts = format!(
         " · {} replies · {} bookmarks",
@@ -215,30 +214,14 @@ fn entry_item<'a>(entry: &'a Entry, theme: &Theme) -> ListItem<'a> {
         header_spans.push(Span::styled(" · [image]", theme.accent_style()));
     }
     let mut lines = vec![Line::from(header_spans)];
-    let snippet = super::markdown::content_preview(&entry.content, 200);
+    let snippet = super::markdown::content_preview(&entry.content, crate::config::get().preview_length);
     if !snippet.is_empty() {
         lines.push(Line::from(Span::styled(snippet, theme.base())));
     }
-    lines.push(Line::from(""));
-    ListItem::new(lines)
-}
-
-fn format_timestamp_relative(t: OffsetDateTime) -> String {
-    let now = OffsetDateTime::now_utc();
-    let delta = now - t;
-    let secs = delta.whole_seconds();
-    if secs < 60 {
-        format!("{secs}s ago")
-    } else if secs < 3_600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h ago", secs / 3_600)
-    } else if secs < 30 * 86_400 {
-        format!("{}d ago", secs / 86_400)
-    } else {
-        let dt = t.date();
-        format!("{}-{:02}-{:02}", dt.year(), u8::from(dt.month()), dt.day())
+    if !crate::config::get().compact {
+        lines.push(Line::from(""));
     }
+    ListItem::new(lines)
 }
 
 #[cfg(test)]

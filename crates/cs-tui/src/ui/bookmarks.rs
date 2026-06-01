@@ -5,7 +5,6 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
-use time::OffsetDateTime;
 
 use super::theme::Theme;
 
@@ -243,14 +242,18 @@ fn bookmark_item<'a>(b: &'a Bookmark, theme: &Theme) -> ListItem<'a> {
             None,
         ),
     };
-    let when_str = when.map(format_timestamp_relative).unwrap_or_default();
+    let when_str = when.map(crate::config::format_list_timestamp).unwrap_or_default();
     let header = Line::from(vec![
         Span::styled(format!("[{kind_label}] "), theme.muted_style()),
         Span::styled(format!("@{author}"), theme.accent_style()),
         Span::styled(format!(" · {when_str}"), theme.muted_style()),
     ]);
     let body = Line::from(Span::styled(snippet, theme.base()));
-    ListItem::new(vec![header, body, Line::from("")])
+    let mut lines = vec![header, body];
+    if !crate::config::get().compact {
+        lines.push(Line::from(""));
+    }
+    ListItem::new(lines)
 }
 
 fn first_line_truncated(s: &str, max: usize) -> String {
@@ -260,24 +263,6 @@ fn first_line_truncated(s: &str, max: usize) -> String {
     } else {
         let truncated: String = first.chars().take(max - 1).collect();
         format!("{truncated}…")
-    }
-}
-
-fn format_timestamp_relative(t: OffsetDateTime) -> String {
-    let now = OffsetDateTime::now_utc();
-    let delta = now - t;
-    let secs = delta.whole_seconds();
-    if secs < 60 {
-        format!("{secs}s ago")
-    } else if secs < 3_600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h ago", secs / 3_600)
-    } else if secs < 30 * 86_400 {
-        format!("{}d ago", secs / 86_400)
-    } else {
-        let dt = t.date();
-        format!("{}-{:02}-{:02}", dt.year(), u8::from(dt.month()), dt.day())
     }
 }
 
