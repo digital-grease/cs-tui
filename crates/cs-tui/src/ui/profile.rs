@@ -293,55 +293,24 @@ impl ProfileScreen {
             ),
         };
 
+        // Pagination must not fire while a page is already in flight, so the
+        // limiter folds `!loading` into "has more" for the shared nav helper.
+        match super::list_nav::navigate(
+            key.code,
+            self.selection_mut(target),
+            len,
+            cursor_present && !loading,
+        ) {
+            super::list_nav::ListNav::LoadMore => return ProfileIntent::LoadMoreCurrentTab,
+            super::list_nav::ListNav::Moved => return ProfileIntent::None,
+            super::list_nav::ListNav::Ignored => {}
+        }
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                // At the bottom, scrolling down pulls the next page automatically.
-                let moved = self.advance_selection(target, len);
-                if !moved && cursor_present && !loading {
-                    return ProfileIntent::LoadMoreCurrentTab;
-                }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.retreat_selection(target);
-            }
-            KeyCode::Char('g') | KeyCode::Home => self.set_selection(target, 0),
-            KeyCode::Char('G') | KeyCode::End => self.set_selection(target, len.saturating_sub(1)),
             KeyCode::Char('r') if !loading => return ProfileIntent::RefreshCurrentTab,
-            KeyCode::Char('n') | KeyCode::Char(' ') | KeyCode::PageDown
-                if cursor_present && !loading =>
-            {
-                return ProfileIntent::LoadMoreCurrentTab;
-            }
-            KeyCode::Enter => {
-                return self.enter_on_list(target);
-            }
+            KeyCode::Enter => return self.enter_on_list(target),
             _ => {}
         }
         ProfileIntent::None
-    }
-
-    /// Move the selection down one. Returns `true` if it actually moved (i.e.
-    /// we weren't already at the bottom).
-    fn advance_selection(&mut self, target: ListTarget, len: usize) -> bool {
-        if len == 0 {
-            return false;
-        }
-        let cur = self.selection_mut(target);
-        if *cur < len - 1 {
-            *cur += 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn retreat_selection(&mut self, target: ListTarget) {
-        let cur = self.selection_mut(target);
-        *cur = cur.saturating_sub(1);
-    }
-
-    fn set_selection(&mut self, target: ListTarget, idx: usize) {
-        *self.selection_mut(target) = idx;
     }
 
     fn selection_mut(&mut self, target: ListTarget) -> &mut usize {

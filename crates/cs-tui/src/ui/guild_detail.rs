@@ -170,37 +170,19 @@ impl GuildScreen {
         if self.loading {
             return GuildIntent::None;
         }
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                let len = self.cur_len();
-                let at_bottom = {
-                    let s = self.cur_sel_mut();
-                    if len > 0 && *s < len - 1 {
-                        *s += 1;
-                        false
-                    } else {
-                        true
-                    }
-                };
-                // At the bottom, scrolling down pulls the next page automatically.
-                if at_bottom && self.cur_has_more() {
-                    self.loading = true;
-                    return GuildIntent::LoadMore;
-                }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                let s = self.cur_sel_mut();
-                *s = s.saturating_sub(1);
-            }
-            KeyCode::Char('g') | KeyCode::Home => *self.cur_sel_mut() = 0,
-            KeyCode::Char('G') | KeyCode::End => {
-                let len = self.cur_len();
-                *self.cur_sel_mut() = len.saturating_sub(1);
-            }
-            KeyCode::Char('n') | KeyCode::Char(' ') | KeyCode::PageDown if self.cur_has_more() => {
+        // Pre-compute len/has_more so the &mut from `cur_sel_mut` doesn't clash
+        // with the immutable reads inside the shared nav call.
+        let len = self.cur_len();
+        let has_more = self.cur_has_more();
+        match super::list_nav::navigate(key.code, self.cur_sel_mut(), len, has_more) {
+            super::list_nav::ListNav::LoadMore => {
                 self.loading = true;
                 return GuildIntent::LoadMore;
             }
+            super::list_nav::ListNav::Moved => return GuildIntent::None,
+            super::list_nav::ListNav::Ignored => {}
+        }
+        match key.code {
             KeyCode::Char('r') => {
                 self.loading = true;
                 self.error = None;

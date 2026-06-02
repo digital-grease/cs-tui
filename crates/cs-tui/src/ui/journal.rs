@@ -100,28 +100,20 @@ impl JournalScreen {
             return self.handle_key_revisions(key);
         }
 
+        match super::list_nav::navigate(
+            key.code,
+            &mut self.selected,
+            self.notes.len(),
+            self.next_cursor.is_some(),
+        ) {
+            super::list_nav::ListNav::LoadMore => {
+                self.loading = true;
+                return JournalIntent::LoadMore;
+            }
+            super::list_nav::ListNav::Moved => return JournalIntent::None,
+            super::list_nav::ListNav::Ignored => {}
+        }
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down
-                if !self.notes.is_empty() && self.selected < self.notes.len() - 1 =>
-            {
-                self.selected += 1;
-            }
-            // At the bottom, scrolling down pulls the next page automatically.
-            KeyCode::Char('j') | KeyCode::Down if self.next_cursor.is_some() => {
-                self.loading = true;
-                return JournalIntent::LoadMore;
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.selected = self.selected.saturating_sub(1);
-            }
-            KeyCode::Char('g') | KeyCode::Home => self.selected = 0,
-            KeyCode::Char('G') | KeyCode::End if !self.notes.is_empty() => {
-                self.selected = self.notes.len() - 1;
-            }
-            KeyCode::Char('n') | KeyCode::PageDown if self.next_cursor.is_some() => {
-                self.loading = true;
-                return JournalIntent::LoadMore;
-            }
             KeyCode::Char('r') => {
                 self.notes.clear();
                 self.next_cursor = None;
