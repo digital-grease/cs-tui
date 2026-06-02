@@ -22,6 +22,14 @@ pub enum TopicFeedIntent {
     OpenSelected {
         post_id: String,
     },
+    /// Follow/unfollow this topic (PATCHes `followedTopics`).
+    ToggleFollow {
+        slug: String,
+    },
+    /// Mute/unmute this topic (PATCHes `mutedTopics`).
+    ToggleMute {
+        slug: String,
+    },
     Quit,
     None,
 }
@@ -35,6 +43,9 @@ pub struct TopicFeedScreen {
     pub loading: bool,
     pub error: Option<String>,
     pub include_nsfw: bool,
+    /// Whether the user follows / mutes this topic (from settings).
+    pub followed: bool,
+    pub muted: bool,
 }
 
 impl TopicFeedScreen {
@@ -47,7 +58,15 @@ impl TopicFeedScreen {
             loading: true,
             error: None,
             include_nsfw: crate::config::get().nsfw,
+            followed: false,
+            muted: false,
         }
+    }
+
+    /// Update the follow/mute state for this topic (from settings).
+    pub fn set_topic_state(&mut self, followed: bool, muted: bool) {
+        self.followed = followed;
+        self.muted = muted;
     }
 
     /// Indices of entries currently visible after NSFW filtering.
@@ -66,6 +85,20 @@ impl TopicFeedScreen {
         }
         if key.code == KeyCode::Backspace {
             return TopicFeedIntent::Back;
+        }
+        // Follow/mute the whole topic — available even while posts are loading.
+        match key.code {
+            KeyCode::Char('f') => {
+                return TopicFeedIntent::ToggleFollow {
+                    slug: self.slug.clone(),
+                }
+            }
+            KeyCode::Char('m') => {
+                return TopicFeedIntent::ToggleMute {
+                    slug: self.slug.clone(),
+                }
+            }
+            _ => {}
         }
         if self.loading {
             return TopicFeedIntent::None;
@@ -145,7 +178,13 @@ impl TopicFeedScreen {
     }
 
     pub fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
-        let title = format!(" cs-tui • #{} ", self.slug);
+        let marks = match (self.followed, self.muted) {
+            (true, true) => " ★ muted",
+            (true, false) => " ★",
+            (false, true) => " muted",
+            (false, false) => "",
+        };
+        let title = format!(" cs-tui • #{}{marks} ", self.slug);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(theme.border_style())
@@ -203,14 +242,16 @@ impl TopicFeedScreen {
             )
         } else if self.loading {
             "loading… · enter open · r refresh · esc back".to_string()
-        } else if self.next_cursor.is_some() {
-            format!(
-                "{} entries · scroll down for more · enter open · r refresh · esc back",
-                self.entries.len()
-            )
         } else {
+            let follow = if self.followed { "unfollow" } else { "follow" };
+            let mute = if self.muted { "unmute" } else { "mute" };
+            let more = if self.next_cursor.is_some() {
+                "scroll for more · "
+            } else {
+                ""
+            };
             format!(
-                "{} entries · end · enter open · r refresh · esc back",
+                "{} entries · {more}enter open · f {follow} · m {mute} · r refresh · esc back",
                 self.entries.len()
             )
         };
@@ -290,6 +331,44 @@ mod tests {
     fn backspace_returns_back_to_index() {
         let mut s = TopicFeedScreen::new("music".into());
         assert_eq!(s.handle_key(key(KeyCode::Backspace)), TopicFeedIntent::Back);
+    }
+
+    #[test]
+    fn f_and_m_toggle_the_topic_even_while_loading() {
+        // new() starts loading; follow/mute must still work (they're topic-level).
+        let mut s = TopicFeedScreen::new("music".into());
+        assert!(s.loading);
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('f'))),
+            TopicFeedIntent::ToggleFollow {
+                slug: "music".into()
+            }
+        );
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('m'))),
+            TopicFeedIntent::ToggleMute {
+                slug: "music".into()
+            }
+        );
+    }
+
+    #[test]
+    fn followed_state_renders_a_star_in_the_header() {
+        let mut s = TopicFeedScreen::new("music".into());
+        s.set_topic_state(true, false);
+        s.apply_initial(Ok((vec![], None)));
+        let theme = Theme::cyber();
+        let backend = ratatui::backend::TestBackend::new(60, 6);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| s.render(f, f.area(), &theme)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains('★'), "followed topic header should show a star");
     }
 
     #[test]
