@@ -3,7 +3,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use cs_api::{Patch, ProfileUpdate, User};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
@@ -288,20 +287,14 @@ impl EditProfileScreen {
                 layout[label_idx],
             );
             let input_line = if i == self.focused {
-                // Block cursor drawn at the cursor position within the text.
-                let chars: Vec<char> = self.fields[i].chars().collect();
-                let cur = self.cursor.min(chars.len());
-                let before: String = chars[..cur].iter().collect();
-                let cursor_style = theme.base().add_modifier(Modifier::REVERSED);
-                let mut spans = vec![Span::styled(before, theme.base())];
-                if cur < chars.len() {
-                    spans.push(Span::styled(chars[cur].to_string(), cursor_style));
-                    spans.push(Span::styled(chars[cur + 1..].iter().collect::<String>(), theme.base()));
-                } else {
-                    // Cursor past the last char: a block over a trailing space.
-                    spans.push(Span::styled(" ", cursor_style));
-                }
-                Line::from(spans)
+                // Windowed block caret so long values (e.g. a bio) keep the
+                // cursor on-screen instead of scrolling off the field.
+                super::input::windowed_line(
+                    &self.fields[i],
+                    self.cursor,
+                    layout[input_idx].width as usize,
+                    theme,
+                )
             } else {
                 let display = if self.cleared[i] && self.fields[i].is_empty() {
                     "<cleared>".to_string()

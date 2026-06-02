@@ -297,18 +297,18 @@ impl ComposeScreen {
                 ))),
                 layout[idx],
             );
-            let caret = if self.focused == ConfirmField::Title {
-                "█"
+            let title_area = layout[idx + 1];
+            let title_line = if self.focused == ConfirmField::Title {
+                super::input::windowed_line(
+                    &self.title_input,
+                    self.title_input.chars().count(),
+                    title_area.width as usize,
+                    theme,
+                )
             } else {
-                ""
+                Line::from(Span::styled(self.title_input.clone(), theme.base()))
             };
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(self.title_input.clone(), theme.base()),
-                    Span::styled(caret, theme.accent_style()),
-                ])),
-                layout[idx + 1],
-            );
+            frame.render_widget(Paragraph::new(title_line), title_area);
         }
 
         // Body preview
@@ -331,18 +331,18 @@ impl ComposeScreen {
                 ))),
                 layout[topics_label_idx],
             );
-            let caret = if self.focused == ConfirmField::Topics {
-                "█"
+            let topics_area = layout[topics_label_idx + 1];
+            let topics_line = if self.focused == ConfirmField::Topics {
+                super::input::windowed_line(
+                    &self.topics_input,
+                    self.topics_input.chars().count(),
+                    topics_area.width as usize,
+                    theme,
+                )
             } else {
-                ""
+                Line::from(Span::styled(self.topics_input.clone(), theme.base()))
             };
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(self.topics_input.clone(), theme.base()),
-                    Span::styled(caret, theme.accent_style()),
-                ])),
-                layout[topics_label_idx + 1],
-            );
+            frame.render_widget(Paragraph::new(topics_line), topics_area);
         } else {
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(

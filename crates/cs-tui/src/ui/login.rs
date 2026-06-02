@@ -143,7 +143,12 @@ impl LoginScreen {
         let email_label = labeled("email", self.focused == Field::Email, theme);
         frame.render_widget(email_label, layout[0]);
         frame.render_widget(
-            input_line(&self.email, self.focused == Field::Email, theme),
+            input_line(
+                &self.email,
+                self.focused == Field::Email,
+                layout[1].width as usize,
+                theme,
+            ),
             layout[1],
         );
 
@@ -151,7 +156,12 @@ impl LoginScreen {
         frame.render_widget(pw_label, layout[3]);
         let masked: String = "•".repeat(self.password.chars().count());
         frame.render_widget(
-            input_line(&masked, self.focused == Field::Password, theme),
+            input_line(
+                &masked,
+                self.focused == Field::Password,
+                layout[4].width as usize,
+                theme,
+            ),
             layout[4],
         );
 
@@ -187,14 +197,15 @@ fn labeled<'a>(text: &'a str, focused: bool, theme: &Theme) -> Paragraph<'a> {
     Paragraph::new(Line::from(Span::styled(text, style)))
 }
 
-fn input_line<'a>(value: &'a str, focused: bool, theme: &Theme) -> Paragraph<'a> {
-    // Caret rendered as a trailing block on the focused field only; a visual
-    // marker, not a true terminal cursor (Phase 7 polish).
-    let mut spans = vec![Span::styled(value, theme.base())];
+fn input_line<'a>(value: &'a str, focused: bool, width: usize, theme: &Theme) -> Paragraph<'a> {
+    // Login fields are append-only, so the caret sits at the end; the shared
+    // helper windows long values (e.g. a long email) so the caret stays visible.
     if focused {
-        spans.push(Span::styled("█", theme.accent_style()));
+        let cursor = value.chars().count();
+        Paragraph::new(super::input::windowed_line(value, cursor, width, theme))
+    } else {
+        Paragraph::new(Line::from(Span::styled(value, theme.base())))
     }
-    Paragraph::new(Line::from(spans))
 }
 
 /// Turn a raw API/transport error string into a concise, actionable message for
@@ -392,16 +403,21 @@ mod tests {
                 s.render(f, area, &theme);
             })
             .unwrap();
-        let text: String = terminal
+        // The caret is now a reverse-video cell (windowed input), so count cells
+        // carrying the REVERSED modifier rather than a literal glyph.
+        let carets = terminal
             .backend()
             .buffer()
             .content
             .iter()
-            .map(|c| c.symbol())
-            .collect();
+            .filter(|c| {
+                c.style()
+                    .add_modifier
+                    .contains(ratatui::style::Modifier::REVERSED)
+            })
+            .count();
         assert_eq!(
-            text.matches('█').count(),
-            1,
+            carets, 1,
             "exactly one caret should render (focused field only)"
         );
     }
