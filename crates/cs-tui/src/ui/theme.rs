@@ -65,7 +65,8 @@ impl Theme {
     /// on the dark background), so the neon is reserved for accents, borders, and
     /// status colors. `error` (neon red), `accent` (pink), `success` (mint), and
     /// `warning` (gold) are kept visibly distinct so a toast's meaning reads at a
-    /// glance. Uses truecolor; modern terminals downsample gracefully.
+    /// glance. Defined in truecolor; on a 256-color terminal the app downsamples
+    /// it to the nearest indexed color (see [`ColorMode`]).
     pub fn vapor() -> Self {
         Self {
             background: Color::Rgb(0x1a, 0x12, 0x2e), // deep indigo
@@ -128,6 +129,94 @@ impl Theme {
     pub fn border_style(&self) -> Style {
         Style::default().fg(self.border)
     }
+
+    /// Adapt the palette to what the terminal can actually display. `Full` is a
+    /// no-op; `Indexed256` downsamples any truecolor (`vapor`, `#hex` customs) to
+    /// the nearest 256-color index; `Monochrome` drops all color (NO_COLOR),
+    /// leaving emphasis to the bold modifiers and layout.
+    #[must_use]
+    pub fn adapt(&self, mode: ColorMode) -> Self {
+        match mode {
+            ColorMode::Full => self.clone(),
+            ColorMode::Indexed256 => self.map(|c| match c {
+                Color::Rgb(r, g, b) => Color::Indexed(rgb_to_ansi256(r, g, b)),
+                other => other,
+            }),
+            ColorMode::Monochrome => self.map(|_| Color::Reset),
+        }
+    }
+
+    fn map(&self, f: impl Fn(Color) -> Color) -> Self {
+        Self {
+            background: f(self.background),
+            foreground: f(self.foreground),
+            muted: f(self.muted),
+            accent: f(self.accent),
+            success: f(self.success),
+            error: f(self.error),
+            warning: f(self.warning),
+            border: f(self.border),
+        }
+    }
+}
+
+/// What the terminal can render, decided once at startup from the environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorMode {
+    /// 24-bit truecolor — render `Rgb` directly.
+    Full,
+    /// 256-color only — downsample `Rgb` to the nearest indexed color.
+    Indexed256,
+    /// `NO_COLOR` is set — render no color at all.
+    Monochrome,
+}
+
+impl ColorMode {
+    /// Detect from `NO_COLOR` (the [no-color.org](https://no-color.org)
+    /// convention) and `COLORTERM`. Absent a truecolor hint we assume 256-color
+    /// and downsample, since sending 24-bit escapes to a 256-color terminal
+    /// renders wrong rather than degrading.
+    #[must_use]
+    pub fn detect() -> Self {
+        if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
+            return Self::Monochrome;
+        }
+        let truecolor = std::env::var("COLORTERM").is_ok_and(|v| {
+            let v = v.to_ascii_lowercase();
+            v.contains("truecolor") || v.contains("24bit")
+        });
+        if truecolor {
+            Self::Full
+        } else {
+            Self::Indexed256
+        }
+    }
+}
+
+/// Nearest xterm-256 index for an RGB color (6×6×6 cube + grayscale ramp).
+#[must_use]
+fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
+    if r == g && g == b {
+        // Grayscale: the 24-step ramp (232..=255), with the cube's ends for the
+        // extremes.
+        if r < 8 {
+            return 16;
+        }
+        if r > 248 {
+            return 231;
+        }
+        return 232 + ((u16::from(r) - 8) * 24 / 247) as u8;
+    }
+    let q = |c: u8| -> u16 {
+        if c < 48 {
+            0
+        } else if c < 115 {
+            1
+        } else {
+            (u16::from(c) - 35) / 40
+        }
+    };
+    (16 + 36 * q(r) + 6 * q(g) + q(b)) as u8
 }
 
 impl Default for Theme {
@@ -231,6 +320,41 @@ mod tests {
         let (c, d) = (Theme::cyber(), Theme::dark());
         assert_ne!(c.accent, d.accent, "accent must differ");
         assert_ne!(c.border, d.border, "border must differ");
+    }
+
+    #[test]
+    fn indexed256_downsamples_truecolor_but_leaves_named_colors() {
+        // vapor is all Rgb → every slot becomes an indexed color.
+        let v = Theme::vapor().adapt(ColorMode::Indexed256);
+        for c in [v.accent, v.background, v.error, v.border] {
+            assert!(matches!(c, Color::Indexed(_)), "expected indexed, got {c:?}");
+        }
+        // cyber uses named/indexed colors → unchanged by the downsample.
+        let c = Theme::cyber();
+        assert_eq!(c.adapt(ColorMode::Indexed256).accent, c.accent);
+    }
+
+    #[test]
+    fn monochrome_drops_all_color() {
+        let m = Theme::vapor().adapt(ColorMode::Monochrome);
+        for c in [m.foreground, m.accent, m.error, m.muted, m.border] {
+            assert_eq!(c, Color::Reset);
+        }
+    }
+
+    #[test]
+    fn full_mode_is_identity() {
+        let v = Theme::vapor();
+        assert_eq!(v.adapt(ColorMode::Full).accent, v.accent);
+    }
+
+    #[test]
+    fn rgb_to_ansi256_maps_primaries_and_grays() {
+        assert_eq!(rgb_to_ansi256(0, 0, 0), 16); // black → cube origin
+        assert_eq!(rgb_to_ansi256(255, 255, 255), 231); // white → cube corner
+        assert_eq!(rgb_to_ansi256(255, 0, 0), 196); // pure red
+        // Mid grays land in the 232..=255 ramp.
+        assert!((232..=255).contains(&rgb_to_ansi256(128, 128, 128)));
     }
 
     #[test]
