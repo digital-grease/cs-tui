@@ -30,7 +30,7 @@ use super::notifications::{NotificationsIntent, NotificationsScreen};
 use super::post_detail::{PostDetailIntent, PostDetailScreen};
 use super::profile::{ProfileIntent, ProfileScreen, ProfileTab};
 use super::settings_screen::{SettingsIntent, SettingsScreen};
-use super::theme::{Theme, ThemeKind};
+use super::theme::{ColorMode, Theme, ThemeKind};
 use super::toast::Toast;
 use super::topic_feed::{TopicFeedIntent, TopicFeedScreen};
 use super::topics::{TopicsIntent, TopicsScreen};
@@ -435,6 +435,9 @@ pub struct App {
     topic_mutes: Vec<String>,
     /// True once we've fetched the follow/mute prefs (reset to retry on failure).
     topic_prefs_loaded: bool,
+    /// What the terminal can render (truecolor / 256 / NO_COLOR), detected once
+    /// at startup; every resolved theme is adapted to it.
+    color_mode: ColorMode,
 }
 
 impl App {
@@ -446,10 +449,12 @@ impl App {
     ) -> Self {
         let (bg_tx, bg_rx) = mpsc::unbounded_channel();
         let last_email = prefill_email.clone();
+        let color_mode = ColorMode::detect();
         let theme = match theme_kind {
             ThemeKind::Custom => custom_theme.clone().unwrap_or_else(Theme::cyber),
             k => k.theme(),
-        };
+        }
+        .adapt(color_mode);
         Self {
             client,
             theme,
@@ -479,6 +484,7 @@ impl App {
             topic_follows: Vec::new(),
             topic_mutes: Vec::new(),
             topic_prefs_loaded: false,
+            color_mode,
         }
     }
 
@@ -1984,12 +1990,14 @@ impl App {
         kinds
     }
 
-    /// Resolve a kind to its concrete palette (`Custom` comes from `config.toml`).
+    /// Resolve a kind to its concrete palette (`Custom` comes from `config.toml`),
+    /// adapted to the terminal's color capability.
     fn resolve_theme(&self, kind: ThemeKind) -> Theme {
         match kind {
             ThemeKind::Custom => self.custom_theme.clone().unwrap_or_else(Theme::cyber),
             k => k.theme(),
         }
+        .adapt(self.color_mode)
     }
 
     /// Advance to the next theme palette, apply it live, and persist the choice
