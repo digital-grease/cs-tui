@@ -866,6 +866,8 @@ impl App {
                     post_id,
                     highlight_reply_id: None,
                 },
+                TopicFeedIntent::ToggleFollow { slug } => Action::ToggleTopicFollow { slug },
+                TopicFeedIntent::ToggleMute { slug } => Action::ToggleTopicMute { slug },
                 TopicFeedIntent::None => Action::None,
             },
             Screen::PostDetail(s) => match s.handle_key(key) {
@@ -1118,9 +1120,19 @@ impl App {
                 self.spawn_topic_prefs_load();
             }
             Action::TopicOpen { slug } => {
-                let new_screen = Screen::TopicFeed(TopicFeedScreen::new(slug.clone()));
-                self.push_screen(new_screen);
+                let mut new = TopicFeedScreen::new(slug.clone());
+                new.set_topic_state(
+                    self.topic_follows.contains(&slug),
+                    self.topic_mutes.contains(&slug),
+                );
+                self.push_screen(Screen::TopicFeed(new));
                 self.spawn_topic_feed_initial(&slug);
+                // Opening a topic directly (e.g. from search) may precede ever
+                // visiting the topics list, so make sure prefs get loaded.
+                if !self.topic_prefs_loaded {
+                    self.topic_prefs_loaded = true;
+                    self.spawn_topic_prefs_load();
+                }
             }
             Action::ToggleTopicFollow { slug } => {
                 if self.block_write_if_offline() {
@@ -2782,10 +2794,18 @@ impl App {
         });
     }
 
-    /// Push the current follow/mute sets into the topics screen, if it's active.
+    /// Push the current follow/mute sets into whichever topic screen is active.
     fn push_topic_prefs(&mut self) {
-        if let Screen::Topics(s) = &mut self.screen {
-            s.set_topic_prefs(self.topic_follows.clone(), self.topic_mutes.clone());
+        match &mut self.screen {
+            Screen::Topics(s) => {
+                s.set_topic_prefs(self.topic_follows.clone(), self.topic_mutes.clone());
+            }
+            Screen::TopicFeed(s) => {
+                let followed = self.topic_follows.contains(&s.slug);
+                let muted = self.topic_mutes.contains(&s.slug);
+                s.set_topic_state(followed, muted);
+            }
+            _ => {}
         }
     }
 
