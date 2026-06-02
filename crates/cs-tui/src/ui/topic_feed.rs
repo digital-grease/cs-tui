@@ -104,30 +104,20 @@ impl TopicFeedScreen {
             return TopicFeedIntent::None;
         }
         let visible = self.visible_indices();
+        match super::list_nav::navigate(
+            key.code,
+            &mut self.selected,
+            visible.len(),
+            self.next_cursor.is_some(),
+        ) {
+            super::list_nav::ListNav::LoadMore => {
+                self.loading = true;
+                return TopicFeedIntent::LoadMore;
+            }
+            super::list_nav::ListNav::Moved => return TopicFeedIntent::None,
+            super::list_nav::ListNav::Ignored => {}
+        }
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down
-                if !visible.is_empty() && self.selected < visible.len() - 1 =>
-            {
-                self.selected += 1;
-            }
-            // At the bottom, scrolling down pulls the next page automatically.
-            KeyCode::Char('j') | KeyCode::Down if self.next_cursor.is_some() => {
-                self.loading = true;
-                return TopicFeedIntent::LoadMore;
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.selected = self.selected.saturating_sub(1);
-            }
-            KeyCode::Char('g') | KeyCode::Home => self.selected = 0,
-            KeyCode::Char('G') | KeyCode::End if !visible.is_empty() => {
-                self.selected = visible.len() - 1;
-            }
-            KeyCode::Char('n') | KeyCode::Char(' ') | KeyCode::PageDown
-                if self.next_cursor.is_some() =>
-            {
-                self.loading = true;
-                return TopicFeedIntent::LoadMore;
-            }
             KeyCode::Char('r') => {
                 self.entries.clear();
                 self.next_cursor = None;

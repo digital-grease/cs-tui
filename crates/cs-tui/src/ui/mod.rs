@@ -8,6 +8,7 @@ pub mod guilds;
 pub mod help;
 pub mod images;
 pub mod journal;
+pub mod list_nav;
 pub mod login;
 pub mod markdown;
 pub mod menu;
