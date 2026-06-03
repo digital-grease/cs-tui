@@ -469,7 +469,7 @@ fn thread_item<'a>(t: &'a GuildThread, theme: &Theme) -> ListItem<'a> {
         let title = title.trim();
         if !title.is_empty() {
             lines.push(Line::from(Span::styled(
-                first_line_truncated(title, 200),
+                super::text::first_line_truncated(title, 200),
                 theme.accent_style(),
             )));
         }
@@ -500,16 +500,6 @@ fn member_item<'a>(m: &'a GuildMembership, theme: &Theme) -> ListItem<'a> {
         Span::styled(format!("  {role}{suffix}"), theme.muted_style()),
     ]);
     ListItem::new(vec![line])
-}
-
-fn first_line_truncated(s: &str, max: usize) -> String {
-    let first = s.lines().next().unwrap_or("").trim();
-    if first.chars().count() <= max {
-        first.to_string()
-    } else {
-        let truncated: String = first.chars().take(max - 1).collect();
-        format!("{truncated}…")
-    }
 }
 
 #[cfg(test)]

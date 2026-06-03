@@ -188,23 +188,13 @@ fn guild_item<'a>(g: &'a Guild, theme: &Theme) -> ListItem<'a> {
         let bio = bio.trim();
         if !bio.is_empty() {
             lines.push(Line::from(Span::styled(
-                first_line_truncated(bio, 200),
+                super::text::first_line_truncated(bio, 200),
                 theme.base(),
             )));
         }
     }
     lines.push(Line::from(""));
     ListItem::new(lines)
-}
-
-fn first_line_truncated(s: &str, max: usize) -> String {
-    let first = s.lines().next().unwrap_or("").trim();
-    if first.chars().count() <= max {
-        first.to_string()
-    } else {
-        let truncated: String = first.chars().take(max - 1).collect();
-        format!("{truncated}…")
-    }
 }
 
 #[cfg(test)]

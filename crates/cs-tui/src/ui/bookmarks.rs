@@ -225,13 +225,13 @@ fn bookmark_item<'a>(b: &'a Bookmark, theme: &Theme) -> ListItem<'a> {
         (BookmarkKind::Post, Some(p), _) => (
             "post",
             p.author_username.clone(),
-            first_line_truncated(&p.content, 160),
+            super::text::first_line_truncated(&p.content, 160),
             p.created_at,
         ),
         (BookmarkKind::Reply, _, Some(r)) => (
             "reply",
             r.author_username.clone(),
-            first_line_truncated(&r.content, 160),
+            super::text::first_line_truncated(&r.content, 160),
             r.created_at,
         ),
         (BookmarkKind::Post, None, _) => (
@@ -267,15 +267,6 @@ fn bookmark_item<'a>(b: &'a Bookmark, theme: &Theme) -> ListItem<'a> {
     ListItem::new(lines)
 }
 
-fn first_line_truncated(s: &str, max: usize) -> String {
-    let first = s.lines().next().unwrap_or("").trim();
-    if first.chars().count() <= max {
-        first.to_string()
-    } else {
-        let truncated: String = first.chars().take(max - 1).collect();
-        format!("{truncated}…")
-    }
-}
 
 fn status_line<'a>(s: &'a BookmarksScreen, theme: &Theme) -> Paragraph<'a> {
     if s.confirming_delete {
