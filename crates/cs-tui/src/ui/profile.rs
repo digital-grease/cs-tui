@@ -120,6 +120,11 @@ pub enum ProfileIntent {
     ToggleFollow,
     /// Enter edit mode (only meaningful when viewing self).
     EditOwnProfile,
+    /// Pin (or unpin) one of your own posts to your profile.
+    PinPost {
+        post_id: String,
+        pin: bool,
+    },
     /// Open the post under the cursor (Posts / Replies tab).
     OpenPost {
         post_id: String,
@@ -256,6 +261,18 @@ impl ProfileScreen {
             }
             KeyCode::Char('e') if self.is_self => {
                 return ProfileIntent::EditOwnProfile;
+            }
+            // Pin/unpin the selected post on your own Posts tab (server requires
+            // it to be your own entry, which it always is here).
+            KeyCode::Char('P') if self.is_self && self.tab == ProfileTab::Posts => {
+                if let Some(e) = self.posts.items.get(self.posts.selected) {
+                    let pinned = self.user.as_ref().and_then(|u| u.pinned_post_id.as_deref())
+                        == Some(e.post_id.as_str());
+                    return ProfileIntent::PinPost {
+                        post_id: e.post_id.clone(),
+                        pin: !pinned,
+                    };
+                }
             }
             _ => {}
         }
@@ -498,13 +515,18 @@ impl ProfileScreen {
     }
 
     fn render_posts(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
-        render_list_with_state(frame, area, theme, &self.posts, "posts", |e: &Entry| {
+        let pinned = self.user.as_ref().and_then(|u| u.pinned_post_id.clone());
+        render_list_with_state(frame, area, theme, &self.posts, "posts", move |e: &Entry| {
             let when = e.created_at.map(format_relative).unwrap_or_default();
+            let mut header = vec![
+                Span::styled(format!("@{}", e.author_username), theme.accent_style()),
+                Span::styled(format!(" · {when}"), theme.muted_style()),
+            ];
+            if pinned.as_deref() == Some(e.post_id.as_str()) {
+                header.push(Span::styled(" · 📌 pinned", theme.warning_style()));
+            }
             vec![
-                Line::from(vec![
-                    Span::styled(format!("@{}", e.author_username), theme.accent_style()),
-                    Span::styled(format!(" · {when}"), theme.muted_style()),
-                ]),
+                Line::from(header),
                 Line::from(Span::styled(
                     first_line_truncated(&e.content, 160),
                     theme.base(),
@@ -575,7 +597,9 @@ impl ProfileScreen {
             "backspace back · esc back"
         };
         parts.push(nav_hint.into());
-        if self.tab != ProfileTab::Info {
+        if self.tab == ProfileTab::Posts && self.is_self {
+            parts.push("enter open · P pin · scroll for more · r refresh".into());
+        } else if self.tab != ProfileTab::Info {
             parts.push("enter open · scroll for more · r refresh".into());
         } else if self.is_self {
             parts.push("e edit".into());
@@ -711,6 +735,66 @@ mod tests {
             follow_id: None,
             created_at: None,
         }
+    }
+
+    fn profile_entry(post_id: &str) -> Entry {
+        Entry {
+            post_id: post_id.into(),
+            author_id: "u".into(),
+            author_username: "me".into(),
+            content: "hi".into(),
+            title: None,
+            slug: None,
+            topics: vec![],
+            replies_count: 0,
+            bookmarks_count: 0,
+            is_public: true,
+            is_nsfw: false,
+            attachments: vec![],
+            created_at: None,
+            deleted: false,
+        }
+    }
+
+    #[test]
+    fn capital_p_pins_an_unpinned_post_on_own_posts_tab() {
+        let mut s = ProfileScreen::new_own();
+        s.apply_user(Ok(user("me"))); // pinned_post_id = None
+        s.posts.apply_initial(Ok((vec![profile_entry("p1")], None)));
+        s.tab = ProfileTab::Posts;
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('P'))),
+            ProfileIntent::PinPost {
+                post_id: "p1".into(),
+                pin: true,
+            }
+        );
+    }
+
+    #[test]
+    fn capital_p_unpins_the_currently_pinned_post() {
+        let mut s = ProfileScreen::new_own();
+        let mut u = user("me");
+        u.pinned_post_id = Some("p1".into());
+        s.apply_user(Ok(u));
+        s.posts.apply_initial(Ok((vec![profile_entry("p1")], None)));
+        s.tab = ProfileTab::Posts;
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('P'))),
+            ProfileIntent::PinPost {
+                post_id: "p1".into(),
+                pin: false,
+            }
+        );
+    }
+
+    #[test]
+    fn capital_p_does_nothing_on_other_users_profile() {
+        let mut s = ProfileScreen::new_for("bob".into()); // not self
+        s.apply_user(Ok(user("bob")));
+        s.posts.apply_initial(Ok((vec![profile_entry("p1")], None)));
+        s.tab = ProfileTab::Posts;
+        assert_eq!(s.handle_key(key(KeyCode::Char('P'))), ProfileIntent::None);
     }
 
     #[test]

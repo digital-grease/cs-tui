@@ -306,6 +306,10 @@ enum Action {
     SubmitEditProfile {
         update: Box<ProfileUpdate>,
     },
+    PinPost {
+        post_id: String,
+        pin: bool,
+    },
     StartComposeEntry,
     BookmarkPost {
         post_id: String,
@@ -996,6 +1000,7 @@ impl App {
                     }
                 }
                 ProfileIntent::EditOwnProfile => Action::OpenEditProfile,
+                ProfileIntent::PinPost { post_id, pin } => Action::PinPost { post_id, pin },
                 ProfileIntent::OpenPost { post_id } => Action::OpenPostDetailById {
                     post_id,
                     highlight_reply_id: None,
@@ -1184,15 +1189,27 @@ impl App {
                 post_id,
                 highlight_reply_id,
             } => {
-                // Fast path: if the entry is already in the current Feed, use it.
+                // Fast path: reuse the entry already in the current feed — but
+                // skip a tombstoned one (a refresh may have marked it deleted),
+                // so we fall through and fetch fresh rather than open a stale shell.
                 if let Screen::Feed(s) = &self.screen {
-                    if let Some(entry) = s.entries.iter().find(|e| e.post_id == post_id).cloned() {
+                    if let Some(entry) = s
+                        .entries
+                        .iter()
+                        .find(|e| e.post_id == post_id && !e.deleted)
+                        .cloned()
+                    {
                         self.enter_post_detail(entry, highlight_reply_id);
                         return;
                     }
                 }
                 if let Screen::TopicFeed(s) = &self.screen {
-                    if let Some(entry) = s.entries.iter().find(|e| e.post_id == post_id).cloned() {
+                    if let Some(entry) = s
+                        .entries
+                        .iter()
+                        .find(|e| e.post_id == post_id && !e.deleted)
+                        .cloned()
+                    {
                         self.enter_post_detail(entry, highlight_reply_id);
                         return;
                     }
@@ -1270,6 +1287,26 @@ impl App {
             }
             Action::SubmitEditProfile { update } => {
                 self.spawn_update_own_profile(*update);
+            }
+            Action::PinPost { post_id, pin } => {
+                if self.block_write_if_offline() {
+                    return;
+                }
+                // Optimistic: flip the marker now (the ★/📌 is the feedback). A
+                // failed PATCH resyncs via the ProfileUpdated error path.
+                if let Screen::Profile(p) = &mut self.screen {
+                    if let Some(u) = &mut p.user {
+                        u.pinned_post_id = pin.then(|| post_id.clone());
+                    }
+                }
+                self.spawn_update_own_profile(ProfileUpdate {
+                    pinned_post_id: if pin {
+                        cs_api::Patch::Set(post_id)
+                    } else {
+                        cs_api::Patch::Clear
+                    },
+                    ..Default::default()
+                });
             }
             Action::StartComposeEntry => {
                 self.start_compose(ComposeKind::NewEntry, String::new())
@@ -1526,7 +1563,10 @@ impl App {
             } => match result {
                 Ok(entry) => self.enter_post_detail(entry, highlight_reply_id),
                 Err(msg) => {
-                    tracing::warn!(error = msg, "open-post-detail fetch failed");
+                    // Don't swallow it: a notification pointing at a missing /
+                    // non-post target would otherwise look like a dead key.
+                    tracing::warn!(error = %msg, "open-post-detail fetch failed");
+                    self.warn_toast_unless_signalled("couldn't open that post");
                 }
             },
             BgEvent::UnreadCount(n) => {
@@ -1624,6 +1664,12 @@ impl App {
                 Err(msg) => {
                     if let Screen::EditProfile(s) = &mut self.screen {
                         s.finish_submit(Err(msg));
+                    } else if matches!(self.screen, Screen::Profile(_)) {
+                        // A pin/unpin from the profile failed — warn and resync
+                        // the marker from the server.
+                        tracing::warn!(error = %msg, "pin update failed");
+                        self.warn_toast_unless_signalled("couldn't update pin");
+                        self.spawn_profile_user_me();
                     }
                 }
             },
@@ -3145,6 +3191,49 @@ mod tests {
         let mut app = test_app();
         app.handle_bg_event(BgEvent::BookmarkRemoveFailed);
         assert!(app.toast.is_some(), "a failed removal should warn the user");
+    }
+
+    #[tokio::test]
+    async fn feed_enter_opens_the_post_via_fast_path() {
+        let mut app = test_app();
+        let mut feed = FeedScreen::new();
+        feed.apply_initial(Ok((vec![test_entry("p1")], None)));
+        app.screen = Screen::Feed(feed);
+        app.current_root = Some(RootKind::Feed);
+        app.handle_terminal_event(key_event(KeyCode::Enter)).await;
+        assert!(
+            matches!(app.screen, Screen::PostDetail(_)),
+            "enter routes through OpenPostDetailById to the post detail"
+        );
+    }
+
+    #[tokio::test]
+    async fn topic_feed_enter_opens_the_post() {
+        let mut app = test_app();
+        let mut tf = TopicFeedScreen::new("music".into());
+        tf.apply_initial(Ok((vec![test_entry("p1")], None)));
+        app.screen = Screen::TopicFeed(tf);
+        app.handle_terminal_event(key_event(KeyCode::Enter)).await;
+        assert!(matches!(app.screen, Screen::PostDetail(_)));
+    }
+
+    #[tokio::test]
+    async fn enter_on_a_deleted_cached_entry_skips_the_fast_path() {
+        // #22: a refresh can tombstone a cached entry; opening it must fetch
+        // fresh rather than show a stale shell, so the fast path is skipped and
+        // the (async) slow fetch leaves the screen on the feed for now.
+        let mut app = test_app();
+        let mut feed = FeedScreen::new();
+        let mut e = test_entry("p1");
+        e.deleted = true;
+        feed.apply_initial(Ok((vec![e], None)));
+        app.screen = Screen::Feed(feed);
+        app.current_root = Some(RootKind::Feed);
+        app.handle_terminal_event(key_event(KeyCode::Enter)).await;
+        assert!(
+            matches!(app.screen, Screen::Feed(_)),
+            "deleted cached entry must not fast-path into a stale detail view"
+        );
     }
 
     #[tokio::test]

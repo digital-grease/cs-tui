@@ -23,7 +23,9 @@ impl Theme {
         Self {
             background: Color::Reset,
             foreground: Color::White,
-            muted: Color::DarkGray,
+            // A mid-gray (not DarkGray) so secondary text — timestamps, counts —
+            // stays legible against a black background.
+            muted: Color::Indexed(245),
             accent: Color::LightGreen,
             success: Color::Green,
             error: Color::LightRed,
