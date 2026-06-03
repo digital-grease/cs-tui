@@ -288,7 +288,7 @@ impl JournalScreen {
             )
         } else if self.next_cursor.is_some() {
             format!(
-                "{} notes · scroll down for more · c compose · e edit · d delete · v revisions · r refresh",
+                "{} notes · scroll down for more · c compose · e edit · d delete · v revisions · r refresh · esc menu",
                 self.notes.len()
             )
         } else {
