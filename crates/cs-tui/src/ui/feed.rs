@@ -230,7 +230,7 @@ fn entry_item<'a>(entry: &'a Entry, width: u16, theme: &Theme) -> ListItem<'a> {
         let title = title.trim();
         if !title.is_empty() {
             lines.push(Line::from(Span::styled(
-                first_line_truncated(title, 200),
+                super::text::first_line_truncated(title, 200),
                 theme.accent_style(),
             )));
         }
@@ -249,16 +249,6 @@ fn entry_item<'a>(entry: &'a Entry, width: u16, theme: &Theme) -> ListItem<'a> {
     }
 
     ListItem::new(lines)
-}
-
-fn first_line_truncated(s: &str, max: usize) -> String {
-    let first_line = s.lines().next().unwrap_or("").trim();
-    if first_line.chars().count() <= max {
-        first_line.to_string()
-    } else {
-        let truncated: String = first_line.chars().take(max - 1).collect();
-        format!("{truncated}…")
-    }
 }
 
 fn status_line<'a>(s: &'a FeedScreen, theme: &Theme) -> Paragraph<'a> {
@@ -606,24 +596,5 @@ mod tests {
         s.apply_more(Ok((vec![entry("b", "b", false)], None)));
         assert_eq!(s.entries.len(), 2);
         assert!(s.next_cursor.is_none());
-    }
-
-    #[test]
-    fn truncation_handles_short_content() {
-        assert_eq!(first_line_truncated("hi", 50), "hi");
-    }
-
-    #[test]
-    fn truncation_truncates_long_content() {
-        let s = "x".repeat(300);
-        let out = first_line_truncated(&s, 200);
-        assert_eq!(out.chars().count(), 200);
-        assert!(out.ends_with('…'));
-    }
-
-    #[test]
-    fn truncation_uses_only_first_line() {
-        let s = "first line\nsecond line";
-        assert_eq!(first_line_truncated(s, 100), "first line");
     }
 }

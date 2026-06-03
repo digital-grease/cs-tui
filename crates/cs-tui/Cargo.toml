@@ -30,4 +30,5 @@ tracing-appender = { workspace = true }
 clap = { workspace = true }
 directories = { workspace = true }
 pulldown-cmark = { workspace = true }
+unicode-width = { workspace = true }
 time = { workspace = true }

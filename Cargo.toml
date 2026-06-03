@@ -39,6 +39,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 
 # Markdown
 pulldown-cmark = { version = "0.12", default-features = false }
+unicode-width = "0.2"
 
 # CLI + config
 clap = { version = "4.5", features = ["derive", "env"] }
