@@ -3,7 +3,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use cs_api::{Entry, Follow, Reply, User};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 use time::OffsetDateTime;
 
@@ -51,60 +51,7 @@ impl ProfileTab {
     }
 }
 
-#[derive(Debug)]
-pub struct TabState<T> {
-    pub items: Vec<T>,
-    pub selected: usize,
-    pub next_cursor: Option<String>,
-    pub loading: bool,
-    pub error: Option<String>,
-    pub loaded: bool,
-}
-
-// Manual Default — `#[derive(Default)]` would add a `T: Default` bound that
-// our payload types (Entry, Reply, Follow) don't satisfy.
-impl<T> Default for TabState<T> {
-    fn default() -> Self {
-        Self {
-            items: Vec::new(),
-            selected: 0,
-            next_cursor: None,
-            loading: false,
-            error: None,
-            loaded: false,
-        }
-    }
-}
-
-impl<T> TabState<T> {
-    pub fn apply_initial(&mut self, result: Result<(Vec<T>, Option<String>), String>) {
-        self.loading = false;
-        self.loaded = true;
-        match result {
-            Ok((items, cursor)) => {
-                self.items = items;
-                self.next_cursor = cursor;
-                if self.selected >= self.items.len() {
-                    self.selected = 0;
-                }
-                self.error = None;
-            }
-            Err(msg) => self.error = Some(msg),
-        }
-    }
-
-    pub fn apply_more(&mut self, result: Result<(Vec<T>, Option<String>), String>) {
-        self.loading = false;
-        match result {
-            Ok((mut items, cursor)) => {
-                self.items.append(&mut items);
-                self.next_cursor = cursor;
-                self.error = None;
-            }
-            Err(msg) => self.error = Some(msg),
-        }
-    }
-}
+pub use super::list::TabState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProfileIntent {
@@ -528,7 +475,7 @@ impl ProfileScreen {
             vec![
                 Line::from(header),
                 Line::from(Span::styled(
-                    first_line_truncated(&e.content, 160),
+                    super::text::first_line_truncated(&e.content, 160),
                     theme.base(),
                 )),
                 Line::from(""),
@@ -545,7 +492,7 @@ impl ProfileScreen {
                     Span::styled(format!(" · {when} · on {}", r.post_id), theme.muted_style()),
                 ]),
                 Line::from(Span::styled(
-                    first_line_truncated(&r.content, 160),
+                    super::text::first_line_truncated(&r.content, 160),
                     theme.base(),
                 )),
                 Line::from(""),
@@ -634,54 +581,13 @@ fn render_list_with_state<T, F>(
 ) where
     F: Fn(&T) -> Vec<Line<'static>>,
 {
-    if state.loading && state.items.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled("loading…", theme.accent_style()))),
-            area,
-        );
-        return;
-    }
-    if let Some(msg) = &state.error {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(msg.clone(), theme.error_style()))),
-            area,
-        );
-        return;
-    }
-    if state.items.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                format!("no {empty_label}"),
-                theme.muted_style(),
-            ))),
-            area,
-        );
-        return;
-    }
-    let items: Vec<ListItem<'static>> = state
-        .items
-        .iter()
-        .map(|t| ListItem::new(item_lines(t)))
-        .collect();
-    let list = List::new(items)
-        .highlight_style(theme.accent_style())
-        .highlight_symbol("▌ ");
-    let mut list_state = ListState::default();
-    list_state.select(Some(
-        state.selected.min(state.items.len().saturating_sub(1)),
-    ));
-    frame.render_stateful_widget(list, area, &mut list_state);
+    let visible: Vec<usize> = (0..state.items.len()).collect();
+    let empty = format!("no {empty_label}");
+    super::list::render_body(frame, area, theme, state, &visible, &empty, |t| {
+        ListItem::new(item_lines(t))
+    });
 }
 
-fn first_line_truncated(s: &str, max: usize) -> String {
-    let first = s.lines().next().unwrap_or("").trim();
-    if first.chars().count() <= max {
-        first.to_string()
-    } else {
-        let truncated: String = first.chars().take(max - 1).collect();
-        format!("{truncated}…")
-    }
-}
 
 fn format_relative(t: OffsetDateTime) -> String {
     let now = OffsetDateTime::now_utc();

@@ -3,9 +3,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use cs_api::Entry;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, ListItem, Paragraph};
 use ratatui::Frame;
 
+use super::list::{self, TabState};
 use super::theme::Theme;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,29 +28,21 @@ pub enum FeedIntent {
 
 #[derive(Debug)]
 pub struct FeedScreen {
-    pub entries: Vec<Entry>,
-    pub selected: usize,
-    pub next_cursor: Option<String>,
-    pub loading: bool,
-    pub error: Option<String>,
+    pub list: TabState<Entry>,
     pub include_nsfw: bool,
 }
 
 impl FeedScreen {
     pub fn new() -> Self {
         Self {
-            entries: Vec::new(),
-            selected: 0,
-            next_cursor: None,
-            loading: true,
-            error: None,
+            list: TabState::loading(),
             include_nsfw: crate::config::get().nsfw,
         }
     }
 
     /// Number of entries currently visible after NSFW filtering.
     fn visible_indices(&self) -> Vec<usize> {
-        self.entries
+        self.list.items
             .iter()
             .enumerate()
             .filter(|(_, e)| self.include_nsfw || !e.is_nsfw)
@@ -61,18 +54,18 @@ impl FeedScreen {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return FeedIntent::Quit;
         }
-        if self.loading {
+        if self.list.loading {
             return FeedIntent::None;
         }
         let visible = self.visible_indices();
         match super::list_nav::navigate(
             key.code,
-            &mut self.selected,
+            &mut self.list.selected,
             visible.len(),
-            self.next_cursor.is_some(),
+            self.list.next_cursor.is_some(),
         ) {
             super::list_nav::ListNav::LoadMore => {
-                self.loading = true;
+                self.list.loading = true;
                 return FeedIntent::LoadMore;
             }
             super::list_nav::ListNav::Moved => return FeedIntent::None,
@@ -80,26 +73,26 @@ impl FeedScreen {
         }
         match key.code {
             KeyCode::Char('r') => {
-                self.entries.clear();
-                self.next_cursor = None;
-                self.selected = 0;
-                self.loading = true;
-                self.error = None;
+                self.list.items.clear();
+                self.list.next_cursor = None;
+                self.list.selected = 0;
+                self.list.loading = true;
+                self.list.error = None;
                 return FeedIntent::Refresh;
             }
             KeyCode::Char('c') => {
                 return FeedIntent::Compose;
             }
             KeyCode::Char('b') => {
-                if let Some(idx) = visible.get(self.selected) {
-                    if let Some(entry) = self.entries.get(*idx) {
+                if let Some(idx) = visible.get(self.list.selected) {
+                    if let Some(entry) = self.list.items.get(*idx) {
                         return FeedIntent::Bookmark(entry.post_id.clone());
                     }
                 }
             }
             KeyCode::Enter => {
-                if let Some(idx) = visible.get(self.selected) {
-                    if let Some(entry) = self.entries.get(*idx) {
+                if let Some(idx) = visible.get(self.list.selected) {
+                    if let Some(entry) = self.list.items.get(*idx) {
                         return FeedIntent::OpenSelected(entry.post_id.clone());
                     }
                 }
@@ -109,33 +102,18 @@ impl FeedScreen {
         FeedIntent::None
     }
 
-    /// Apply the result of an initial load or refresh.
+    /// Apply the result of an initial load or refresh. Selection clamps to the
+    /// NSFW-filtered view, not the raw item count.
     pub fn apply_initial(&mut self, result: Result<(Vec<Entry>, Option<String>), String>) {
-        self.loading = false;
-        match result {
-            Ok((entries, cursor)) => {
-                self.entries = entries;
-                self.next_cursor = cursor;
-                if self.selected >= self.visible_indices().len() {
-                    self.selected = 0;
-                }
-                self.error = None;
-            }
-            Err(msg) => self.error = Some(msg),
+        self.list.apply_initial(result);
+        if self.list.selected >= self.visible_indices().len() {
+            self.list.selected = 0;
         }
     }
 
     /// Append the result of a load-more page.
     pub fn apply_more(&mut self, result: Result<(Vec<Entry>, Option<String>), String>) {
-        self.loading = false;
-        match result {
-            Ok((mut entries, cursor)) => {
-                self.entries.append(&mut entries);
-                self.next_cursor = cursor;
-                self.error = None;
-            }
-            Err(msg) => self.error = Some(msg),
-        }
+        self.list.apply_more(result);
     }
 
     pub fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
@@ -153,38 +131,17 @@ impl FeedScreen {
         let list_area = layout[0];
         let status_area = layout[1];
 
-        let visible_indices = self.visible_indices();
-
-        if self.loading && self.entries.is_empty() {
-            let para = Paragraph::new(Line::from(Span::styled(
-                "loading feed…",
-                theme.accent_style(),
-            )));
-            frame.render_widget(para, list_area);
-        } else if visible_indices.is_empty() {
-            // Empty list: distinguish an initial-load failure from genuine
-            // emptiness. (A load-more failure keeps entries, so it never lands
-            // here — it rides the status line instead.)
-            let (text, style) = if let Some(msg) = &self.error {
-                (msg.clone(), theme.error_style())
-            } else {
-                ("no entries to show".to_string(), theme.muted_style())
-            };
-            frame.render_widget(Paragraph::new(Line::from(Span::styled(text, style))), list_area);
-        } else {
-            let items: Vec<ListItem<'_>> = visible_indices
-                .iter()
-                .map(|i| entry_item(&self.entries[*i], list_area.width, theme))
-                .collect();
-            let list = List::new(items)
-                .highlight_style(theme.accent_style())
-                .highlight_symbol("▌ ");
-            let mut state = ListState::default();
-            state.select(Some(
-                self.selected.min(visible_indices.len().saturating_sub(1)),
-            ));
-            frame.render_stateful_widget(list, list_area, &mut state);
-        }
+        let visible = self.visible_indices();
+        let width = list_area.width;
+        list::render_body(
+            frame,
+            list_area,
+            theme,
+            &self.list,
+            &visible,
+            "no entries to show",
+            |e| entry_item(e, width, theme),
+        );
 
         let status = status_line(self, theme);
         frame.render_widget(status, status_area);
@@ -197,7 +154,7 @@ impl Default for FeedScreen {
     }
 }
 
-fn entry_item<'a>(entry: &'a Entry, width: u16, theme: &Theme) -> ListItem<'a> {
+fn entry_item(entry: &Entry, width: u16, theme: &Theme) -> ListItem<'static> {
     let when = entry
         .created_at
         .map(crate::config::format_list_timestamp)
@@ -252,27 +209,20 @@ fn entry_item<'a>(entry: &'a Entry, width: u16, theme: &Theme) -> ListItem<'a> {
 }
 
 fn status_line<'a>(s: &'a FeedScreen, theme: &Theme) -> Paragraph<'a> {
-    // A load-more failure with entries already on screen rides the status line so
-    // the feed stays put instead of being replaced by a full-screen error.
-    if !s.loading && !s.entries.is_empty() {
-        if let Some(msg) = &s.error {
-            return Paragraph::new(Line::from(Span::styled(
-                format!("⚠ {msg} · scroll or r to retry"),
-                theme.error_style(),
-            )));
-        }
+    if let Some(msg) = list::load_more_error(&s.list) {
+        return Paragraph::new(Line::from(Span::styled(msg, theme.error_style())));
     }
-    let text = if s.loading {
+    let text = if s.list.loading {
         "loading… · enter open · b bookmark · r refresh · esc menu".to_string()
-    } else if s.next_cursor.is_some() {
+    } else if s.list.next_cursor.is_some() {
         format!(
             "{} entries · scroll down for more · enter open · b bookmark · r refresh · esc menu",
-            s.entries.len()
+            s.list.items.len()
         )
     } else {
         format!(
             "{} entries · end of feed · enter open · b bookmark · r refresh · esc menu",
-            s.entries.len()
+            s.list.items.len()
         )
     };
     Paragraph::new(Line::from(Span::styled(text, theme.muted_style())))
@@ -379,27 +329,27 @@ mod tests {
     #[test]
     fn new_starts_loading() {
         let s = FeedScreen::new();
-        assert!(s.loading);
-        assert!(s.entries.is_empty());
-        assert_eq!(s.selected, 0);
+        assert!(s.list.loading);
+        assert!(s.list.items.is_empty());
+        assert_eq!(s.list.selected, 0);
     }
 
     #[test]
     fn apply_initial_clears_loading_and_populates() {
         let mut s = FeedScreen::new();
         s.apply_initial(Ok((vec![entry("a", "alice", false)], None)));
-        assert!(!s.loading);
-        assert_eq!(s.entries.len(), 1);
-        assert!(s.next_cursor.is_none());
-        assert!(s.error.is_none());
+        assert!(!s.list.loading);
+        assert_eq!(s.list.items.len(), 1);
+        assert!(s.list.next_cursor.is_none());
+        assert!(s.list.error.is_none());
     }
 
     #[test]
     fn apply_initial_error_sets_error_and_clears_loading() {
         let mut s = FeedScreen::new();
         s.apply_initial(Err("boom".into()));
-        assert!(!s.loading);
-        assert_eq!(s.error.as_deref(), Some("boom"));
+        assert!(!s.list.loading);
+        assert_eq!(s.list.error.as_deref(), Some("boom"));
     }
 
     #[test]
@@ -414,11 +364,11 @@ mod tests {
             None,
         )));
         s.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(s.selected, 1);
+        assert_eq!(s.list.selected, 1);
         s.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(s.selected, 2);
+        assert_eq!(s.list.selected, 2);
         s.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(s.selected, 2, "should not advance past last");
+        assert_eq!(s.list.selected, 2, "should not advance past last");
     }
 
     #[test]
@@ -428,11 +378,11 @@ mod tests {
             vec![entry("a", "a", false), entry("b", "b", false)],
             None,
         )));
-        s.selected = 1;
+        s.list.selected = 1;
         s.handle_key(key(KeyCode::Char('k')));
-        assert_eq!(s.selected, 0);
+        assert_eq!(s.list.selected, 0);
         s.handle_key(key(KeyCode::Char('k')));
-        assert_eq!(s.selected, 0);
+        assert_eq!(s.list.selected, 0);
     }
 
     #[test]
@@ -442,7 +392,7 @@ mod tests {
             vec![entry("p1", "a", false), entry("p2", "b", false)],
             None,
         )));
-        s.selected = 1;
+        s.list.selected = 1;
         assert_eq!(
             s.handle_key(key(KeyCode::Char('b'))),
             FeedIntent::Bookmark("p2".into())
@@ -456,7 +406,7 @@ mod tests {
             vec![entry("p1", "a", false), entry("p2", "b", false)],
             None,
         )));
-        s.selected = 1;
+        s.list.selected = 1;
         let intent = s.handle_key(key(KeyCode::Enter));
         assert_eq!(intent, FeedIntent::OpenSelected("p2".into()));
     }
@@ -467,10 +417,10 @@ mod tests {
         s.apply_initial(Ok((vec![entry("a", "a", false)], Some("next".into()))));
         let intent = s.handle_key(key(KeyCode::Char('n')));
         assert_eq!(intent, FeedIntent::LoadMore);
-        assert!(s.loading);
+        assert!(s.list.loading);
 
-        s.loading = false;
-        s.next_cursor = None;
+        s.list.loading = false;
+        s.list.next_cursor = None;
         let intent = s.handle_key(key(KeyCode::Char('n')));
         assert_eq!(intent, FeedIntent::None);
     }
@@ -484,10 +434,10 @@ mod tests {
         )));
         // Move to the last entry, then one more `j` paginates instead of stalling.
         s.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(s.selected, 1);
+        assert_eq!(s.list.selected, 1);
         let intent = s.handle_key(key(KeyCode::Char('j')));
         assert_eq!(intent, FeedIntent::LoadMore);
-        assert!(s.loading);
+        assert!(s.list.loading);
     }
 
     #[test]
@@ -496,20 +446,20 @@ mod tests {
         s.apply_initial(Ok((vec![entry("a", "a", false)], None)));
         let intent = s.handle_key(key(KeyCode::Char('j')));
         assert_eq!(intent, FeedIntent::None);
-        assert_eq!(s.selected, 0);
-        assert!(!s.loading);
+        assert_eq!(s.list.selected, 0);
+        assert!(!s.list.loading);
     }
 
     #[test]
     fn r_resets_and_requests_refresh() {
         let mut s = FeedScreen::new();
         s.apply_initial(Ok((vec![entry("a", "a", false)], Some("cur".into()))));
-        s.selected = 0;
+        s.list.selected = 0;
         let intent = s.handle_key(key(KeyCode::Char('r')));
         assert_eq!(intent, FeedIntent::Refresh);
-        assert!(s.loading);
-        assert!(s.entries.is_empty());
-        assert!(s.next_cursor.is_none());
+        assert!(s.list.loading);
+        assert!(s.list.items.is_empty());
+        assert!(s.list.next_cursor.is_none());
     }
 
     #[test]
@@ -594,7 +544,7 @@ mod tests {
         let mut s = FeedScreen::new();
         s.apply_initial(Ok((vec![entry("a", "a", false)], Some("c1".into()))));
         s.apply_more(Ok((vec![entry("b", "b", false)], None)));
-        assert_eq!(s.entries.len(), 2);
-        assert!(s.next_cursor.is_none());
+        assert_eq!(s.list.items.len(), 2);
+        assert!(s.list.next_cursor.is_none());
     }
 }

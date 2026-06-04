@@ -9,6 +9,7 @@ pub mod help;
 pub mod images;
 pub mod input;
 pub mod journal;
+pub mod list;
 pub mod list_nav;
 pub mod login;
 pub mod markdown;
