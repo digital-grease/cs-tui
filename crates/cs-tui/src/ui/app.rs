@@ -3231,12 +3231,12 @@ mod tests {
             kind: cs_api::NotificationType::Reply,
             read: false,
             created_at: None,
-            actor: None,
+            actor_id: None,
+            actor_username: None,
             target_id: None,
             target_type: None,
-            reply_id: None,
-            thread_author_username: None,
-            guild_name: None,
+            reason: None,
+            metadata: cs_api::NotificationMetadata::default(),
         }
     }
 

@@ -1,6 +1,6 @@
-//! Async Rust client for the cyberspace.online API (v0.4).
+//! Async Rust client for the cyberspace.online API (v0.5.0).
 //!
-//! Authoritative spec: `docs/api-v0.4.md` at the repo root.
+//! Authoritative spec: `docs/api-v0.5.0.md` at the repo root.
 #![deny(rust_2018_idioms)]
 
 mod auth;
@@ -32,7 +32,9 @@ pub use error::{ApiError, ErrorCode, Result};
 pub use follows::{Follow, FollowsDirection};
 pub use guilds::{Guild, GuildMembership, GuildRole, GuildThread, JoinedGuild};
 pub use notes::{Note, NoteRevision};
-pub use notifications::{Notification, NotificationActor, NotificationType, NotificationsFilter};
+pub use notifications::{
+    Notification, NotificationMetadata, NotificationType, NotificationsFilter,
+};
 pub use profile_patch::{Patch, ProfileUpdate};
 pub use rate_limit::RateLimit;
 pub use settings::{NotificationPrefs, Settings, SettingsUpdate};
@@ -41,7 +43,7 @@ pub use topics::Topic;
 pub use types::{Attachment, Entry, Reply};
 pub use users::User;
 
-pub const API_VERSION: &str = "v0.4";
+pub const API_VERSION: &str = "v0.5.0";
 pub const DEFAULT_BASE_URL: &str = "https://api.cyberspace.online";
 
 #[cfg(test)]
@@ -50,7 +52,7 @@ mod tests {
 
     #[test]
     fn constants_present() {
-        assert_eq!(API_VERSION, "v0.4");
+        assert_eq!(API_VERSION, "v0.5.0");
         assert!(DEFAULT_BASE_URL.starts_with("https://"));
     }
 }
