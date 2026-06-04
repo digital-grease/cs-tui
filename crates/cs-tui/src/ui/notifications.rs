@@ -162,11 +162,18 @@ impl NotificationsScreen {
             KeyCode::Char('M') => return NotificationsIntent::MarkAllRead,
             KeyCode::Enter => {
                 if let Some(n) = self.list.items.get(self.list.selected) {
-                    if let Some(post_id) = &n.target_id {
-                        return NotificationsIntent::OpenSelected {
-                            post_id: post_id.clone(),
-                            highlight_reply_id: n.reply_id.clone(),
-                        };
+                    // Only notifications with a non-empty target_type are
+                    // navigable to a post (post/reply); non-navigable ones
+                    // (followers, pokes, …) carry an empty target_type and would
+                    // otherwise try to open an unrelated id as a post.
+                    let navigable = n.target_type.as_deref().is_some_and(|t| !t.is_empty());
+                    if navigable {
+                        if let Some(post_id) = &n.target_id {
+                            return NotificationsIntent::OpenSelected {
+                                post_id: post_id.clone(),
+                                highlight_reply_id: n.reply_id.clone(),
+                            };
+                        }
                     }
                 }
             }
@@ -474,6 +481,17 @@ mod tests {
         )));
         let intent = s.handle_key(key(KeyCode::Enter));
         assert_eq!(intent, NotificationsIntent::None);
+    }
+
+    #[test]
+    fn enter_ignores_non_navigable_notification_with_a_target_id() {
+        // A follower-style notification can carry a non-post target_id but an
+        // empty target_type — Enter must not try to open it as a post.
+        let mut s = NotificationsScreen::new();
+        let mut n = notif("n1", NotificationType::NewFollower, Some("u1"), None);
+        n.target_type = None;
+        s.apply_initial(Ok((vec![n], None)));
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), NotificationsIntent::None);
     }
 
     #[test]
