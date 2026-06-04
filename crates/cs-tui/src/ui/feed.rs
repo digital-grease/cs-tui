@@ -213,15 +213,15 @@ fn status_line<'a>(s: &'a FeedScreen, theme: &Theme) -> Paragraph<'a> {
         return Paragraph::new(Line::from(Span::styled(msg, theme.error_style())));
     }
     let text = if s.list.loading {
-        "loading… · enter open · b bookmark · r refresh · esc menu".to_string()
+        "loading… · c new post · enter open · b bookmark · r refresh · esc menu".to_string()
     } else if s.list.next_cursor.is_some() {
         format!(
-            "{} entries · scroll down for more · enter open · b bookmark · r refresh · esc menu",
+            "{} entries · scroll down for more · c new post · enter open · b bookmark · r refresh · esc menu",
             s.list.items.len()
         )
     } else {
         format!(
-            "{} entries · end of feed · enter open · b bookmark · r refresh · esc menu",
+            "{} entries · end of feed · c new post · enter open · b bookmark · r refresh · esc menu",
             s.list.items.len()
         )
     };
