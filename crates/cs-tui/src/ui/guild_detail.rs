@@ -342,8 +342,8 @@ impl GuildScreen {
         }
 
         let base = match self.tab {
-            GuildTab::Threads => "tab tabs · enter open · scroll for more · r refresh",
-            GuildTab::Members => "tab tabs · scroll for more · r refresh",
+            GuildTab::Threads => "tab/h/l tabs · enter open · scroll for more · r refresh",
+            GuildTab::Members => "tab/h/l tabs · scroll for more · r refresh",
         };
         let action = match &self.guild {
             _ if self.action_pending => " · working…",

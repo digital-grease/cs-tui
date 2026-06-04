@@ -41,6 +41,7 @@ const COMMON: &[Row] = &[
     Row { keys: "k / ↑", desc: "move up" },
     Row { keys: "g / Home", desc: "jump to top" },
     Row { keys: "G / End", desc: "jump to bottom" },
+    Row { keys: "n / Space", desc: "next page" },
     Row { keys: "Enter", desc: "open / select" },
     Row { keys: "r", desc: "refresh" },
     Row { keys: "c", desc: "compose / new" },

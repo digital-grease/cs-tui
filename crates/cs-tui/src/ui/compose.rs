@@ -218,7 +218,7 @@ impl ComposeScreen {
 
     fn try_submit(&mut self) -> ComposeIntent {
         if self.content.trim().is_empty() {
-            self.error = Some("content is empty — press e to re-edit".into());
+            self.error = Some("content is empty — esc to cancel".into());
             return ComposeIntent::None;
         }
         if self.kind.has_title() {
