@@ -24,7 +24,6 @@ mod topics;
 mod types;
 mod users;
 
-pub use auth::{CheckUsernameResponse, ResendVerificationResponse};
 pub use bookmarks::{Bookmark, BookmarkKind};
 pub use client::{Client, ClientBuilder};
 pub use endpoint::EndpointKey;

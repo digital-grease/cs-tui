@@ -7,12 +7,9 @@ use crate::rate_limit::RateLimit;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EndpointKey {
-    // Auth
+    // Auth (registration is out of scope — login + refresh only)
     AuthLogin,
-    AuthRegister,
     AuthRefresh,
-    AuthResendVerification,
-    AuthCheckUsername,
 
     // Entries (posts)
     EntriesList,
@@ -83,8 +80,8 @@ impl EndpointKey {
     #[must_use]
     pub fn rate_limit(self) -> RateLimit {
         use EndpointKey::{
-            AuthCheckUsername, AuthLogin, AuthRefresh, AuthRegister, AuthResendVerification,
-            BookmarksCreate, BookmarksDelete, BookmarksList, EntriesCreate, EntriesDelete,
+            AuthLogin, AuthRefresh, BookmarksCreate, BookmarksDelete, BookmarksList, EntriesCreate,
+            EntriesDelete,
             EntriesGet, EntriesList, FollowsCreate, FollowsDelete, FollowsList, GuildsGet,
             GuildsJoin, GuildsLeave, GuildsList, GuildsMembersList, GuildsThreadsCreate,
             GuildsThreadsList, NotesCreate,
@@ -96,9 +93,8 @@ impl EndpointKey {
         };
 
         match self {
-            // Auth — only resend-verification has a documented limit.
-            AuthResendVerification => RateLimit::per_minute(1),
-            AuthLogin | AuthRegister | AuthRefresh | AuthCheckUsername => RateLimit::none(),
+            // Auth — login/refresh carry no documented limit.
+            AuthLogin | AuthRefresh => RateLimit::none(),
 
             // Reads — table values from § Anti-Scraping.
             EntriesList
