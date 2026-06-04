@@ -7,7 +7,8 @@ use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use cs_api::{
     ApiError, Bookmark, Client, EndpointKey, Entry, Follow, FollowsDirection, Guild,
-    GuildMembership, GuildThread, JoinedGuild, Note, NoteRevision, Notification, NotificationsFilter,
+    GuildMembership, GuildThread, JoinedGuild, Note, NoteRevision, Notification, NotificationType,
+    NotificationsFilter,
     ProfileUpdate, Reply, Settings, SettingsUpdate, Topic, User,
 };
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -132,7 +133,9 @@ pub enum BgEvent {
     },
     ProfileFollowToggled(Result<Option<String>, String>), // Ok(Some(follow_id)) on follow, Ok(None) on unfollow
     ProfileUpdated(Result<User, String>),
-    EntryCreated(Result<String, String>),
+    /// Ok carries (post_id, final slug) — the server may suffix the slug on
+    /// collision, so we echo what was actually stored.
+    EntryCreated(Result<(String, Option<String>), String>),
     ReplyCreated(Result<String, String>),
     EntryDeleted(Result<String, String>),
     NotesInitial(Result<(Vec<Note>, Option<String>), String>),
@@ -225,6 +228,7 @@ impl Screen {
 }
 
 /// Intent captured from a screen before we drop its borrow on `self.screen`.
+#[derive(Debug, PartialEq)]
 enum Action {
     None,
     Quit,
@@ -313,6 +317,9 @@ enum Action {
     StartComposeEntry,
     BookmarkPost {
         post_id: String,
+    },
+    BookmarkReply {
+        reply_id: String,
     },
     StartComposeReply {
         post_id: String,
@@ -673,127 +680,10 @@ impl App {
         }
     }
 
-    async fn handle_terminal_event(&mut self, ev: Event) {
-        let key = match ev {
-            Event::Key(k) if k.kind == event::KeyEventKind::Press => k,
-            // Mouse wheel → one selection step per notch. Button+scroll reporting
-            // is enabled in main; motion tracking is not, so the mouse doesn't
-            // flood events when moved.
-            Event::Mouse(m) => match m.kind {
-                event::MouseEventKind::ScrollDown => synthetic_key(KeyCode::Down),
-                event::MouseEventKind::ScrollUp => synthetic_key(KeyCode::Up),
-                _ => return,
-            },
-            _ => return,
-        };
-
-        // The help overlay swallows the next key to dismiss (Ctrl+C still quits).
-        if self.help {
-            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                self.should_quit = true;
-            } else {
-                self.help = false;
-            }
-            return;
-        }
-
-        // If the overlay menu is open, route the key there.
-        if let Some(menu) = &mut self.menu {
-            match menu.handle_key(key) {
-                MenuIntent::None => {}
-                MenuIntent::Cancel => self.menu = None,
-                MenuIntent::Back => {
-                    self.menu = None;
-                    self.pop_screen();
-                }
-                MenuIntent::Logout => {
-                    self.menu = None;
-                    self.logout().await;
-                }
-                MenuIntent::CycleTheme => {
-                    self.cycle_theme();
-                    // Keep the menu open with a refreshed label so the user can
-                    // cycle repeatedly and watch the palette change live.
-                    if let Some(menu) = &mut self.menu {
-                        menu.refresh_theme_label(self.theme_kind.name());
-                    }
-                }
-                MenuIntent::Quit => self.should_quit = true,
-            }
-            return;
-        }
-
-        // Esc closes the topics search box first, before its "back/menu" role.
-        if key.code == KeyCode::Esc {
-            if let Screen::Topics(s) = &mut self.screen {
-                if s.clear_filter() {
-                    return;
-                }
-            }
-        }
-
-        // Esc is the reflexive "back": pop to the previous screen when there is
-        // one; on a top-level section (nothing to pop) it opens the overlay menu.
-        if key.code == KeyCode::Esc {
-            if self.back_stack.is_empty() {
-                let authenticated = !self.screen.is_login();
-                self.menu =
-                    Some(MenuOverlay::build(authenticated, false, self.theme_kind.name()));
-            } else {
-                self.pop_screen();
-            }
-            return;
-        }
-
-        // Backspace mirrors Esc's "back" globally (so the help overlay can
-        // advertise it honestly), but only where there's somewhere to return to.
-        // It's also a text-delete key, so defer to the focused field on input
-        // screens, and it has no menu role at the top level.
-        if key.code == KeyCode::Backspace
-            && !self.screen.accepts_text_input()
-            && !self.back_stack.is_empty()
-        {
-            self.pop_screen();
-            return;
-        }
-
-        // `?` opens the help overlay, except where a screen captures text input.
-        if key.code == KeyCode::Char('?') && !self.screen.accepts_text_input() {
-            self.help = true;
-            return;
-        }
-
-        // Section nav: ←/→ cycle and 1-8 jump, but only on screens that don't
-        // capture text (a digit typed into a compose title must reach the field,
-        // not navigate). Tab is deliberately NOT a section key — it's reserved
-        // for switching sub-tabs within a screen (profile tabs, guild tabs,
-        // settings fields).
-        if !self.screen.accepts_text_input() {
-            match key.code {
-                KeyCode::Right => {
-                    let next = self.current_root.unwrap_or(RootKind::Feed).next();
-                    self.goto_root(next);
-                    return;
-                }
-                KeyCode::Left => {
-                    let prev = self.current_root.unwrap_or(RootKind::Feed).prev();
-                    self.goto_root(prev);
-                    return;
-                }
-                KeyCode::Char(c) => {
-                    if let Some(target) = RootKind::from_shortcut(c) {
-                        if self.current_root != Some(target) {
-                            self.goto_root(target);
-                            return;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        // Phase 1: derive an Action with a mutable borrow on the active screen.
-        let action = match &mut self.screen {
+    /// Phase 1 of input handling: map a key on the active screen to an Action.
+    /// Only touches the screen it mutates, so it can be unit-tested directly.
+    fn route_key(screen: &mut Screen, key: event::KeyEvent) -> Action {
+        match screen {
             Screen::Login(s) => match s.handle_key(key) {
                 LoginIntent::Submit => Action::LoginSubmit {
                     email: s.email.trim().to_string(),
@@ -905,6 +795,9 @@ impl App {
                 PostDetailIntent::Bookmark => Action::BookmarkPost {
                     post_id: s.entry.post_id.clone(),
                 },
+                PostDetailIntent::BookmarkReply { reply_id } => {
+                    Action::BookmarkReply { reply_id }
+                }
                 PostDetailIntent::None => Action::None,
             },
             Screen::Compose(s) => match s.handle_key(key) {
@@ -1061,7 +954,130 @@ impl App {
                 },
                 GuildIntent::None => Action::None,
             },
+        }
+    }
+
+    async fn handle_terminal_event(&mut self, ev: Event) {
+        let key = match ev {
+            Event::Key(k) if k.kind == event::KeyEventKind::Press => k,
+            // Mouse wheel → one selection step per notch. Button+scroll reporting
+            // is enabled in main; motion tracking is not, so the mouse doesn't
+            // flood events when moved.
+            Event::Mouse(m) => match m.kind {
+                event::MouseEventKind::ScrollDown => synthetic_key(KeyCode::Down),
+                event::MouseEventKind::ScrollUp => synthetic_key(KeyCode::Up),
+                _ => return,
+            },
+            _ => return,
         };
+
+        // The help overlay swallows the next key to dismiss (Ctrl+C still quits).
+        if self.help {
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                self.should_quit = true;
+            } else {
+                self.help = false;
+            }
+            return;
+        }
+
+        // If the overlay menu is open, route the key there.
+        if let Some(menu) = &mut self.menu {
+            match menu.handle_key(key) {
+                MenuIntent::None => {}
+                MenuIntent::Cancel => self.menu = None,
+                MenuIntent::Back => {
+                    self.menu = None;
+                    self.pop_screen();
+                }
+                MenuIntent::Logout => {
+                    self.menu = None;
+                    self.logout().await;
+                }
+                MenuIntent::CycleTheme => {
+                    self.cycle_theme();
+                    // Keep the menu open with a refreshed label so the user can
+                    // cycle repeatedly and watch the palette change live.
+                    if let Some(menu) = &mut self.menu {
+                        menu.refresh_theme_label(self.theme_kind.name());
+                    }
+                }
+                MenuIntent::Quit => self.should_quit = true,
+            }
+            return;
+        }
+
+        // Esc closes the topics search box first, before its "back/menu" role.
+        if key.code == KeyCode::Esc {
+            if let Screen::Topics(s) = &mut self.screen {
+                if s.clear_filter() {
+                    return;
+                }
+            }
+        }
+
+        // Esc is the reflexive "back": pop to the previous screen when there is
+        // one; on a top-level section (nothing to pop) it opens the overlay menu.
+        if key.code == KeyCode::Esc {
+            if self.back_stack.is_empty() {
+                let authenticated = !self.screen.is_login();
+                self.menu =
+                    Some(MenuOverlay::build(authenticated, false, self.theme_kind.name()));
+            } else {
+                self.pop_screen();
+            }
+            return;
+        }
+
+        // Backspace mirrors Esc's "back" globally (so the help overlay can
+        // advertise it honestly), but only where there's somewhere to return to.
+        // It's also a text-delete key, so defer to the focused field on input
+        // screens, and it has no menu role at the top level.
+        if key.code == KeyCode::Backspace
+            && !self.screen.accepts_text_input()
+            && !self.back_stack.is_empty()
+        {
+            self.pop_screen();
+            return;
+        }
+
+        // `?` opens the help overlay, except where a screen captures text input.
+        if key.code == KeyCode::Char('?') && !self.screen.accepts_text_input() {
+            self.help = true;
+            return;
+        }
+
+        // Section nav: ←/→ cycle and 1-8 jump, but only on screens that don't
+        // capture text (a digit typed into a compose title must reach the field,
+        // not navigate). Tab is deliberately NOT a section key — it's reserved
+        // for switching sub-tabs within a screen (profile tabs, guild tabs,
+        // settings fields).
+        if !self.screen.accepts_text_input() {
+            match key.code {
+                KeyCode::Right => {
+                    let next = self.current_root.unwrap_or(RootKind::Feed).next();
+                    self.goto_root(next);
+                    return;
+                }
+                KeyCode::Left => {
+                    let prev = self.current_root.unwrap_or(RootKind::Feed).prev();
+                    self.goto_root(prev);
+                    return;
+                }
+                KeyCode::Char(c) => {
+                    if let Some(target) = RootKind::from_shortcut(c) {
+                        if self.current_root != Some(target) {
+                            self.goto_root(target);
+                            return;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Phase 1: derive an Action with a mutable borrow on the active screen.
+        let action = Self::route_key(&mut self.screen, key);
 
         // Phase 2: apply the action with full mutable access to self.
         match action {
@@ -1071,20 +1087,12 @@ impl App {
             Action::FeedRefresh => self.spawn_feed_initial(),
             Action::FeedMore { cursor } => self.spawn_feed_more(cursor),
             Action::NotificationsRefresh => {
-                let filter = if let Screen::Notifications(s) = &self.screen {
-                    s.filter
-                } else {
-                    NotificationsFilter::All
-                };
-                self.spawn_notifications_initial(filter);
+                let (filter, types) = self.notification_query();
+                self.spawn_notifications_initial(filter, types);
             }
             Action::NotificationsMore { cursor } => {
-                let filter = if let Screen::Notifications(s) = &self.screen {
-                    s.filter
-                } else {
-                    NotificationsFilter::All
-                };
-                self.spawn_notifications_more(filter, cursor);
+                let (filter, types) = self.notification_query();
+                self.spawn_notifications_more(filter, types, cursor);
             }
             Action::NotificationsMarkOne { notification_id } => {
                 if self.block_write_if_offline() {
@@ -1318,6 +1326,12 @@ impl App {
                 }
                 self.spawn_bookmark_post(post_id);
             }
+            Action::BookmarkReply { reply_id } => {
+                if self.block_write_if_offline() {
+                    return;
+                }
+                self.spawn_bookmark_reply(reply_id);
+            }
             Action::StartComposeReply {
                 post_id,
                 parent_reply_id,
@@ -1453,13 +1467,9 @@ impl App {
             BgEvent::AllNotificationsMarkFailed => {
                 // We can't reconstruct which were unread, so resync from server.
                 self.warn_toast_unless_signalled("couldn't mark all as read");
-                let filter = if let Screen::Notifications(s) = &self.screen {
-                    Some(s.filter)
-                } else {
-                    None
-                };
-                if let Some(filter) = filter {
-                    self.spawn_notifications_initial(filter);
+                if matches!(self.screen, Screen::Notifications(_)) {
+                    let (filter, types) = self.notification_query();
+                    self.spawn_notifications_initial(filter, types);
                 }
                 self.spawn_unread_count_once();
             }
@@ -1674,7 +1684,7 @@ impl App {
                 }
             },
             BgEvent::EntryCreated(result) => match result {
-                Ok(_new_post_id) => {
+                Ok((_post_id, slug)) => {
                     if matches!(self.screen, Screen::Compose(_)) {
                         self.pop_screen();
                     }
@@ -1682,6 +1692,11 @@ impl App {
                     if matches!(self.screen, Screen::Feed(_)) {
                         self.spawn_feed_initial();
                     }
+                    // Echo the stored slug so the user sees any collision suffix.
+                    self.toast = Some(match slug {
+                        Some(s) => Toast::confirmation(format!("posted · /{s}")),
+                        None => Toast::confirmation("posted"),
+                    });
                 }
                 Err(msg) => {
                     if let Screen::Compose(s) = &mut self.screen {
@@ -2073,7 +2088,7 @@ impl App {
                 let mut s = NotificationsScreen::new();
                 s.filter = NotificationsFilter::All;
                 self.screen = Screen::Notifications(s);
-                self.spawn_notifications_initial(NotificationsFilter::All);
+                self.spawn_notifications_initial(NotificationsFilter::All, Vec::new());
             }
             RootKind::Bookmarks => {
                 self.screen = Screen::Bookmarks(BookmarksScreen::new());
@@ -2150,24 +2165,39 @@ impl App {
         });
     }
 
-    fn spawn_notifications_initial(&self, filter: NotificationsFilter) {
+    /// The active read filter + type-bucket from the notifications screen
+    /// (defaults when it isn't the current screen).
+    fn notification_query(&self) -> (NotificationsFilter, Vec<NotificationType>) {
+        if let Screen::Notifications(s) = &self.screen {
+            (s.filter, s.selected_types())
+        } else {
+            (NotificationsFilter::All, Vec::new())
+        }
+    }
+
+    fn spawn_notifications_initial(&self, filter: NotificationsFilter, types: Vec<NotificationType>) {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
             let result = client
-                .list_notifications(None, None, filter, &[])
+                .list_notifications(None, None, filter, &types)
                 .await
                 .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::NotificationsInitial(result));
         });
     }
 
-    fn spawn_notifications_more(&self, filter: NotificationsFilter, cursor: Option<String>) {
+    fn spawn_notifications_more(
+        &self,
+        filter: NotificationsFilter,
+        types: Vec<NotificationType>,
+        cursor: Option<String>,
+    ) {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
             let result = client
-                .list_notifications(cursor.as_deref(), None, filter, &[])
+                .list_notifications(cursor.as_deref(), None, filter, &types)
                 .await
                 .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::NotificationsMore(result));
@@ -2255,6 +2285,18 @@ impl App {
         tokio::spawn(async move {
             let result = client
                 .bookmark_post(&post_id)
+                .await
+                .map_err(|e| note_api_err(&tx, e));
+            let _ = tx.send(BgEvent::BookmarkCreated(result));
+        });
+    }
+
+    fn spawn_bookmark_reply(&self, reply_id: String) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .bookmark_reply(&reply_id)
                 .await
                 .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::BookmarkCreated(result));
@@ -2685,11 +2727,12 @@ impl App {
     }
 
     fn spawn_compose_submit(&self) {
-        let (kind, content, title, topics, is_public, is_nsfw) = match &self.screen {
+        let (kind, content, title, slug, topics, is_public, is_nsfw) = match &self.screen {
             Screen::Compose(s) => (
                 s.kind.clone(),
                 s.content.clone(),
                 s.title_to_send(),
+                s.slug_to_send(),
                 s.parse_topics(),
                 s.is_public,
                 s.is_nsfw,
@@ -2705,13 +2748,13 @@ impl App {
                         .create_entry(
                             &content,
                             title.as_deref(),
-                            None,
+                            slug.as_deref(),
                             &topics,
                             is_public,
                             is_nsfw,
                         )
                         .await
-                        .map(|created| created.post_id)
+                        .map(|created| (created.post_id, created.slug))
                         .map_err(|e| note_api_err(&tx, e));
                     let _ = tx.send(BgEvent::EntryCreated(result));
                 }
@@ -2742,7 +2785,13 @@ impl App {
                 }
                 ComposeKind::GuildThread { guild_slug } => {
                     let result = client
-                        .create_guild_thread(&guild_slug, &content, title.as_deref(), None, &topics)
+                        .create_guild_thread(
+                            &guild_slug,
+                            &content,
+                            title.as_deref(),
+                            slug.as_deref(),
+                            &topics,
+                        )
                         .await
                         .map(|created| created.post_id)
                         .map_err(|e| note_api_err(&tx, e));
@@ -3191,6 +3240,38 @@ mod tests {
         let mut app = test_app();
         app.handle_bg_event(BgEvent::BookmarkRemoveFailed);
         assert!(app.toast.is_some(), "a failed removal should warn the user");
+    }
+
+    fn kev(code: KeyCode) -> event::KeyEvent {
+        event::KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    #[test]
+    fn route_key_maps_feed_intents_to_actions() {
+        // Direct, synchronous coverage of the Phase-1 router (no side effects).
+        let mut feed = FeedScreen::new();
+        feed.apply_initial(Ok((vec![test_entry("p1")], None)));
+        let mut screen = Screen::Feed(feed);
+
+        assert_eq!(
+            App::route_key(&mut screen, kev(KeyCode::Enter)),
+            Action::OpenPostDetailById {
+                post_id: "p1".into(),
+                highlight_reply_id: None,
+            }
+        );
+        assert_eq!(
+            App::route_key(&mut screen, kev(KeyCode::Char('c'))),
+            Action::StartComposeEntry
+        );
+        assert_eq!(
+            App::route_key(&mut screen, kev(KeyCode::Char('b'))),
+            Action::BookmarkPost { post_id: "p1".into() }
+        );
+        assert_eq!(
+            App::route_key(&mut screen, kev(KeyCode::Char('x'))),
+            Action::None
+        );
     }
 
     #[tokio::test]

@@ -53,11 +53,17 @@ impl ComposeKind {
     fn has_title(&self) -> bool {
         matches!(self, Self::NewEntry | Self::GuildThread { .. })
     }
+
+    /// A custom per-author URL slug is accepted on entries and guild threads.
+    fn has_slug(&self) -> bool {
+        matches!(self, Self::NewEntry | Self::GuildThread { .. })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfirmField {
     Title,
+    Slug,
     Topics,
     Public,
     Nsfw,
@@ -76,6 +82,7 @@ pub struct ComposeScreen {
     pub kind: ComposeKind,
     pub content: String,
     pub title_input: String,
+    pub slug_input: String,
     pub topics_input: String,
     pub is_public: bool,
     pub is_nsfw: bool,
@@ -95,6 +102,7 @@ impl ComposeScreen {
             kind,
             content,
             title_input: String::new(),
+            slug_input: String::new(),
             topics_input: String::new(),
             is_public: false,
             is_nsfw: false,
@@ -124,38 +132,57 @@ impl ComposeScreen {
             KeyCode::Enter => {
                 return self.try_submit();
             }
-            KeyCode::Char(' ')
-                if !matches!(self.focused, ConfirmField::Title | ConfirmField::Topics) =>
-            {
+            KeyCode::Char(' ') if !self.focused_is_text() => {
                 self.toggle_current();
             }
-            KeyCode::Backspace if self.focused == ConfirmField::Title => {
-                self.title_input.pop();
+            KeyCode::Backspace => {
+                if let Some(field) = self.focused_text_mut() {
+                    field.pop();
+                }
             }
-            KeyCode::Backspace if self.focused == ConfirmField::Topics => {
-                self.topics_input.pop();
-            }
-            KeyCode::Char(c) if self.focused == ConfirmField::Title => {
-                self.title_input.push(c);
-            }
-            KeyCode::Char(c) if self.focused == ConfirmField::Topics => {
-                self.topics_input.push(c);
+            KeyCode::Char(c) => {
+                if let Some(field) = self.focused_text_mut() {
+                    field.push(c);
+                }
             }
             _ => {}
         }
         ComposeIntent::None
     }
 
+    /// Whether the focused field accepts typed characters.
+    fn focused_is_text(&self) -> bool {
+        matches!(
+            self.focused,
+            ConfirmField::Title | ConfirmField::Slug | ConfirmField::Topics
+        )
+    }
+
+    /// The text buffer for the focused field, if it's a text field.
+    fn focused_text_mut(&mut self) -> Option<&mut String> {
+        match self.focused {
+            ConfirmField::Title => Some(&mut self.title_input),
+            ConfirmField::Slug => Some(&mut self.slug_input),
+            ConfirmField::Topics => Some(&mut self.topics_input),
+            ConfirmField::Public | ConfirmField::Nsfw => None,
+        }
+    }
+
     fn cycle_focus(&mut self, backward: bool) {
         let order: &[ConfirmField] = match self.kind {
             ComposeKind::NewEntry => &[
                 ConfirmField::Title,
+                ConfirmField::Slug,
                 ConfirmField::Topics,
                 ConfirmField::Public,
                 ConfirmField::Nsfw,
             ],
             ComposeKind::NewNote | ComposeKind::UpdateNote { .. } => &[ConfirmField::Topics],
-            ComposeKind::GuildThread { .. } => &[ConfirmField::Title, ConfirmField::Topics],
+            ComposeKind::GuildThread { .. } => &[
+                ConfirmField::Title,
+                ConfirmField::Slug,
+                ConfirmField::Topics,
+            ],
             ComposeKind::Reply { .. } => &[],
         };
         if order.is_empty() {
@@ -175,7 +202,17 @@ impl ComposeScreen {
         match self.focused {
             ConfirmField::Public => self.is_public = !self.is_public,
             ConfirmField::Nsfw => self.is_nsfw = !self.is_nsfw,
-            ConfirmField::Title | ConfirmField::Topics => {}
+            ConfirmField::Title | ConfirmField::Slug | ConfirmField::Topics => {}
+        }
+    }
+
+    /// The slug to send (trimmed; `None` when blank — server auto-generates).
+    pub fn slug_to_send(&self) -> Option<String> {
+        let s = self.slug_input.trim();
+        if s.is_empty() {
+            None
+        } else {
+            Some(s.to_string())
         }
     }
 
@@ -189,6 +226,21 @@ impl ComposeScreen {
             if t.chars().count() > 100 {
                 self.error = Some("title must be ≤100 characters".into());
                 return ComposeIntent::None;
+            }
+        }
+        if self.kind.has_slug() {
+            let s = self.slug_input.trim();
+            if !s.is_empty() {
+                if s.chars().count() > 100 {
+                    self.error = Some("slug must be ≤100 characters".into());
+                    return ComposeIntent::None;
+                }
+                if s.chars()
+                    .any(|c| !c.is_ascii_lowercase() && !c.is_ascii_digit() && c != '-')
+                {
+                    self.error = Some("slug must be lowercase a-z, 0-9, or -".into());
+                    return ComposeIntent::None;
+                }
             }
         }
         if self.kind.has_topics() {
@@ -267,6 +319,14 @@ impl ComposeScreen {
         } else {
             None
         };
+        let slug_idx = if self.kind.has_slug() {
+            let idx = constraints.len();
+            constraints.push(Constraint::Length(1)); // slug label
+            constraints.push(Constraint::Length(1)); // slug input
+            Some(idx)
+        } else {
+            None
+        };
         let body_idx = constraints.len();
         constraints.push(Constraint::Min(3)); // body preview
         let topics_label_idx = constraints.len();
@@ -309,6 +369,34 @@ impl ComposeScreen {
                 Line::from(Span::styled(self.title_input.clone(), theme.base()))
             };
             frame.render_widget(Paragraph::new(title_line), title_area);
+        }
+
+        // Slug (entries / guild threads)
+        if let Some(idx) = slug_idx {
+            let style = if self.focused == ConfirmField::Slug {
+                theme.accent_style()
+            } else {
+                theme.muted_style()
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "slug (optional · a-z 0-9 - · blank = auto)",
+                    style,
+                ))),
+                layout[idx],
+            );
+            let slug_area = layout[idx + 1];
+            let slug_line = if self.focused == ConfirmField::Slug {
+                super::input::windowed_line(
+                    &self.slug_input,
+                    self.slug_input.chars().count(),
+                    slug_area.width as usize,
+                    theme,
+                )
+            } else {
+                Line::from(Span::styled(self.slug_input.clone(), theme.base()))
+            };
+            frame.render_widget(Paragraph::new(slug_line), slug_area);
         }
 
         // Body preview
@@ -546,6 +634,8 @@ mod tests {
         // New default for entries is Title (v0.3.7+).
         assert_eq!(s.focused, ConfirmField::Title);
         s.handle_key(key(KeyCode::Tab, KeyModifiers::empty()));
+        assert_eq!(s.focused, ConfirmField::Slug);
+        s.handle_key(key(KeyCode::Tab, KeyModifiers::empty()));
         assert_eq!(s.focused, ConfirmField::Topics);
         s.handle_key(key(KeyCode::Tab, KeyModifiers::empty()));
         assert_eq!(s.focused, ConfirmField::Public);
@@ -553,6 +643,22 @@ mod tests {
         assert_eq!(s.focused, ConfirmField::Nsfw);
         s.handle_key(key(KeyCode::Tab, KeyModifiers::empty()));
         assert_eq!(s.focused, ConfirmField::Title);
+    }
+
+    #[test]
+    fn slug_input_accepts_typing_and_validates() {
+        let mut s = ComposeScreen::new(ComposeKind::NewEntry, "hi".into());
+        s.focused = ConfirmField::Slug;
+        for c in "my-post".chars() {
+            s.handle_key(key(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        assert_eq!(s.slug_to_send().as_deref(), Some("my-post"));
+
+        // An invalid slug is rejected at submit with a clear message.
+        s.slug_input = "Bad Slug!".into();
+        let intent = s.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
+        assert_eq!(intent, ComposeIntent::None);
+        assert!(s.error.as_deref().unwrap_or_default().contains("slug"));
     }
 
     #[test]

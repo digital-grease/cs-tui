@@ -4,6 +4,7 @@ use std::cell::{Cell, RefCell};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use cs_api::{Entry, Reply};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
@@ -27,6 +28,10 @@ pub enum PostDetailIntent {
     Reply,
     /// Bookmark this post.
     Bookmark,
+    /// Bookmark the selected reply.
+    BookmarkReply {
+        reply_id: String,
+    },
     /// User confirmed deletion of the entry.
     DeleteEntryConfirmed,
     None,
@@ -45,6 +50,14 @@ pub struct PostDetailScreen {
     pub max_scroll: Cell<u16>,
     /// Optional reply id to highlight (set when arriving from a reply notification).
     pub highlight_reply_id: Option<String>,
+    /// Currently selected reply (index into `replies`), driven by `J`/`K`. `None`
+    /// means the post itself is the focus. Selecting a reply lets `b` bookmark it.
+    pub selected_reply: Option<usize>,
+    /// Logical line index where each reply begins, recorded during `compose_body`.
+    reply_starts: RefCell<Vec<usize>>,
+    /// Wrapped-row scroll offset of each reply, derived each render so `J`/`K`
+    /// can scroll the selected reply into view.
+    reply_anchors: RefCell<Vec<u16>>,
     /// Two-step delete: first `d` arms confirmation; `y` confirms.
     pub confirming_delete: bool,
     /// First image of the post, decoded into a terminal-graphics protocol once
@@ -64,6 +77,9 @@ impl PostDetailScreen {
             scroll: 0,
             max_scroll: Cell::new(0),
             highlight_reply_id: None,
+            selected_reply: None,
+            reply_starts: RefCell::new(Vec::new()),
+            reply_anchors: RefCell::new(Vec::new()),
             confirming_delete: false,
             image: RefCell::new(None),
         }
@@ -90,7 +106,32 @@ impl PostDetailScreen {
         match key.code {
             KeyCode::Backspace => PostDetailIntent::Back,
             KeyCode::Char('R') => PostDetailIntent::Reply,
-            KeyCode::Char('b') => PostDetailIntent::Bookmark,
+            // J/K move a reply selection (capitalized so j/k still scroll); the
+            // selected reply scrolls into view via the recorded anchors.
+            KeyCode::Char('J') if !self.replies.is_empty() => {
+                let next = match self.selected_reply {
+                    Some(i) => (i + 1).min(self.replies.len() - 1),
+                    None => 0,
+                };
+                self.selected_reply = Some(next);
+                self.scroll_to_reply(next);
+                PostDetailIntent::None
+            }
+            KeyCode::Char('K') => {
+                if let Some(i) = self.selected_reply {
+                    let prev = i.saturating_sub(1);
+                    self.selected_reply = Some(prev);
+                    self.scroll_to_reply(prev);
+                }
+                PostDetailIntent::None
+            }
+            // `b` bookmarks the selected reply, or the post when none is selected.
+            KeyCode::Char('b') => match self.selected_reply.and_then(|i| self.replies.get(i)) {
+                Some(r) => PostDetailIntent::BookmarkReply {
+                    reply_id: r.reply_id.clone(),
+                },
+                None => PostDetailIntent::Bookmark,
+            },
             KeyCode::Char('d') => {
                 if crate::config::get().confirm_deletes {
                     self.confirming_delete = true;
@@ -154,8 +195,18 @@ impl PostDetailScreen {
                 self.replies = replies;
                 self.next_replies_cursor = cursor;
                 self.error = None;
+                // The list changed out from under any selection.
+                self.selected_reply = None;
             }
             Err(msg) => self.error = Some(msg),
+        }
+    }
+
+    /// Scroll so reply `i` sits at the top of the viewport (best effort, using
+    /// the anchors recorded at the last render).
+    fn scroll_to_reply(&mut self, i: usize) {
+        if let Some(&anchor) = self.reply_anchors.borrow().get(i) {
+            self.scroll = anchor.min(self.max_scroll.get());
         }
     }
 
@@ -213,21 +264,27 @@ impl PostDetailScreen {
         // (ceil(line width / columns)); close enough to ratatui's word wrap to
         // keep `j`/`G` from running past the end.
         let cols = u32::from(text_area.width).max(1);
-        let wrapped_rows: u32 = lines
-            .iter()
-            .map(|l| {
-                let w = l.width() as u32;
-                if w <= cols {
-                    1
-                } else {
-                    // +1 cushions greedy word wrap, which can take one more row
-                    // than ceil(width/cols) when a word won't fit the last
-                    // column — better a blank line at the bottom than an
-                    // unreachable one.
-                    w.div_ceil(cols) + 1
-                }
-            })
-            .sum();
+        // Single pass: total wrapped rows (for max_scroll) and, at each reply's
+        // start line, the wrapped-row offset (so `J`/`K` can scroll it into view).
+        let reply_starts = self.reply_starts.borrow();
+        let mut anchors: Vec<u16> = Vec::with_capacity(reply_starts.len());
+        let mut acc: u32 = 0;
+        let mut si = 0;
+        let row_count = |w: u32| if w <= cols { 1 } else { w.div_ceil(cols) + 1 };
+        for (idx, l) in lines.iter().enumerate() {
+            while si < reply_starts.len() && reply_starts[si] == idx {
+                anchors.push(acc.min(u32::from(u16::MAX)) as u16);
+                si += 1;
+            }
+            acc += row_count(l.width() as u32);
+        }
+        while si < reply_starts.len() {
+            anchors.push(acc.min(u32::from(u16::MAX)) as u16);
+            si += 1;
+        }
+        drop(reply_starts);
+        *self.reply_anchors.borrow_mut() = anchors;
+        let wrapped_rows = acc;
         let max_scroll = wrapped_rows
             .saturating_sub(u32::from(text_area.height))
             .min(u32::from(u16::MAX)) as u16;
@@ -254,12 +311,12 @@ impl PostDetailScreen {
             format!("error: {msg} · esc back · r retry")
         } else if self.next_replies_cursor.is_some() {
             format!(
-                "{} replies · scroll down for more · esc back · R reply · b bookmark · d delete (own) · r refresh",
+                "{} replies · scroll down for more · esc back · J/K select reply · R reply · b bookmark · d delete · r refresh",
                 self.replies.len()
             )
         } else {
             format!(
-                "{} replies · end · esc back · R reply · b bookmark · d delete (own) · r refresh",
+                "{} replies · end · esc back · J/K select reply · R reply · b bookmark · d delete · r refresh",
                 self.replies.len()
             )
         };
@@ -326,11 +383,14 @@ impl PostDetailScreen {
         }
 
         // Replies
-        for reply in &self.replies {
+        let mut reply_starts = Vec::with_capacity(self.replies.len());
+        for (i, reply) in self.replies.iter().enumerate() {
+            reply_starts.push(lines.len());
             let highlight = self
                 .highlight_reply_id
                 .as_deref()
                 .is_some_and(|id| id == reply.reply_id);
+            let selected = self.selected_reply == Some(i);
             let style = if highlight {
                 theme.accent_style()
             } else {
@@ -345,8 +405,14 @@ impl PostDetailScreen {
             } else {
                 ""
             };
+            // The selected reply's header is reverse-video so it stands out.
+            let author_style = if selected {
+                theme.accent_style().add_modifier(Modifier::REVERSED)
+            } else {
+                theme.accent_style()
+            };
             lines.push(Line::from(vec![
-                Span::styled(format!("@{}", reply.author_username), theme.accent_style()),
+                Span::styled(format!("@{}", reply.author_username), author_style),
                 Span::styled(format!(" · {when}{parent}"), theme.muted_style()),
             ]));
             // Reply body — markdown-rendered. Highlight overrides via the loop below.
@@ -372,6 +438,7 @@ impl PostDetailScreen {
             )));
         }
 
+        *self.reply_starts.borrow_mut() = reply_starts;
         lines
     }
 }
@@ -421,6 +488,37 @@ mod tests {
             created_at: None,
             deleted: false,
         }
+    }
+
+    #[test]
+    fn j_k_select_replies_and_b_bookmarks_the_selection() {
+        let mut s = PostDetailScreen::new(entry("p1"));
+        s.apply_replies_initial(Ok((vec![reply("r1", "p1"), reply("r2", "p1")], None)));
+
+        // No selection → b bookmarks the post.
+        assert_eq!(s.handle_key(key(KeyCode::Char('b'))), PostDetailIntent::Bookmark);
+
+        // J selects the first reply; b bookmarks it.
+        s.handle_key(key(KeyCode::Char('J')));
+        assert_eq!(s.selected_reply, Some(0));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('b'))),
+            PostDetailIntent::BookmarkReply {
+                reply_id: "r1".into()
+            }
+        );
+
+        // J advances, K retreats; selection clamps at the ends.
+        s.handle_key(key(KeyCode::Char('J')));
+        assert_eq!(s.selected_reply, Some(1));
+        s.handle_key(key(KeyCode::Char('J')));
+        assert_eq!(s.selected_reply, Some(1), "stays on the last reply");
+        s.handle_key(key(KeyCode::Char('K')));
+        assert_eq!(s.selected_reply, Some(0));
+
+        // A fresh reply page clears the selection.
+        s.apply_replies_initial(Ok((vec![reply("r1", "p1")], None)));
+        assert_eq!(s.selected_reply, None);
     }
 
     fn body_text(s: &PostDetailScreen) -> Vec<String> {

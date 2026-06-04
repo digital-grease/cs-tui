@@ -31,6 +31,69 @@ pub enum NotificationsIntent {
     None,
 }
 
+/// Server-side type buckets, cycled with `t`. Each maps to a set of
+/// [`NotificationType`]s passed to the list endpoint's `type` query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifTypeFilter {
+    All,
+    Mentions,
+    Replies,
+    Social,
+    System,
+}
+
+impl NotifTypeFilter {
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Mentions,
+            Self::Mentions => Self::Replies,
+            Self::Replies => Self::Social,
+            Self::Social => Self::System,
+            Self::System => Self::All,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Mentions => "mentions",
+            Self::Replies => "replies",
+            Self::Social => "social",
+            Self::System => "system",
+        }
+    }
+
+    /// The notification types this bucket selects (empty = no type filter).
+    fn types(self) -> Vec<NotificationType> {
+        use NotificationType::*;
+        match self {
+            Self::All => vec![],
+            Self::Mentions => vec![PostMention, ReplyMention, ChatMention, DmMessage],
+            Self::Replies => vec![Reply, ThreadReply],
+            Self::Social => vec![
+                NewFollower,
+                Unfollowed,
+                Poke,
+                NewPostFollowing,
+                NewPostFriend,
+                Bookmark,
+                GuildNewThread,
+            ],
+            Self::System => vec![
+                SupporterGranted,
+                SupporterRemoved,
+                HackerGranted,
+                HackerRemoved,
+                ImagePermissionGranted,
+                ImagePermissionRemoved,
+                AttachmentPermissionGranted,
+                AttachmentPermissionRemoved,
+                SystemBan,
+            ],
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct NotificationsScreen {
     pub items: Vec<Notification>,
@@ -39,6 +102,7 @@ pub struct NotificationsScreen {
     pub loading: bool,
     pub error: Option<String>,
     pub filter: NotificationsFilter,
+    pub type_filter: NotifTypeFilter,
 }
 
 impl NotificationsScreen {
@@ -50,7 +114,14 @@ impl NotificationsScreen {
             loading: true,
             error: None,
             filter: NotificationsFilter::All,
+            type_filter: NotifTypeFilter::All,
         }
+    }
+
+    /// The notification types currently selected by the `t` filter.
+    #[must_use]
+    pub fn selected_types(&self) -> Vec<NotificationType> {
+        self.type_filter.types()
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> NotificationsIntent {
@@ -66,6 +137,16 @@ impl NotificationsScreen {
                     NotificationsFilter::Unread => NotificationsFilter::Read,
                     NotificationsFilter::Read => NotificationsFilter::All,
                 };
+                self.items.clear();
+                self.next_cursor = None;
+                self.selected = 0;
+                self.loading = true;
+                self.error = None;
+                return NotificationsIntent::ToggleFilter;
+            }
+            KeyCode::Char('t') => {
+                // Cycle the server-side type bucket; reload like the read filter.
+                self.type_filter = self.type_filter.next();
                 self.items.clear();
                 self.next_cursor = None;
                 self.selected = 0;
@@ -183,11 +264,17 @@ impl NotificationsScreen {
     }
 
     pub fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
-        let title = match self.filter {
-            NotificationsFilter::All => " cs-tui • notifications ",
-            NotificationsFilter::Unread => " cs-tui • notifications · unread ",
-            NotificationsFilter::Read => " cs-tui • notifications · read ",
+        let read = match self.filter {
+            NotificationsFilter::All => "",
+            NotificationsFilter::Unread => " · unread",
+            NotificationsFilter::Read => " · read",
         };
+        let typ = if self.type_filter == NotifTypeFilter::All {
+            String::new()
+        } else {
+            format!(" · {}", self.type_filter.label())
+        };
+        let title = format!(" cs-tui • notifications{read}{typ} ");
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(theme.border_style())
@@ -321,16 +408,16 @@ fn status_line<'a>(s: &'a NotificationsScreen, theme: &Theme) -> Paragraph<'a> {
         }
     }
     let text = if s.loading {
-        "loading… · enter open · m mark · M mark-all · f filter · r refresh · esc menu"
+        "loading… · enter open · m mark · M mark-all · f read · t type · r refresh · esc menu"
             .to_string()
     } else if s.next_cursor.is_some() {
         format!(
-            "{} items · scroll down for more · enter open · m mark · M mark-all · f filter · r refresh · esc menu",
+            "{} items · scroll down for more · enter open · m mark · M mark-all · f read · t type · r refresh · esc menu",
             s.items.len()
         )
     } else {
         format!(
-            "{} items · end · enter open · m mark · M mark-all · f filter · r refresh · esc menu",
+            "{} items · end · enter open · m mark · M mark-all · f read · t type · r refresh · esc menu",
             s.items.len()
         )
     };
@@ -499,6 +586,31 @@ mod tests {
         assert!(matches!(s.filter, NotificationsFilter::Read));
         s.handle_key(key(KeyCode::Char('f')));
         assert!(matches!(s.filter, NotificationsFilter::All));
+    }
+
+    #[test]
+    fn t_cycles_type_filter_and_reloads() {
+        let mut s = NotificationsScreen::new();
+        s.apply_initial(Ok((vec![], None)));
+        assert!(matches!(s.type_filter, NotifTypeFilter::All));
+        assert!(s.selected_types().is_empty());
+
+        let intent = s.handle_key(key(KeyCode::Char('t')));
+        assert_eq!(intent, NotificationsIntent::ToggleFilter);
+        assert!(matches!(s.type_filter, NotifTypeFilter::Mentions));
+        assert!(s.selected_types().contains(&NotificationType::PostMention));
+        assert!(s.loading, "changing the type filter triggers a reload");
+    }
+
+    #[test]
+    fn type_filter_wraps_back_to_all() {
+        let mut s = NotificationsScreen::new();
+        s.apply_initial(Ok((vec![], None)));
+        for _ in 0..5 {
+            s.handle_key(key(KeyCode::Char('t')));
+            s.loading = false; // let the next press through
+        }
+        assert!(matches!(s.type_filter, NotifTypeFilter::All));
     }
 
     #[test]
