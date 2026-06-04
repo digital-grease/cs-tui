@@ -696,7 +696,7 @@ impl App {
                 FeedIntent::Quit => Action::Quit,
                 FeedIntent::Refresh => Action::FeedRefresh,
                 FeedIntent::LoadMore => Action::FeedMore {
-                    cursor: s.next_cursor.clone(),
+                    cursor: s.list.next_cursor.clone(),
                 },
                 FeedIntent::OpenSelected(post_id) => Action::OpenPostDetailById {
                     post_id,
@@ -710,7 +710,7 @@ impl App {
                 NotificationsIntent::Quit => Action::Quit,
                 NotificationsIntent::Refresh => Action::NotificationsRefresh,
                 NotificationsIntent::LoadMore => Action::NotificationsMore {
-                    cursor: s.next_cursor.clone(),
+                    cursor: s.list.next_cursor.clone(),
                 },
                 NotificationsIntent::ToggleFilter => Action::NotificationsRefresh,
                 NotificationsIntent::MarkSelectedRead { notification_id } => {
@@ -730,7 +730,7 @@ impl App {
                 BookmarksIntent::Quit => Action::Quit,
                 BookmarksIntent::Refresh => Action::BookmarksRefresh,
                 BookmarksIntent::LoadMore => Action::BookmarksMore {
-                    cursor: s.next_cursor.clone(),
+                    cursor: s.list.next_cursor.clone(),
                 },
                 BookmarksIntent::RemoveSelected { bookmark_id } => {
                     Action::BookmarkRemove { bookmark_id }
@@ -760,7 +760,7 @@ impl App {
                 },
                 TopicFeedIntent::LoadMore => Action::TopicFeedMore {
                     slug: s.slug.clone(),
-                    cursor: s.next_cursor.clone(),
+                    cursor: s.list.next_cursor.clone(),
                 },
                 TopicFeedIntent::OpenSelected { post_id } => Action::OpenPostDetailById {
                     post_id,
@@ -915,7 +915,7 @@ impl App {
                 GuildsIntent::Quit => Action::Quit,
                 GuildsIntent::Refresh => Action::GuildsRefresh,
                 GuildsIntent::LoadMore => Action::GuildsMore {
-                    cursor: s.next_cursor.clone(),
+                    cursor: s.list.next_cursor.clone(),
                 },
                 GuildsIntent::OpenSelected { slug } => Action::GuildOpen { slug },
                 GuildsIntent::None => Action::None,
@@ -1202,7 +1202,7 @@ impl App {
                 // so we fall through and fetch fresh rather than open a stale shell.
                 if let Screen::Feed(s) = &self.screen {
                     if let Some(entry) = s
-                        .entries
+                        .list.items
                         .iter()
                         .find(|e| e.post_id == post_id && !e.deleted)
                         .cloned()
@@ -1213,7 +1213,7 @@ impl App {
                 }
                 if let Screen::TopicFeed(s) = &self.screen {
                     if let Some(entry) = s
-                        .entries
+                        .list.items
                         .iter()
                         .find(|e| e.post_id == post_id && !e.deleted)
                         .cloned()
@@ -3230,7 +3230,7 @@ mod tests {
         let Screen::Notifications(s) = &app.screen else {
             panic!("expected Notifications");
         };
-        assert!(!s.items[0].read, "read flag should roll back");
+        assert!(!s.list.items[0].read, "read flag should roll back");
         assert_eq!(app.unread_count, 3, "unread count should be restored");
         assert!(app.toast.is_some(), "a warning toast should be shown");
     }
@@ -3373,7 +3373,7 @@ mod tests {
         let Screen::Notifications(s) = &app.screen else {
             panic!("expected Notifications");
         };
-        assert!(!s.items[0].read, "offline write must not optimistically mark");
+        assert!(!s.list.items[0].read, "offline write must not optimistically mark");
         assert_eq!(app.unread_count, 3, "unread count unchanged while offline");
         assert!(app.toast.is_some(), "offline write surfaces a toast");
     }

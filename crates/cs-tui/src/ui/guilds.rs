@@ -4,9 +4,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use cs_api::Guild;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, ListItem, Paragraph};
 use ratatui::Frame;
 
+use super::list::{self, TabState};
 use super::theme::Theme;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,21 +22,13 @@ pub enum GuildsIntent {
 
 #[derive(Debug)]
 pub struct GuildsScreen {
-    pub items: Vec<Guild>,
-    pub selected: usize,
-    pub next_cursor: Option<String>,
-    pub loading: bool,
-    pub error: Option<String>,
+    pub list: TabState<Guild>,
 }
 
 impl GuildsScreen {
     pub fn new() -> Self {
         Self {
-            items: Vec::new(),
-            selected: 0,
-            next_cursor: None,
-            loading: true,
-            error: None,
+            list: TabState::loading(),
         }
     }
 
@@ -43,17 +36,17 @@ impl GuildsScreen {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return GuildsIntent::Quit;
         }
-        if self.loading {
+        if self.list.loading {
             return GuildsIntent::None;
         }
         match super::list_nav::navigate(
             key.code,
-            &mut self.selected,
-            self.items.len(),
-            self.next_cursor.is_some(),
+            &mut self.list.selected,
+            self.list.items.len(),
+            self.list.next_cursor.is_some(),
         ) {
             super::list_nav::ListNav::LoadMore => {
-                self.loading = true;
+                self.list.loading = true;
                 return GuildsIntent::LoadMore;
             }
             super::list_nav::ListNav::Moved => return GuildsIntent::None,
@@ -61,15 +54,15 @@ impl GuildsScreen {
         }
         match key.code {
             KeyCode::Char('r') => {
-                self.items.clear();
-                self.next_cursor = None;
-                self.selected = 0;
-                self.loading = true;
-                self.error = None;
+                self.list.items.clear();
+                self.list.next_cursor = None;
+                self.list.selected = 0;
+                self.list.loading = true;
+                self.list.error = None;
                 return GuildsIntent::Refresh;
             }
             KeyCode::Enter => {
-                if let Some(g) = self.items.get(self.selected) {
+                if let Some(g) = self.list.items.get(self.list.selected) {
                     return GuildsIntent::OpenSelected {
                         slug: g.slug.clone(),
                     };
@@ -81,30 +74,11 @@ impl GuildsScreen {
     }
 
     pub fn apply_initial(&mut self, result: Result<(Vec<Guild>, Option<String>), String>) {
-        self.loading = false;
-        match result {
-            Ok((items, cursor)) => {
-                self.items = items;
-                self.next_cursor = cursor;
-                if self.selected >= self.items.len() {
-                    self.selected = 0;
-                }
-                self.error = None;
-            }
-            Err(msg) => self.error = Some(msg),
-        }
+        self.list.apply_initial(result);
     }
 
     pub fn apply_more(&mut self, result: Result<(Vec<Guild>, Option<String>), String>) {
-        self.loading = false;
-        match result {
-            Ok((mut items, cursor)) => {
-                self.items.append(&mut items);
-                self.next_cursor = cursor;
-                self.error = None;
-            }
-            Err(msg) => self.error = Some(msg),
-        }
+        self.list.apply_more(result);
     }
 
     pub fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
@@ -120,48 +94,32 @@ impl GuildsScreen {
             .constraints([Constraint::Min(1), Constraint::Length(1)])
             .split(inner);
 
-        if self.loading && self.items.is_empty() {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    "loading guilds…",
-                    theme.accent_style(),
-                ))),
-                layout[0],
-            );
-        } else if let Some(msg) = &self.error {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(msg.clone(), theme.error_style()))),
-                layout[0],
-            );
-        } else if self.items.is_empty() {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled("no guilds", theme.muted_style()))),
-                layout[0],
-            );
-        } else {
-            let items: Vec<ListItem<'_>> =
-                self.items.iter().map(|g| guild_item(g, theme)).collect();
-            let list = List::new(items)
-                .highlight_style(theme.accent_style())
-                .highlight_symbol("▌ ");
-            let mut state = ListState::default();
-            state.select(Some(self.selected.min(self.items.len().saturating_sub(1))));
-            frame.render_stateful_widget(list, layout[0], &mut state);
-        }
+        let visible: Vec<usize> = (0..self.list.items.len()).collect();
+        list::render_body(frame, layout[0], theme, &self.list, &visible, "no guilds", |g| {
+            guild_item(g, theme)
+        });
 
-        let status = if self.next_cursor.is_some() {
-            format!(
-                "{} guilds · scroll down for more · enter open · r refresh · esc menu",
-                self.items.len()
+        let (status, style) = if let Some(msg) = list::load_more_error(&self.list) {
+            (msg, theme.error_style())
+        } else if self.list.next_cursor.is_some() {
+            (
+                format!(
+                    "{} guilds · scroll down for more · enter open · r refresh · esc menu",
+                    self.list.items.len()
+                ),
+                theme.muted_style(),
             )
         } else {
-            format!(
-                "{} guilds · enter open · r refresh · esc menu",
-                self.items.len()
+            (
+                format!(
+                    "{} guilds · enter open · r refresh · esc menu",
+                    self.list.items.len()
+                ),
+                theme.muted_style(),
             )
         };
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(status, theme.muted_style()))),
+            Paragraph::new(Line::from(Span::styled(status, style))),
             layout[1],
         );
     }
@@ -173,7 +131,7 @@ impl Default for GuildsScreen {
     }
 }
 
-fn guild_item<'a>(g: &'a Guild, theme: &Theme) -> ListItem<'a> {
+fn guild_item(g: &Guild, theme: &Theme) -> ListItem<'static> {
     // The API's `icon` is an icon *identifier* (e.g. "arrows-maximize"), not a
     // glyph, so it's not rendered as text.
     let header = Line::from(vec![
@@ -225,9 +183,9 @@ mod tests {
     fn apply_initial_populates_and_threads_cursor() {
         let mut s = GuildsScreen::new();
         s.apply_initial(Ok((vec![guild("a"), guild("b")], Some("c1".into()))));
-        assert!(!s.loading);
-        assert_eq!(s.items.len(), 2);
-        assert_eq!(s.next_cursor.as_deref(), Some("c1"));
+        assert!(!s.list.loading);
+        assert_eq!(s.list.items.len(), 2);
+        assert_eq!(s.list.next_cursor.as_deref(), Some("c1"));
     }
 
     #[test]
@@ -235,15 +193,15 @@ mod tests {
         let mut s = GuildsScreen::new();
         s.apply_initial(Ok((vec![guild("a")], Some("c".into()))));
         s.apply_more(Ok((vec![guild("b")], None)));
-        assert_eq!(s.items.len(), 2);
-        assert!(s.next_cursor.is_none());
+        assert_eq!(s.list.items.len(), 2);
+        assert!(s.list.next_cursor.is_none());
     }
 
     #[test]
     fn enter_opens_selected_slug() {
         let mut s = GuildsScreen::new();
         s.apply_initial(Ok((vec![guild("owls"), guild("cats")], None)));
-        s.selected = 1;
+        s.list.selected = 1;
         assert_eq!(
             s.handle_key(key(KeyCode::Enter)),
             GuildsIntent::OpenSelected {

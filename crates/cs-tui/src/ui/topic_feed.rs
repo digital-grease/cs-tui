@@ -8,9 +8,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use cs_api::Entry;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, ListItem, Paragraph};
 use ratatui::Frame;
 
+use super::list::{self, TabState};
 use super::theme::Theme;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,11 +38,7 @@ pub enum TopicFeedIntent {
 #[derive(Debug)]
 pub struct TopicFeedScreen {
     pub slug: String,
-    pub entries: Vec<Entry>,
-    pub selected: usize,
-    pub next_cursor: Option<String>,
-    pub loading: bool,
-    pub error: Option<String>,
+    pub list: TabState<Entry>,
     pub include_nsfw: bool,
     /// Whether the user follows / mutes this topic (from settings).
     pub followed: bool,
@@ -52,11 +49,7 @@ impl TopicFeedScreen {
     pub fn new(slug: String) -> Self {
         Self {
             slug,
-            entries: Vec::new(),
-            selected: 0,
-            next_cursor: None,
-            loading: true,
-            error: None,
+            list: TabState::loading(),
             include_nsfw: crate::config::get().nsfw,
             followed: false,
             muted: false,
@@ -71,7 +64,7 @@ impl TopicFeedScreen {
 
     /// Indices of entries currently visible after NSFW filtering.
     fn visible_indices(&self) -> Vec<usize> {
-        self.entries
+        self.list.items
             .iter()
             .enumerate()
             .filter(|(_, e)| self.include_nsfw || !e.is_nsfw)
@@ -100,18 +93,18 @@ impl TopicFeedScreen {
             }
             _ => {}
         }
-        if self.loading {
+        if self.list.loading {
             return TopicFeedIntent::None;
         }
         let visible = self.visible_indices();
         match super::list_nav::navigate(
             key.code,
-            &mut self.selected,
+            &mut self.list.selected,
             visible.len(),
-            self.next_cursor.is_some(),
+            self.list.next_cursor.is_some(),
         ) {
             super::list_nav::ListNav::LoadMore => {
-                self.loading = true;
+                self.list.loading = true;
                 return TopicFeedIntent::LoadMore;
             }
             super::list_nav::ListNav::Moved => return TopicFeedIntent::None,
@@ -119,16 +112,16 @@ impl TopicFeedScreen {
         }
         match key.code {
             KeyCode::Char('r') => {
-                self.entries.clear();
-                self.next_cursor = None;
-                self.selected = 0;
-                self.loading = true;
-                self.error = None;
+                self.list.items.clear();
+                self.list.next_cursor = None;
+                self.list.selected = 0;
+                self.list.loading = true;
+                self.list.error = None;
                 return TopicFeedIntent::Refresh;
             }
             KeyCode::Enter => {
-                if let Some(idx) = visible.get(self.selected) {
-                    if let Some(e) = self.entries.get(*idx) {
+                if let Some(idx) = visible.get(self.list.selected) {
+                    if let Some(e) = self.list.items.get(*idx) {
                         return TopicFeedIntent::OpenSelected {
                             post_id: e.post_id.clone(),
                         };
@@ -141,30 +134,14 @@ impl TopicFeedScreen {
     }
 
     pub fn apply_initial(&mut self, result: Result<(Vec<Entry>, Option<String>), String>) {
-        self.loading = false;
-        match result {
-            Ok((entries, cursor)) => {
-                self.entries = entries;
-                self.next_cursor = cursor;
-                if self.selected >= self.visible_indices().len() {
-                    self.selected = 0;
-                }
-                self.error = None;
-            }
-            Err(msg) => self.error = Some(msg),
+        self.list.apply_initial(result);
+        if self.list.selected >= self.visible_indices().len() {
+            self.list.selected = 0;
         }
     }
 
     pub fn apply_more(&mut self, result: Result<(Vec<Entry>, Option<String>), String>) {
-        self.loading = false;
-        match result {
-            Ok((mut entries, cursor)) => {
-                self.entries.append(&mut entries);
-                self.next_cursor = cursor;
-                self.error = None;
-            }
-            Err(msg) => self.error = Some(msg),
-        }
+        self.list.apply_more(result);
     }
 
     pub fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
@@ -188,67 +165,38 @@ impl TopicFeedScreen {
             .split(inner);
 
         let visible = self.visible_indices();
-        if self.loading && self.entries.is_empty() {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    "loading topic…",
-                    theme.accent_style(),
-                ))),
-                layout[0],
-            );
-        } else if !visible.is_empty() {
-            // Keep the list visible even if a load-more failed (the error rides
-            // the status line below); only blank the area for an empty load.
-            let items: Vec<ListItem<'_>> = visible
-                .iter()
-                .map(|i| entry_item(&self.entries[*i], theme))
-                .collect();
-            let list = List::new(items)
-                .highlight_style(theme.accent_style())
-                .highlight_symbol("▌ ");
-            let mut state = ListState::default();
-            state.select(Some(self.selected.min(visible.len().saturating_sub(1))));
-            frame.render_stateful_widget(list, layout[0], &mut state);
-        } else if let Some(msg) = &self.error {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(msg.clone(), theme.error_style()))),
-                layout[0],
-            );
-        } else {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    "no entries in this topic",
-                    theme.muted_style(),
-                ))),
-                layout[0],
-            );
-        }
+        list::render_body(
+            frame,
+            layout[0],
+            theme,
+            &self.list,
+            &visible,
+            "no entries in this topic",
+            |e| entry_item(e, theme),
+        );
 
-        let status_text = if !self.loading && !self.entries.is_empty() && self.error.is_some() {
-            // Non-destructive load-more failure: surface inline, keep the list.
-            format!(
-                "⚠ {} · scroll or r to retry",
-                self.error.as_deref().unwrap_or_default()
+        let (status_text, status_style) = if let Some(msg) = list::load_more_error(&self.list) {
+            (msg, theme.error_style())
+        } else if self.list.loading {
+            (
+                "loading… · enter open · r refresh · esc back".to_string(),
+                theme.muted_style(),
             )
-        } else if self.loading {
-            "loading… · enter open · r refresh · esc back".to_string()
         } else {
             let follow = if self.followed { "unfollow" } else { "follow" };
             let mute = if self.muted { "unmute" } else { "mute" };
-            let more = if self.next_cursor.is_some() {
+            let more = if self.list.next_cursor.is_some() {
                 "scroll for more · "
             } else {
                 ""
             };
-            format!(
-                "{} entries · {more}enter open · f {follow} · m {mute} · r refresh · esc back",
-                self.entries.len()
+            (
+                format!(
+                    "{} entries · {more}enter open · f {follow} · m {mute} · r refresh · esc back",
+                    self.list.items.len()
+                ),
+                theme.muted_style(),
             )
-        };
-        let status_style = if !self.loading && !self.entries.is_empty() && self.error.is_some() {
-            theme.error_style()
-        } else {
-            theme.muted_style()
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(status_text, status_style))),
@@ -257,7 +205,7 @@ impl TopicFeedScreen {
     }
 }
 
-fn entry_item<'a>(entry: &'a Entry, theme: &Theme) -> ListItem<'a> {
+fn entry_item(entry: &Entry, theme: &Theme) -> ListItem<'static> {
     let when = entry
         .created_at
         .map(crate::config::format_list_timestamp)
@@ -327,7 +275,7 @@ mod tests {
     fn f_and_m_toggle_the_topic_even_while_loading() {
         // new() starts loading; follow/mute must still work (they're topic-level).
         let mut s = TopicFeedScreen::new("music".into());
-        assert!(s.loading);
+        assert!(s.list.loading);
         assert_eq!(
             s.handle_key(key(KeyCode::Char('f'))),
             TopicFeedIntent::ToggleFollow {
@@ -365,7 +313,7 @@ mod tests {
     fn enter_opens_selected_post() {
         let mut s = TopicFeedScreen::new("music".into());
         s.apply_initial(Ok((vec![entry("p1"), entry("p2")], None)));
-        s.selected = 1;
+        s.list.selected = 1;
         let intent = s.handle_key(key(KeyCode::Enter));
         assert_eq!(
             intent,
@@ -380,8 +328,8 @@ mod tests {
         let mut s = TopicFeedScreen::new("linux".into());
         s.apply_initial(Ok((vec![entry("p1")], Some("c".into()))));
         s.apply_more(Ok((vec![entry("p2")], None)));
-        assert_eq!(s.entries.len(), 2);
-        assert!(s.next_cursor.is_none());
+        assert_eq!(s.list.items.len(), 2);
+        assert!(s.list.next_cursor.is_none());
     }
 
     #[test]
@@ -389,10 +337,10 @@ mod tests {
         let mut s = TopicFeedScreen::new("music".into());
         s.apply_initial(Ok((vec![entry("p1"), entry("p2")], Some("next".into()))));
         s.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(s.selected, 1);
+        assert_eq!(s.list.selected, 1);
         let intent = s.handle_key(key(KeyCode::Char('j')));
         assert_eq!(intent, TopicFeedIntent::LoadMore);
-        assert!(s.loading);
+        assert!(s.list.loading);
     }
 
     #[test]
@@ -422,7 +370,7 @@ mod tests {
         s.apply_initial(Ok((vec![entry("p1")], None)));
         let intent = s.handle_key(key(KeyCode::Char('j')));
         assert_eq!(intent, TopicFeedIntent::None);
-        assert_eq!(s.selected, 0);
-        assert!(!s.loading);
+        assert_eq!(s.list.selected, 0);
+        assert!(!s.list.loading);
     }
 }

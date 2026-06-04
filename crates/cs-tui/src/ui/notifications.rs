@@ -3,9 +3,10 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use cs_api::{Notification, NotificationType, NotificationsFilter};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, ListItem, Paragraph};
 use ratatui::Frame;
 
+use super::list::{self, TabState};
 use super::theme::Theme;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,11 +97,7 @@ impl NotifTypeFilter {
 
 #[derive(Debug)]
 pub struct NotificationsScreen {
-    pub items: Vec<Notification>,
-    pub selected: usize,
-    pub next_cursor: Option<String>,
-    pub loading: bool,
-    pub error: Option<String>,
+    pub list: TabState<Notification>,
     pub filter: NotificationsFilter,
     pub type_filter: NotifTypeFilter,
 }
@@ -108,11 +105,7 @@ pub struct NotificationsScreen {
 impl NotificationsScreen {
     pub fn new() -> Self {
         Self {
-            items: Vec::new(),
-            selected: 0,
-            next_cursor: None,
-            loading: true,
-            error: None,
+            list: TabState::loading(),
             filter: NotificationsFilter::All,
             type_filter: NotifTypeFilter::All,
         }
@@ -137,28 +130,28 @@ impl NotificationsScreen {
                     NotificationsFilter::Unread => NotificationsFilter::Read,
                     NotificationsFilter::Read => NotificationsFilter::All,
                 };
-                self.items.clear();
-                self.next_cursor = None;
-                self.selected = 0;
-                self.loading = true;
-                self.error = None;
+                self.list.items.clear();
+                self.list.next_cursor = None;
+                self.list.selected = 0;
+                self.list.loading = true;
+                self.list.error = None;
                 return NotificationsIntent::ToggleFilter;
             }
             KeyCode::Char('t') => {
                 // Cycle the server-side type bucket; reload like the read filter.
                 self.type_filter = self.type_filter.next();
-                self.items.clear();
-                self.next_cursor = None;
-                self.selected = 0;
-                self.loading = true;
-                self.error = None;
+                self.list.items.clear();
+                self.list.next_cursor = None;
+                self.list.selected = 0;
+                self.list.loading = true;
+                self.list.error = None;
                 return NotificationsIntent::ToggleFilter;
             }
             KeyCode::Char('m') => {
                 // Only mark when actually unread: marking an already-read item
                 // would burn a rate-limited write and wrongly decrement the
                 // global unread count.
-                if let Some(n) = self.items.get(self.selected) {
+                if let Some(n) = self.list.items.get(self.list.selected) {
                     if !n.read {
                         return NotificationsIntent::MarkSelectedRead {
                             notification_id: n.notification_id.clone(),
@@ -168,7 +161,7 @@ impl NotificationsScreen {
             }
             KeyCode::Char('M') => return NotificationsIntent::MarkAllRead,
             KeyCode::Enter => {
-                if let Some(n) = self.items.get(self.selected) {
+                if let Some(n) = self.list.items.get(self.list.selected) {
                     if let Some(post_id) = &n.target_id {
                         return NotificationsIntent::OpenSelected {
                             post_id: post_id.clone(),
@@ -182,63 +175,44 @@ impl NotificationsScreen {
 
         // Movement + load keys are gated on not-currently-loading so a single
         // press doesn't queue duplicate fetches.
-        if self.loading {
+        if self.list.loading {
             return NotificationsIntent::None;
         }
         match super::list_nav::navigate(
             key.code,
-            &mut self.selected,
-            self.items.len(),
-            self.next_cursor.is_some(),
+            &mut self.list.selected,
+            self.list.items.len(),
+            self.list.next_cursor.is_some(),
         ) {
             super::list_nav::ListNav::LoadMore => {
-                self.loading = true;
+                self.list.loading = true;
                 return NotificationsIntent::LoadMore;
             }
             super::list_nav::ListNav::Moved => return NotificationsIntent::None,
             super::list_nav::ListNav::Ignored => {}
         }
         if key.code == KeyCode::Char('r') {
-            self.items.clear();
-            self.next_cursor = None;
-            self.selected = 0;
-            self.loading = true;
-            self.error = None;
+            self.list.items.clear();
+            self.list.next_cursor = None;
+            self.list.selected = 0;
+            self.list.loading = true;
+            self.list.error = None;
             return NotificationsIntent::Refresh;
         }
         NotificationsIntent::None
     }
 
     pub fn apply_initial(&mut self, result: Result<(Vec<Notification>, Option<String>), String>) {
-        self.loading = false;
-        match result {
-            Ok((items, cursor)) => {
-                self.items = items;
-                self.next_cursor = cursor;
-                if self.selected >= self.items.len() {
-                    self.selected = 0;
-                }
-                self.error = None;
-            }
-            Err(msg) => self.error = Some(msg),
-        }
+        self.list.apply_initial(result);
     }
 
     pub fn apply_more(&mut self, result: Result<(Vec<Notification>, Option<String>), String>) {
-        self.loading = false;
-        match result {
-            Ok((mut items, cursor)) => {
-                self.items.append(&mut items);
-                self.next_cursor = cursor;
-                self.error = None;
-            }
-            Err(msg) => self.error = Some(msg),
-        }
+        self.list.apply_more(result);
     }
 
     /// Optimistically mark a single notification as read in local state.
     pub fn mark_local(&mut self, notification_id: &str) {
-        for n in &mut self.items {
+        for n in &mut self.list.items {
             if n.notification_id == notification_id {
                 n.read = true;
                 break;
@@ -248,7 +222,7 @@ impl NotificationsScreen {
 
     /// Undo a `mark_local` when the server rejected the mark.
     pub fn unmark_local(&mut self, notification_id: &str) {
-        for n in &mut self.items {
+        for n in &mut self.list.items {
             if n.notification_id == notification_id {
                 n.read = false;
                 break;
@@ -258,7 +232,7 @@ impl NotificationsScreen {
 
     /// Optimistically mark every notification as read in local state.
     pub fn mark_all_local(&mut self) {
-        for n in &mut self.items {
+        for n in &mut self.list.items {
             n.read = true;
         }
     }
@@ -287,40 +261,16 @@ impl NotificationsScreen {
             .constraints([Constraint::Min(1), Constraint::Length(1)])
             .split(inner);
 
-        if self.loading && self.items.is_empty() {
-            let para = Paragraph::new(Line::from(Span::styled(
-                "loading notifications…",
-                theme.accent_style(),
-            )));
-            frame.render_widget(para, layout[0]);
-        } else if !self.items.is_empty() {
-            // Keep the list visible even if a load-more failed (the error rides
-            // the status line below); only blank the area for an empty load.
-            let items: Vec<ListItem<'_>> = self
-                .items
-                .iter()
-                .map(|n| notification_item(n, theme))
-                .collect();
-            let list = List::new(items)
-                .highlight_style(theme.accent_style())
-                .highlight_symbol("▌ ");
-            let mut state = ListState::default();
-            state.select(Some(self.selected.min(self.items.len().saturating_sub(1))));
-            frame.render_stateful_widget(list, layout[0], &mut state);
-        } else if let Some(msg) = &self.error {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(msg.clone(), theme.error_style()))),
-                layout[0],
-            );
-        } else {
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    "no notifications",
-                    theme.muted_style(),
-                ))),
-                layout[0],
-            );
-        }
+        let visible: Vec<usize> = (0..self.list.items.len()).collect();
+        list::render_body(
+            frame,
+            layout[0],
+            theme,
+            &self.list,
+            &visible,
+            "no notifications",
+            |n| notification_item(n, theme),
+        );
 
         let status = status_line(self, theme);
         frame.render_widget(status, layout[1]);
@@ -333,7 +283,7 @@ impl Default for NotificationsScreen {
     }
 }
 
-fn notification_item<'a>(n: &'a Notification, theme: &Theme) -> ListItem<'a> {
+fn notification_item(n: &Notification, theme: &Theme) -> ListItem<'static> {
     let actor = n
         .actor
         .as_ref()
@@ -397,28 +347,21 @@ fn summarize(n: &Notification, actor: &str) -> String {
 }
 
 fn status_line<'a>(s: &'a NotificationsScreen, theme: &Theme) -> Paragraph<'a> {
-    // A load-more failure with items already on screen rides the status line so
-    // the list stays put instead of being replaced by a full-screen error.
-    if !s.loading && !s.items.is_empty() {
-        if let Some(msg) = &s.error {
-            return Paragraph::new(Line::from(Span::styled(
-                format!("⚠ {msg} · scroll or r to retry"),
-                theme.error_style(),
-            )));
-        }
+    if let Some(msg) = list::load_more_error(&s.list) {
+        return Paragraph::new(Line::from(Span::styled(msg, theme.error_style())));
     }
-    let text = if s.loading {
+    let text = if s.list.loading {
         "loading… · enter open · m mark · M mark-all · f read · t type · r refresh · esc menu"
             .to_string()
-    } else if s.next_cursor.is_some() {
+    } else if s.list.next_cursor.is_some() {
         format!(
             "{} items · scroll down for more · enter open · m mark · M mark-all · f read · t type · r refresh · esc menu",
-            s.items.len()
+            s.list.items.len()
         )
     } else {
         format!(
             "{} items · end · enter open · m mark · M mark-all · f read · t type · r refresh · esc menu",
-            s.items.len()
+            s.list.items.len()
         )
     };
     Paragraph::new(Line::from(Span::styled(text, theme.muted_style())))
@@ -461,8 +404,8 @@ mod tests {
     #[test]
     fn new_starts_loading() {
         let s = NotificationsScreen::new();
-        assert!(s.loading);
-        assert!(s.items.is_empty());
+        assert!(s.list.loading);
+        assert!(s.list.items.is_empty());
     }
 
     #[test]
@@ -472,9 +415,9 @@ mod tests {
             vec![notif("n1", NotificationType::Reply, Some("p1"), Some("r1"))],
             Some("cur".into()),
         )));
-        assert!(!s.loading);
-        assert_eq!(s.items.len(), 1);
-        assert_eq!(s.next_cursor.as_deref(), Some("cur"));
+        assert!(!s.list.loading);
+        assert_eq!(s.list.items.len(), 1);
+        assert_eq!(s.list.next_cursor.as_deref(), Some("cur"));
     }
 
     #[test]
@@ -488,9 +431,9 @@ mod tests {
             None,
         )));
         s.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(s.selected, 1);
+        assert_eq!(s.list.selected, 1);
         s.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(s.selected, 1);
+        assert_eq!(s.list.selected, 1);
     }
 
     #[test]
@@ -502,7 +445,7 @@ mod tests {
         )));
         let intent = s.handle_key(key(KeyCode::Char('j')));
         assert_eq!(intent, NotificationsIntent::LoadMore);
-        assert!(s.loading);
+        assert!(s.list.loading);
     }
 
     #[test]
@@ -599,7 +542,7 @@ mod tests {
         assert_eq!(intent, NotificationsIntent::ToggleFilter);
         assert!(matches!(s.type_filter, NotifTypeFilter::Mentions));
         assert!(s.selected_types().contains(&NotificationType::PostMention));
-        assert!(s.loading, "changing the type filter triggers a reload");
+        assert!(s.list.loading, "changing the type filter triggers a reload");
     }
 
     #[test]
@@ -608,7 +551,7 @@ mod tests {
         s.apply_initial(Ok((vec![], None)));
         for _ in 0..5 {
             s.handle_key(key(KeyCode::Char('t')));
-            s.loading = false; // let the next press through
+            s.list.loading = false; // let the next press through
         }
         assert!(matches!(s.type_filter, NotifTypeFilter::All));
     }
@@ -624,8 +567,8 @@ mod tests {
             None,
         )));
         s.mark_local("a");
-        assert!(s.items[0].read);
-        assert!(!s.items[1].read);
+        assert!(s.list.items[0].read);
+        assert!(!s.list.items[1].read);
     }
 
     #[test]
@@ -639,7 +582,7 @@ mod tests {
             None,
         )));
         s.mark_all_local();
-        assert!(s.items.iter().all(|n| n.read));
+        assert!(s.list.items.iter().all(|n| n.read));
     }
 
     #[test]
