@@ -74,6 +74,8 @@ pub enum ComposeIntent {
     Quit,
     /// User confirmed: send to the API.
     Submit,
+    /// Re-open `$EDITOR` on the current body (Ctrl+E).
+    Edit,
     None,
 }
 
@@ -121,6 +123,11 @@ impl ComposeScreen {
         }
         if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return self.try_submit();
+        }
+        // Ctrl+E re-opens the editor on the body (plain `e` is a typed char in
+        // the title/slug/topics fields, so it must be modified).
+        if key.code == KeyCode::Char('e') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            return ComposeIntent::Edit;
         }
         match key.code {
             KeyCode::Tab => {
@@ -218,7 +225,7 @@ impl ComposeScreen {
 
     fn try_submit(&mut self) -> ComposeIntent {
         if self.content.trim().is_empty() {
-            self.error = Some("content is empty — esc to cancel".into());
+            self.error = Some("content is empty — ctrl+e to re-edit · esc to cancel".into());
             return ComposeIntent::None;
         }
         if self.kind.has_title() {
@@ -472,7 +479,7 @@ impl ComposeScreen {
             Line::from(Span::styled(msg.clone(), theme.error_style()))
         } else {
             Line::from(Span::styled(
-                "tab/shift+tab focus · space toggle · enter or ctrl+s submit · esc cancel",
+                "tab focus · space toggle · ctrl+e edit body · enter/ctrl+s submit · esc cancel",
                 theme.muted_style(),
             ))
         };
@@ -659,6 +666,26 @@ mod tests {
         let intent = s.handle_key(key(KeyCode::Enter, KeyModifiers::empty()));
         assert_eq!(intent, ComposeIntent::None);
         assert!(s.error.as_deref().unwrap_or_default().contains("slug"));
+    }
+
+    #[test]
+    fn ctrl_e_requests_re_edit() {
+        let mut s = ComposeScreen::new(ComposeKind::NewEntry, "body".into());
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+            ComposeIntent::Edit
+        );
+    }
+
+    #[test]
+    fn plain_e_types_into_a_text_field_not_re_edit() {
+        let mut s = ComposeScreen::new(ComposeKind::NewEntry, "body".into());
+        s.focused = ConfirmField::Title;
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('e'), KeyModifiers::empty())),
+            ComposeIntent::None
+        );
+        assert_eq!(s.title_input, "e");
     }
 
     #[test]

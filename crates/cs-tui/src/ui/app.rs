@@ -333,6 +333,7 @@ enum Action {
         topics: Vec<String>,
     },
     ComposeSubmit,
+    ComposeReEdit,
     DeleteEntry {
         post_id: String,
     },
@@ -803,6 +804,7 @@ impl App {
             Screen::Compose(s) => match s.handle_key(key) {
                 ComposeIntent::Quit => Action::Quit,
                 ComposeIntent::Submit => Action::ComposeSubmit,
+                ComposeIntent::Edit => Action::ComposeReEdit,
                 ComposeIntent::None => Action::None,
             },
             Screen::Settings(s) => match s.handle_key(key) {
@@ -1350,6 +1352,7 @@ impl App {
                 self.warn_if_compose_throttled();
                 self.spawn_compose_submit();
             }
+            Action::ComposeReEdit => self.re_edit_compose().await,
             Action::DeleteEntry { post_id } => {
                 self.spawn_delete_entry(post_id);
             }
@@ -2724,6 +2727,24 @@ impl App {
         }
         let screen = ComposeScreen::new(kind, content);
         self.push_screen(Screen::Compose(screen));
+    }
+
+    /// Re-open `$EDITOR` on the body of the active compose screen (Ctrl+E),
+    /// preserving the title/slug/topics/visibility fields.
+    async fn re_edit_compose(&mut self) {
+        let Screen::Compose(s) = &self.screen else {
+            return;
+        };
+        let current = s.content.clone();
+        match self.run_editor(current).await {
+            Ok(content) => {
+                if let Screen::Compose(s) = &mut self.screen {
+                    s.content = content;
+                    s.error = None;
+                }
+            }
+            Err(msg) => tracing::warn!(error = %msg, "compose: re-edit editor failed"),
+        }
     }
 
     fn spawn_compose_submit(&self) {
