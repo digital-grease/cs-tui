@@ -160,7 +160,9 @@ impl GuildScreen {
                 return GuildIntent::None;
             }
             KeyCode::Char('c') => {
-                if self.guild.as_ref().is_some_and(|g| g.is_member) {
+                // v0.5.0: guild forums are open — any authenticated user can
+                // start a thread, membership not required.
+                if self.guild.is_some() {
                     return GuildIntent::Compose;
                 }
                 return GuildIntent::None;
@@ -347,7 +349,7 @@ impl GuildScreen {
         };
         let action = match &self.guild {
             _ if self.action_pending => " · working…",
-            Some(g) if !g.is_member => " · J join",
+            Some(g) if !g.is_member => " · c new · J join",
             Some(g) if g.role != Some(GuildRole::Founder) => " · c new · L leave",
             Some(_) => " · c new",
             None => "",
@@ -686,7 +688,8 @@ mod tests {
     }
 
     #[test]
-    fn c_requests_compose_only_for_members() {
+    fn c_requests_compose_for_members_and_outsiders() {
+        // v0.5.0: guild forums are open, so non-members can start threads too.
         let mut member = with_guild(true, Some(GuildRole::Member));
         assert_eq!(
             member.handle_key(key(KeyCode::Char('c'))),
@@ -695,7 +698,7 @@ mod tests {
         let mut outsider = with_guild(false, None);
         assert_eq!(
             outsider.handle_key(key(KeyCode::Char('c'))),
-            GuildIntent::None
+            GuildIntent::Compose
         );
     }
 }

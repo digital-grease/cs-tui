@@ -1,4 +1,4 @@
-# ᑕ¥βєяรקค¢є API v0.4
+# ᑕ¥βєяรקค¢є API v0.5.0
 
 ## Access
 
@@ -511,7 +511,7 @@ Rate limit: 45/min.
 POST /v1/guilds/:slug/posts
 ```
 
-You must be a member of the guild (otherwise `403`).
+Guild forums are open: any authenticated user can start a thread (membership is not required), matching the web.
 
 ```json
 {
@@ -575,6 +575,47 @@ Query params:
 Notification types: `bookmark`, `reply`, `thread_reply`, `new_follower`, `unfollowed`, `new_post_following`, `new_post_friend`, `poke`, `chat_mention`, `post_mention`, `reply_mention`, `dm_message`, `guild_new_thread`, `supporter_granted`, `supporter_removed`, `hacker_granted`, `hacker_removed`, `image_permission_granted`, `image_permission_removed`, `attachment_permission_granted`, `attachment_permission_removed`, `system_ban`.
 
 Rate limit: 30/min.
+
+### Notification object
+
+Each notification has this shape:
+
+```json
+{
+  "id": "notificationId",
+  "userId": "recipientUid",
+  "type": "reply",
+  "actorId": "actorUid",
+  "actorUsername": "someone",
+  "targetId": "postId",
+  "targetType": "post",
+  "read": false,
+  "createdAt": "2026-06-03T12:00:00.000Z",
+  "metadata": { "postSlug": "my-entry", "replyId": "replyId", "authorUsername": "me" }
+}
+```
+
+- `actorId` / `actorUsername` — who triggered the notification (denormalized so no extra lookup is needed).
+- `targetType` — `post` or `reply`; `targetId` is the related entry's ID.
+- `read` — always `false` on creation.
+- `reason` — present only on some system notifications (e.g. `system_ban`).
+- `metadata` — type-dependent context. Common keys: `postSlug` and `authorUsername` (build the `/{username}/{slug}` deep link), `replyId` (the relevant reply), `postContent` / `replyContent` (the mention source text), and for guild threads `guildSlug`, `guildName`, `isGuildThread`, `threadId`. `metadata` is open-ended — clients should treat unknown keys as optional.
+
+`guildSlug` / `isGuildThread` here live inside notification `metadata`; the same names also appear as top-level fields on guild-thread **entries** (see Guilds).
+
+### How notifications are generated
+
+The API emits these notifications server-side — clients don't create them:
+
+- `new_follower` — someone follows you.
+- `bookmark` — someone bookmarks your entry or reply.
+- `reply` — someone replies to your entry.
+- `new_post_following` / `new_post_friend` — someone you follow posts a new entry. `new_post_friend` is sent when the follow is **mutual** (you follow each other); `new_post_following` when it's one-way.
+- `post_mention` / `reply_mention` — you're `@`-mentioned in an entry or reply. Mentions use the `@username` syntax (case-insensitive). Mentioning a user in an entry also subscribes them to that thread, so they receive `thread_reply` for future replies.
+- `thread_reply` — a new reply is posted to a thread you're watching.
+- `guild_new_thread` — a new thread is posted in a guild you belong to.
+
+Notifications are never sent to yourself for your own actions, and a user who would otherwise receive several notifications for the same event gets only one (the most specific). Remaining types in the list above are produced by other parts of the platform (DMs, chat, moderation, role/permission changes).
 
 ### Unread Count
 
@@ -779,34 +820,36 @@ All responses follow this structure:
 
 | Action | Per Minute | Per Day |
 |--------|-----------|---------|
-| Entries | 2 | 10 |
-| Replies | 3 | 10 |
-| Follows | 3 | 10 |
-| Unfollows | 3 | 10 |
-| Notes | 3 | 20 |
-| Bookmarks | 5 | 50 |
+| Entries | 2 | 15 |
+| Replies | 3 | 15 |
+| Follows | 3 | 15 |
+| Unfollows | 3 | 15 |
+| Notes | 3 | 30 |
+| Bookmarks | 5 | 75 |
 | Guild threads | 2 | 15 |
 | Guild join | 3 | 15 |
 | Guild leave | 3 | 15 |
-| Profile updates | 2 | 10 |
-| Settings updates | 2 | 10 |
+| Profile updates | 2 | 15 |
+| Settings updates | 2 | 15 |
+
+`POST /v1/auth/resend-verification` is limited separately to 1/min and 5/hour.
 
 ### Read Actions (Anti-Scraping)
 
 | Endpoint | Per Minute |
 |----------|-----------|
-| List entries | 30 |
-| List replies | 30 |
-| List user entries | 30 |
-| List user replies | 30 |
-| List topic entries | 30 |
-| List topics | 20 |
-| List bookmarks | 20 |
-| List notes | 20 |
+| List entries | 45 |
+| List replies | 45 |
+| List user entries | 45 |
+| List user replies | 45 |
+| List topic entries | 45 |
+| List topics | 30 |
+| List bookmarks | 30 |
+| List notes | 30 |
 | List notifications | 30 |
 | Unread notification count | 30 |
-| List followers/following | 20 |
-| View user profile | 20 |
+| List followers/following | 30 |
+| View user profile | 30 |
 | List guilds / members | 30 |
 | List guild threads | 45 |
 

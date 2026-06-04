@@ -75,18 +75,44 @@ impl NotificationType {
 }
 
 /// The user who triggered a notification.
-#[derive(Debug, Clone, Deserialize)]
+/// Type-dependent context attached to a notification (API v0.5.0 § Notifications,
+/// "Notification object"). The server treats `metadata` as open-ended, so only
+/// the commonly-used keys are modelled here; unknown keys are ignored.
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct NotificationActor {
-    #[serde(default, alias = "userId")]
-    pub id: String,
+pub struct NotificationMetadata {
+    /// Entry slug — with `author_username`, builds the `/{username}/{slug}` link.
     #[serde(default)]
-    pub username: String,
+    pub post_slug: Option<String>,
+
+    /// Entry author handle, for deep links and `thread_reply` summaries.
+    #[serde(default)]
+    pub author_username: Option<String>,
+
+    /// Reply id to highlight in the linked post detail view.
+    #[serde(default)]
+    pub reply_id: Option<String>,
+
+    /// Guild display name, for `guild_new_thread` summaries.
+    #[serde(default)]
+    pub guild_name: Option<String>,
+
+    /// Guild slug, for guild deep links.
+    #[serde(default)]
+    pub guild_slug: Option<String>,
+
+    /// Guild thread id.
+    #[serde(default)]
+    pub thread_id: Option<String>,
+
+    /// Set on guild-thread notifications.
+    #[serde(default)]
+    pub is_guild_thread: Option<bool>,
 }
 
-/// A notification record. The v0.3.6 spec does not publish the full shape; this
-/// models the obvious / commonly-observed fields and captures everything else
-/// in `extra` so future fields don't break decoding.
+/// A notification record. Shape per API v0.5.0 § Notifications: the actor is
+/// denormalized onto `actorId` / `actorUsername`, and type-dependent context
+/// (deep-link slug, reply id, guild/thread info) lives under `metadata`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Notification {
@@ -102,8 +128,13 @@ pub struct Notification {
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub created_at: Option<OffsetDateTime>,
 
+    /// Actor id (denormalized so no extra lookup is needed).
     #[serde(default)]
-    pub actor: Option<NotificationActor>,
+    pub actor_id: Option<String>,
+
+    /// Actor display handle; `None` for actor-less system notifications.
+    #[serde(default)]
+    pub actor_username: Option<String>,
 
     /// Target resource id — typically a post id for navigable notifications.
     #[serde(default)]
@@ -113,18 +144,35 @@ pub struct Notification {
     #[serde(default)]
     pub target_type: Option<String>,
 
-    /// For reply/thread_reply notifications — the reply id to highlight in the
-    /// linked post detail view.
+    /// Present only on some system notifications (e.g. `system_ban`).
     #[serde(default)]
-    pub reply_id: Option<String>,
+    pub reason: Option<String>,
 
-    /// For thread_reply — the original thread author.
+    /// Type-dependent context; unknown keys are ignored.
     #[serde(default)]
-    pub thread_author_username: Option<String>,
+    pub metadata: NotificationMetadata,
+}
 
-    /// For guild_new_thread — the guild display name.
-    #[serde(default)]
-    pub guild_name: Option<String>,
+impl Notification {
+    /// Actor display handle, or `"system"` for actor-less system notifications.
+    pub fn actor_name(&self) -> &str {
+        self.actor_username.as_deref().unwrap_or("system")
+    }
+
+    /// Reply id to highlight when opening the linked post detail.
+    pub fn reply_id(&self) -> Option<&str> {
+        self.metadata.reply_id.as_deref()
+    }
+
+    /// Original thread author, for `thread_reply` summaries.
+    pub fn thread_author(&self) -> Option<&str> {
+        self.metadata.author_username.as_deref()
+    }
+
+    /// Guild display name, for `guild_new_thread` summaries.
+    pub fn guild_display_name(&self) -> Option<&str> {
+        self.metadata.guild_name.as_deref()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -276,20 +324,23 @@ mod tests {
             "type": "reply",
             "read": false,
             "createdAt": "2026-03-27T10:12:01Z",
-            "actor": {"id": "u1", "username": "alice"},
+            "actorId": "u1",
+            "actorUsername": "alice",
             "targetId": "p1",
             "targetType": "post",
-            "replyId": "r1"
+            "metadata": {"postSlug": "my-entry", "authorUsername": "me", "replyId": "r1"}
         }"#;
         let n: Notification = serde_json::from_str(raw).unwrap();
         assert_eq!(n.notification_id, "n1");
         assert_eq!(n.kind, NotificationType::Reply);
         assert!(!n.read);
         assert!(n.created_at.is_some());
-        assert_eq!(n.actor.as_ref().unwrap().username, "alice");
+        assert_eq!(n.actor_name(), "alice");
         assert_eq!(n.target_id.as_deref(), Some("p1"));
         assert_eq!(n.target_type.as_deref(), Some("post"));
-        assert_eq!(n.reply_id.as_deref(), Some("r1"));
+        assert_eq!(n.reply_id(), Some("r1"));
+        assert_eq!(n.metadata.post_slug.as_deref(), Some("my-entry"));
+        assert_eq!(n.thread_author(), Some("me"));
     }
 
     #[test]
@@ -306,9 +357,9 @@ mod tests {
         let n: Notification = serde_json::from_str(raw).unwrap();
         assert!(!n.read);
         assert!(n.created_at.is_none());
-        assert!(n.actor.is_none());
+        assert_eq!(n.actor_name(), "system");
         assert!(n.target_id.is_none());
-        assert!(n.reply_id.is_none());
+        assert!(n.reply_id().is_none());
     }
 
     #[test]

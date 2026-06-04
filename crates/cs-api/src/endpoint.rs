@@ -1,6 +1,6 @@
 //! Endpoint keys for rate-limiter accounting. One variant per documented endpoint.
 //!
-//! Rate-limit values come from `docs/api-v0.4.md`. Where the consolidated table
+//! Rate-limit values come from `docs/api-v0.5.0.md`. Where the consolidated table
 //! and the per-endpoint section disagree, the lower (more restrictive) value is
 //! used so the client cannot self-trigger 429s.
 use crate::rate_limit::RateLimit;
@@ -64,7 +64,7 @@ pub enum EndpointKey {
     SettingsGet,
     SettingsUpdate,
 
-    // Guilds (v0.4)
+    // Guilds (v0.5.0)
     GuildsList,
     GuildsGet,
     GuildsMembersList,
@@ -96,28 +96,29 @@ impl EndpointKey {
             // Auth — login/refresh carry no documented limit.
             AuthLogin | AuthRefresh => RateLimit::none(),
 
-            // Reads — table values from § Anti-Scraping.
-            EntriesList
-            | RepliesList
-            | UsersListPosts
-            | UsersGetPostBySlug
-            | UsersListReplies
-            | TopicsListPosts
+            // Reads — table values from § Anti-Scraping (v0.5.0).
+            EntriesList | RepliesList | UsersListPosts | UsersListReplies | TopicsListPosts => {
+                RateLimit::per_minute(45)
+            }
+            TopicsList
+            | BookmarksList
+            | NotesList
+            | FollowsList
+            | UsersGet
             | NotificationsList
             | NotificationsUnreadCount => RateLimit::per_minute(30),
-            TopicsList | BookmarksList | NotesList | FollowsList | UsersGet => {
-                RateLimit::per_minute(20)
-            }
+            // Single-post-by-slug isn't in the table; keep a conservative read cap.
+            UsersGetPostBySlug => RateLimit::per_minute(30),
 
             // Single-resource reads — not documented; no client-side cap.
             EntriesGet | RepliesGet | UsersGetMe | NotesGet | NotesGetRevision
             | NotesListRevisions | SettingsGet => RateLimit::none(),
 
-            // Writes — lower of (table, section) values.
-            EntriesCreate | UsersUpdateMe | SettingsUpdate => RateLimit::with_day(2, 10),
-            RepliesCreate | FollowsCreate | FollowsDelete => RateLimit::with_day(3, 10),
-            NotesCreate => RateLimit::with_day(3, 20),
-            BookmarksCreate => RateLimit::with_day(5, 50),
+            // Writes — lower of (table, section) values (v0.5.0).
+            EntriesCreate | UsersUpdateMe | SettingsUpdate => RateLimit::with_day(2, 15),
+            RepliesCreate | FollowsCreate | FollowsDelete => RateLimit::with_day(3, 15),
+            NotesCreate => RateLimit::with_day(3, 30),
+            BookmarksCreate => RateLimit::with_day(5, 75),
 
             // Deletes — not documented; no client-side cap.
             EntriesDelete
@@ -128,7 +129,7 @@ impl EndpointKey {
             | NotificationsMarkRead
             | NotificationsMarkAllRead => RateLimit::none(),
 
-            // Guilds (v0.4) — per-endpoint sections + § Anti-Scraping table.
+            // Guilds (v0.5.0) — per-endpoint sections + § Anti-Scraping table.
             GuildsList | GuildsMembersList => RateLimit::per_minute(30),
             GuildsThreadsList => RateLimit::per_minute(45),
             GuildsGet => RateLimit::none(),
@@ -145,7 +146,7 @@ mod tests {
     #[test]
     fn read_endpoints_have_per_minute_caps() {
         let rl = EndpointKey::EntriesList.rate_limit();
-        assert_eq!(rl.per_minute, Some(30));
+        assert_eq!(rl.per_minute, Some(45));
         assert_eq!(rl.per_day, None);
     }
 
@@ -153,7 +154,7 @@ mod tests {
     fn write_endpoints_have_both_caps() {
         let rl = EndpointKey::EntriesCreate.rate_limit();
         assert_eq!(rl.per_minute, Some(2));
-        assert_eq!(rl.per_day, Some(10));
+        assert_eq!(rl.per_day, Some(15));
     }
 
     #[test]

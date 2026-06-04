@@ -1,4 +1,4 @@
-//! Guild types and endpoints (`/v1/guilds/*`, v0.4).
+//! Guild types and endpoints (`/v1/guilds/*`, v0.5.0).
 //!
 //! Guilds are member groups with their own forum of threads; a user belongs to
 //! at most one. Founding a guild and editing its profile happen on the web —

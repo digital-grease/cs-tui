@@ -171,7 +171,7 @@ impl NotificationsScreen {
                         if let Some(post_id) = &n.target_id {
                             return NotificationsIntent::OpenSelected {
                                 post_id: post_id.clone(),
-                                highlight_reply_id: n.reply_id.clone(),
+                                highlight_reply_id: n.reply_id().map(String::from),
                             };
                         }
                     }
@@ -291,11 +291,7 @@ impl Default for NotificationsScreen {
 }
 
 fn notification_item(n: &Notification, theme: &Theme) -> ListItem<'static> {
-    let actor = n
-        .actor
-        .as_ref()
-        .map(|a| a.username.as_str())
-        .unwrap_or("system");
+    let actor = n.actor_name();
     let when = n
         .created_at
         .map(crate::config::format_list_timestamp)
@@ -324,7 +320,7 @@ fn summarize(n: &Notification, actor: &str) -> String {
         Bookmark => format!("@{actor} bookmarked your post"),
         Reply => format!("@{actor} replied to your post"),
         ThreadReply => {
-            let thread = n.thread_author_username.as_deref().unwrap_or("a thread");
+            let thread = n.thread_author().unwrap_or("a thread");
             format!("@{actor} replied in @{thread}'s thread")
         }
         ReplyMention => format!("@{actor} mentioned you in a reply"),
@@ -337,7 +333,7 @@ fn summarize(n: &Notification, actor: &str) -> String {
         NewPostFriend => format!("@{actor} posted (from friends)"),
         Poke => format!("@{actor} poked you"),
         GuildNewThread => {
-            let guild = n.guild_name.as_deref().unwrap_or("a guild");
+            let guild = n.guild_display_name().unwrap_or("a guild");
             format!("new thread in {guild} by @{actor}")
         }
         SupporterGranted => "supporter status granted".to_string(),
@@ -399,12 +395,15 @@ mod tests {
             kind,
             read: false,
             created_at: None,
-            actor: None,
+            actor_id: None,
+            actor_username: None,
             target_id: target.map(String::from),
             target_type: target.map(|_| "post".to_string()),
-            reply_id: reply.map(String::from),
-            thread_author_username: None,
-            guild_name: None,
+            reason: None,
+            metadata: cs_api::NotificationMetadata {
+                reply_id: reply.map(String::from),
+                ..Default::default()
+            },
         }
     }
 
@@ -610,17 +609,14 @@ mod tests {
             kind: NotificationType::Reply,
             read: false,
             created_at: None,
-            actor: Some(cs_api::NotificationActor {
-                id: "u".into(),
-                username: "alice".into(),
-            }),
+            actor_id: Some("u".into()),
+            actor_username: Some("alice".into()),
             target_id: None,
             target_type: None,
-            reply_id: None,
-            thread_author_username: None,
-            guild_name: None,
+            reason: None,
+            metadata: cs_api::NotificationMetadata::default(),
         };
-        let s = summarize(&actor_n, "alice");
+        let s = summarize(&actor_n, actor_n.actor_name());
         assert!(s.contains("@alice"));
         assert!(s.contains("replied"));
     }
