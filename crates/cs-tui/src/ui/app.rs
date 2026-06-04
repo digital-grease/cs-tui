@@ -784,6 +784,11 @@ impl App {
                 PostDetailIntent::Reply => Action::StartComposeReply {
                     post_id: s.entry.post_id.clone(),
                     parent_reply_id: None,
+                    prefill: String::new(),
+                },
+                PostDetailIntent::QuoteReply => Action::StartComposeReply {
+                    post_id: s.entry.post_id.clone(),
+                    parent_reply_id: None,
                     prefill: format!(
                         "> @{}: {}\n\n",
                         s.entry.author_username,
