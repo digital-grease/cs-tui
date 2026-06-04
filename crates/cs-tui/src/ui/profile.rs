@@ -544,14 +544,17 @@ impl ProfileScreen {
             "backspace back · esc back"
         };
         parts.push(nav_hint.into());
+        // Account-level action — works on every tab, so always surface it.
+        if self.is_self {
+            parts.push("e edit".into());
+        } else if self.user.is_some() {
+            parts.push("F follow/unfollow".into());
+        }
+        // List actions only apply on the list tabs.
         if self.tab == ProfileTab::Posts && self.is_self {
             parts.push("enter open · P pin · scroll for more · r refresh".into());
         } else if self.tab != ProfileTab::Info {
             parts.push("enter open · scroll for more · r refresh".into());
-        } else if self.is_self {
-            parts.push("e edit".into());
-        } else {
-            parts.push("F follow/unfollow".into());
         }
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
