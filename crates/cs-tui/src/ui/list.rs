@@ -6,6 +6,8 @@
 //! That was copy-pasted per screen, so fixes (e.g. "a load-more failure must not
 //! blank an already-loaded list") had to be ported by hand to each one and were
 //! easy to miss. This centralizes both.
+use std::cell::Cell;
+
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, ListState, Paragraph};
@@ -23,6 +25,11 @@ pub struct TabState<T> {
     pub error: Option<String>,
     /// Whether an initial load has completed (used by lazily-loaded profile tabs).
     pub loaded: bool,
+    /// Persisted vertical scroll offset (index of the first visible row), kept
+    /// across renders so the viewport scrolls naturally instead of re-deriving
+    /// from 0 each frame (which pins the selection to the bottom row when
+    /// scrolling back up). Updated by [`render_body`].
+    list_offset: Cell<usize>,
 }
 
 // Manual `Default` — `#[derive(Default)]` would add a `T: Default` bound that the
@@ -36,6 +43,7 @@ impl<T> Default for TabState<T> {
             loading: false,
             error: None,
             loaded: false,
+            list_offset: Cell::new(0),
         }
     }
 }
@@ -75,6 +83,13 @@ impl<T> TabState<T> {
     /// Apply an initial load, clamping selection to the raw item count.
     pub fn apply_initial(&mut self, result: Result<(Vec<T>, Option<String>), String>) {
         self.apply_initial_filtered(result, |s| s.items.len());
+    }
+
+    /// Shift the persisted scroll offset (used when items are prepended at the
+    /// top, e.g. background feed refresh, so the viewport keeps the same rows in
+    /// view rather than jumping).
+    pub fn shift_offset(&self, delta: usize) {
+        self.list_offset.set(self.list_offset.get() + delta);
     }
 
     /// Append a load-more page (selection is unaffected).
@@ -135,9 +150,15 @@ pub fn render_body<T, F>(
         let list = List::new(items)
             .highlight_style(theme.accent_style())
             .highlight_symbol("▌ ");
-        let mut list_state = ListState::default();
-        list_state.select(Some(state.selected.min(visible.len().saturating_sub(1))));
+        let sel = state.selected.min(visible.len().saturating_sub(1));
+        let mut list_state = ListState::default()
+            .with_offset(state.list_offset.get())
+            .with_selected(Some(sel));
         frame.render_stateful_widget(list, area, &mut list_state);
+        // Persist the offset ratatui settled on so next frame scrolls naturally
+        // (only when the selection leaves the window) instead of snapping the
+        // selection to the bottom row on every upward move.
+        state.list_offset.set(list_state.offset());
         return;
     }
     if let Some(msg) = &state.error {
