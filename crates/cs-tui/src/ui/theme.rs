@@ -246,8 +246,8 @@ impl ThemeKind {
     pub const ALL: [ThemeKind; 5] =
         [Self::Cyber, Self::C64, Self::Vt320, Self::Dark, Self::Vapor];
 
-    /// Stable lowercase name — matches the `--theme` flag and the persisted
-    /// prefs value.
+    /// Stable lowercase name — matches the persisted prefs value and the
+    /// `config.toml` `theme` key.
     pub fn name(self) -> &'static str {
         match self {
             Self::Cyber => "cyber",

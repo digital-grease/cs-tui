@@ -17,16 +17,6 @@ use ui::{theme::ThemeKind, App};
 #[derive(Debug, Parser)]
 #[command(version, about = "TUI client for cyberspace.online")]
 struct Cli {
-    /// Override the API base URL.
-    #[arg(long, env = "CS_TUI_API_BASE")]
-    api_base: Option<String>,
-
-    /// Color theme: cyber (default), c64, vt320, dark, vapor, or custom (define
-    /// the palette in config.toml). Overrides the saved preference for this run;
-    /// the theme is also remembered between runs.
-    #[arg(long, env = "CS_TUI_THEME")]
-    theme: Option<String>,
-
     /// Run against the in-memory mock client (no network). Not yet implemented.
     #[arg(long)]
     mock: bool,
@@ -76,8 +66,8 @@ async fn main() -> Result<()> {
     config::set_config_path(config_path.clone());
     let custom_theme = cfg.custom_theme();
 
-    // API base: --api-base / $CS_TUI_API_BASE > config > built-in default.
-    let api_base = cli.api_base.as_deref().or(cfg.api_base.as_deref());
+    // API base: config.toml `api_base` > built-in default.
+    let api_base = cfg.api_base.as_deref();
     let client = build_client(api_base).context("build api client")?;
 
     let saved = match Session::load() {
@@ -97,13 +87,12 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Theme precedence: --theme/$CS_TUI_THEME > saved prefs (last cycled) >
-    // config.toml `theme` > cyber.
+    // Theme precedence: saved prefs (last cycled in-app) > config.toml `theme`
+    // > cyber.
     let prefs = Prefs::load();
-    let mut theme_kind = cli
+    let mut theme_kind = prefs
         .theme
         .as_deref()
-        .or(prefs.theme.as_deref())
         .or(cfg.theme.as_deref())
         .map(ThemeKind::from_name)
         .unwrap_or(ThemeKind::Cyber);
@@ -222,7 +211,7 @@ fn log_dir() -> Option<std::path::PathBuf> {
 fn build_client(api_base: Option<&str>) -> Result<Client> {
     let mut b = Client::builder();
     if let Some(s) = api_base {
-        b = b.base_url_str(s).context("invalid --api-base")?;
+        b = b.base_url_str(s).context("invalid config api_base")?;
     }
     b.build().context("build cs_api client")
 }
