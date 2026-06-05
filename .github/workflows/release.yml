@@ -14,7 +14,18 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # upload-rust-binary-action uploads into an existing Release but does not
+  # create one, so make the Release once here; the matrix below fills it.
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   binaries:
+    needs: create-release
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -43,9 +54,18 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # The static musl target needs a musl C toolchain because `ring` (our TLS
+      # backend) compiles a little C. This sets up musl-gcc + the linker/CC env
+      # so the build below uses cargo on the host instead of falling back to
+      # cross/Docker. The native gnu, macOS, and Windows legs don't need it.
+      - name: Set up musl toolchain
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
       # Builds the `cs-tui` binary for the target, archives it (.tar.gz on
-      # Unix, .zip on Windows), and uploads it to the Release for this tag,
-      # creating the Release if it doesn't exist yet. Handles musl cross-build.
+      # Unix, .zip on Windows), and uploads it to the Release created above.
       - name: Build and upload
         uses: taiki-e/upload-rust-binary-action@v1
         with:
