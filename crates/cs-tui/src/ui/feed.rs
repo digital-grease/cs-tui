@@ -160,6 +160,9 @@ impl FeedScreen {
         self.list.items.splice(0..0, new);
         if self.list.selected != 0 {
             self.list.selected += visible_new;
+            // Keep the viewport on the same rows: the visible list grew by
+            // `visible_new` at the top, so the persisted scroll offset shifts too.
+            self.list.shift_offset(visible_new);
         }
         if visible_new == 0 {
             HeadUpdate::None
