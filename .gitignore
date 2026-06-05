@@ -6,19 +6,6 @@
 .env
 .env.local
 
-# Reference implementations cloned for cross-checking against the authoritative
-# spec at docs/api-v0.4.md. Not part of this project; tracked locally only.
-/references/cyber-tui/
-/references/cyberspacecli/
-# Spec drops live here too; the tracked authoritative copy is docs/api-v0.4.md.
-/references/apidocs.md
-
-# Runtime config and logs (live under XDG dirs, but exclude any local fallbacks)
+# Local runtime fallbacks (the app normally writes these under XDG dirs)
 /cs-tui.log
 /session.json
-
-# Local tooling state — not part of the published project
-
-
-
-
