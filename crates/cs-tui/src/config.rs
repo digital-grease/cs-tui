@@ -203,7 +203,7 @@ const TEMPLATE: &str = r##"# cs-tui configuration. Edit and restart cs-tui.
 # Render inline images on graphics-capable terminals. --no-images forces off.
 #images = true
 
-# API base URL. --api-base / $CS_TUI_API_BASE override this.
+# API base URL (overrides the built-in default).
 #api_base = "https://api.cyberspace.online"
 "##;
 

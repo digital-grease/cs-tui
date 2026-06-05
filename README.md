@@ -2,8 +2,6 @@
 
 A terminal client for [cyberspace.online](https://cyberspace.online), targeting the v0.5.0 API.
 
-Personal, human-driven client. Per the [Cyberspace API terms](docs/api-v0.5.0.md): no scraping, no bots, no LLM-driven agents. This is software you drive with your own keystrokes.
-
 ## Status
 
 Early development. Most of the documented v0.5.0 REST surface is implemented; live testing against the API is ongoing. Chat and DMs await the published Firebase RTDB schema.
@@ -36,14 +34,8 @@ Requires Rust 1.81+ (stable channel; see `rust-toolchain.toml`).
 ## Usage
 
 ```sh
-# Run against the default API (https://api.cyberspace.online)
+# Launch
 cs-tui
-
-# Pick a theme for this run (also remembered between runs)
-cs-tui --theme vt320
-
-# Point at a different API base (include the scheme)
-cs-tui --api-base https://staging.example.com
 
 # Verbose logging (written to the log file, not the terminal)
 cs-tui --debug
@@ -73,9 +65,8 @@ overlay anywhere you aren't typing into a field.
 
 ### Themes
 
-Cycle palettes at runtime via **Esc → Theme** (or set one at startup with
-`--theme` / the `CS_TUI_THEME` environment variable). The selection is
-remembered between runs.
+Cycle palettes at runtime via **Esc → Theme**; the selection is remembered
+between runs. Set a default (or define a `custom` palette) in `config.toml`.
 
 ## Files
 
