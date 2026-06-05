@@ -47,6 +47,10 @@ pub struct Config {
     pub nsfw: Option<bool>,
     pub editor: Option<String>,
     pub confirm_deletes: Option<bool>,
+    /// Background feed auto-refresh: prepend new entries at the top.
+    pub feed_autorefresh: Option<bool>,
+    /// Seconds between background feed refreshes (clamped to a 10s minimum).
+    pub feed_refresh_secs: Option<u64>,
 }
 
 /// Hex/named overrides for the eight theme colors. Any omitted color keeps the
@@ -86,6 +90,8 @@ pub struct Runtime {
     pub nsfw: bool,
     pub editor: Option<String>,
     pub confirm_deletes: bool,
+    pub feed_autorefresh: bool,
+    pub feed_refresh_secs: u64,
 }
 
 impl Default for Runtime {
@@ -100,6 +106,8 @@ impl Default for Runtime {
             nsfw: false,
             editor: None,
             confirm_deletes: true,
+            feed_autorefresh: true,
+            feed_refresh_secs: 60,
         }
     }
 }
@@ -184,6 +192,15 @@ const TEMPLATE: &str = r##"# cs-tui configuration. Edit and restart cs-tui.
 
 # Require the two-step d → y confirmation before deleting a post/note.
 #confirm_deletes = true
+
+# Auto-refresh the feed in the background: new entries are prepended at the top
+# without moving your scroll position. Only runs while you're viewing the feed.
+# true | false
+#feed_autorefresh = true
+
+# How often (seconds) the background feed poll checks for new entries.
+# Minimum 10; lower values use more of the read rate limit.
+#feed_refresh_secs = 60
 
 # Editor for composing posts/notes. Defaults to $VISUAL, then $EDITOR, then nano.
 #editor = "nvim"
@@ -289,6 +306,11 @@ impl Config {
             nsfw: self.nsfw.unwrap_or(d.nsfw),
             editor: self.editor.clone().filter(|s| !s.trim().is_empty()),
             confirm_deletes: self.confirm_deletes.unwrap_or(d.confirm_deletes),
+            feed_autorefresh: self.feed_autorefresh.unwrap_or(d.feed_autorefresh),
+            feed_refresh_secs: self
+                .feed_refresh_secs
+                .unwrap_or(d.feed_refresh_secs)
+                .clamp(10, 3600),
         }
     }
 }
