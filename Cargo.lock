@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "cs-api"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64",
  "futures-util",
@@ -452,7 +452,7 @@ dependencies = [
 
 [[package]]
 name = "cs-tui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
