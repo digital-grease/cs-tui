@@ -72,4 +72,6 @@ jobs:
           bin: cs-tui
           target: ${{ matrix.target }}
           archive: cs-tui-$tag-$target
+          # Publish a SHA-256 checksum file alongside each archive.
+          checksum: sha256
           token: ${{ secrets.GITHUB_TOKEN }}
