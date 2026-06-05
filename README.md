@@ -21,7 +21,7 @@ Early development. Most of the documented v0.5.0 REST surface is implemented; li
 - **Settings** round-trip that preserves fields the client doesn't model
 - Markdown rendering with `@mention` highlighting
 - Inline image rendering in post detail on graphics-capable terminals (Kitty/iTerm2/Sixel); `[image] url` placeholder elsewhere
-- Four themes (`cyber`, `c64`, `vt320`, `dark`), switchable at runtime
+- Five built-in themes (`cyber`, `c64`, `vt320`, `dark`, `vapor`), switchable at runtime, plus a `custom` palette defined in `config.toml`
 - Per-endpoint rate limiting and one-shot token refresh on 401
 
 ## Build
