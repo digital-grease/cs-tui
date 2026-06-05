@@ -42,7 +42,8 @@ impl FeedScreen {
 
     /// Number of entries currently visible after NSFW filtering.
     fn visible_indices(&self) -> Vec<usize> {
-        self.list.items
+        self.list
+            .items
             .iter()
             .enumerate()
             .filter(|(_, e)| self.include_nsfw || !e.is_nsfw)
@@ -193,7 +194,8 @@ fn entry_item(entry: &Entry, width: u16, theme: &Theme) -> ListItem<'static> {
         }
     }
 
-    let snippet = super::markdown::content_preview(&entry.content, crate::config::get().preview_length);
+    let snippet =
+        super::markdown::content_preview(&entry.content, crate::config::get().preview_length);
     if !snippet.is_empty() {
         lines.push(Line::from(Span::styled(snippet, theme.base())));
     }
@@ -311,7 +313,10 @@ mod tests {
             height: 0,
         }];
         let text = render_entry_item(&e);
-        assert!(text.contains("[image]"), "attachment image must be flagged: {text:?}");
+        assert!(
+            text.contains("[image]"),
+            "attachment image must be flagged: {text:?}"
+        );
         assert!(text.contains("content of a"), "text snippet still renders");
     }
 
@@ -512,9 +517,7 @@ mod tests {
         let theme = Theme::cyber();
         let backend = ratatui::backend::TestBackend::new(80, 12);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal
-            .draw(|f| s.render(f, f.area(), &theme))
-            .unwrap();
+        terminal.draw(|f| s.render(f, f.area(), &theme)).unwrap();
         terminal
             .backend()
             .buffer()
@@ -535,8 +538,14 @@ mod tests {
         )));
         s.apply_more(Err("network blip".into()));
         let text = render_feed_to_string(&s);
-        assert!(text.contains("@alice"), "list must remain after a load-more error: {text:?}");
-        assert!(text.contains("network blip"), "error should be surfaced inline");
+        assert!(
+            text.contains("@alice"),
+            "list must remain after a load-more error: {text:?}"
+        );
+        assert!(
+            text.contains("network blip"),
+            "error should be surfaced inline"
+        );
     }
 
     #[test]

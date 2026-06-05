@@ -295,7 +295,10 @@ mod tests {
     fn digit_picks_directly() {
         // [Back(1), Logout(2), Theme(3), Quit(4), Cancel(5)]
         let mut m = MenuOverlay::build(true, true, "cyber");
-        assert_eq!(m.handle_key(key(KeyCode::Char('3'))), MenuIntent::CycleTheme);
+        assert_eq!(
+            m.handle_key(key(KeyCode::Char('3'))),
+            MenuIntent::CycleTheme
+        );
         assert_eq!(m.handle_key(key(KeyCode::Char('5'))), MenuIntent::Cancel);
     }
 
@@ -342,7 +345,10 @@ mod tests {
         let m = MenuOverlay::build(true, true, "cyber");
         let text = render_to_string(&m, 60, 7);
         assert!(text.contains("Back"), "first item missing");
-        assert!(text.contains("Cancel"), "last item clipped on short terminal");
+        assert!(
+            text.contains("Cancel"),
+            "last item clipped on short terminal"
+        );
         assert!(
             !text.contains("enter select"),
             "hint should be dropped when space is tight"

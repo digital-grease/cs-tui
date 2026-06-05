@@ -198,7 +198,10 @@ mod tests {
     async fn peek_wait_estimates_without_consuming() {
         let limiter = EndpointLimiter::new();
         // Untouched bucket starts full → writable now.
-        assert_eq!(limiter.peek_wait(EndpointKey::EntriesCreate), Duration::ZERO);
+        assert_eq!(
+            limiter.peek_wait(EndpointKey::EntriesCreate),
+            Duration::ZERO
+        );
         // Unlimited endpoints are always writable.
         assert_eq!(limiter.peek_wait(EndpointKey::AuthLogin), Duration::ZERO);
 
@@ -211,7 +214,10 @@ mod tests {
         let w1 = limiter.peek_wait(EndpointKey::EntriesCreate);
         let w2 = limiter.peek_wait(EndpointKey::EntriesCreate);
         assert!(w1 > Duration::from_secs(20), "expected ~30s, got {w1:?}");
-        assert!(w2 > Duration::from_secs(20), "peek must not consume a token");
+        assert!(
+            w2 > Duration::from_secs(20),
+            "peek must not consume a token"
+        );
     }
 
     #[tokio::test]

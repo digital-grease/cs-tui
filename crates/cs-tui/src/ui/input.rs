@@ -79,9 +79,15 @@ mod tests {
         // caret stays on-screen.
         let value: String = ('a'..='z').chain('A'..='Z').take(30).collect();
         let (text, caret) = render(&windowed_line(&value, value.chars().count(), 10, &theme));
-        assert!(text.chars().count() <= 10, "windowed to field width: {text:?}");
+        assert!(
+            text.chars().count() <= 10,
+            "windowed to field width: {text:?}"
+        );
         assert!(caret < 10, "caret stays within the window");
-        assert!(value.ends_with(text.trim_end()), "shows the tail near the caret");
+        assert!(
+            value.ends_with(text.trim_end()),
+            "shows the tail near the caret"
+        );
     }
 
     #[test]

@@ -27,7 +27,9 @@ pub enum GuildIntent {
     /// Switch tab (emitted only when the new tab still needs its first fetch).
     SelectTab(GuildTab),
     /// Open the selected thread in the post-detail view.
-    OpenThread { post_id: String },
+    OpenThread {
+        post_id: String,
+    },
     /// Join this guild.
     Join,
     /// Leave this guild.
@@ -308,11 +310,18 @@ impl GuildScreen {
     }
 
     pub fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
-        let name = self.guild.as_ref().map(|g| g.name.as_str()).unwrap_or(&self.slug);
+        let name = self
+            .guild
+            .as_ref()
+            .map(|g| g.name.as_str())
+            .unwrap_or(&self.slug);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(theme.border_style())
-            .title(Span::styled(format!(" cs-tui • {name} "), theme.accent_style()));
+            .title(Span::styled(
+                format!(" cs-tui • {name} "),
+                theme.accent_style(),
+            ));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -426,10 +435,7 @@ impl GuildScreen {
             GuildTab::Members => {
                 if self.members.is_empty() {
                     frame.render_widget(
-                        Paragraph::new(Line::from(Span::styled(
-                            "no members",
-                            theme.muted_style(),
-                        ))),
+                        Paragraph::new(Line::from(Span::styled("no members", theme.muted_style()))),
                         area,
                     );
                     return;
@@ -640,16 +646,25 @@ mod tests {
         assert!(s.action_pending);
 
         let mut member = with_guild(true, Some(GuildRole::Member));
-        assert_eq!(member.handle_key(key(KeyCode::Char('J'))), GuildIntent::None);
+        assert_eq!(
+            member.handle_key(key(KeyCode::Char('J'))),
+            GuildIntent::None
+        );
     }
 
     #[test]
     fn l_requests_leave_for_member_but_not_founder() {
         let mut member = with_guild(true, Some(GuildRole::Member));
-        assert_eq!(member.handle_key(key(KeyCode::Char('L'))), GuildIntent::Leave);
+        assert_eq!(
+            member.handle_key(key(KeyCode::Char('L'))),
+            GuildIntent::Leave
+        );
 
         let mut founder = with_guild(true, Some(GuildRole::Founder));
-        assert_eq!(founder.handle_key(key(KeyCode::Char('L'))), GuildIntent::None);
+        assert_eq!(
+            founder.handle_key(key(KeyCode::Char('L'))),
+            GuildIntent::None
+        );
     }
 
     #[test]

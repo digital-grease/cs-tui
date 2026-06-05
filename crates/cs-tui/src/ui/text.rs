@@ -55,7 +55,10 @@ mod tests {
         // Each CJK char is 2 columns wide. With max=5 columns we fit 2 of them
         // (4 cols) plus the ellipsis — never overflowing the column budget.
         let out = truncate_to_width("日本語テスト", 5);
-        assert!(out.width() <= 5, "must not exceed the column budget: {out:?}");
+        assert!(
+            out.width() <= 5,
+            "must not exceed the column budget: {out:?}"
+        );
         assert!(out.ends_with('…'));
         assert_eq!(out.chars().filter(|c| *c != '…').count(), 2);
     }

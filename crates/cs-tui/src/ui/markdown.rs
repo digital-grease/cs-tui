@@ -413,7 +413,10 @@ mod tests {
     fn image_placeholder_carries_alt_text() {
         let lines = render_markdown("![a cat](https://x/cat.png)", &Theme::dark());
         let text = flat_text(&lines);
-        assert!(text.contains("[image: a cat]"), "alt is in the tag: {text:?}");
+        assert!(
+            text.contains("[image: a cat]"),
+            "alt is in the tag: {text:?}"
+        );
         assert!(!text.contains("https://x/cat.png"), "url no longer inlined");
     }
 
@@ -421,7 +424,10 @@ mod tests {
     fn image_without_alt_is_a_plain_tag() {
         let lines = render_markdown("![](https://x/cat.png)", &Theme::dark());
         let text = flat_text(&lines);
-        assert!(text.contains("[image]"), "no-alt image is a plain tag: {text:?}");
+        assert!(
+            text.contains("[image]"),
+            "no-alt image is a plain tag: {text:?}"
+        );
         assert!(!text.contains("[image:"), "no empty alt suffix");
     }
 

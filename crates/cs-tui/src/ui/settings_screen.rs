@@ -289,8 +289,10 @@ impl SettingsScreen {
 
         // Local config-file path — shown regardless of the server-settings load
         // state so users can always find (and edit) their config.toml.
-        let cfg_path = crate::config::config_path()
-            .map_or_else(|| "(default location)".to_string(), |p| p.display().to_string());
+        let cfg_path = crate::config::config_path().map_or_else(
+            || "(default location)".to_string(),
+            |p| p.display().to_string(),
+        );
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("config file: ", theme.muted_style()),

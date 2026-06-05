@@ -128,7 +128,12 @@ impl BookmarksScreen {
 
     /// Optimistically remove a bookmark from local state.
     pub fn remove_local(&mut self, bookmark_id: &str) {
-        if let Some(idx) = self.list.items.iter().position(|b| b.bookmark_id == bookmark_id) {
+        if let Some(idx) = self
+            .list
+            .items
+            .iter()
+            .position(|b| b.bookmark_id == bookmark_id)
+        {
             self.list.items.remove(idx);
             if self.list.selected >= self.list.items.len() {
                 self.list.selected = self.list.items.len().saturating_sub(1);
@@ -150,9 +155,15 @@ impl BookmarksScreen {
             .split(inner);
 
         let visible: Vec<usize> = (0..self.list.items.len()).collect();
-        list::render_body(frame, layout[0], theme, &self.list, &visible, "no bookmarks", |b| {
-            bookmark_item(b, theme)
-        });
+        list::render_body(
+            frame,
+            layout[0],
+            theme,
+            &self.list,
+            &visible,
+            "no bookmarks",
+            |b| bookmark_item(b, theme),
+        );
 
         let status = status_line(self, theme);
         frame.render_widget(status, layout[1]);
@@ -198,7 +209,9 @@ fn bookmark_item(b: &Bookmark, theme: &Theme) -> ListItem<'static> {
             None,
         ),
     };
-    let when_str = when.map(crate::config::format_list_timestamp).unwrap_or_default();
+    let when_str = when
+        .map(crate::config::format_list_timestamp)
+        .unwrap_or_default();
     let header = Line::from(vec![
         Span::styled(format!("[{kind_label}] "), theme.muted_style()),
         Span::styled(format!("@{author}"), theme.accent_style()),
@@ -211,7 +224,6 @@ fn bookmark_item(b: &Bookmark, theme: &Theme) -> ListItem<'static> {
     }
     ListItem::new(lines)
 }
-
 
 fn status_line<'a>(s: &'a BookmarksScreen, theme: &Theme) -> Paragraph<'a> {
     if s.confirming_delete {
@@ -364,7 +376,10 @@ mod tests {
         s.handle_key(key(KeyCode::Char('d')));
         assert!(s.confirming_delete);
         assert_eq!(s.handle_key(key(KeyCode::Char('x'))), BookmarksIntent::None);
-        assert!(!s.confirming_delete, "any other key cancels the confirmation");
+        assert!(
+            !s.confirming_delete,
+            "any other key cancels the confirmation"
+        );
     }
 
     #[test]

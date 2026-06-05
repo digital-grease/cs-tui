@@ -519,7 +519,10 @@ mod tests {
             None,
         )));
         s.mark_local("n1"); // now read
-        assert_eq!(s.handle_key(key(KeyCode::Char('m'))), NotificationsIntent::None);
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('m'))),
+            NotificationsIntent::None
+        );
     }
 
     #[test]

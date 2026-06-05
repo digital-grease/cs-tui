@@ -301,7 +301,11 @@ impl PostDetailScreen {
         if has_image {
             if let Some(proto) = img.as_mut() {
                 let img_area = Rect::new(body_area.x, body_area.y, body_area.width, img_h);
-                frame.render_stateful_widget(StatefulImage::<StatefulProtocol>::new(), img_area, proto);
+                frame.render_stateful_widget(
+                    StatefulImage::<StatefulProtocol>::new(),
+                    img_area,
+                    proto,
+                );
             }
         }
         frame.render_widget(para, text_area);
@@ -499,7 +503,10 @@ mod tests {
         s.apply_replies_initial(Ok((vec![reply("r1", "p1"), reply("r2", "p1")], None)));
 
         // No selection → b bookmarks the post.
-        assert_eq!(s.handle_key(key(KeyCode::Char('b'))), PostDetailIntent::Bookmark);
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('b'))),
+            PostDetailIntent::Bookmark
+        );
 
         // J selects the first reply; b bookmarks it.
         s.handle_key(key(KeyCode::Char('J')));
@@ -575,7 +582,10 @@ mod tests {
     #[test]
     fn r_plain_reply_and_q_quote_reply_are_distinct() {
         let mut s = PostDetailScreen::new(entry("p1"));
-        assert_eq!(s.handle_key(key(KeyCode::Char('R'))), PostDetailIntent::Reply);
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('R'))),
+            PostDetailIntent::Reply
+        );
         assert_eq!(
             s.handle_key(key(KeyCode::Char('Q'))),
             PostDetailIntent::QuoteReply

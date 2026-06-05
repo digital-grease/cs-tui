@@ -3,8 +3,8 @@
 //! confirmations like "bookmarked" (success).
 use std::time::{Duration, Instant};
 
-use ratatui::style::Style;
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
@@ -94,7 +94,12 @@ impl Toast {
 
     fn label(&self) -> String {
         if self.countdown {
-            format!(" {} {} ({}s) ", self.glyph(), self.text, self.display_secs())
+            format!(
+                " {} {} ({}s) ",
+                self.glyph(),
+                self.text,
+                self.display_secs()
+            )
         } else {
             format!(" {} {} ", self.glyph(), self.text)
         }
@@ -166,7 +171,10 @@ mod tests {
         assert!(!c.is_expired());
         assert!(c.label().contains("✓"));
         assert!(c.label().contains("bookmarked"));
-        assert!(!c.label().contains("(1s)"), "confirmation must not count down");
+        assert!(
+            !c.label().contains("(1s)"),
+            "confirmation must not count down"
+        );
 
         let w = Toast::warning("bookmark failed");
         assert!(w.label().contains("⚠"));

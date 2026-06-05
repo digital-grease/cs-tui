@@ -474,7 +474,10 @@ mod tests {
         s.handle_key(key(KeyCode::Char('a'))); // narrows; selection re-anchors to 0
         assert_eq!(s.selected, 0);
         assert!(s.clear_filter()); // Esc closes the box
-        assert_eq!(s.selected, 2, "aborting a search returns to the browse spot");
+        assert_eq!(
+            s.selected, 2,
+            "aborting a search returns to the browse spot"
+        );
     }
 
     fn render_topics_to_string(s: &TopicsScreen) -> String {
@@ -533,9 +536,7 @@ mod tests {
         s.selected = 2;
         assert_eq!(
             s.handle_key(key(KeyCode::Enter)),
-            TopicsIntent::OpenSelected {
-                slug: "art".into()
-            }
+            TopicsIntent::OpenSelected { slug: "art".into() }
         );
     }
 

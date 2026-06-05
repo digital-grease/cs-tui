@@ -16,37 +16,112 @@ struct Row {
 }
 
 const SECTIONS: &[Row] = &[
-    Row { keys: "1", desc: "Feed" },
-    Row { keys: "2", desc: "Notifications" },
-    Row { keys: "3", desc: "Bookmarks" },
-    Row { keys: "4", desc: "Topics" },
-    Row { keys: "5", desc: "Profile" },
-    Row { keys: "6", desc: "Journal" },
-    Row { keys: "7", desc: "Settings" },
-    Row { keys: "8", desc: "Guilds" },
+    Row {
+        keys: "1",
+        desc: "Feed",
+    },
+    Row {
+        keys: "2",
+        desc: "Notifications",
+    },
+    Row {
+        keys: "3",
+        desc: "Bookmarks",
+    },
+    Row {
+        keys: "4",
+        desc: "Topics",
+    },
+    Row {
+        keys: "5",
+        desc: "Profile",
+    },
+    Row {
+        keys: "6",
+        desc: "Journal",
+    },
+    Row {
+        keys: "7",
+        desc: "Settings",
+    },
+    Row {
+        keys: "8",
+        desc: "Guilds",
+    },
 ];
 
 const GLOBAL: &[Row] = &[
-    Row { keys: "Esc", desc: "back — or the menu on a top-level section" },
-    Row { keys: "Backspace", desc: "back" },
-    Row { keys: "1-8 / ← →", desc: "jump to / cycle sections" },
-    Row { keys: "Tab / Shift+Tab", desc: "switch sub-tabs (profile, guild)" },
-    Row { keys: "mouse", desc: "drag to select/copy · click opens links (run --mouse for wheel scroll)" },
-    Row { keys: "?", desc: "this help" },
-    Row { keys: "Ctrl+C", desc: "quit" },
+    Row {
+        keys: "Esc",
+        desc: "back — or the menu on a top-level section",
+    },
+    Row {
+        keys: "Backspace",
+        desc: "back",
+    },
+    Row {
+        keys: "1-8 / ← →",
+        desc: "jump to / cycle sections",
+    },
+    Row {
+        keys: "Tab / Shift+Tab",
+        desc: "switch sub-tabs (profile, guild)",
+    },
+    Row {
+        keys: "mouse",
+        desc: "drag to select/copy · click opens links (run --mouse for wheel scroll)",
+    },
+    Row {
+        keys: "?",
+        desc: "this help",
+    },
+    Row {
+        keys: "Ctrl+C",
+        desc: "quit",
+    },
 ];
 
 const COMMON: &[Row] = &[
-    Row { keys: "j / ↓", desc: "move down" },
-    Row { keys: "k / ↑", desc: "move up" },
-    Row { keys: "g / Home", desc: "jump to top" },
-    Row { keys: "G / End", desc: "jump to bottom" },
-    Row { keys: "n / Space", desc: "next page" },
-    Row { keys: "Enter", desc: "open / select" },
-    Row { keys: "r", desc: "refresh" },
-    Row { keys: "c", desc: "compose / new" },
-    Row { keys: "b", desc: "bookmark (feed / post)" },
-    Row { keys: "/", desc: "search (topics)" },
+    Row {
+        keys: "j / ↓",
+        desc: "move down",
+    },
+    Row {
+        keys: "k / ↑",
+        desc: "move up",
+    },
+    Row {
+        keys: "g / Home",
+        desc: "jump to top",
+    },
+    Row {
+        keys: "G / End",
+        desc: "jump to bottom",
+    },
+    Row {
+        keys: "n / Space",
+        desc: "next page",
+    },
+    Row {
+        keys: "Enter",
+        desc: "open / select",
+    },
+    Row {
+        keys: "r",
+        desc: "refresh",
+    },
+    Row {
+        keys: "c",
+        desc: "compose / new",
+    },
+    Row {
+        keys: "b",
+        desc: "bookmark (feed / post)",
+    },
+    Row {
+        keys: "/",
+        desc: "search (topics)",
+    },
 ];
 
 /// Build the help body. Kept separate from rendering so tests can assert on the

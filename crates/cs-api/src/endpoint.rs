@@ -81,15 +81,14 @@ impl EndpointKey {
     pub fn rate_limit(self) -> RateLimit {
         use EndpointKey::{
             AuthLogin, AuthRefresh, BookmarksCreate, BookmarksDelete, BookmarksList, EntriesCreate,
-            EntriesDelete,
-            EntriesGet, EntriesList, FollowsCreate, FollowsDelete, FollowsList, GuildsGet,
-            GuildsJoin, GuildsLeave, GuildsList, GuildsMembersList, GuildsThreadsCreate,
-            GuildsThreadsList, NotesCreate,
-            NotesDelete, NotesGet, NotesGetRevision, NotesList, NotesListRevisions, NotesUpdate,
-            NotificationsList, NotificationsMarkAllRead, NotificationsMarkRead,
-            NotificationsUnreadCount, RepliesCreate, RepliesDelete, RepliesGet, RepliesList,
-            SettingsGet, SettingsUpdate, TopicsList, TopicsListPosts, UsersGet, UsersGetMe,
-            UsersGetPostBySlug, UsersListPosts, UsersListReplies, UsersUpdateMe,
+            EntriesDelete, EntriesGet, EntriesList, FollowsCreate, FollowsDelete, FollowsList,
+            GuildsGet, GuildsJoin, GuildsLeave, GuildsList, GuildsMembersList, GuildsThreadsCreate,
+            GuildsThreadsList, NotesCreate, NotesDelete, NotesGet, NotesGetRevision, NotesList,
+            NotesListRevisions, NotesUpdate, NotificationsList, NotificationsMarkAllRead,
+            NotificationsMarkRead, NotificationsUnreadCount, RepliesCreate, RepliesDelete,
+            RepliesGet, RepliesList, SettingsGet, SettingsUpdate, TopicsList, TopicsListPosts,
+            UsersGet, UsersGetMe, UsersGetPostBySlug, UsersListPosts, UsersListReplies,
+            UsersUpdateMe,
         };
 
         match self {

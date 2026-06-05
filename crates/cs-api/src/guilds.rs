@@ -366,8 +366,7 @@ mod tests {
 
     #[test]
     fn joined_guild_decodes() {
-        let j: JoinedGuild =
-            serde_json::from_str(r#"{"guildId":"g1","role":"member"}"#).unwrap();
+        let j: JoinedGuild = serde_json::from_str(r#"{"guildId":"g1","role":"member"}"#).unwrap();
         assert_eq!(j.guild_id, "g1");
         assert_eq!(j.role, Some(GuildRole::Member));
     }
