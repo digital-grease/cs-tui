@@ -1,0 +1,13 @@
+# Renovate (renovate.json) owns the cargo crates, with a 7-day release-age
+# cooldown. Dependabot is scoped to the GitHub Actions used in the workflows so
+# the two don't open duplicate PRs.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "ci"
