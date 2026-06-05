@@ -2,6 +2,10 @@
 
 A terminal client for [cyberspace.online](https://cyberspace.online), targeting the v0.5.0 API.
 
+![cs-tui screenshot](docs/screenshot.png)
+
+*The feed in the `vapor` theme (one of five built-in themes; see [Configuration](#configuration)).*
+
 ## Status
 
 Early development. Most of the documented v0.5.0 REST surface is implemented; live testing against the API is ongoing. Chat and DMs await the published Firebase RTDB schema.
@@ -22,7 +26,35 @@ Early development. Most of the documented v0.5.0 REST surface is implemented; li
 - Five built-in themes (`cyber`, `c64`, `vt320`, `dark`, `vapor`), switchable at runtime, plus a `custom` palette defined in `config.toml`
 - Per-endpoint rate limiting and one-shot token refresh on 401
 
-## Build
+## Install
+
+Download the archive for your platform from the [latest release](https://github.com/digital-grease/cs-tui/releases/latest), extract it, and run the binary. No Rust toolchain required.
+
+| Platform | Asset | Notes |
+|---|---|---|
+| Linux (any distro) | `cs-tui-<ver>-x86_64-unknown-linux-musl.tar.gz` | Fully static; the most portable Linux build. |
+| Linux (glibc) | `cs-tui-<ver>-x86_64-unknown-linux-gnu.tar.gz` | Needs glibc 2.39 or newer. |
+| macOS (Apple Silicon) | `cs-tui-<ver>-aarch64-apple-darwin.tar.gz` | |
+| macOS (Intel) | `cs-tui-<ver>-x86_64-apple-darwin.tar.gz` | |
+| Windows | `cs-tui-<ver>-x86_64-pc-windows-msvc.zip` | Windows 10 or newer. |
+
+```sh
+# Linux / macOS
+tar xzf cs-tui-*-x86_64-unknown-linux-musl.tar.gz
+./cs-tui
+# optionally put it on your PATH
+install -m 755 cs-tui ~/.local/bin/
+```
+
+On macOS the binaries are not notarized, so the first launch is blocked by Gatekeeper. Right-click the binary and choose Open, or clear the quarantine flag:
+
+```sh
+xattr -d com.apple.quarantine cs-tui
+```
+
+On Windows, SmartScreen may warn on the unsigned `.exe` (choose More info, then Run anyway). No extra runtime is needed on Windows 10 or newer.
+
+## Build from source
 
 ```sh
 cargo build --release
