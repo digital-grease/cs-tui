@@ -224,7 +224,9 @@ fn humanize_login_error(raw: &str) -> String {
             .to_string()
     } else if lower.contains("rate limited") || lower.contains("too many") {
         "Too many attempts. Wait a moment, then try again.".to_string()
-    } else if lower.contains("unauthorized") || lower.contains("(401)") || lower.contains("credential")
+    } else if lower.contains("unauthorized")
+        || lower.contains("(401)")
+        || lower.contains("credential")
     {
         "Incorrect email or password.".to_string()
     } else {
@@ -386,7 +388,11 @@ mod tests {
         s.password = "pw".into();
         s.submitting = true;
         s.finish_submit(Err("api Unknown (403): email not verified".into()));
-        assert!(s.error.as_deref().unwrap().starts_with("Email not verified"));
+        assert!(s
+            .error
+            .as_deref()
+            .unwrap()
+            .starts_with("Email not verified"));
         assert_eq!(s.password, "");
     }
 

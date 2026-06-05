@@ -8,8 +8,7 @@ use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use cs_api::{
     ApiError, Bookmark, Client, EndpointKey, Entry, Follow, FollowsDirection, Guild,
     GuildMembership, GuildThread, JoinedGuild, Note, NoteRevision, Notification, NotificationType,
-    NotificationsFilter,
-    ProfileUpdate, Reply, Settings, SettingsUpdate, Topic, User,
+    NotificationsFilter, ProfileUpdate, Reply, Settings, SettingsUpdate, Topic, User,
 };
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::DefaultTerminal;
@@ -801,9 +800,7 @@ impl App {
                 PostDetailIntent::Bookmark => Action::BookmarkPost {
                     post_id: s.entry.post_id.clone(),
                 },
-                PostDetailIntent::BookmarkReply { reply_id } => {
-                    Action::BookmarkReply { reply_id }
-                }
+                PostDetailIntent::BookmarkReply { reply_id } => Action::BookmarkReply { reply_id },
                 PostDetailIntent::None => Action::None,
             },
             Screen::Compose(s) => match s.handle_key(key) {
@@ -1028,8 +1025,11 @@ impl App {
         if key.code == KeyCode::Esc {
             if self.back_stack.is_empty() {
                 let authenticated = !self.screen.is_login();
-                self.menu =
-                    Some(MenuOverlay::build(authenticated, false, self.theme_kind.name()));
+                self.menu = Some(MenuOverlay::build(
+                    authenticated,
+                    false,
+                    self.theme_kind.name(),
+                ));
             } else {
                 self.pop_screen();
             }
@@ -1209,7 +1209,8 @@ impl App {
                 // so we fall through and fetch fresh rather than open a stale shell.
                 if let Screen::Feed(s) = &self.screen {
                     if let Some(entry) = s
-                        .list.items
+                        .list
+                        .items
                         .iter()
                         .find(|e| e.post_id == post_id && !e.deleted)
                         .cloned()
@@ -1220,7 +1221,8 @@ impl App {
                 }
                 if let Screen::TopicFeed(s) = &self.screen {
                     if let Some(entry) = s
-                        .list.items
+                        .list
+                        .items
                         .iter()
                         .find(|e| e.post_id == post_id && !e.deleted)
                         .cloned()
@@ -2005,7 +2007,9 @@ impl App {
     /// when the caller should skip the action.
     fn block_write_if_offline(&mut self) -> bool {
         if self.offline {
-            self.toast = Some(Toast::warning("you're offline — try again when reconnected"));
+            self.toast = Some(Toast::warning(
+                "you're offline — try again when reconnected",
+            ));
             true
         } else {
             false
@@ -2073,7 +2077,10 @@ impl App {
     /// to local prefs so it survives restarts. A failed save is non-fatal.
     fn cycle_theme(&mut self) {
         let kinds = self.available_theme_kinds();
-        let idx = kinds.iter().position(|k| *k == self.theme_kind).unwrap_or(0);
+        let idx = kinds
+            .iter()
+            .position(|k| *k == self.theme_kind)
+            .unwrap_or(0);
         self.theme_kind = kinds[(idx + 1) % kinds.len()];
         self.theme = self.resolve_theme(self.theme_kind);
         let prefs = crate::prefs::Prefs {
@@ -2183,7 +2190,11 @@ impl App {
         }
     }
 
-    fn spawn_notifications_initial(&self, filter: NotificationsFilter, types: Vec<NotificationType>) {
+    fn spawn_notifications_initial(
+        &self,
+        filter: NotificationsFilter,
+        types: Vec<NotificationType>,
+    ) {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
@@ -2398,7 +2409,10 @@ impl App {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
-            let result = client.list_guilds(None, None).await.map_err(|e| note_api_err(&tx, e));
+            let result = client
+                .list_guilds(None, None)
+                .await
+                .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::GuildsInitial(result));
         });
     }
@@ -2421,7 +2435,10 @@ impl App {
         let tx = self.bg_tx.clone();
         let info_slug = slug.clone();
         tokio::spawn(async move {
-            let result = client.get_guild(&info_slug).await.map_err(|e| note_api_err(&tx, e));
+            let result = client
+                .get_guild(&info_slug)
+                .await
+                .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::GuildInfo {
                 slug: info_slug,
                 result,
@@ -2482,7 +2499,10 @@ impl App {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
-            let result = client.join_guild(&slug).await.map_err(|e| note_api_err(&tx, e));
+            let result = client
+                .join_guild(&slug)
+                .await
+                .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::GuildJoined { slug, result });
         });
     }
@@ -2491,7 +2511,10 @@ impl App {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
-            let result = client.leave_guild(&slug).await.map_err(|e| note_api_err(&tx, e));
+            let result = client
+                .leave_guild(&slug)
+                .await
+                .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::GuildLeft { slug, result });
         });
     }
@@ -2526,7 +2549,10 @@ impl App {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
-            let result = client.get_entry(&post_id).await.map_err(|e| note_api_err(&tx, e));
+            let result = client
+                .get_entry(&post_id)
+                .await
+                .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::OpenPostDetail {
                 result,
                 highlight_reply_id,
@@ -2585,7 +2611,10 @@ impl App {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
-            let result = client.get_own_profile().await.map_err(|e| note_api_err(&tx, e));
+            let result = client
+                .get_own_profile()
+                .await
+                .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::ProfileUser(result));
         });
     }
@@ -2906,7 +2935,10 @@ impl App {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
-            let result = client.get_settings().await.map_err(|e| note_api_err(&tx, e));
+            let result = client
+                .get_settings()
+                .await
+                .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::SettingsLoaded(result));
         });
     }
@@ -3146,7 +3178,10 @@ mod tests {
     fn login_screen_without_menu_draws_no_menu_chrome() {
         let app = test_app();
         let text = render_to_string(&app);
-        assert!(!text.contains("Cancel"), "menu chrome leaked with no menu open");
+        assert!(
+            !text.contains("Cancel"),
+            "menu chrome leaked with no menu open"
+        );
     }
 
     fn key_event(code: KeyCode) -> Event {
@@ -3200,7 +3235,10 @@ mod tests {
         let Screen::PostDetail(s) = &app.screen else {
             panic!("expected PostDetail");
         };
-        assert!(s.replies.is_empty(), "stale page for post A must not land on B");
+        assert!(
+            s.replies.is_empty(),
+            "stale page for post A must not land on B"
+        );
 
         // The matching page for B applies normally.
         app.handle_bg_event(BgEvent::DetailRepliesInitial {
@@ -3218,7 +3256,8 @@ mod tests {
         let mut app = test_app();
         app.push_screen(Screen::PostDetail(PostDetailScreen::new(test_entry("p1"))));
         assert!(matches!(app.screen, Screen::PostDetail(_)));
-        app.handle_terminal_event(key_event(KeyCode::Backspace)).await;
+        app.handle_terminal_event(key_event(KeyCode::Backspace))
+            .await;
         assert!(
             !matches!(app.screen, Screen::PostDetail(_)),
             "backspace should pop a pushed screen (global back)"
@@ -3292,7 +3331,9 @@ mod tests {
         );
         assert_eq!(
             App::route_key(&mut screen, kev(KeyCode::Char('b'))),
-            Action::BookmarkPost { post_id: "p1".into() }
+            Action::BookmarkPost {
+                post_id: "p1".into()
+            }
         );
         assert_eq!(
             App::route_key(&mut screen, kev(KeyCode::Char('x'))),
@@ -3357,13 +3398,15 @@ mod tests {
         app.screen = Screen::Topics(s);
         app.current_root = Some(RootKind::Topics);
 
-        app.handle_terminal_event(key_event(KeyCode::Char('f'))).await;
+        app.handle_terminal_event(key_event(KeyCode::Char('f')))
+            .await;
         assert!(
             app.topic_follows.iter().any(|s| s == "music"),
             "follow applied optimistically"
         );
 
-        app.handle_terminal_event(key_event(KeyCode::Char('f'))).await;
+        app.handle_terminal_event(key_event(KeyCode::Char('f')))
+            .await;
         assert!(
             !app.topic_follows.iter().any(|s| s == "music"),
             "pressing f again unfollows"
@@ -3394,12 +3437,16 @@ mod tests {
         app.offline = true;
 
         // `m` on the unread item would normally mark it read optimistically.
-        app.handle_terminal_event(key_event(KeyCode::Char('m'))).await;
+        app.handle_terminal_event(key_event(KeyCode::Char('m')))
+            .await;
 
         let Screen::Notifications(s) = &app.screen else {
             panic!("expected Notifications");
         };
-        assert!(!s.list.items[0].read, "offline write must not optimistically mark");
+        assert!(
+            !s.list.items[0].read,
+            "offline write must not optimistically mark"
+        );
         assert_eq!(app.unread_count, 3, "unread count unchanged while offline");
         assert!(app.toast.is_some(), "offline write surfaces a toast");
     }
@@ -3424,16 +3471,19 @@ mod tests {
     async fn question_mark_toggles_help_on_read_screens() {
         let mut app = test_app();
         app.screen = Screen::Feed(FeedScreen::new()); // not a text-input screen
-        app.handle_terminal_event(key_event(KeyCode::Char('?'))).await;
+        app.handle_terminal_event(key_event(KeyCode::Char('?')))
+            .await;
         assert!(app.help, "? should open help on the feed");
-        app.handle_terminal_event(key_event(KeyCode::Char('j'))).await;
+        app.handle_terminal_event(key_event(KeyCode::Char('j')))
+            .await;
         assert!(!app.help, "any key should dismiss help");
     }
 
     #[tokio::test]
     async fn question_mark_is_text_on_the_login_screen() {
         let mut app = test_app(); // starts on Login (text input)
-        app.handle_terminal_event(key_event(KeyCode::Char('?'))).await;
+        app.handle_terminal_event(key_event(KeyCode::Char('?')))
+            .await;
         assert!(!app.help, "? must not open help while typing into login");
     }
 
@@ -3451,7 +3501,8 @@ mod tests {
         let mut app = test_app();
         app.screen = Screen::Feed(FeedScreen::new());
         app.current_root = Some(RootKind::Feed);
-        app.handle_terminal_event(key_event(KeyCode::Char('2'))).await;
+        app.handle_terminal_event(key_event(KeyCode::Char('2')))
+            .await;
         assert!(
             matches!(app.screen, Screen::Notifications(_)),
             "2 should switch to notifications from a read screen"
@@ -3465,7 +3516,8 @@ mod tests {
         let mut app = test_app();
         app.screen = Screen::Compose(ComposeScreen::new(ComposeKind::NewEntry, String::new()));
         app.current_root = Some(RootKind::Feed);
-        app.handle_terminal_event(key_event(KeyCode::Char('2'))).await;
+        app.handle_terminal_event(key_event(KeyCode::Char('2')))
+            .await;
         assert!(
             matches!(app.screen, Screen::Compose(_)),
             "a digit on a text-input screen must reach the screen, not navigate"
@@ -3487,7 +3539,8 @@ mod tests {
         let mut app = test_app();
         app.screen = settings_focused(0); // filterNSFW — a Bool field
         app.current_root = Some(RootKind::Settings);
-        app.handle_terminal_event(key_event(KeyCode::Char('2'))).await;
+        app.handle_terminal_event(key_event(KeyCode::Char('2')))
+            .await;
         assert!(
             matches!(app.screen, Screen::Notifications(_)),
             "a digit on a settings toggle should jump to that section"
@@ -3510,7 +3563,8 @@ mod tests {
         let mut app = test_app();
         app.screen = settings_focused(12); // timeDisplayFormat — a Choice field
         app.current_root = Some(RootKind::Settings);
-        app.handle_terminal_event(key_event(KeyCode::Char('2'))).await;
+        app.handle_terminal_event(key_event(KeyCode::Char('2')))
+            .await;
         assert!(
             matches!(app.screen, Screen::Notifications(_)),
             "a digit on a settings choice field should jump to that section"
@@ -3532,11 +3586,21 @@ mod tests {
 
         // Rate limited → carries the retry hint; the display string still flows
         // through to the per-screen path unchanged.
-        let msg = note_api_err(&tx, ApiError::RateLimited { retry_after_secs: 12 });
-        assert!(msg.contains("retry after 12s"), "display string lost: {msg}");
+        let msg = note_api_err(
+            &tx,
+            ApiError::RateLimited {
+                retry_after_secs: 12,
+            },
+        );
+        assert!(
+            msg.contains("retry after 12s"),
+            "display string lost: {msg}"
+        );
         assert!(matches!(
             drain_signal(&mut rx),
-            ApiSignal::RateLimited { retry_after_secs: 12 }
+            ApiSignal::RateLimited {
+                retry_after_secs: 12
+            }
         ));
 
         // Unauthorized → terminal session-expiry (refresh already failed upstream).
@@ -3561,8 +3625,13 @@ mod tests {
     fn rate_limited_signal_shows_toast_and_is_online() {
         let mut app = test_app();
         app.offline = true;
-        app.handle_api_signal(ApiSignal::RateLimited { retry_after_secs: 8 });
-        assert!(app.toast.is_some(), "rate-limit signal should raise a toast");
+        app.handle_api_signal(ApiSignal::RateLimited {
+            retry_after_secs: 8,
+        });
+        assert!(
+            app.toast.is_some(),
+            "rate-limit signal should raise a toast"
+        );
         assert!(!app.offline, "a rate-limit response proves we're online");
     }
 
@@ -3671,7 +3740,10 @@ mod tests {
         // First warm-up page (not complete): cache grows, screen updates live.
         app.handle_bg_event(BgEvent::TopicsPrefetched {
             epoch,
-            topics: vec![Topic { slug: "music".into(), post_count: 5 }],
+            topics: vec![Topic {
+                slug: "music".into(),
+                post_count: 5,
+            }],
             complete: false,
         });
         assert_eq!(app.topics_cache.len(), 1);
@@ -3680,7 +3752,10 @@ mod tests {
         // Final page: completes the cache.
         app.handle_bg_event(BgEvent::TopicsPrefetched {
             epoch,
-            topics: vec![Topic { slug: "linux".into(), post_count: 9 }],
+            topics: vec![Topic {
+                slug: "linux".into(),
+                post_count: 9,
+            }],
             complete: true,
         });
         assert_eq!(app.topics_cache.len(), 2);
@@ -3689,10 +3764,17 @@ mod tests {
         // A stale page from a superseded run (wrong epoch) is ignored.
         app.handle_bg_event(BgEvent::TopicsPrefetched {
             epoch: epoch.wrapping_add(99),
-            topics: vec![Topic { slug: "ghost".into(), post_count: 1 }],
+            topics: vec![Topic {
+                slug: "ghost".into(),
+                post_count: 1,
+            }],
             complete: false,
         });
-        assert_eq!(app.topics_cache.len(), 2, "stale-epoch page must be dropped");
+        assert_eq!(
+            app.topics_cache.len(),
+            2,
+            "stale-epoch page must be dropped"
+        );
 
         // Revisiting topics fills the screen from the cache — no loading, no fetch.
         app.goto_root(RootKind::Topics);
@@ -3725,7 +3807,10 @@ mod tests {
         ));
 
         // Five wheel events from one physical notch collapse to a single move.
-        assert_eq!(coalesce_scroll(vec![down(), down(), down(), down(), down()]).len(), 1);
+        assert_eq!(
+            coalesce_scroll(vec![down(), down(), down(), down(), down()]).len(),
+            1
+        );
 
         // Direction changes are kept; a key breaks the run and passes through.
         let out = coalesce_scroll(vec![down(), down(), up(), up(), keyev, down()]);

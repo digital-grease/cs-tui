@@ -168,7 +168,10 @@ mod tests {
     #[test]
     fn retry_after_only_set_for_rate_limited() {
         assert_eq!(
-            ApiError::RateLimited { retry_after_secs: 30 }.retry_after_secs(),
+            ApiError::RateLimited {
+                retry_after_secs: 30
+            }
+            .retry_after_secs(),
             Some(30)
         );
         assert_eq!(ApiError::Unauthorized.retry_after_secs(), None);
@@ -215,14 +218,18 @@ mod tests {
         assert_eq!(nf.user_message(), "not found");
 
         // Rate-limit keeps the retry hint (and the "retry after Ns" phrasing).
-        assert!(ApiError::RateLimited { retry_after_secs: 12 }
-            .user_message()
-            .contains("retry after 12s"));
+        assert!(ApiError::RateLimited {
+            retry_after_secs: 12
+        }
+        .user_message()
+        .contains("retry after 12s"));
     }
 
     #[test]
     fn classification_helpers_partition_variants() {
-        let rl = ApiError::RateLimited { retry_after_secs: 5 };
+        let rl = ApiError::RateLimited {
+            retry_after_secs: 5,
+        };
         assert!(rl.is_rate_limited() && !rl.is_transport() && !rl.is_unauthorized());
 
         let un = ApiError::Unauthorized;

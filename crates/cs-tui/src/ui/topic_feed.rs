@@ -64,7 +64,8 @@ impl TopicFeedScreen {
 
     /// Indices of entries currently visible after NSFW filtering.
     fn visible_indices(&self) -> Vec<usize> {
-        self.list.items
+        self.list
+            .items
             .iter()
             .enumerate()
             .filter(|(_, e)| self.include_nsfw || !e.is_nsfw)
@@ -222,7 +223,8 @@ fn entry_item(entry: &Entry, theme: &Theme) -> ListItem<'static> {
         header_spans.push(Span::styled(" · [image]", theme.accent_style()));
     }
     let mut lines = vec![Line::from(header_spans)];
-    let snippet = super::markdown::content_preview(&entry.content, crate::config::get().preview_length);
+    let snippet =
+        super::markdown::content_preview(&entry.content, crate::config::get().preview_length);
     if !snippet.is_empty() {
         lines.push(Line::from(Span::styled(snippet, theme.base())));
     }
@@ -306,7 +308,10 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        assert!(text.contains('★'), "followed topic header should show a star");
+        assert!(
+            text.contains('★'),
+            "followed topic header should show a star"
+        );
     }
 
     #[test]
@@ -361,7 +366,12 @@ mod tests {
         s.apply_initial(Ok((vec![nsfw, entry("p3")], None)));
         // selected=0 maps to the first VISIBLE entry (p3), not the hidden p2.
         let intent = s.handle_key(key(KeyCode::Enter));
-        assert_eq!(intent, TopicFeedIntent::OpenSelected { post_id: "p3".into() });
+        assert_eq!(
+            intent,
+            TopicFeedIntent::OpenSelected {
+                post_id: "p3".into()
+            }
+        );
     }
 
     #[test]

@@ -110,7 +110,12 @@ fn styled_token(text: &str, active: bool, theme: &Theme) -> Span<'static> {
 /// stays visible within `avail` columns. Returns `(lo, hi, clipped_left,
 /// clipped_right)`; the window is `lo..hi`. Grows rightward first so upcoming
 /// sections are revealed as you tab forward, then leftward near the end.
-fn tab_window(widths: &[usize], sep_w: usize, cur: usize, avail: usize) -> (usize, usize, bool, bool) {
+fn tab_window(
+    widths: &[usize],
+    sep_w: usize,
+    cur: usize,
+    avail: usize,
+) -> (usize, usize, bool, bool) {
     let len = widths.len();
     if len == 0 {
         return (0, 0, false, false);

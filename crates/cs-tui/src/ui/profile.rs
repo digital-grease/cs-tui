@@ -463,24 +463,31 @@ impl ProfileScreen {
 
     fn render_posts(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         let pinned = self.user.as_ref().and_then(|u| u.pinned_post_id.clone());
-        render_list_with_state(frame, area, theme, &self.posts, "posts", move |e: &Entry| {
-            let when = e.created_at.map(format_relative).unwrap_or_default();
-            let mut header = vec![
-                Span::styled(format!("@{}", e.author_username), theme.accent_style()),
-                Span::styled(format!(" · {when}"), theme.muted_style()),
-            ];
-            if pinned.as_deref() == Some(e.post_id.as_str()) {
-                header.push(Span::styled(" · 📌 pinned", theme.warning_style()));
-            }
-            vec![
-                Line::from(header),
-                Line::from(Span::styled(
-                    super::text::first_line_truncated(&e.content, 160),
-                    theme.base(),
-                )),
-                Line::from(""),
-            ]
-        });
+        render_list_with_state(
+            frame,
+            area,
+            theme,
+            &self.posts,
+            "posts",
+            move |e: &Entry| {
+                let when = e.created_at.map(format_relative).unwrap_or_default();
+                let mut header = vec![
+                    Span::styled(format!("@{}", e.author_username), theme.accent_style()),
+                    Span::styled(format!(" · {when}"), theme.muted_style()),
+                ];
+                if pinned.as_deref() == Some(e.post_id.as_str()) {
+                    header.push(Span::styled(" · 📌 pinned", theme.warning_style()));
+                }
+                vec![
+                    Line::from(header),
+                    Line::from(Span::styled(
+                        super::text::first_line_truncated(&e.content, 160),
+                        theme.base(),
+                    )),
+                    Line::from(""),
+                ]
+            },
+        );
     }
 
     fn render_replies(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
@@ -590,7 +597,6 @@ fn render_list_with_state<T, F>(
         ListItem::new(item_lines(t))
     });
 }
-
 
 fn format_relative(t: OffsetDateTime) -> String {
     let now = OffsetDateTime::now_utc();

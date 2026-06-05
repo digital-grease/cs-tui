@@ -51,7 +51,9 @@ pub fn navigate(key: KeyCode, selected: &mut usize, view_len: usize, has_more: b
             *selected = view_len.saturating_sub(1);
             ListNav::Moved
         }
-        KeyCode::Char('n') | KeyCode::Char(' ') | KeyCode::PageDown if has_more => ListNav::LoadMore,
+        KeyCode::Char('n') | KeyCode::Char(' ') | KeyCode::PageDown if has_more => {
+            ListNav::LoadMore
+        }
         _ => ListNav::Ignored,
     }
 }
@@ -63,12 +65,18 @@ mod tests {
     #[test]
     fn j_advances_until_the_last_visible_item() {
         let mut sel = 0;
-        assert_eq!(navigate(KeyCode::Char('j'), &mut sel, 3, false), ListNav::Moved);
+        assert_eq!(
+            navigate(KeyCode::Char('j'), &mut sel, 3, false),
+            ListNav::Moved
+        );
         assert_eq!(sel, 1);
         navigate(KeyCode::Char('j'), &mut sel, 3, false);
         assert_eq!(sel, 2);
         // At the bottom with no more pages: stays put, no load.
-        assert_eq!(navigate(KeyCode::Char('j'), &mut sel, 3, false), ListNav::Moved);
+        assert_eq!(
+            navigate(KeyCode::Char('j'), &mut sel, 3, false),
+            ListNav::Moved
+        );
         assert_eq!(sel, 2);
     }
 

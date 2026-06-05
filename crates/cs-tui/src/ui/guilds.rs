@@ -15,7 +15,9 @@ pub enum GuildsIntent {
     Refresh,
     LoadMore,
     /// Open the selected guild's detail screen.
-    OpenSelected { slug: String },
+    OpenSelected {
+        slug: String,
+    },
     Quit,
     None,
 }
@@ -95,9 +97,15 @@ impl GuildsScreen {
             .split(inner);
 
         let visible: Vec<usize> = (0..self.list.items.len()).collect();
-        list::render_body(frame, layout[0], theme, &self.list, &visible, "no guilds", |g| {
-            guild_item(g, theme)
-        });
+        list::render_body(
+            frame,
+            layout[0],
+            theme,
+            &self.list,
+            &visible,
+            "no guilds",
+            |g| guild_item(g, theme),
+        );
 
         let (status, style) = if let Some(msg) = list::load_more_error(&self.list) {
             (msg, theme.error_style())
@@ -216,7 +224,10 @@ mod tests {
         s.apply_initial(Ok((vec![guild("a")], None)));
         assert_eq!(s.handle_key(key(KeyCode::Char('n'))), GuildsIntent::None);
         s.apply_initial(Ok((vec![guild("a")], Some("c".into()))));
-        assert_eq!(s.handle_key(key(KeyCode::Char('n'))), GuildsIntent::LoadMore);
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('n'))),
+            GuildsIntent::LoadMore
+        );
     }
 
     #[test]

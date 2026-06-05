@@ -274,7 +274,10 @@ impl Config {
                 None => d.tz_offset,
             },
             compact: self.compact.unwrap_or(d.compact),
-            preview_length: self.preview_length.unwrap_or(d.preview_length).clamp(20, 2000),
+            preview_length: self
+                .preview_length
+                .unwrap_or(d.preview_length)
+                .clamp(20, 2000),
             image_height: self.image_height.unwrap_or(d.image_height).clamp(1, 60),
             start_section: match self.start_section.as_deref() {
                 Some(s) => parse_section(s).unwrap_or_else(|| {
@@ -310,7 +313,10 @@ fn apply(field: &mut Color, spec: Option<&str>) {
         match parse_color(s) {
             Some(c) => *field = c,
             None => {
-                tracing::warn!(value = s, "unrecognized color in config.toml; keeping default");
+                tracing::warn!(
+                    value = s,
+                    "unrecognized color in config.toml; keeping default"
+                );
             }
         }
     }
@@ -340,7 +346,11 @@ pub fn parse_color(s: &str) -> Option<Color> {
         }
         3 => {
             let nib = |c: &str| u8::from_str_radix(c, 16).ok().map(|v| v * 17);
-            Some(Color::Rgb(nib(&hex[0..1])?, nib(&hex[1..2])?, nib(&hex[2..3])?))
+            Some(Color::Rgb(
+                nib(&hex[0..1])?,
+                nib(&hex[1..2])?,
+                nib(&hex[2..3])?,
+            ))
         }
         _ => None,
     }
@@ -458,10 +468,19 @@ mod tests {
     #[test]
     fn parse_tz_handles_utc_and_offsets() {
         assert_eq!(parse_tz("utc"), Some(UtcOffset::UTC));
-        assert_eq!(parse_tz("-05:00"), Some(UtcOffset::from_hms(-5, 0, 0).unwrap()));
-        assert_eq!(parse_tz("+0530"), Some(UtcOffset::from_hms(5, 30, 0).unwrap()));
+        assert_eq!(
+            parse_tz("-05:00"),
+            Some(UtcOffset::from_hms(-5, 0, 0).unwrap())
+        );
+        assert_eq!(
+            parse_tz("+0530"),
+            Some(UtcOffset::from_hms(5, 30, 0).unwrap())
+        );
         assert_eq!(parse_tz("+2"), Some(UtcOffset::from_hms(2, 0, 0).unwrap()));
-        assert_eq!(parse_tz("+14:00"), Some(UtcOffset::from_hms(14, 0, 0).unwrap()));
+        assert_eq!(
+            parse_tz("+14:00"),
+            Some(UtcOffset::from_hms(14, 0, 0).unwrap())
+        );
         assert_eq!(parse_tz("nonsense"), None);
         // Out-of-range offsets fall back (None → caller uses UTC), not ±25:59.
         assert_eq!(parse_tz("+25"), None);

@@ -243,8 +243,7 @@ pub enum ThemeKind {
 impl ThemeKind {
     /// The built-in palettes, in cycle order. (`Custom` is appended by the App
     /// when configured.)
-    pub const ALL: [ThemeKind; 5] =
-        [Self::Cyber, Self::C64, Self::Vt320, Self::Dark, Self::Vapor];
+    pub const ALL: [ThemeKind; 5] = [Self::Cyber, Self::C64, Self::Vt320, Self::Dark, Self::Vapor];
 
     /// Stable lowercase name — matches the persisted prefs value and the
     /// `config.toml` `theme` key.
@@ -329,7 +328,10 @@ mod tests {
         // vapor is all Rgb → every slot becomes an indexed color.
         let v = Theme::vapor().adapt(ColorMode::Indexed256);
         for c in [v.accent, v.background, v.error, v.border] {
-            assert!(matches!(c, Color::Indexed(_)), "expected indexed, got {c:?}");
+            assert!(
+                matches!(c, Color::Indexed(_)),
+                "expected indexed, got {c:?}"
+            );
         }
         // cyber uses named/indexed colors → unchanged by the downsample.
         let c = Theme::cyber();
@@ -355,7 +357,7 @@ mod tests {
         assert_eq!(rgb_to_ansi256(0, 0, 0), 16); // black → cube origin
         assert_eq!(rgb_to_ansi256(255, 255, 255), 231); // white → cube corner
         assert_eq!(rgb_to_ansi256(255, 0, 0), 196); // pure red
-        // Mid grays land in the 232..=255 ramp.
+                                                    // Mid grays land in the 232..=255 ramp.
         assert!((232..=255).contains(&rgb_to_ansi256(128, 128, 128)));
     }
 

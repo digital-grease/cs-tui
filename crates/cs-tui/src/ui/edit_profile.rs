@@ -113,7 +113,10 @@ impl EditProfileScreen {
     /// Insert a char at the cursor (char-aware so multibyte text is safe).
     fn insert_char(&mut self, c: char) {
         let f = &mut self.fields[self.focused];
-        let byte = f.char_indices().nth(self.cursor).map_or(f.len(), |(b, _)| b);
+        let byte = f
+            .char_indices()
+            .nth(self.cursor)
+            .map_or(f.len(), |(b, _)| b);
         f.insert(byte, c);
         self.cursor += 1;
         self.cleared[self.focused] = false;
