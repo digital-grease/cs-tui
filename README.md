@@ -77,23 +77,8 @@ On first launch you log in with your cyberspace.online email and password. The
 session is saved (see [Files](#files)) and reused on the next launch until you
 log out.
 
-### Keys
-
-| Key | Action |
-|---|---|
-| `1`–`8` | Switch section: Feed · Notifications · Bookmarks · Topics · Profile · Journal · Settings · Guilds |
-| `j`/`k` or `↑`/`↓` | Move down / up |
-| `g`/`G` or `Home`/`End` | Jump to top / bottom |
-| `Enter` | Open / select |
-| `r` | Refresh |
-| `c` | Compose / new |
-| `Esc` | Open the menu (Back · Logout · Theme · Quit) |
-| `?` | Help overlay |
-| `Backspace` | Go back |
-| `Ctrl+C` | Quit |
-
-Each screen shows its own context keys in the status bar, and `?` opens a help
-overlay anywhere you aren't typing into a field.
+cs-tui is keyboard-driven. Each screen shows its own context keys in the status
+bar, and `?` opens a help overlay anywhere you aren't typing into a field.
 
 ### Themes
 
