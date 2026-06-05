@@ -109,7 +109,14 @@ async fn main() -> Result<()> {
         tracing::info!("image rendering disabled");
         None
     } else {
-        match ratatui_image::picker::Picker::from_query_stdio() {
+        // Pin the capability-query timeout: ratatui-image's default rose to
+        // 2000ms in v11, so set it explicitly to preserve the prior ~1s ceiling
+        // on terminals that never answer the query.
+        let query_opts = ratatui_image::picker::cap_parser::QueryStdioOptions {
+            timeout: std::time::Duration::from_millis(1000),
+            ..Default::default()
+        };
+        match ratatui_image::picker::Picker::from_query_stdio_with_options(query_opts) {
             Ok(p) => {
                 tracing::info!(protocol = ?p.protocol_type(), "terminal image graphics detected");
                 Some(p)
