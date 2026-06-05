@@ -32,6 +32,19 @@ pub struct FeedScreen {
     pub include_nsfw: bool,
 }
 
+/// Outcome of folding a background head-poll into the feed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeadUpdate {
+    /// Nothing visibly changed.
+    None,
+    /// `n` new (visible) entries were prepended at the top.
+    Prepended(usize),
+    /// The head page didn't overlap the current top — more than a page of new
+    /// entries arrived, so prepending would leave a gap; a manual refresh is
+    /// needed to catch up cleanly.
+    Gap,
+}
+
 impl FeedScreen {
     pub fn new() -> Self {
         Self {
@@ -115,6 +128,44 @@ impl FeedScreen {
     /// Append the result of a load-more page.
     pub fn apply_more(&mut self, result: Result<(Vec<Entry>, Option<String>), String>) {
         self.list.apply_more(result);
+    }
+
+    /// Fold a background head-poll (the newest page) into the feed without
+    /// moving the user's scroll position. Strictly-new entries (the prefix of
+    /// `head` ahead of the first entry we already have) are prepended at the
+    /// top, and `selected` — a NSFW-filtered *view* index — shifts by the number
+    /// of *visible* new entries so the row under the cursor stays put. If the
+    /// user is at the very top, the newest is revealed (selection stays at 0).
+    /// If the page doesn't overlap our current top (more than a page of new
+    /// entries), returns `Gap` and changes nothing, so we never hide entries.
+    pub fn apply_new_head(&mut self, head: Vec<Entry>) -> HeadUpdate {
+        use std::collections::HashSet;
+        if head.is_empty() || self.list.items.is_empty() {
+            return HeadUpdate::None;
+        }
+        let existing: HashSet<&str> = self.list.items.iter().map(|e| e.post_id.as_str()).collect();
+        let new_count = match head
+            .iter()
+            .position(|e| existing.contains(e.post_id.as_str()))
+        {
+            Some(0) => return HeadUpdate::None, // head's newest already at our top
+            Some(k) => k,                       // head[0..k] are strictly newer
+            None => return HeadUpdate::Gap,     // a full page of new entries: gap
+        };
+        let new: Vec<Entry> = head.into_iter().take(new_count).collect();
+        let visible_new = new
+            .iter()
+            .filter(|e| self.include_nsfw || !e.is_nsfw)
+            .count();
+        self.list.items.splice(0..0, new);
+        if self.list.selected != 0 {
+            self.list.selected += visible_new;
+        }
+        if visible_new == 0 {
+            HeadUpdate::None
+        } else {
+            HeadUpdate::Prepended(visible_new)
+        }
     }
 
     pub fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
@@ -355,6 +406,110 @@ mod tests {
         s.apply_initial(Err("boom".into()));
         assert!(!s.list.loading);
         assert_eq!(s.list.error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn apply_new_head_prepends_and_preserves_scroll() {
+        let mut s = FeedScreen::new();
+        s.apply_initial(Ok((
+            vec![
+                entry("a", "a", false),
+                entry("b", "b", false),
+                entry("c", "c", false),
+            ],
+            None,
+        )));
+        s.list.selected = 2; // viewing "c"
+        let update = s.apply_new_head(vec![
+            entry("x", "x", false),
+            entry("a", "a", false),
+            entry("b", "b", false),
+            entry("c", "c", false),
+        ]);
+        assert_eq!(update, HeadUpdate::Prepended(1));
+        assert_eq!(s.list.items[0].post_id, "x");
+        assert_eq!(s.list.items.len(), 4);
+        // selection followed "c" down by the one prepended row.
+        assert_eq!(s.list.selected, 3);
+        assert_eq!(s.list.items[s.list.selected].post_id, "c");
+    }
+
+    #[test]
+    fn apply_new_head_at_top_reveals_newest() {
+        let mut s = FeedScreen::new();
+        s.apply_initial(Ok((
+            vec![entry("a", "a", false), entry("b", "b", false)],
+            None,
+        )));
+        assert_eq!(s.list.selected, 0);
+        let update = s.apply_new_head(vec![
+            entry("x", "x", false),
+            entry("a", "a", false),
+            entry("b", "b", false),
+        ]);
+        assert_eq!(update, HeadUpdate::Prepended(1));
+        assert_eq!(s.list.selected, 0); // stays at top, now showing "x"
+        assert_eq!(s.list.items[0].post_id, "x");
+    }
+
+    #[test]
+    fn apply_new_head_no_overlap_is_a_gap() {
+        let mut s = FeedScreen::new();
+        s.apply_initial(Ok((
+            vec![entry("a", "a", false), entry("b", "b", false)],
+            None,
+        )));
+        let update = s.apply_new_head(vec![entry("x", "x", false), entry("y", "y", false)]);
+        assert_eq!(update, HeadUpdate::Gap);
+        assert_eq!(s.list.items.len(), 2); // unchanged
+        assert_eq!(s.list.items[0].post_id, "a");
+    }
+
+    #[test]
+    fn apply_new_head_nothing_new_is_noop() {
+        let mut s = FeedScreen::new();
+        s.apply_initial(Ok((
+            vec![entry("a", "a", false), entry("b", "b", false)],
+            None,
+        )));
+        let update = s.apply_new_head(vec![entry("a", "a", false), entry("b", "b", false)]);
+        assert_eq!(update, HeadUpdate::None);
+        assert_eq!(s.list.items.len(), 2);
+    }
+
+    #[test]
+    fn apply_new_head_shifts_by_visible_new_only() {
+        // A hidden NSFW entry among the new ones doesn't move the visible cursor.
+        let mut s = FeedScreen::new();
+        s.apply_initial(Ok((
+            vec![entry("a", "a", false), entry("b", "b", false)],
+            None,
+        )));
+        s.include_nsfw = false;
+        s.list.selected = 1; // "b" in the visible view
+        let update = s.apply_new_head(vec![
+            entry("n", "n", true),  // NSFW → hidden
+            entry("x", "x", false), // visible
+            entry("a", "a", false),
+            entry("b", "b", false),
+        ]);
+        assert_eq!(update, HeadUpdate::Prepended(1)); // only "x" is visible-new
+        assert_eq!(s.list.items.len(), 4); // raw grew by 2...
+        assert_eq!(s.list.selected, 2); // ...but the view cursor shifted by 1
+        let visible: Vec<_> = s
+            .visible_indices()
+            .iter()
+            .map(|i| s.list.items[*i].post_id.clone())
+            .collect();
+        assert_eq!(visible[s.list.selected], "b");
+    }
+
+    #[test]
+    fn apply_new_head_on_empty_feed_is_noop() {
+        let mut s = FeedScreen::new();
+        let update = s.apply_new_head(vec![entry("x", "x", false)]);
+        assert_eq!(update, HeadUpdate::None);
+        assert!(s.list.items.is_empty());
     }
 
     #[test]

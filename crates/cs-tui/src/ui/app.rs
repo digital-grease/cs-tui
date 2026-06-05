@@ -19,7 +19,7 @@ use tokio::time::MissedTickBehavior;
 use super::bookmarks::{BookmarksIntent, BookmarksScreen};
 use super::compose::{launch_editor, ComposeIntent, ComposeKind, ComposeScreen};
 use super::edit_profile::{EditProfileIntent, EditProfileScreen};
-use super::feed::{FeedIntent, FeedScreen};
+use super::feed::{FeedIntent, FeedScreen, HeadUpdate};
 use super::guild_detail::{GuildIntent, GuildScreen, GuildTab};
 use super::guilds::{GuildsIntent, GuildsScreen};
 use super::journal::{JournalIntent, JournalScreen};
@@ -64,6 +64,9 @@ pub enum BgEvent {
     LoginResult(Result<String, String>),
     FeedInitial(Result<(Vec<Entry>, Option<String>), String>),
     FeedMore(Result<(Vec<Entry>, Option<String>), String>),
+    /// The newest feed page from the background poll — prepended without moving
+    /// the user's scroll position. Only emitted while the feed is on screen.
+    FeedHead(Vec<Entry>),
     NotificationsInitial(Result<(Vec<Notification>, Option<String>), String>),
     NotificationsMore(Result<(Vec<Notification>, Option<String>), String>),
     NotificationMarkedRead,
@@ -420,6 +423,12 @@ pub struct App {
     /// outlives logout (idling on the login screen) so re-login reuses it
     /// instead of stacking duplicates.
     poller_started: bool,
+    /// True while the Feed is the active screen — gates the background feed
+    /// poller so it only fetches while the user is actually viewing the feed.
+    feed_active: Arc<AtomicBool>,
+    /// Whether the long-lived feed head-poller has been spawned (mirrors
+    /// `poller_started`; outlives logout).
+    feed_poller_started: bool,
     /// When set, the input reader thread stops touching crossterm so an external
     /// `$EDITOR` owns the terminal exclusively (otherwise the reader steals the
     /// editor's keystrokes, which then replay onto the TUI when it exits).
@@ -487,6 +496,8 @@ impl App {
             pending_logout: None,
             offline_notify: Arc::new(Notify::new()),
             poller_started: false,
+            feed_active: Arc::new(AtomicBool::new(false)),
+            feed_poller_started: false,
             input_paused: Arc::new(AtomicBool::new(false)),
             force_clear: false,
             topics_cache: Vec::new(),
@@ -522,6 +533,12 @@ impl App {
         // and bumped the epoch, so this starts a fresh fill for the new session
         // (and the epoch bump means any prior run's pages are already discarded).
         self.spawn_topics_prefetch();
+        // Background feed auto-refresh (config-gated). Like the unread poller,
+        // it's a single long-lived task reused across re-logins.
+        if crate::config::get().feed_autorefresh && !self.feed_poller_started {
+            self.spawn_feed_head_poller();
+            self.feed_poller_started = true;
+        }
     }
 
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> Result<()> {
@@ -612,6 +629,10 @@ impl App {
                 terminal.clear().context("terminal clear")?;
                 self.force_clear = false;
             }
+            // Gate the background feed poller: it only fetches while the feed is
+            // the screen on top.
+            self.feed_active
+                .store(matches!(self.screen, Screen::Feed(_)), Ordering::Relaxed);
             terminal.draw(|f| self.render(f)).context("terminal draw")?;
         }
         Ok(())
@@ -1449,6 +1470,21 @@ impl App {
             BgEvent::FeedMore(result) => {
                 if let Screen::Feed(s) = &mut self.screen {
                     s.apply_more(result);
+                }
+            }
+            BgEvent::FeedHead(entries) => {
+                // Apply only if the feed is still on screen (the user may have
+                // navigated away between the poll and now).
+                if let Screen::Feed(s) = &mut self.screen {
+                    match s.apply_new_head(entries) {
+                        HeadUpdate::Prepended(n) => {
+                            self.toast = Some(Toast::confirmation(format!("↑ {n} new")));
+                        }
+                        HeadUpdate::Gap => {
+                            self.toast = Some(Toast::confirmation("new posts · r to refresh"));
+                        }
+                        HeadUpdate::None => {}
+                    }
                 }
             }
             BgEvent::NotificationsInitial(result) => {
@@ -3056,6 +3092,40 @@ impl App {
                 tokio::select! {
                     () = tokio::time::sleep(Duration::from_secs(next_delay)) => {}
                     () = wake.notified() => {}
+                }
+            }
+        });
+    }
+
+    /// A slow background poll of the feed head. While the user is viewing the
+    /// feed, it fetches the newest page and the UI prepends genuinely-new
+    /// entries without moving the scroll position (see
+    /// [`FeedScreen::apply_new_head`]). Gated by `feed_active` so it never
+    /// fetches off-screen; the interval comes from config (`feed_refresh_secs`).
+    /// One long-lived task, like the unread poller. Errors are funnelled through
+    /// `note_api_err` for the connectivity side-channel but otherwise stay
+    /// silent — a background poll must never nag the user.
+    fn spawn_feed_head_poller(&self) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        let active = self.feed_active.clone();
+        let interval = crate::config::get().feed_refresh_secs;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(interval)).await;
+                if !active.load(Ordering::Relaxed) {
+                    continue; // not viewing the feed — don't fetch
+                }
+                match client.list_entries(None, None).await {
+                    Ok((entries, _cursor)) => {
+                        if tx.send(BgEvent::FeedHead(entries)).is_err() {
+                            return; // app gone
+                        }
+                    }
+                    Err(e) => {
+                        let msg = note_api_err(&tx, e);
+                        tracing::debug!(error = %msg, "feed head poll failed");
+                    }
                 }
             }
         });
