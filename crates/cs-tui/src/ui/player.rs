@@ -355,7 +355,10 @@ pub fn render_bar(frame: &mut Frame<'_>, area: Rect, handle: &Handle, theme: &Th
     let resume_or_pause = if handle.paused { "p resume" } else { "p pause" };
 
     let left = format!("♪ {state} ");
-    let controls = format!("  ·  {resume_or_pause} · s stop · [ ] vol {}%", handle.volume);
+    let controls = format!(
+        "  ·  {resume_or_pause} · s stop · [ ] vol {}%",
+        handle.volume
+    );
 
     let dur = handle.duration_secs;
     let pos = if dur > 0.0 {
@@ -441,7 +444,10 @@ mod tests {
     fn parse_progress_reads_duration_and_position_replies() {
         match parse_progress(r#"{"data":253.0,"request_id":2,"error":"success"}"#) {
             Some(Progress::Duration(d)) => assert!((d - 253.0).abs() < 1e-9),
-            other => panic!("expected Duration, got {}", matches!(other, Some(Progress::Position(_)))),
+            other => panic!(
+                "expected Duration, got {}",
+                matches!(other, Some(Progress::Position(_)))
+            ),
         }
         match parse_progress(r#"{"data":67.4,"request_id":1,"error":"success"}"#) {
             Some(Progress::Position(p)) => assert!((p - 67.4).abs() < 1e-9),
@@ -506,7 +512,8 @@ mod tests {
         let b = socket_path(2);
         assert_ne!(a, b, "different tokens must not collide");
         assert!(
-            a.to_string_lossy().contains(&std::process::id().to_string()),
+            a.to_string_lossy()
+                .contains(&std::process::id().to_string()),
             "path is namespaced by pid: {a:?}"
         );
     }

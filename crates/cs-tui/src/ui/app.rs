@@ -2765,17 +2765,17 @@ impl App {
     /// The probe blocks on a subprocess, so run it via `block_in_place` to avoid
     /// stalling the event loop on the first play attempt.
     fn mpv_available(&mut self) -> bool {
-        *self.mpv_available.get_or_insert_with(|| {
-            tokio::task::block_in_place(super::player::mpv_available)
-        })
+        *self
+            .mpv_available
+            .get_or_insert_with(|| tokio::task::block_in_place(super::player::mpv_available))
     }
 
     /// Whether a YouTube resolver (yt-dlp/youtube-dl) is usable, probed once.
     /// Same blocking-subprocess caveat as [`Self::mpv_available`].
     fn ytdlp_available(&mut self) -> bool {
-        *self.ytdlp_available.get_or_insert_with(|| {
-            tokio::task::block_in_place(super::player::ytdlp_available)
-        })
+        *self
+            .ytdlp_available
+            .get_or_insert_with(|| tokio::task::block_in_place(super::player::ytdlp_available))
     }
 
     /// Handle `p` on a screen given the track under the cursor: play it, switch

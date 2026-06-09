@@ -691,7 +691,10 @@ mod tests {
     #[test]
     fn o_is_a_noop_without_a_jukebox_link() {
         let mut s = PostDetailScreen::new(entry("p1")); // no attachments
-        assert_eq!(s.handle_key(key(KeyCode::Char('o'))), PostDetailIntent::None);
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('o'))),
+            PostDetailIntent::None
+        );
     }
 
     #[test]

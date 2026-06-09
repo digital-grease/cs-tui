@@ -133,9 +133,7 @@ impl Client {
         let fetched: Vec<(usize, Option<FetchedContent>)> = stream::iter(targets)
             .map(|(i, kind, id)| async move {
                 let content = match kind {
-                    BookmarkKind::Post => {
-                        self.get_entry(&id).await.ok().map(FetchedContent::Post)
-                    }
+                    BookmarkKind::Post => self.get_entry(&id).await.ok().map(FetchedContent::Post),
                     BookmarkKind::Reply => {
                         self.get_reply(&id).await.ok().map(FetchedContent::Reply)
                     }
