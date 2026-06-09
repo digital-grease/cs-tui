@@ -21,12 +21,17 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
+use unicode_width::UnicodeWidthStr;
 
 use super::app::BgEvent;
 use super::theme::Theme;
+
+/// Boxed read/write halves of the IPC connection (unix socket or Windows pipe).
+type IpcWriter = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
+type IpcReader = tokio::io::BufReader<Box<dyn tokio::io::AsyncRead + Unpin + Send>>;
 
 /// Volume bounds. mpv accepts 0..=130 (above 100 is soft amplification); we keep
 /// the same range so the displayed percentage matches what mpv applies.
@@ -59,6 +64,11 @@ pub struct Handle {
     pub paused: bool,
     /// UI-side mirror of mpv's volume (0..=130).
     pub volume: i64,
+    /// Latest playback position in seconds, polled from mpv (0 until known).
+    pub position_secs: f64,
+    /// Track length in seconds, polled from mpv (0 until known, or for a stream
+    /// with no duration). Drives the progress gauge's denominator.
+    pub duration_secs: f64,
     tx: mpsc::UnboundedSender<Cmd>,
 }
 
@@ -167,6 +177,8 @@ pub fn play(
         token,
         paused: false,
         volume,
+        position_secs: 0.0,
+        duration_secs: 0.0,
         tx,
     })
 }
@@ -179,24 +191,31 @@ async fn run(
     token: u64,
     bg_tx: mpsc::UnboundedSender<BgEvent>,
 ) {
-    let mut ipc = connect_ipc(&sock).await;
-    // Poll for mpv's own exit (track ended / external quit). The futures in the
-    // select borrow `rx` and the timer, never `child`, so the arm bodies are
-    // free to call `child` without a borrow conflict.
+    let (mut reader, mut writer) = match connect_ipc(&sock).await {
+        Some((r, w)) => (Some(r), Some(w)),
+        None => (None, None),
+    };
+    let mut reader_done = reader.is_none();
+    // Last known track length, carried so a `time-pos` reply can be paired with
+    // the gauge denominator from the preceding `duration` reply.
+    let mut duration = 0.0f64;
+    // The 300ms tick drives both exit-detection (try_wait) and progress polling.
+    // The select futures borrow `rx`, the timer, and `reader` — never `child` or
+    // `writer` — so the arm bodies use those freely without a borrow conflict.
     let mut tick = tokio::time::interval(Duration::from_millis(300));
     loop {
         tokio::select! {
             cmd = rx.recv() => match cmd {
                 Some(Cmd::TogglePause) => {
-                    write_cmd(&mut ipc, r#"{"command":["cycle","pause"]}"#).await;
+                    write_cmd(&mut writer, r#"{"command":["cycle","pause"]}"#).await;
                 }
                 Some(Cmd::Volume(delta)) => {
-                    write_cmd(&mut ipc, &format!(r#"{{"command":["add","volume",{delta}]}}"#)).await;
+                    write_cmd(&mut writer, &format!(r#"{{"command":["add","volume",{delta}]}}"#)).await;
                 }
                 // Explicit stop, or the handle was dropped: ask mpv to quit, then
                 // make sure it's gone.
                 Some(Cmd::Stop) | None => {
-                    write_cmd(&mut ipc, r#"{"command":["quit"]}"#).await;
+                    write_cmd(&mut writer, r#"{"command":["quit"]}"#).await;
                     let _ = child.start_kill();
                     break;
                 }
@@ -205,6 +224,26 @@ async fn run(
                 if matches!(child.try_wait(), Ok(Some(_))) {
                     break;
                 }
+                // Ask for the track length first, then the position, so a position
+                // reply lands with the gauge denominator already updated.
+                write_cmd(&mut writer, r#"{"command":["get_property","duration"],"request_id":2}"#).await;
+                write_cmd(&mut writer, r#"{"command":["get_property","time-pos"],"request_id":1}"#).await;
+            }
+            line = next_line(&mut reader), if !reader_done => match line {
+                Some(l) => match parse_progress(&l) {
+                    Some(Progress::Duration(d)) => duration = d,
+                    Some(Progress::Position(p)) => {
+                        let _ = bg_tx.send(BgEvent::PlaybackProgress {
+                            token,
+                            position_secs: p,
+                            duration_secs: duration,
+                        });
+                    }
+                    None => {}
+                },
+                // EOF (mpv closed the socket): stop reading so the branch goes idle
+                // instead of busy-looping. `try_wait` will catch the exit.
+                None => reader_done = true,
             }
         }
     }
@@ -215,32 +254,77 @@ async fn run(
     let _ = bg_tx.send(BgEvent::PlaybackEnded { token });
 }
 
-/// Send a single newline-terminated JSON command to mpv. Fire-and-forget: we
-/// never read replies (the commands we use don't need them).
-async fn write_cmd(ipc: &mut Option<Box<dyn tokio::io::AsyncWrite + Unpin + Send>>, json: &str) {
-    if let Some(conn) = ipc.as_mut() {
-        let _ = conn.write_all(json.as_bytes()).await;
-        let _ = conn.write_all(b"\n").await;
-        let _ = conn.flush().await;
+/// Read one newline-delimited reply from mpv. Resolves to `None` on EOF/error;
+/// stays pending forever when there's no reader, so the select branch (guarded by
+/// `!reader_done`) simply never fires in that case.
+async fn next_line(reader: &mut Option<IpcReader>) -> Option<String> {
+    match reader {
+        Some(r) => {
+            let mut line = String::new();
+            match r.read_line(&mut line).await {
+                Ok(0) | Err(_) => None,
+                Ok(_) => Some(line),
+            }
+        }
+        None => std::future::pending::<Option<String>>().await,
+    }
+}
+
+/// A parsed progress reply from mpv (`get_property` for `duration` / `time-pos`).
+enum Progress {
+    Duration(f64),
+    Position(f64),
+}
+
+/// Parse one mpv IPC reply line. Returns `None` for async events, replies with no
+/// numeric `data` (e.g. "property unavailable" while yt-dlp is still resolving),
+/// and anything unrecognized.
+fn parse_progress(line: &str) -> Option<Progress> {
+    let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    let data = v.get("data")?.as_f64()?;
+    if !data.is_finite() {
+        return None;
+    }
+    match v.get("request_id")?.as_i64()? {
+        2 => Some(Progress::Duration(data)),
+        1 => Some(Progress::Position(data)),
+        _ => None,
+    }
+}
+
+/// Send a single newline-terminated JSON command to mpv. Fire-and-forget for
+/// control commands; the polling commands' replies are read separately.
+async fn write_cmd(writer: &mut Option<IpcWriter>, json: &str) {
+    if let Some(w) = writer.as_mut() {
+        let _ = w.write_all(json.as_bytes()).await;
+        let _ = w.write_all(b"\n").await;
+        let _ = w.flush().await;
     }
 }
 
 /// Connect to mpv's IPC endpoint, retrying briefly since the socket/pipe appears
-/// a moment after mpv launches. Returns `None` if it never shows (controls then
-/// no-op, but playback and end-detection still work).
-async fn connect_ipc(sock: &Path) -> Option<Box<dyn tokio::io::AsyncWrite + Unpin + Send>> {
+/// a moment after mpv launches. Returns the read+write halves, or `None` if it
+/// never shows (controls/progress then no-op, but playback + end-detection still
+/// work).
+async fn connect_ipc(sock: &Path) -> Option<(IpcReader, IpcWriter)> {
     for _ in 0..50 {
         #[cfg(unix)]
         {
             if let Ok(stream) = tokio::net::UnixStream::connect(sock).await {
-                return Some(Box::new(stream));
+                let (r, w) = stream.into_split();
+                let r: Box<dyn tokio::io::AsyncRead + Unpin + Send> = Box::new(r);
+                let w: IpcWriter = Box::new(w);
+                return Some((tokio::io::BufReader::new(r), w));
             }
         }
         #[cfg(windows)]
         {
             use tokio::net::windows::named_pipe::ClientOptions;
             if let Ok(pipe) = ClientOptions::new().open(sock) {
-                return Some(Box::new(pipe));
+                let (r, w) = tokio::io::split(pipe);
+                let r: Box<dyn tokio::io::AsyncRead + Unpin + Send> = Box::new(r);
+                let w: IpcWriter = Box::new(w);
+                return Some((tokio::io::BufReader::new(r), w));
             }
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -248,8 +332,16 @@ async fn connect_ipc(sock: &Path) -> Option<Box<dyn tokio::io::AsyncWrite + Unpi
     None
 }
 
-/// Render the now-playing bar (a single row). Shows the track, play/pause state,
-/// volume, and the control keys.
+/// Format a second count as `m:ss` (e.g. 67.0 → "1:07"). Tracks over an hour
+/// just keep counting minutes, which is fine for songs.
+fn fmt_time(secs: f64) -> String {
+    let s = secs.max(0.0) as u64;
+    format!("{}:{:02}", s / 60, s % 60)
+}
+
+/// Render the now-playing bar (a single row): track, play/pause state, elapsed /
+/// total time, a progress gauge (when there's room and a known duration), and the
+/// control keys. The gauge is dropped on narrow terminals so the line never wraps.
 pub fn render_bar(frame: &mut Frame<'_>, area: Rect, handle: &Handle, theme: &Theme) {
     let state = if handle.paused { "⏸" } else { "▶" };
     let track = match (handle.title.is_empty(), handle.artist.is_empty()) {
@@ -259,19 +351,45 @@ pub fn render_bar(frame: &mut Frame<'_>, area: Rect, handle: &Handle, theme: &Th
         (true, true) => "jukebox".to_string(),
     };
     let resume_or_pause = if handle.paused { "p resume" } else { "p pause" };
+
+    let left = format!("♪ {state} ");
+    let controls = format!("  ·  {resume_or_pause} · s stop · [ ] vol {}%", handle.volume);
+
+    let dur = handle.duration_secs;
+    let pos = if dur > 0.0 {
+        handle.position_secs.clamp(0.0, dur)
+    } else {
+        handle.position_secs.max(0.0)
+    };
+    // Time readout: "elapsed / total" when the duration is known, just the elapsed
+    // for a stream with none, and nothing until mpv reports a position.
+    let time = if dur > 0.0 {
+        format!("  {} / {}", fmt_time(pos), fmt_time(dur))
+    } else if handle.position_secs > 0.0 {
+        format!("  {}", fmt_time(pos))
+    } else {
+        String::new()
+    };
+
+    // Fit a gauge into whatever width is left, but only when a duration is known
+    // and the rest of the bar already fits with room to spare.
+    let fixed = left.width() + track.width() + time.width() + controls.width();
+    let total = area.width as usize;
+    let gauge = if dur > 0.0 && total > fixed + 8 {
+        let cells = (total - fixed - 4).min(20); // interior, minus "  ▕" and "▏"
+        let filled = (((pos / dur).clamp(0.0, 1.0) * cells as f64).round() as usize).min(cells);
+        let bar = "█".repeat(filled) + &"░".repeat(cells - filled);
+        format!("  ▕{bar}▏")
+    } else {
+        String::new()
+    };
+
     let spans = vec![
-        Span::styled(
-            format!("♪ {state} "),
-            theme.accent_style().add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(left, theme.accent_style().add_modifier(Modifier::BOLD)),
         Span::styled(track, theme.base()),
-        Span::styled(
-            format!(
-                "  ·  {resume_or_pause} · s stop · [ ] vol {}%",
-                handle.volume
-            ),
-            theme.muted_style(),
-        ),
+        Span::styled(time, theme.accent_style()),
+        Span::styled(gauge, theme.muted_style()),
+        Span::styled(controls, theme.muted_style()),
     ];
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -289,8 +407,76 @@ mod tests {
             token: 1,
             paused: false,
             volume,
+            position_secs: 0.0,
+            duration_secs: 0.0,
             tx,
         }
+    }
+
+    fn bar_text(h: &Handle, width: u16) -> String {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let theme = Theme::cyber();
+        let mut term = Terminal::new(TestBackend::new(width, 1)).unwrap();
+        term.draw(|f| render_bar(f, f.area(), h, &theme)).unwrap();
+        term.backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn fmt_time_formats_minutes_and_seconds() {
+        assert_eq!(fmt_time(0.0), "0:00");
+        assert_eq!(fmt_time(7.0), "0:07");
+        assert_eq!(fmt_time(67.4), "1:07");
+        assert_eq!(fmt_time(253.0), "4:13");
+    }
+
+    #[test]
+    fn parse_progress_reads_duration_and_position_replies() {
+        match parse_progress(r#"{"data":253.0,"request_id":2,"error":"success"}"#) {
+            Some(Progress::Duration(d)) => assert!((d - 253.0).abs() < 1e-9),
+            other => panic!("expected Duration, got {}", matches!(other, Some(Progress::Position(_)))),
+        }
+        match parse_progress(r#"{"data":67.4,"request_id":1,"error":"success"}"#) {
+            Some(Progress::Position(p)) => assert!((p - 67.4).abs() < 1e-9),
+            _ => panic!("expected Position"),
+        }
+        // Unavailable property (no data), an async event, and garbage → ignored.
+        assert!(parse_progress(r#"{"request_id":1,"error":"property unavailable"}"#).is_none());
+        assert!(parse_progress(r#"{"event":"playback-restart"}"#).is_none());
+        assert!(parse_progress("not json").is_none());
+    }
+
+    #[test]
+    fn bar_shows_time_and_gauge_when_duration_known() {
+        let mut h = handle(50);
+        h.position_secs = 67.0;
+        h.duration_secs = 253.0;
+        let text = bar_text(&h, 90);
+        assert!(text.contains("1:07 / 4:13"), "time readout: {text:?}");
+        assert!(text.contains('█'), "gauge filled cells: {text:?}");
+        assert!(text.contains('░'), "gauge empty cells: {text:?}");
+    }
+
+    #[test]
+    fn bar_hides_gauge_on_narrow_terminals() {
+        let mut h = handle(50);
+        h.position_secs = 67.0;
+        h.duration_secs = 253.0;
+        let text = bar_text(&h, 40); // too narrow for a gauge
+        assert!(!text.contains('█'), "no gauge when cramped: {text:?}");
+    }
+
+    #[test]
+    fn bar_omits_time_until_a_position_is_known() {
+        let h = handle(50); // position/duration both 0
+        let text = bar_text(&h, 90);
+        assert!(!text.contains('/'), "no time readout yet: {text:?}");
+        assert!(!text.contains('█'), "no gauge yet: {text:?}");
     }
 
     #[test]

@@ -89,6 +89,13 @@ pub enum BgEvent {
     PlaybackEnded {
         token: u64,
     },
+    /// A progress update (position/duration in seconds) polled from mpv for
+    /// generation `token`. Feeds the now-playing bar's time readout and gauge.
+    PlaybackProgress {
+        token: u64,
+        position_secs: f64,
+        duration_secs: f64,
+    },
     /// A page from the background topics warm-up. `complete` is true on the last
     /// page (or when the fill gives up); `epoch` guards against a superseded run.
     TopicsPrefetched {
@@ -1650,6 +1657,19 @@ impl App {
                 // track (a superseded track's exit must not clear a newer one).
                 if self.now_playing.as_ref().is_some_and(|h| h.token == token) {
                     self.now_playing = None;
+                }
+            }
+            BgEvent::PlaybackProgress {
+                token,
+                position_secs,
+                duration_secs,
+            } => {
+                // Ignore progress from a superseded track (token mismatch).
+                if let Some(h) = self.now_playing.as_mut() {
+                    if h.token == token {
+                        h.position_secs = position_secs;
+                        h.duration_secs = duration_secs;
+                    }
                 }
             }
             BgEvent::TopicsPrefetched {
