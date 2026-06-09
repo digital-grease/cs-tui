@@ -12,7 +12,7 @@ authors = ["digitalgrease"]
 
 [workspace.dependencies]
 # HTTP + async
-tokio = { version = "1.41", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "fs", "signal"] }
+tokio = { version = "1.41", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "fs", "signal", "process", "net"] }
 tokio-util = { version = "0.7", default-features = false, features = ["io"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "gzip"] }

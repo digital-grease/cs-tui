@@ -84,6 +84,11 @@ pub enum BgEvent {
     BookmarkRemoveFailed,
     /// Result of bookmarking a post from the feed / post detail.
     BookmarkCreated(Result<String, String>),
+    /// The jukebox player for generation `token` stopped (track ended, stopped,
+    /// or mpv exited). Clears the now-playing bar if it's still the current one.
+    PlaybackEnded {
+        token: u64,
+    },
     /// A page from the background topics warm-up. `complete` is true on the last
     /// page (or when the fill gives up); `epoch` guards against a superseded run.
     TopicsPrefetched {
@@ -317,6 +322,15 @@ enum Action {
         pin: bool,
     },
     StartComposeEntry,
+    OpenUrl {
+        url: String,
+    },
+    /// `p` pressed on a screen: start/switch/toggle based on the focused track.
+    /// The other player controls (pause/stop/volume) are handled inline in the
+    /// global key block, not as actions, since they don't touch a screen.
+    PlayPressed {
+        track: Option<super::audio::JukeboxTrack>,
+    },
     BookmarkPost {
         post_id: String,
     },
@@ -458,6 +472,19 @@ pub struct App {
     /// What the terminal can render (truecolor / 256 / NO_COLOR), detected once
     /// at startup; every resolved theme is adapted to it.
     color_mode: ColorMode,
+    /// The currently playing jukebox track (mpv background player), if any.
+    /// Drives the now-playing bar and the playback control keys.
+    now_playing: Option<super::player::Handle>,
+    /// Memoized `mpv --version` probe: `None` until the first play attempt, then
+    /// the cached answer. Keeps tests and non-music sessions from spawning mpv.
+    mpv_available: Option<bool>,
+    /// Memoized yt-dlp/youtube-dl probe (mpv needs one for YouTube URLs).
+    ytdlp_available: Option<bool>,
+    /// Generation counter for playback; each new track gets a fresh token so a
+    /// previous track's exit can't clear the bar for the current one.
+    next_play_token: u64,
+    /// Volume carried across tracks (0..=130), updated by the volume keys.
+    player_volume: i64,
 }
 
 impl App {
@@ -507,6 +534,11 @@ impl App {
             topic_mutes: Vec::new(),
             topic_prefs_loaded: false,
             color_mode,
+            now_playing: None,
+            mpv_available: None,
+            ytdlp_available: None,
+            next_play_token: 0,
+            player_volume: 100,
         }
     }
 
@@ -646,9 +678,15 @@ impl App {
                 s.render(frame, full_area, &self.theme);
             }
         } else {
+            // Reserve a bottom row for the now-playing bar while a track is loaded.
+            let playing = self.now_playing.is_some();
+            let mut constraints = vec![Constraint::Length(1), Constraint::Min(1)];
+            if playing {
+                constraints.push(Constraint::Length(1));
+            }
             let layout = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(1), Constraint::Min(1)])
+                .constraints(constraints)
                 .split(full_area);
             let tab_area = layout[0];
             let screen_area = layout[1];
@@ -681,6 +719,11 @@ impl App {
                 Screen::Settings(s) => s.render(frame, screen_area, &self.theme),
                 Screen::Guilds(s) => s.render(frame, screen_area, &self.theme),
                 Screen::Guild(s) => s.render(frame, screen_area, &self.theme),
+            }
+
+            // Now-playing bar in the reserved bottom row (added to `constraints`).
+            if let Some(handle) = &self.now_playing {
+                super::player::render_bar(frame, layout[2], handle, &self.theme);
             }
         }
 
@@ -725,6 +768,8 @@ impl App {
                 },
                 FeedIntent::Compose => Action::StartComposeEntry,
                 FeedIntent::Bookmark(post_id) => Action::BookmarkPost { post_id },
+                FeedIntent::PlayJukebox(track) => Action::PlayPressed { track },
+                FeedIntent::OpenJukebox(url) => Action::OpenUrl { url },
                 FeedIntent::None => Action::None,
             },
             Screen::Notifications(s) => match s.handle_key(key) {
@@ -763,6 +808,8 @@ impl App {
                     post_id,
                     highlight_reply_id,
                 },
+                BookmarksIntent::PlayJukebox(track) => Action::PlayPressed { track },
+                BookmarksIntent::OpenJukebox(url) => Action::OpenUrl { url },
                 BookmarksIntent::None => Action::None,
             },
             Screen::Topics(s) => match s.handle_key(key) {
@@ -789,6 +836,8 @@ impl App {
                 },
                 TopicFeedIntent::ToggleFollow { slug } => Action::ToggleTopicFollow { slug },
                 TopicFeedIntent::ToggleMute { slug } => Action::ToggleTopicMute { slug },
+                TopicFeedIntent::PlayJukebox(track) => Action::PlayPressed { track },
+                TopicFeedIntent::OpenJukebox(url) => Action::OpenUrl { url },
                 TopicFeedIntent::None => Action::None,
             },
             Screen::PostDetail(s) => match s.handle_key(key) {
@@ -822,6 +871,8 @@ impl App {
                     post_id: s.entry.post_id.clone(),
                 },
                 PostDetailIntent::BookmarkReply { reply_id } => Action::BookmarkReply { reply_id },
+                PostDetailIntent::OpenUrl(url) => Action::OpenUrl { url },
+                PostDetailIntent::PlayJukebox(track) => Action::PlayPressed { track },
                 PostDetailIntent::None => Action::None,
             },
             Screen::Compose(s) => match s.handle_key(key) {
@@ -1104,6 +1155,42 @@ impl App {
             }
         }
 
+        // Jukebox player controls, active only while something is playing and no
+        // field is capturing text. `p` is left to the browse screens that bind it
+        // to play/switch a focused track; on every other screen it toggles pause.
+        // Require no modifiers so `Ctrl+s` (Settings save) etc. still pass through.
+        if self.now_playing.is_some()
+            && !self.screen.accepts_text_input()
+            && key.modifiers.is_empty()
+        {
+            let on_browse_screen = matches!(
+                self.screen,
+                Screen::Feed(_)
+                    | Screen::PostDetail(_)
+                    | Screen::TopicFeed(_)
+                    | Screen::Bookmarks(_)
+            );
+            match key.code {
+                KeyCode::Char('s') => {
+                    self.player_stop();
+                    return;
+                }
+                KeyCode::Char('[') => {
+                    self.player_volume(-5);
+                    return;
+                }
+                KeyCode::Char(']') => {
+                    self.player_volume(5);
+                    return;
+                }
+                KeyCode::Char('p') if !on_browse_screen => {
+                    self.player_toggle_pause();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         // Phase 1: derive an Action with a mutable borrow on the active screen.
         let action = Self::route_key(&mut self.screen, key);
 
@@ -1350,6 +1437,18 @@ impl App {
                 self.start_compose(ComposeKind::NewEntry, String::new())
                     .await;
             }
+            Action::OpenUrl { url } => {
+                // Hands the link to the desktop browser. No network of ours, so
+                // it's fine offline; just report success/failure via a toast.
+                match super::open::open_url(&url) {
+                    Ok(()) => self.toast = Some(Toast::confirmation("opening in browser…")),
+                    Err(e) => {
+                        tracing::debug!(error = %e, %url, "failed to open url");
+                        self.toast = Some(Toast::warning("couldn't open your browser"));
+                    }
+                }
+            }
+            Action::PlayPressed { track } => self.play_pressed(track),
             Action::BookmarkPost { post_id } => {
                 if self.block_write_if_offline() {
                     return;
@@ -1545,6 +1644,13 @@ impl App {
                     Ok(_) => Toast::confirmation("bookmarked"),
                     Err(msg) => Toast::warning(format!("bookmark failed: {}", first_line(&msg))),
                 });
+            }
+            BgEvent::PlaybackEnded { token } => {
+                // Clear the now-playing bar only if this is still the current
+                // track (a superseded track's exit must not clear a newer one).
+                if self.now_playing.as_ref().is_some_and(|h| h.token == token) {
+                    self.now_playing = None;
+                }
             }
             BgEvent::TopicsPrefetched {
                 epoch,
@@ -1971,6 +2077,8 @@ impl App {
         if let Err(e) = crate::session::Session::clear() {
             tracing::warn!(error = %e, "session clear failed");
         }
+        // Stop any music so it doesn't keep playing on the login screen.
+        self.player_stop();
         self.back_stack.clear();
         self.current_root = None;
         self.unread_count = 0;
@@ -2600,8 +2708,14 @@ impl App {
     /// terminal supports graphics) start fetching its first image.
     fn enter_post_detail(&mut self, entry: Entry, highlight_reply_id: Option<String>) {
         let id = entry.post_id.clone();
+        // Prefer a real image attachment; for a jukebox post (which carries no
+        // image) fall back to the track's YouTube thumbnail as cover art. Both
+        // flow through the same fetch/decode/render path.
         let first_image = if self.picker.is_some() {
-            super::images::entry_image_urls(&entry).into_iter().next()
+            super::images::entry_image_urls(&entry)
+                .into_iter()
+                .next()
+                .or_else(|| super::audio::entry_cover_art_url(&entry))
         } else {
             None
         };
@@ -2625,6 +2739,104 @@ impl App {
                 result,
             });
         });
+    }
+
+    /// Whether mpv is usable, probed once (spawns `mpv --version`) and cached.
+    /// The probe blocks on a subprocess, so run it via `block_in_place` to avoid
+    /// stalling the event loop on the first play attempt.
+    fn mpv_available(&mut self) -> bool {
+        *self.mpv_available.get_or_insert_with(|| {
+            tokio::task::block_in_place(super::player::mpv_available)
+        })
+    }
+
+    /// Whether a YouTube resolver (yt-dlp/youtube-dl) is usable, probed once.
+    /// Same blocking-subprocess caveat as [`Self::mpv_available`].
+    fn ytdlp_available(&mut self) -> bool {
+        *self.ytdlp_available.get_or_insert_with(|| {
+            tokio::task::block_in_place(super::player::ytdlp_available)
+        })
+    }
+
+    /// Handle `p` on a screen given the track under the cursor: play it, switch
+    /// to it, or — when it's already the current track, or there's no track here
+    /// — toggle pause on whatever is playing.
+    fn play_pressed(&mut self, track: Option<super::audio::JukeboxTrack>) {
+        match track {
+            Some(t) => {
+                if self.now_playing.as_ref().is_some_and(|h| h.url == t.url) {
+                    self.player_toggle_pause();
+                } else {
+                    self.start_playback(t);
+                }
+            }
+            None => {
+                if self.now_playing.is_some() {
+                    self.player_toggle_pause();
+                } else {
+                    self.toast = Some(Toast::warning("no jukebox track here"));
+                }
+            }
+        }
+    }
+
+    /// Start (or replace) playback of `track` via the mpv background player.
+    fn start_playback(&mut self, track: super::audio::JukeboxTrack) {
+        if !self.mpv_available() {
+            self.toast = Some(Toast::warning(
+                "install mpv + yt-dlp to play audio · o opens it in your browser",
+            ));
+            return;
+        }
+        // mpv needs yt-dlp to resolve YouTube; without it playback would fail
+        // instantly, so warn rather than flash an empty now-playing bar.
+        if super::audio::is_youtube(&track.url) && !self.ytdlp_available() {
+            self.toast = Some(Toast::warning(
+                "install yt-dlp to play YouTube tracks · o opens it in your browser",
+            ));
+            return;
+        }
+        // Replace any current track (its task still emits PlaybackEnded for the
+        // old token, which the handler ignores once the token has moved on).
+        if let Some(handle) = self.now_playing.take() {
+            handle.stop();
+        }
+        self.next_play_token += 1;
+        let token = self.next_play_token;
+        match super::player::play(
+            &track.url,
+            track.artist,
+            track.title,
+            token,
+            self.player_volume,
+            self.bg_tx.clone(),
+        ) {
+            Ok(handle) => self.now_playing = Some(handle),
+            Err(e) => {
+                tracing::debug!(error = %e, "failed to spawn mpv");
+                self.toast = Some(Toast::warning("couldn't start mpv"));
+            }
+        }
+    }
+
+    fn player_toggle_pause(&mut self) {
+        if let Some(handle) = self.now_playing.as_mut() {
+            handle.toggle_pause();
+        }
+    }
+
+    fn player_stop(&mut self) {
+        if let Some(handle) = self.now_playing.take() {
+            handle.stop();
+            self.toast = Some(Toast::confirmation("stopped"));
+        }
+    }
+
+    fn player_volume(&mut self, delta: i64) {
+        if let Some(handle) = self.now_playing.as_mut() {
+            handle.step_volume(delta);
+            self.player_volume = handle.volume;
+        }
     }
 
     fn spawn_unread_count_once(&self) {

@@ -19,6 +19,11 @@ pub enum FeedIntent {
     OpenSelected(String),
     /// Bookmark the selected entry (`post_id`).
     Bookmark(String),
+    /// Play (or toggle) the selected entry's jukebox track. `None` when it has
+    /// none — the app then treats `p` as pause for whatever is already playing.
+    PlayJukebox(Option<super::audio::JukeboxTrack>),
+    /// Open the selected entry's jukebox link in the browser.
+    OpenJukebox(String),
     /// Start composing a new entry.
     Compose,
     /// Exit the app.
@@ -62,6 +67,13 @@ impl FeedScreen {
             .filter(|(_, e)| self.include_nsfw || !e.is_nsfw)
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// The currently highlighted entry (after NSFW filtering), if any.
+    fn selected_entry(&self) -> Option<&Entry> {
+        self.visible_indices()
+            .get(self.list.selected)
+            .and_then(|idx| self.list.items.get(*idx))
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> FeedIntent {
@@ -109,6 +121,22 @@ impl FeedScreen {
                     if let Some(entry) = self.list.items.get(*idx) {
                         return FeedIntent::OpenSelected(entry.post_id.clone());
                     }
+                }
+            }
+            KeyCode::Char('p') => {
+                let track = visible
+                    .get(self.list.selected)
+                    .and_then(|idx| self.list.items.get(*idx))
+                    .and_then(|e| super::audio::jukebox_track(&e.attachments));
+                return FeedIntent::PlayJukebox(track);
+            }
+            KeyCode::Char('o') => {
+                if let Some(url) = visible
+                    .get(self.list.selected)
+                    .and_then(|idx| self.list.items.get(*idx))
+                    .and_then(|e| super::audio::jukebox_url(&e.attachments))
+                {
+                    return FeedIntent::OpenJukebox(url);
                 }
             }
             _ => {}
@@ -233,6 +261,10 @@ fn entry_item(entry: &Entry, width: u16, theme: &Theme) -> ListItem<'static> {
     if super::images::has_image(entry) {
         header_spans.push(Span::styled(" · [image]", theme.accent_style()));
     }
+    // Likewise flag a jukebox (audio) attachment so it's visible from the list.
+    if super::audio::has_audio(entry) {
+        header_spans.push(Span::styled(" · [jukebox]", theme.accent_style()));
+    }
 
     let mut lines = vec![Line::from(header_spans)];
 
@@ -268,16 +300,25 @@ fn status_line<'a>(s: &'a FeedScreen, theme: &Theme) -> Paragraph<'a> {
     if let Some(msg) = list::load_more_error(&s.list) {
         return Paragraph::new(Line::from(Span::styled(msg, theme.error_style())));
     }
+    // Surface the jukebox keys only when the highlighted post has a track.
+    let media = if s
+        .selected_entry()
+        .is_some_and(super::audio::has_audio)
+    {
+        " · p play · o open"
+    } else {
+        ""
+    };
     let text = if s.list.loading {
         "loading… · c new post · enter open · b bookmark · r refresh · esc menu".to_string()
     } else if s.list.next_cursor.is_some() {
         format!(
-            "{} entries · scroll down for more · c new post · enter open · b bookmark · r refresh · esc menu",
+            "{} entries · scroll down for more · c new post · enter open · b bookmark{media} · r refresh · esc menu",
             s.list.items.len()
         )
     } else {
         format!(
-            "{} entries · end of feed · c new post · enter open · b bookmark · r refresh · esc menu",
+            "{} entries · end of feed · c new post · enter open · b bookmark{media} · r refresh · esc menu",
             s.list.items.len()
         )
     };
@@ -370,6 +411,80 @@ mod tests {
         assert!(
             text.contains("[image]"),
             "attachment image must be flagged: {text:?}"
+        );
+        assert!(text.contains("content of a"), "text snippet still renders");
+    }
+
+    #[test]
+    fn p_plays_the_highlighted_entrys_jukebox() {
+        let mut s = FeedScreen::new();
+        let mut e = entry("a", "alice", false);
+        e.attachments = vec![cs_api::Attachment::Audio {
+            src: "https://youtu.be/abc".into(),
+            origin: "youtube".into(),
+            artist: "Art of Noise".into(),
+            title: "Paranoimia".into(),
+            genre: "electronic".into(),
+        }];
+        s.apply_initial(Ok((vec![e], None)));
+        match s.handle_key(key(KeyCode::Char('p'))) {
+            FeedIntent::PlayJukebox(Some(t)) => {
+                assert_eq!(t.url, "https://youtu.be/abc");
+                assert_eq!(t.title, "Paranoimia");
+            }
+            other => panic!("expected PlayJukebox(Some), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn p_with_no_jukebox_yields_play_none() {
+        let mut s = FeedScreen::new();
+        s.apply_initial(Ok((vec![entry("a", "alice", false)], None)));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('p'))),
+            FeedIntent::PlayJukebox(None)
+        );
+    }
+
+    #[test]
+    fn o_opens_the_highlighted_entrys_jukebox() {
+        let mut s = FeedScreen::new();
+        let mut e = entry("a", "alice", false);
+        e.attachments = vec![cs_api::Attachment::Audio {
+            src: "https://youtu.be/abc".into(),
+            origin: "youtube".into(),
+            artist: "Art of Noise".into(),
+            title: "Paranoimia".into(),
+            genre: "electronic".into(),
+        }];
+        s.apply_initial(Ok((vec![e], None)));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('o'))),
+            FeedIntent::OpenJukebox("https://youtu.be/abc".into())
+        );
+    }
+
+    #[test]
+    fn o_without_a_jukebox_is_a_noop() {
+        let mut s = FeedScreen::new();
+        s.apply_initial(Ok((vec![entry("a", "alice", false)], None)));
+        assert_eq!(s.handle_key(key(KeyCode::Char('o'))), FeedIntent::None);
+    }
+
+    #[test]
+    fn entry_item_flags_a_jukebox_attachment() {
+        let mut e = entry("a", "alice", false); // content "content of a"
+        e.attachments = vec![cs_api::Attachment::Audio {
+            src: "https://www.youtube.com/watch?v=abc".into(),
+            origin: "youtube".into(),
+            artist: "Art of Noise".into(),
+            title: "Paranoimia".into(),
+            genre: "electronic".into(),
+        }];
+        let text = render_entry_item(&e);
+        assert!(
+            text.contains("[jukebox]"),
+            "audio attachment must be flagged: {text:?}"
         );
         assert!(text.contains("content of a"), "text snippet still renders");
     }
