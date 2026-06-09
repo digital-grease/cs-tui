@@ -199,10 +199,12 @@ async fn run(
     // Last known track length, carried so a `time-pos` reply can be paired with
     // the gauge denominator from the preceding `duration` reply.
     let mut duration = 0.0f64;
-    // The 300ms tick drives both exit-detection (try_wait) and progress polling.
-    // The select futures borrow `rx`, the timer, and `reader` — never `child` or
+    // A 1s tick drives both progress polling (one bar redraw per second is plenty
+    // for a gauge) and exit-detection (try_wait), so a finished track clears the
+    // bar within ~1s; an explicit stop is instant via the command channel. The
+    // select futures borrow `rx`, the timer, and `reader` — never `child` or
     // `writer` — so the arm bodies use those freely without a borrow conflict.
-    let mut tick = tokio::time::interval(Duration::from_millis(300));
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
             cmd = rx.recv() => match cmd {
