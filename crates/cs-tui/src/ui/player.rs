@@ -33,6 +33,10 @@ use super::theme::Theme;
 const VOLUME_MIN: i64 = 0;
 const VOLUME_MAX: i64 = 130;
 
+/// Starting volume for a fresh session. Deliberately conservative: mpv at 100%
+/// of a YouTube source is loud, so we open at half and let `[`/`]` adjust.
+pub const DEFAULT_VOLUME: i64 = 50;
+
 /// Control messages sent from the UI to the per-playback task.
 enum Cmd {
     TogglePause,

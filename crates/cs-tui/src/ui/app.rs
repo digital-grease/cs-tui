@@ -538,7 +538,7 @@ impl App {
             mpv_available: None,
             ytdlp_available: None,
             next_play_token: 0,
-            player_volume: 100,
+            player_volume: super::player::DEFAULT_VOLUME,
         }
     }
 
