@@ -124,6 +124,25 @@ const COMMON: &[Row] = &[
     },
 ];
 
+const JUKEBOX: &[Row] = &[
+    Row {
+        keys: "p",
+        desc: "play / pause the focused jukebox track",
+    },
+    Row {
+        keys: "o",
+        desc: "open the jukebox link in your browser",
+    },
+    Row {
+        keys: "s",
+        desc: "stop playback",
+    },
+    Row {
+        keys: "[ / ]",
+        desc: "volume down / up (needs mpv + yt-dlp)",
+    },
+];
+
 /// Build the help body. Kept separate from rendering so tests can assert on the
 /// content without a terminal backend.
 fn help_lines(theme: &Theme) -> Vec<Line<'static>> {
@@ -142,6 +161,7 @@ fn help_lines(theme: &Theme) -> Vec<Line<'static>> {
     group(&mut lines, "Sections", SECTIONS);
     group(&mut lines, "Global", GLOBAL);
     group(&mut lines, "Lists & reading", COMMON);
+    group(&mut lines, "Jukebox", JUKEBOX);
     lines.push(Line::from(Span::styled(
         "Each screen shows its own keys in the status bar.",
         theme.muted_style(),
@@ -197,6 +217,8 @@ mod tests {
         assert!(text.contains("Esc"));
         assert!(text.contains("Ctrl+C"));
         assert!(text.contains("compose"));
+        assert!(text.contains("Jukebox"));
+        assert!(text.contains("play / pause the focused jukebox track"));
         assert!(text.contains("Press any key to close."));
     }
 
