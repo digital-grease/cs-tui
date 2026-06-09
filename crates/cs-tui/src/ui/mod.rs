@@ -1,4 +1,5 @@
 pub mod app;
+pub mod audio;
 pub mod bookmarks;
 pub mod compose;
 pub mod edit_profile;
@@ -16,6 +17,8 @@ pub mod markdown;
 pub mod menu;
 pub mod nav;
 pub mod notifications;
+pub mod open;
+pub mod player;
 pub mod post_detail;
 pub mod profile;
 pub mod settings_screen;

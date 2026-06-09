@@ -22,6 +22,11 @@ pub enum BookmarksIntent {
         post_id: String,
         highlight_reply_id: Option<String>,
     },
+    /// Play (or toggle) the bookmarked post/reply's jukebox track. `None` when it
+    /// has none — the app then treats `p` as pause for whatever is playing.
+    PlayJukebox(Option<super::audio::JukeboxTrack>),
+    /// Open the bookmarked post/reply's jukebox link in the browser.
+    OpenJukebox(String),
     Quit,
     None,
 }
@@ -113,6 +118,22 @@ impl BookmarksScreen {
                     }
                 }
             }
+            KeyCode::Char('p') => {
+                // A bookmark inlines its post or reply; play whichever carries a
+                // jukebox track. Deleted content (no inline) → no track → no-op.
+                let track = self
+                    .selected_attachments()
+                    .and_then(super::audio::jukebox_track);
+                return BookmarksIntent::PlayJukebox(track);
+            }
+            KeyCode::Char('o') => {
+                if let Some(url) = self
+                    .selected_attachments()
+                    .and_then(super::audio::jukebox_url)
+                {
+                    return BookmarksIntent::OpenJukebox(url);
+                }
+            }
             _ => {}
         }
         BookmarksIntent::None
@@ -124,6 +145,17 @@ impl BookmarksScreen {
 
     pub fn apply_more(&mut self, result: Result<(Vec<Bookmark>, Option<String>), String>) {
         self.list.apply_more(result);
+    }
+
+    /// Attachments of the highlighted bookmark's inlined post or reply, if any.
+    /// Bookmarks embed the referenced content, so a jukebox track is reachable
+    /// without a separate fetch. `None` for a deleted target (no inline).
+    fn selected_attachments(&self) -> Option<&[cs_api::Attachment]> {
+        let b = self.list.items.get(self.list.selected)?;
+        b.post
+            .as_ref()
+            .map(|p| p.attachments.as_slice())
+            .or_else(|| b.reply.as_ref().map(|r| r.attachments.as_slice()))
     }
 
     /// Optimistically remove a bookmark from local state.
@@ -212,11 +244,22 @@ fn bookmark_item(b: &Bookmark, theme: &Theme) -> ListItem<'static> {
     let when_str = when
         .map(crate::config::format_list_timestamp)
         .unwrap_or_default();
-    let header = Line::from(vec![
+    let mut header_spans = vec![
         Span::styled(format!("[{kind_label}] "), theme.muted_style()),
         Span::styled(format!("@{author}"), theme.accent_style()),
         Span::styled(format!(" · {when_str}"), theme.muted_style()),
-    ]);
+    ];
+    // Flag a jukebox attachment so it's discoverable as playable from the list.
+    let has_jukebox = b
+        .post
+        .as_ref()
+        .map(|p| p.attachments.as_slice())
+        .or_else(|| b.reply.as_ref().map(|r| r.attachments.as_slice()))
+        .is_some_and(|a| super::audio::jukebox_url(a).is_some());
+    if has_jukebox {
+        header_spans.push(Span::styled(" · [jukebox]", theme.accent_style()));
+    }
+    let header = Line::from(header_spans);
     let body = Line::from(Span::styled(snippet, theme.base()));
     let mut lines = vec![header, body];
     if !crate::config::get().compact {
@@ -235,16 +278,25 @@ fn status_line<'a>(s: &'a BookmarksScreen, theme: &Theme) -> Paragraph<'a> {
     if let Some(msg) = list::load_more_error(&s.list) {
         return Paragraph::new(Line::from(Span::styled(msg, theme.error_style())));
     }
+    // Surface the jukebox keys only when the highlighted bookmark has a track.
+    let media = if s
+        .selected_attachments()
+        .is_some_and(|a| super::audio::jukebox_url(a).is_some())
+    {
+        " · p play · o open"
+    } else {
+        ""
+    };
     let text = if s.list.loading {
         "loading… · enter open · d remove · n next · r refresh · esc menu".to_string()
     } else if s.list.next_cursor.is_some() {
         format!(
-            "{} bookmarks · scroll down for more · enter open · d remove · r refresh · esc menu",
+            "{} bookmarks · scroll down for more · enter open{media} · d remove · r refresh · esc menu",
             s.list.items.len()
         )
     } else {
         format!(
-            "{} bookmarks · end · enter open · d remove · r refresh · esc menu",
+            "{} bookmarks · end · enter open{media} · d remove · r refresh · esc menu",
             s.list.items.len()
         )
     };
@@ -321,6 +373,65 @@ mod tests {
             reply: Some(reply(reply_id, post_id)),
             created_at: None,
         }
+    }
+
+    fn audio() -> cs_api::Attachment {
+        cs_api::Attachment::Audio {
+            src: "https://youtu.be/abc".into(),
+            origin: "youtube".into(),
+            artist: "Art of Noise".into(),
+            title: "Paranoimia".into(),
+            genre: "electronic".into(),
+        }
+    }
+
+    #[test]
+    fn p_plays_a_post_bookmarks_jukebox() {
+        let mut s = BookmarksScreen::new();
+        let mut b = post_bookmark("b1", "p1");
+        b.post.as_mut().unwrap().attachments = vec![audio()];
+        s.apply_initial(Ok((vec![b], None)));
+        match s.handle_key(key(KeyCode::Char('p'))) {
+            BookmarksIntent::PlayJukebox(Some(t)) => {
+                assert_eq!(t.url, "https://youtu.be/abc");
+                assert_eq!(t.title, "Paranoimia");
+            }
+            other => panic!("expected PlayJukebox(Some), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn p_plays_a_reply_bookmarks_jukebox() {
+        let mut s = BookmarksScreen::new();
+        let mut b = reply_bookmark("b1", "r1", "p1");
+        b.reply.as_mut().unwrap().attachments = vec![audio()];
+        s.apply_initial(Ok((vec![b], None)));
+        match s.handle_key(key(KeyCode::Char('p'))) {
+            BookmarksIntent::PlayJukebox(Some(t)) => assert_eq!(t.url, "https://youtu.be/abc"),
+            other => panic!("expected PlayJukebox(Some), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn p_with_no_jukebox_yields_play_none() {
+        let mut s = BookmarksScreen::new();
+        s.apply_initial(Ok((vec![post_bookmark("b1", "p1")], None)));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('p'))),
+            BookmarksIntent::PlayJukebox(None)
+        );
+    }
+
+    #[test]
+    fn o_opens_a_bookmarks_jukebox() {
+        let mut s = BookmarksScreen::new();
+        let mut b = post_bookmark("b1", "p1");
+        b.post.as_mut().unwrap().attachments = vec![audio()];
+        s.apply_initial(Ok((vec![b], None)));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('o'))),
+            BookmarksIntent::OpenJukebox("https://youtu.be/abc".into())
+        );
     }
 
     #[test]

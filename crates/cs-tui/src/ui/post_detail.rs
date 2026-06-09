@@ -34,6 +34,11 @@ pub enum PostDetailIntent {
     BookmarkReply {
         reply_id: String,
     },
+    /// Open a URL (the jukebox link) in the user's default browser.
+    OpenUrl(String),
+    /// Play (or toggle) the focused jukebox track. `None` when there's none —
+    /// the app then treats `p` as pause for whatever is already playing.
+    PlayJukebox(Option<super::audio::JukeboxTrack>),
     /// User confirmed deletion of the entry.
     DeleteEntryConfirmed,
     None,
@@ -135,6 +140,15 @@ impl PostDetailScreen {
                 },
                 None => PostDetailIntent::Bookmark,
             },
+            // `o` opens the jukebox link in the browser — the selected reply's
+            // link when one is selected, otherwise the post's.
+            KeyCode::Char('o') => match self.jukebox_url() {
+                Some(url) => PostDetailIntent::OpenUrl(url),
+                None => PostDetailIntent::None,
+            },
+            // `p` plays the focused jukebox track (selected reply's, else the
+            // post's); the app toggles pause when it's already playing.
+            KeyCode::Char('p') => PostDetailIntent::PlayJukebox(self.focused_track()),
             KeyCode::Char('d') => {
                 if crate::config::get().confirm_deletes {
                     self.confirming_delete = true;
@@ -203,6 +217,29 @@ impl PostDetailScreen {
             }
             Err(msg) => self.error = Some(msg),
         }
+    }
+
+    /// The jukebox link to open with `o`: the selected reply's when a reply is
+    /// selected and carries one, otherwise the post's. Mirrors how `b` targets
+    /// the selection before falling back to the post.
+    fn jukebox_url(&self) -> Option<String> {
+        if let Some(reply) = self.selected_reply.and_then(|i| self.replies.get(i)) {
+            if let Some(url) = super::audio::jukebox_url(&reply.attachments) {
+                return Some(url);
+            }
+        }
+        super::audio::jukebox_url(&self.entry.attachments)
+    }
+
+    /// The jukebox track to play with `p`, same selection precedence as
+    /// [`Self::jukebox_url`].
+    fn focused_track(&self) -> Option<super::audio::JukeboxTrack> {
+        if let Some(reply) = self.selected_reply.and_then(|i| self.replies.get(i)) {
+            if let Some(track) = super::audio::jukebox_track(&reply.attachments) {
+                return Some(track);
+            }
+        }
+        super::audio::jukebox_track(&self.entry.attachments)
     }
 
     /// Scroll so reply `i` sits at the top of the viewport (best effort, using
@@ -310,6 +347,12 @@ impl PostDetailScreen {
         }
         frame.render_widget(para, text_area);
 
+        // Surface the jukebox keys only when there's a track to act on.
+        let open_hint = if self.jukebox_url().is_some() {
+            " · p play · o open"
+        } else {
+            ""
+        };
         let status_text = if self.confirming_delete {
             "really delete this post? y=yes, any other key=cancel".to_string()
         } else if self.loading_replies && self.replies.is_empty() {
@@ -318,12 +361,12 @@ impl PostDetailScreen {
             format!("error: {msg} · esc back · r retry")
         } else if self.next_replies_cursor.is_some() {
             format!(
-                "{} replies · scroll down for more · esc back · J/K select reply · R reply · Q quote · b bookmark · d delete · r refresh",
+                "{} replies · scroll down for more · esc back · J/K select reply · R reply · Q quote · b bookmark{open_hint} · d delete · r refresh",
                 self.replies.len()
             )
         } else {
             format!(
-                "{} replies · end · esc back · J/K select reply · R reply · Q quote · b bookmark · d delete · r refresh",
+                "{} replies · end · esc back · J/K select reply · R reply · Q quote · b bookmark{open_hint} · d delete · r refresh",
                 self.replies.len()
             )
         };
@@ -377,6 +420,15 @@ impl PostDetailScreen {
         // Body — rendered with pulldown-cmark (markdown + @mention highlighting).
         for md_line in render_markdown(&self.entry.content, theme) {
             lines.push(md_line);
+        }
+
+        // Jukebox (audio) attachment — usually a YouTube link. We can't stream it
+        // inline, but keep the track card and link visible rather than dropping
+        // the whole attachment with the rest of the non-text content.
+        let audio = super::audio::audio_lines(&self.entry.attachments, theme);
+        if !audio.is_empty() {
+            lines.push(Line::from(""));
+            lines.extend(audio);
         }
 
         // Replies separator
@@ -434,6 +486,10 @@ impl PostDetailScreen {
                 } else {
                     lines.push(md_line);
                 }
+            }
+            // A jukebox link on the reply gets the same treatment as the post body.
+            for audio_line in super::audio::audio_lines(&reply.attachments, theme) {
+                lines.push(audio_line);
             }
             lines.push(Line::from(""));
         }
@@ -553,6 +609,25 @@ mod tests {
     }
 
     #[test]
+    fn compose_body_renders_jukebox_link_and_metadata() {
+        let mut e = entry("p1");
+        e.attachments = vec![cs_api::Attachment::Audio {
+            src: "https://www.youtube.com/watch?v=abc".into(),
+            origin: "youtube".into(),
+            artist: "Art of Noise".into(),
+            title: "Paranoimia".into(),
+            genre: "electronic".into(),
+        }];
+        let lines = body_text(&PostDetailScreen::new(e)).join("\n");
+        assert!(lines.contains("♪ Paranoimia"), "track title: {lines:?}");
+        assert!(lines.contains("Art of Noise"), "artist: {lines:?}");
+        assert!(
+            lines.contains("https://www.youtube.com/watch?v=abc"),
+            "the jukebox link must be retained in the post body: {lines:?}"
+        );
+    }
+
+    #[test]
     fn compose_body_omits_title_when_none() {
         let lines = body_text(&PostDetailScreen::new(entry("p1"))); // title: None
         assert!(
@@ -589,6 +664,78 @@ mod tests {
         assert_eq!(
             s.handle_key(key(KeyCode::Char('Q'))),
             PostDetailIntent::QuoteReply
+        );
+    }
+
+    fn jukebox(src: &str) -> cs_api::Attachment {
+        cs_api::Attachment::Audio {
+            src: src.into(),
+            origin: "youtube".into(),
+            artist: "Art of Noise".into(),
+            title: "Paranoimia".into(),
+            genre: "electronic".into(),
+        }
+    }
+
+    #[test]
+    fn o_opens_the_post_jukebox_link() {
+        let mut e = entry("p1");
+        e.attachments = vec![jukebox("https://youtu.be/abc")];
+        let mut s = PostDetailScreen::new(e);
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('o'))),
+            PostDetailIntent::OpenUrl("https://youtu.be/abc".into())
+        );
+    }
+
+    #[test]
+    fn o_is_a_noop_without_a_jukebox_link() {
+        let mut s = PostDetailScreen::new(entry("p1")); // no attachments
+        assert_eq!(s.handle_key(key(KeyCode::Char('o'))), PostDetailIntent::None);
+    }
+
+    #[test]
+    fn o_prefers_the_selected_replys_jukebox_link() {
+        let mut e = entry("p1");
+        e.attachments = vec![jukebox("https://youtu.be/post")];
+        let mut s = PostDetailScreen::new(e);
+        let mut r = reply("r1", "p1");
+        r.attachments = vec![jukebox("https://youtu.be/reply")];
+        s.apply_replies_initial(Ok((vec![r], None)));
+
+        // No selection → opens the post's link.
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('o'))),
+            PostDetailIntent::OpenUrl("https://youtu.be/post".into())
+        );
+        // Select the reply → opens the reply's link instead.
+        s.handle_key(key(KeyCode::Char('J')));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('o'))),
+            PostDetailIntent::OpenUrl("https://youtu.be/reply".into())
+        );
+    }
+
+    #[test]
+    fn p_plays_the_post_jukebox_track() {
+        let mut e = entry("p1");
+        e.attachments = vec![jukebox("https://youtu.be/abc")];
+        let mut s = PostDetailScreen::new(e);
+        match s.handle_key(key(KeyCode::Char('p'))) {
+            PostDetailIntent::PlayJukebox(Some(t)) => {
+                assert_eq!(t.url, "https://youtu.be/abc");
+                assert_eq!(t.title, "Paranoimia");
+            }
+            other => panic!("expected PlayJukebox(Some), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn p_without_a_jukebox_yields_play_none() {
+        let mut s = PostDetailScreen::new(entry("p1")); // no attachments
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('p'))),
+            PostDetailIntent::PlayJukebox(None)
         );
     }
 

@@ -23,6 +23,11 @@ pub enum TopicFeedIntent {
     OpenSelected {
         post_id: String,
     },
+    /// Play (or toggle) the selected entry's jukebox track. `None` when it has
+    /// none — the app then treats `p` as pause for whatever is already playing.
+    PlayJukebox(Option<super::audio::JukeboxTrack>),
+    /// Open the selected entry's jukebox link in the browser.
+    OpenJukebox(String),
     /// Follow/unfollow this topic (PATCHes `followedTopics`).
     ToggleFollow {
         slug: String,
@@ -71,6 +76,13 @@ impl TopicFeedScreen {
             .filter(|(_, e)| self.include_nsfw || !e.is_nsfw)
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// The currently highlighted entry (after NSFW filtering), if any.
+    fn selected_entry(&self) -> Option<&Entry> {
+        self.visible_indices()
+            .get(self.list.selected)
+            .and_then(|idx| self.list.items.get(*idx))
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> TopicFeedIntent {
@@ -127,6 +139,22 @@ impl TopicFeedScreen {
                             post_id: e.post_id.clone(),
                         };
                     }
+                }
+            }
+            KeyCode::Char('p') => {
+                let track = visible
+                    .get(self.list.selected)
+                    .and_then(|idx| self.list.items.get(*idx))
+                    .and_then(|e| super::audio::jukebox_track(&e.attachments));
+                return TopicFeedIntent::PlayJukebox(track);
+            }
+            KeyCode::Char('o') => {
+                if let Some(url) = visible
+                    .get(self.list.selected)
+                    .and_then(|idx| self.list.items.get(*idx))
+                    .and_then(|e| super::audio::jukebox_url(&e.attachments))
+                {
+                    return TopicFeedIntent::OpenJukebox(url);
                 }
             }
             _ => {}
@@ -191,9 +219,15 @@ impl TopicFeedScreen {
             } else {
                 ""
             };
+            // Surface the jukebox keys only when the highlighted post has a track.
+            let media = if self.selected_entry().is_some_and(super::audio::has_audio) {
+                " · p play · o open"
+            } else {
+                ""
+            };
             (
                 format!(
-                    "{} entries · {more}enter open · f {follow} · m {mute} · r refresh · esc back",
+                    "{} entries · {more}enter open{media} · f {follow} · m {mute} · r refresh · esc back",
                     self.list.items.len()
                 ),
                 theme.muted_style(),
@@ -221,6 +255,9 @@ fn entry_item(entry: &Entry, theme: &Theme) -> ListItem<'static> {
     ];
     if super::images::has_image(entry) {
         header_spans.push(Span::styled(" · [image]", theme.accent_style()));
+    }
+    if super::audio::has_audio(entry) {
+        header_spans.push(Span::styled(" · [jukebox]", theme.accent_style()));
     }
     let mut lines = vec![Line::from(header_spans)];
     let snippet =
@@ -289,6 +326,55 @@ mod tests {
             TopicFeedIntent::ToggleMute {
                 slug: "music".into()
             }
+        );
+    }
+
+    #[test]
+    fn p_plays_the_highlighted_entrys_jukebox() {
+        let mut s = TopicFeedScreen::new("music".into());
+        let mut e = entry("p1");
+        e.attachments = vec![cs_api::Attachment::Audio {
+            src: "https://youtu.be/abc".into(),
+            origin: "youtube".into(),
+            artist: "Art of Noise".into(),
+            title: "Paranoimia".into(),
+            genre: "electronic".into(),
+        }];
+        s.apply_initial(Ok((vec![e], None)));
+        match s.handle_key(key(KeyCode::Char('p'))) {
+            TopicFeedIntent::PlayJukebox(Some(t)) => {
+                assert_eq!(t.url, "https://youtu.be/abc");
+                assert_eq!(t.title, "Paranoimia");
+            }
+            other => panic!("expected PlayJukebox(Some), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn p_with_no_jukebox_yields_play_none() {
+        let mut s = TopicFeedScreen::new("music".into());
+        s.apply_initial(Ok((vec![entry("p1")], None)));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('p'))),
+            TopicFeedIntent::PlayJukebox(None)
+        );
+    }
+
+    #[test]
+    fn o_opens_the_highlighted_entrys_jukebox() {
+        let mut s = TopicFeedScreen::new("music".into());
+        let mut e = entry("p1");
+        e.attachments = vec![cs_api::Attachment::Audio {
+            src: "https://youtu.be/abc".into(),
+            origin: "youtube".into(),
+            artist: "Art of Noise".into(),
+            title: "Paranoimia".into(),
+            genre: "electronic".into(),
+        }];
+        s.apply_initial(Ok((vec![e], None)));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('o'))),
+            TopicFeedIntent::OpenJukebox("https://youtu.be/abc".into())
         );
     }
 
