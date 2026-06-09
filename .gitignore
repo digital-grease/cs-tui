@@ -9,3 +9,5 @@
 # Local runtime fallbacks (the app normally writes these under XDG dirs)
 /cs-tui.log
 /session.json
+.devloop
+CLAUDE.md
