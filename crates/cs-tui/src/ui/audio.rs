@@ -59,7 +59,10 @@ pub fn audio_lines(attachments: &[Attachment], theme: &Theme) -> Vec<Line<'stati
             ),
         ]));
         if !artist.is_empty() {
-            lines.push(Line::from(Span::styled(format!("  {artist}"), theme.base())));
+            lines.push(Line::from(Span::styled(
+                format!("  {artist}"),
+                theme.base(),
+            )));
         }
         if !genre.is_empty() {
             lines.push(Line::from(Span::styled(
@@ -133,7 +136,12 @@ fn youtube_id(src: &str) -> Option<String> {
         .trim_start_matches("www.")
         .trim_start_matches("m.")
         .trim_start_matches("music.");
-    let first_segment = |s: &str| s.split(['?', '&', '/', '#']).next().unwrap_or("").to_string();
+    let first_segment = |s: &str| {
+        s.split(['?', '&', '/', '#'])
+            .next()
+            .unwrap_or("")
+            .to_string()
+    };
     let raw = match host {
         "youtu.be" => first_segment(path_and_query),
         "youtube.com" | "youtube-nocookie.com" => {
@@ -156,7 +164,11 @@ fn youtube_id(src: &str) -> Option<String> {
     };
     // YouTube IDs are short tokens of [A-Za-z0-9_-]; reject anything else so a
     // malformed src never becomes a bogus thumbnail request.
-    if !raw.is_empty() && raw.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+    if !raw.is_empty()
+        && raw
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
         Some(raw)
     } else {
         None
@@ -269,7 +281,10 @@ mod tests {
         let lines = audio_lines(&[audio("", "", "", "https://youtu.be/x")], &theme);
         let text = flat(&lines);
         assert!(text.contains("♪ jukebox"), "fallback heading: {text:?}");
-        assert!(text.contains("https://youtu.be/x"), "link still shown: {text:?}");
+        assert!(
+            text.contains("https://youtu.be/x"),
+            "link still shown: {text:?}"
+        );
     }
 
     #[test]
@@ -325,7 +340,10 @@ mod tests {
             Some("https://img.youtube.com/vi/dQw4w9WgXcQ/hqdefault.jpg")
         );
         // Non-YouTube audio (e.g. a direct file) has no derivable thumbnail.
-        assert_eq!(cover_art_url(&audio("A", "T", "g", "https://x/song.mp3")), None);
+        assert_eq!(
+            cover_art_url(&audio("A", "T", "g", "https://x/song.mp3")),
+            None
+        );
         // Image attachments aren't audio.
         assert_eq!(
             cover_art_url(&Attachment::Image {
@@ -339,7 +357,12 @@ mod tests {
 
     #[test]
     fn entry_cover_art_url_finds_the_audio_attachment() {
-        let e = entry_with(vec![audio("A", "T", "g", "https://www.youtube.com/watch?v=dQw4w9WgXcQ")]);
+        let e = entry_with(vec![audio(
+            "A",
+            "T",
+            "g",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        )]);
         assert_eq!(
             entry_cover_art_url(&e).as_deref(),
             Some("https://img.youtube.com/vi/dQw4w9WgXcQ/hqdefault.jpg")

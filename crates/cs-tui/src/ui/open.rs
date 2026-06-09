@@ -46,7 +46,10 @@ mod tests {
         let url = "https://youtu.be/dQw4w9WgXcQ";
         let cmd = opener_command(url);
         assert!(!cmd.get_program().is_empty(), "a program must be chosen");
-        let last = cmd.get_args().last().map(|a| a.to_string_lossy().into_owned());
+        let last = cmd
+            .get_args()
+            .last()
+            .map(|a| a.to_string_lossy().into_owned());
         assert_eq!(last.as_deref(), Some(url), "url must be the final argument");
     }
 }

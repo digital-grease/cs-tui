@@ -301,10 +301,7 @@ fn status_line<'a>(s: &'a FeedScreen, theme: &Theme) -> Paragraph<'a> {
         return Paragraph::new(Line::from(Span::styled(msg, theme.error_style())));
     }
     // Surface the jukebox keys only when the highlighted post has a track.
-    let media = if s
-        .selected_entry()
-        .is_some_and(super::audio::has_audio)
-    {
+    let media = if s.selected_entry().is_some_and(super::audio::has_audio) {
         " · p play · o open"
     } else {
         ""
