@@ -85,6 +85,24 @@ bar, and `?` opens a help overlay anywhere you aren't typing into a field.
 Cycle palettes at runtime via **Esc → Theme**; the selection is remembered
 between runs. Set a default (or define a `custom` palette) in `config.toml`.
 
+### Jukebox playback (optional)
+
+Posts can carry a "jukebox" track (a YouTube link). cs-tui shows the track card
+and cover art inline, and can stream the audio in the background when
+[`mpv`](https://mpv.io) and [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) are
+installed and on your `PATH`. Without them the card and link still render, and
+`o` opens the link in your browser instead.
+
+| Key | Action |
+|---|---|
+| `p` | play / pause the focused track (feed, post, topics, bookmarks) |
+| `o` | open the jukebox link in your browser |
+| `s` | stop playback |
+| `[` / `]` | volume down / up |
+
+A now-playing bar shows at the bottom while audio plays. Set the starting volume
+with `audio_volume` (0-130, default 50) in `config.toml`.
+
 ## Files
 
 | Path | Purpose |
