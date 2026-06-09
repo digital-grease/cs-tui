@@ -10,6 +10,15 @@ use crate::types::{Entry, Reply};
 
 const DEFAULT_PAGE_LIMIT: u32 = 20;
 const MAX_PAGE_LIMIT: u32 = 50;
+/// Cap on in-flight content fetches while hydrating a bookmarks page, to stay
+/// clear of per-endpoint rate limits when a page references many posts.
+const BOOKMARK_HYDRATE_CONCURRENCY: usize = 6;
+
+/// Content fetched to hydrate a bookmark reference.
+enum FetchedContent {
+    Post(Entry),
+    Reply(Reply),
+}
 
 /// Whether a bookmark refers to a post or a reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,12 +45,15 @@ pub struct Bookmark {
     #[serde(default)]
     pub reply_id: Option<String>,
 
-    /// Embedded entry when `kind == Post` (the list endpoint inlines the
-    /// referenced content).
+    /// The referenced entry when `kind == Post`. The list endpoint returns
+    /// *references only* (no inlined content), so this is filled in client-side
+    /// by [`Client::list_bookmarks`] fetching the post; `None` means the fetch
+    /// failed or the post was deleted.
     #[serde(default)]
     pub post: Option<Entry>,
 
-    /// Embedded reply when `kind == Reply`.
+    /// The referenced reply when `kind == Reply`, hydrated the same way as
+    /// [`Self::post`].
     #[serde(default)]
     pub reply: Option<Reply>,
 
@@ -85,13 +97,62 @@ impl Client {
         if let Some(c) = cursor {
             query.push(("cursor", c.to_string()));
         }
-        self.request_page(
-            EndpointKey::BookmarksList,
-            Method::GET,
-            "/v1/bookmarks",
-            &query,
-        )
-        .await
+        let (mut items, cursor): (Vec<Bookmark>, Option<String>) = self
+            .request_page(
+                EndpointKey::BookmarksList,
+                Method::GET,
+                "/v1/bookmarks",
+                &query,
+            )
+            .await?;
+        // The list returns references only; fetch the referenced content so the
+        // caller has something to render.
+        self.hydrate_bookmarks(&mut items).await;
+        Ok((items, cursor))
+    }
+
+    /// Fill in each bookmark's referenced post/reply (the list endpoint omits
+    /// them). Fetches are concurrent but bounded; a per-item failure — e.g. a
+    /// 404 for genuinely deleted content — leaves that bookmark's content `None`,
+    /// which the UI renders as a deleted placeholder.
+    async fn hydrate_bookmarks(&self, bookmarks: &mut [Bookmark]) {
+        use futures_util::stream::{self, StreamExt};
+
+        // Collect (index, kind, id) for every bookmark that needs a fetch.
+        let targets: Vec<(usize, BookmarkKind, String)> = bookmarks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| match b.kind {
+                BookmarkKind::Post => b.post_id.clone().map(|id| (i, BookmarkKind::Post, id)),
+                BookmarkKind::Reply => b.reply_id.clone().map(|id| (i, BookmarkKind::Reply, id)),
+            })
+            .collect();
+
+        // Fetch concurrently (bounded so we don't fan out into rate limits), then
+        // assign back by index so the original order is preserved.
+        let fetched: Vec<(usize, Option<FetchedContent>)> = stream::iter(targets)
+            .map(|(i, kind, id)| async move {
+                let content = match kind {
+                    BookmarkKind::Post => {
+                        self.get_entry(&id).await.ok().map(FetchedContent::Post)
+                    }
+                    BookmarkKind::Reply => {
+                        self.get_reply(&id).await.ok().map(FetchedContent::Reply)
+                    }
+                };
+                (i, content)
+            })
+            .buffer_unordered(BOOKMARK_HYDRATE_CONCURRENCY)
+            .collect()
+            .await;
+
+        for (i, content) in fetched {
+            match content {
+                Some(FetchedContent::Post(e)) => bookmarks[i].post = Some(e),
+                Some(FetchedContent::Reply(r)) => bookmarks[i].reply = Some(r),
+                None => {}
+            }
+        }
     }
 
     /// `POST /v1/bookmarks` for a post target. Returns the new bookmark id.
