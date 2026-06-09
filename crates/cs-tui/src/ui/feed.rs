@@ -176,10 +176,19 @@ impl FeedScreen {
             .iter()
             .position(|e| existing.contains(e.post_id.as_str()))
         {
-            Some(0) => return HeadUpdate::None, // head's newest already at our top
-            Some(k) => k,                       // head[0..k] are strictly newer
-            None => return HeadUpdate::Gap,     // a full page of new entries: gap
+            // No strictly-new entries, but the head page may carry fresher
+            // engagement counts for posts we already show — fold those in so a
+            // reply/bookmark count converges without a manual refresh.
+            Some(0) => {
+                self.merge_counts(&head);
+                return HeadUpdate::None;
+            }
+            Some(k) => k,                   // head[0..k] are strictly newer
+            None => return HeadUpdate::Gap, // a full page of new entries: gap
         };
+        // head[new_count..] overlaps posts we already have; refresh their counts
+        // before splicing the strictly-new prefix in at the top.
+        self.merge_counts(&head);
         let new: Vec<Entry> = head.into_iter().take(new_count).collect();
         let visible_new = new
             .iter()
@@ -196,6 +205,23 @@ impl FeedScreen {
             HeadUpdate::None
         } else {
             HeadUpdate::Prepended(visible_new)
+        }
+    }
+
+    /// Refresh the mutable engagement counts (`replies_count`,
+    /// `bookmarks_count`) on already-loaded entries from a freshly fetched head
+    /// page, matched by `post_id`. The background head-poll fetches these for
+    /// free, so folding them in lets counts on visible posts converge without
+    /// the user pressing `r`. Strictly-new entries are handled separately by
+    /// [`apply_new_head`](Self::apply_new_head).
+    fn merge_counts(&mut self, head: &[Entry]) {
+        use std::collections::HashMap;
+        let fresh: HashMap<&str, &Entry> = head.iter().map(|e| (e.post_id.as_str(), e)).collect();
+        for item in &mut self.list.items {
+            if let Some(f) = fresh.get(item.post_id.as_str()) {
+                item.replies_count = f.replies_count;
+                item.bookmarks_count = f.bookmarks_count;
+            }
         }
     }
 
@@ -617,6 +643,52 @@ mod tests {
             .map(|i| s.list.items[*i].post_id.clone())
             .collect();
         assert_eq!(visible[s.list.selected], "b");
+    }
+
+    #[test]
+    fn apply_new_head_refreshes_counts_when_nothing_new() {
+        // The reported bug: a post you already see gains replies, but the
+        // background head-poll left its count stale because no *new* posts
+        // arrived. The head page now folds fresher counts into existing posts.
+        let mut s = FeedScreen::new();
+        s.apply_initial(Ok((
+            vec![entry("a", "a", false), entry("b", "b", false)],
+            None,
+        )));
+        assert_eq!(s.list.items[0].replies_count, 0);
+
+        let mut fresh_a = entry("a", "a", false);
+        fresh_a.replies_count = 3;
+        fresh_a.bookmarks_count = 2;
+        let update = s.apply_new_head(vec![fresh_a, entry("b", "b", false)]);
+
+        assert_eq!(update, HeadUpdate::None); // nothing prepended
+        assert_eq!(s.list.items.len(), 2); // no entries added
+        assert_eq!(s.list.items[0].replies_count, 3); // ...but counts updated
+        assert_eq!(s.list.items[0].bookmarks_count, 2);
+    }
+
+    #[test]
+    fn apply_new_head_refreshes_counts_while_prepending() {
+        // A new post arrives AND an existing post's reply count changed in the
+        // same poll: prepend the new one and refresh the overlap's counts.
+        let mut s = FeedScreen::new();
+        s.apply_initial(Ok((
+            vec![entry("a", "a", false), entry("b", "b", false)],
+            None,
+        )));
+        let mut fresh_a = entry("a", "a", false);
+        fresh_a.replies_count = 5;
+        let update = s.apply_new_head(vec![
+            entry("x", "x", false), // strictly new
+            fresh_a,                // existing, now with replies
+            entry("b", "b", false),
+        ]);
+        assert_eq!(update, HeadUpdate::Prepended(1));
+        assert_eq!(s.list.items[0].post_id, "x");
+        // "a" is now at index 1 and carries the refreshed count.
+        assert_eq!(s.list.items[1].post_id, "a");
+        assert_eq!(s.list.items[1].replies_count, 5);
     }
 
     #[test]
