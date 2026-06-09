@@ -66,7 +66,9 @@ struct CreateBookmarkReplyBody<'a> {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct CreateBookmarkResponse {
+    // The live server returns `bookmarkId`; `id` is accepted as a fallback.
     #[serde(alias = "id")]
     bookmark_id: String,
 }
@@ -201,6 +203,24 @@ mod tests {
         let raw = r#"{"id":"b3","type":"post"}"#;
         let b: Bookmark = serde_json::from_str(raw).unwrap();
         assert_eq!(b.bookmark_id, "b3");
+    }
+
+    #[test]
+    fn create_bookmark_response_decodes_camelcase_id() {
+        // The server returns {"data":{"bookmarkId":"..."}}; after the `data`
+        // envelope is unwrapped this is what CreateBookmarkResponse must decode.
+        // Regression: the missing camelCase rename made every bookmark report a
+        // false "server sent something unexpected" failure.
+        let raw = r#"{"bookmarkId":"JxPvqF5_post_OtwiYmmW0"}"#;
+        let r: CreateBookmarkResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(r.bookmark_id, "JxPvqF5_post_OtwiYmmW0");
+    }
+
+    #[test]
+    fn create_bookmark_response_still_accepts_id_alias() {
+        let raw = r#"{"id":"b9"}"#;
+        let r: CreateBookmarkResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(r.bookmark_id, "b9");
     }
 
     #[test]
