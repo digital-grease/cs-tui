@@ -51,6 +51,8 @@ pub struct Config {
     pub feed_autorefresh: Option<bool>,
     /// Seconds between background feed refreshes (clamped to a 10s minimum).
     pub feed_refresh_secs: Option<u64>,
+    /// Initial jukebox volume for a fresh session (0..=130).
+    pub audio_volume: Option<i64>,
 }
 
 /// Hex/named overrides for the eight theme colors. Any omitted color keeps the
@@ -92,6 +94,8 @@ pub struct Runtime {
     pub confirm_deletes: bool,
     pub feed_autorefresh: bool,
     pub feed_refresh_secs: u64,
+    /// Initial jukebox volume (0..=130) the player opens at each session.
+    pub audio_volume: i64,
 }
 
 impl Default for Runtime {
@@ -108,6 +112,8 @@ impl Default for Runtime {
             confirm_deletes: true,
             feed_autorefresh: true,
             feed_refresh_secs: 60,
+            // Single-sourced with the player so the two never drift.
+            audio_volume: crate::ui::player::DEFAULT_VOLUME,
         }
     }
 }
@@ -211,6 +217,10 @@ const TEMPLATE: &str = r##"# cs-tui configuration. Edit and restart cs-tui.
 # Max rows for the inline image strip in post detail.
 #image_height = 20
 
+# Initial jukebox volume for a fresh session (0-130; above 100 is soft
+# amplification). Adjust live with [ and ].
+#audio_volume = 50
+
 # ── Input / connection ───────────────────────────────────────────────────────
 
 # Capture the scroll wheel for in-app scrolling. Off keeps native terminal mouse
@@ -311,6 +321,7 @@ impl Config {
                 .feed_refresh_secs
                 .unwrap_or(d.feed_refresh_secs)
                 .clamp(10, 3600),
+            audio_volume: self.audio_volume.unwrap_or(d.audio_volume).clamp(0, 130),
         }
     }
 }
@@ -538,6 +549,7 @@ mod tests {
             nsfw = true
             confirm_deletes = false
             editor = "nvim"
+            audio_volume = 999
             "#,
         )
         .unwrap();
@@ -547,6 +559,7 @@ mod tests {
         assert!(rt.compact);
         assert_eq!(rt.preview_length, 20); // clamped up from 5
         assert_eq!(rt.image_height, 60); // clamped down from 999
+        assert_eq!(rt.audio_volume, 130); // clamped down from 999
         assert_eq!(rt.start_section, RootKind::Topics);
         assert!(rt.nsfw);
         assert!(!rt.confirm_deletes);
