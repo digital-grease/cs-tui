@@ -52,6 +52,9 @@ const SUSPECT_WALL_TIME: Duration = Duration::from_secs(10);
 /// failure (network down, yt-dlp broken) can't spin mpv in a loop.
 const SUSPECT_END_LIMIT: u8 = 3;
 
+/// How many played tracks `<` / `>` can navigate back through.
+const PLAY_HISTORY_CAP: usize = 50;
+
 /// Connectivity / auth signal distilled from a background `ApiError`, delivered
 /// out-of-band via [`BgEvent::ApiSignal`]. This is the typed side-channel that
 /// lets the main loop react to network/session conditions centrally — driving
@@ -531,6 +534,11 @@ pub struct App {
     /// bumped on logout and on shuffle-off so a superseded walk aborts and its
     /// result event is dropped instead of mutating the reset pool.
     shuffle_epoch: Arc<AtomicU64>,
+    /// Tracks in the order they actually played (manual picks and shuffled
+    /// alike), capped at [`PLAY_HISTORY_CAP`]. `<` / `>` navigate it;
+    /// `play_history_pos` is the index of the current (or latest) track.
+    play_history: Vec<super::audio::JukeboxTrack>,
+    play_history_pos: usize,
 }
 
 impl App {
@@ -589,6 +597,8 @@ impl App {
             shuffle_pool: ShufflePool::new(),
             shuffle_suspect_ends: 0,
             shuffle_epoch: Arc::new(AtomicU64::new(0)),
+            play_history: Vec::new(),
+            play_history_pos: 0,
         }
     }
 
@@ -600,6 +610,10 @@ impl App {
 
     /// Skip the login screen — used when a valid session was restored at launch.
     pub fn enter_feed_initial(&mut self) {
+        // Seed shuffle from config at session start (re-login included, since
+        // logout disarms it). Armed only — playback still needs a first track
+        // started by hand; chaining takes over from there.
+        self.shuffle = crate::config::get().shuffle;
         self.goto_root(crate::config::get().start_section);
         if self.poller_started {
             // A poller from a previous session is still alive (it idled on the
@@ -1228,10 +1242,12 @@ impl App {
         // Jukebox player controls, active only while something is playing and no
         // field is capturing text. `p` is left to the browse screens that bind it
         // to play/switch a focused track; on every other screen it toggles pause.
-        // Require no modifiers so `Ctrl+s` (Settings save) etc. still pass through.
+        // Allow no modifiers (so `Ctrl+s` Settings-save etc. still pass through)
+        // or a bare SHIFT — `<` / `>` arrive shifted, and shifted letters are
+        // distinct `Char` values, so the existing lowercase arms can't collide.
         if self.now_playing.is_some()
             && !self.screen.accepts_text_input()
-            && key.modifiers.is_empty()
+            && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
         {
             let on_browse_screen = matches!(
                 self.screen,
@@ -1251,6 +1267,15 @@ impl App {
                 }
                 KeyCode::Char(']') => {
                     self.player_volume(5);
+                    return;
+                }
+                // mpv's own playlist-navigation keys.
+                KeyCode::Char('<') => {
+                    self.player_prev();
+                    return;
+                }
+                KeyCode::Char('>') => {
+                    self.player_next();
                     return;
                 }
                 KeyCode::Char('p') if !on_browse_screen => {
@@ -1757,6 +1782,21 @@ impl App {
                             self.shuffle = false;
                             self.toast =
                                 Some(Toast::warning("shuffle off: tracks keep failing to play"));
+                        } else if self.play_history_pos + 1 < self.play_history.len() {
+                            // `<` rewound into the play history: natural ends
+                            // replay forward through the remembered sequence
+                            // before fresh random picks resume at the tip.
+                            self.play_history_pos += 1;
+                            let track = self.play_history[self.play_history_pos].clone();
+                            self.start_playback_at(track, false);
+                            if self.now_playing.is_none() {
+                                // Same no-dead-armed-mode rule as the random
+                                // chain: a start that bailed will never emit
+                                // PlaybackEnded to continue from.
+                                self.shuffle = false;
+                                self.toast =
+                                    Some(Toast::warning("shuffle off: couldn't start playback"));
+                            }
                         } else {
                             self.shuffle_advance(Some(&ended.url));
                         }
@@ -2260,6 +2300,8 @@ impl App {
         self.shuffle = false;
         self.shuffle_pool.clear();
         self.shuffle_epoch.fetch_add(1, Ordering::SeqCst);
+        self.play_history.clear();
+        self.play_history_pos = 0;
         self.back_stack.clear();
         self.current_root = None;
         self.unread_count = 0;
@@ -2961,8 +3003,16 @@ impl App {
         }
     }
 
-    /// Start (or replace) playback of `track` via the mpv background player.
+    /// Start (or replace) playback of `track` via the mpv background player,
+    /// recording it in the play history (so `<` can return to it).
     fn start_playback(&mut self, track: super::audio::JukeboxTrack) {
+        self.start_playback_at(track, true);
+    }
+
+    /// [`Self::start_playback`], minus the history push — used when the track
+    /// IS a history entry (`<` / `>` navigation), where re-pushing would
+    /// duplicate it and orphan the forward entries.
+    fn start_playback_at(&mut self, track: super::audio::JukeboxTrack, push_history: bool) {
         if !self.mpv_available() {
             self.toast = Some(Toast::warning(
                 "install mpv + yt-dlp to play audio · o opens it in your browser",
@@ -2986,16 +3036,77 @@ impl App {
         let token = self.next_play_token;
         match super::player::play(
             &track.url,
-            track.artist,
-            track.title,
+            track.artist.clone(),
+            track.title.clone(),
             token,
             self.player_volume,
             self.bg_tx.clone(),
         ) {
-            Ok(handle) => self.now_playing = Some(handle),
+            Ok(handle) => {
+                self.now_playing = Some(handle);
+                if push_history {
+                    self.push_play_history(track);
+                }
+            }
             Err(e) => {
                 tracing::debug!(error = %e, "failed to spawn mpv");
                 self.toast = Some(Toast::warning("couldn't start mpv"));
+            }
+        }
+    }
+
+    /// Append a successfully started track to the play history and point the
+    /// cursor at it. Starting a new track while rewound into history abandons
+    /// the forward entries (the usual media-player branching rule); replaying
+    /// the track already at the cursor is a no-op so pause-style restarts
+    /// don't pile up duplicates.
+    fn push_play_history(&mut self, track: super::audio::JukeboxTrack) {
+        if self.play_history.get(self.play_history_pos) == Some(&track) {
+            return;
+        }
+        self.play_history.truncate(self.play_history_pos + 1);
+        self.play_history.push(track);
+        if self.play_history.len() > PLAY_HISTORY_CAP {
+            self.play_history.remove(0);
+        }
+        self.play_history_pos = self.play_history.len() - 1;
+    }
+
+    /// `<` — replay the previous track from the play history.
+    fn player_prev(&mut self) {
+        if self.play_history_pos > 0 && !self.play_history.is_empty() {
+            self.play_history_pos -= 1;
+            let track = self.play_history[self.play_history_pos].clone();
+            self.start_playback_at(track, false);
+        } else {
+            self.toast = Some(Toast::warning("no previous track"));
+        }
+    }
+
+    /// `>` — skip forward: through the history when `<` rewound into it,
+    /// otherwise to a fresh random pick from the shuffle pool. The skip is
+    /// just a pick, not a mode change — shuffle stays however it was.
+    fn player_next(&mut self) {
+        if self.play_history_pos + 1 < self.play_history.len() {
+            self.play_history_pos += 1;
+            let track = self.play_history[self.play_history_pos].clone();
+            self.start_playback_at(track, false);
+            return;
+        }
+        let current = self.now_playing.as_ref().map(|h| h.url.clone());
+        if self.shuffle {
+            // Full machinery: refills, the pending latch, disarm on failure.
+            self.shuffle_advance(current.as_deref());
+        } else {
+            // One-shot random pick; with no material, point at shuffle rather
+            // than silently spinning up its refill walk for a single skip.
+            match self.shuffle_pool.pick(current.as_deref()) {
+                Some(track) => self.start_playback(track),
+                None => {
+                    self.toast = Some(Toast::warning(
+                        "no other jukebox tracks known yet · S starts shuffle",
+                    ));
+                }
             }
         }
     }
@@ -4631,6 +4742,106 @@ mod tests {
         assert!(
             app.shuffle_epoch.load(Ordering::SeqCst) > epoch_before,
             "the epoch bump is what invalidates the in-flight walk"
+        );
+    }
+
+    #[test]
+    fn play_history_push_dedupes_restarts_and_branches() {
+        let mut app = test_app();
+        app.push_play_history(jukebox_track("a"));
+        app.push_play_history(jukebox_track("b"));
+        app.push_play_history(jukebox_track("b")); // restart of the current track
+        assert_eq!(app.play_history.len(), 2, "restart must not duplicate");
+        assert_eq!(app.play_history_pos, 1);
+        // Rewound to "a", then a new track: the forward branch ("b") is gone.
+        app.play_history_pos = 0;
+        app.push_play_history(jukebox_track("c"));
+        let urls: Vec<_> = app.play_history.iter().map(|t| t.url.as_str()).collect();
+        assert_eq!(urls, ["a", "c"]);
+        assert_eq!(app.play_history_pos, 1);
+    }
+
+    #[test]
+    fn prev_and_next_navigate_the_play_history() {
+        let mut app = test_app();
+        app.screen = Screen::Feed(FeedScreen::new());
+        app.current_root = Some(RootKind::Feed);
+        // With mpv stubbed out the nav playback bails, but the cursor logic —
+        // what this test is about — still runs.
+        app.mpv_available = Some(false);
+        app.ytdlp_available = Some(false);
+        app.play_history = vec![
+            jukebox_track("https://youtu.be/a"),
+            jukebox_track("https://youtu.be/b"),
+            jukebox_track("https://youtu.be/c"),
+        ];
+        app.play_history_pos = 2;
+
+        app.player_prev();
+        assert_eq!(app.play_history_pos, 1);
+        app.player_prev();
+        assert_eq!(app.play_history_pos, 0);
+        app.player_prev(); // at the oldest entry: stays put and warns
+        assert_eq!(app.play_history_pos, 0);
+        let text = render_to_string(&app);
+        assert!(text.contains("no previous track"), "{text:?}");
+
+        app.player_next(); // forward through history, not a random pick
+        assert_eq!(app.play_history_pos, 1);
+    }
+
+    #[test]
+    fn next_at_the_tip_picks_a_random_track_without_enabling_shuffle() {
+        let mut app = test_app();
+        app.screen = Screen::Feed(FeedScreen::new());
+        app.current_root = Some(RootKind::Feed);
+        app.mpv_available = Some(false);
+        app.ytdlp_available = Some(false);
+        app.shuffle_pool
+            .add_tracks(vec![jukebox_track("https://youtu.be/other")]);
+        app.now_playing = Some(super::super::player::test_handle("https://youtu.be/cur", 1));
+
+        app.player_next();
+
+        assert!(!app.shuffle, "a skip is not a mode change");
+        // The pick reached start_playback, which bailed on the stubbed mpv.
+        let text = render_to_string(&app);
+        assert!(text.contains("mpv"), "skip reached the play step: {text:?}");
+    }
+
+    #[test]
+    fn next_with_no_material_and_no_shuffle_points_at_shuffle() {
+        let mut app = test_app();
+        app.screen = Screen::Feed(FeedScreen::new());
+        app.current_root = Some(RootKind::Feed);
+        app.now_playing = Some(super::super::player::test_handle("https://youtu.be/cur", 1));
+        app.player_next();
+        let text = render_to_string(&app);
+        assert!(text.contains("S starts shuffle"), "{text:?}");
+    }
+
+    #[test]
+    fn natural_end_replays_forward_through_history_when_rewound() {
+        let mut app = test_app();
+        app.screen = Screen::Feed(FeedScreen::new());
+        app.current_root = Some(RootKind::Feed);
+        app.mpv_available = Some(false);
+        app.ytdlp_available = Some(false);
+        app.shuffle = true;
+        app.play_history = vec![
+            jukebox_track("https://youtu.be/a"),
+            jukebox_track("https://youtu.be/b"),
+        ];
+        app.play_history_pos = 0; // rewound: "a" is playing, "b" is ahead
+        let mut h = super::super::player::test_handle("https://youtu.be/a", 4);
+        h.position_secs = 100.0; // a genuine full play, not a suspect end
+        app.now_playing = Some(h);
+
+        app.handle_bg_event(BgEvent::PlaybackEnded { token: 4 });
+
+        assert_eq!(
+            app.play_history_pos, 1,
+            "mid-history end must replay forward, not pick randomly"
         );
     }
 

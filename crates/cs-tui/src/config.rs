@@ -53,6 +53,8 @@ pub struct Config {
     pub feed_refresh_secs: Option<u64>,
     /// Initial jukebox volume for a fresh session (0..=130).
     pub audio_volume: Option<i64>,
+    /// Start each session with shuffle mode already armed.
+    pub shuffle: Option<bool>,
 }
 
 /// Hex/named overrides for the eight theme colors. Any omitted color keeps the
@@ -96,6 +98,9 @@ pub struct Runtime {
     pub feed_refresh_secs: u64,
     /// Initial jukebox volume (0..=130) the player opens at each session.
     pub audio_volume: i64,
+    /// Whether sessions begin with shuffle mode armed (never auto-playing:
+    /// the first track is still started by hand, it just chains from there).
+    pub shuffle: bool,
 }
 
 impl Default for Runtime {
@@ -114,6 +119,7 @@ impl Default for Runtime {
             feed_refresh_secs: 60,
             // Single-sourced with the player so the two never drift.
             audio_volume: crate::ui::player::DEFAULT_VOLUME,
+            shuffle: false,
         }
     }
 }
@@ -221,6 +227,12 @@ const TEMPLATE: &str = r##"# cs-tui configuration. Edit and restart cs-tui.
 # amplification). Adjust live with [ and ].
 #audio_volume = 50
 
+# Start each session with shuffle mode armed (same as pressing S; needs mpv +
+# yt-dlp). Music never starts on its own at launch: the first track is still
+# played by hand, and shuffle chains random jukebox posts from there.
+# true | false
+#shuffle = false
+
 # ── Input / connection ───────────────────────────────────────────────────────
 
 # Capture the scroll wheel for in-app scrolling. Off keeps native terminal mouse
@@ -322,6 +334,7 @@ impl Config {
                 .unwrap_or(d.feed_refresh_secs)
                 .clamp(10, 3600),
             audio_volume: self.audio_volume.unwrap_or(d.audio_volume).clamp(0, 130),
+            shuffle: self.shuffle.unwrap_or(d.shuffle),
         }
     }
 }
@@ -550,6 +563,7 @@ mod tests {
             confirm_deletes = false
             editor = "nvim"
             audio_volume = 999
+            shuffle = true
             "#,
         )
         .unwrap();
@@ -564,6 +578,9 @@ mod tests {
         assert!(rt.nsfw);
         assert!(!rt.confirm_deletes);
         assert_eq!(rt.editor.as_deref(), Some("nvim"));
+        assert!(rt.shuffle);
+        // Unset defaults to off (sessions start with shuffle disarmed).
+        assert!(!Config::default().to_runtime().shuffle);
     }
 
     #[test]

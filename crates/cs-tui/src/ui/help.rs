@@ -142,6 +142,10 @@ const JUKEBOX: &[Row] = &[
         desc: "shuffle: play random jukebox posts (press while idle to start)",
     },
     Row {
+        keys: "< / >",
+        desc: "previous / next track (next is a random pick at the newest)",
+    },
+    Row {
         keys: "[ / ]",
         desc: "volume down / up (needs mpv + yt-dlp)",
     },

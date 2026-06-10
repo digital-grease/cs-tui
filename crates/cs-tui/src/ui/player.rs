@@ -431,7 +431,7 @@ pub fn render_bar(
     // hint stay visible on an 80-column terminal.
     let total = area.width as usize;
     let controls_full = format!(
-        "  ·  {resume_or_pause} · s stop · {shuffle_hint} · [ ] vol {}%",
+        "  ·  {resume_or_pause} · s stop · < > track · {shuffle_hint} · [ ] vol {}%",
         handle.volume
     );
     let controls_short = format!(
