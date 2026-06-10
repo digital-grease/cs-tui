@@ -22,6 +22,7 @@ pub mod player;
 pub mod post_detail;
 pub mod profile;
 pub mod settings_screen;
+pub mod shuffle;
 pub mod text;
 pub mod theme;
 pub mod toast;

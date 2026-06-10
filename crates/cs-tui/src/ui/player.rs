@@ -14,7 +14,7 @@
 //! the UI can clear the bar.
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
@@ -69,6 +69,10 @@ pub struct Handle {
     /// Track length in seconds, polled from mpv (0 until known, or for a stream
     /// with no duration). Drives the progress gauge's denominator.
     pub duration_secs: f64,
+    /// When the mpv process was spawned. Shuffle's failure detection needs a
+    /// wall-clock signal alongside `position_secs`, which stays 0 not only for
+    /// a dead link but also for a fine track played over a broken IPC socket.
+    pub started_at: Instant,
     tx: mpsc::UnboundedSender<Cmd>,
 }
 
@@ -160,6 +164,9 @@ pub fn play(
         .arg("--idle=no")
         .arg(format!("--volume={volume}"))
         .arg(format!("--input-ipc-server={}", sock.display()))
+        // End-of-options marker: the URL comes from a post's attachment, so a
+        // value starting with `-` must reach mpv as media, never as an option.
+        .arg("--")
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -179,6 +186,7 @@ pub fn play(
         volume,
         position_secs: 0.0,
         duration_secs: 0.0,
+        started_at: Instant::now(),
         tx,
     })
 }
@@ -334,6 +342,37 @@ async fn connect_ipc(sock: &Path) -> Option<(IpcReader, IpcWriter)> {
     None
 }
 
+/// A handle with no mpv process behind it, for tests elsewhere in the crate
+/// (the channel's receiving end is dropped, so control sends are no-ops).
+#[cfg(test)]
+pub(crate) fn test_handle(url: &str, token: u64) -> Handle {
+    let (tx, _rx) = mpsc::unbounded_channel();
+    Handle {
+        artist: String::new(),
+        title: String::new(),
+        url: url.to_string(),
+        token,
+        paused: false,
+        volume: DEFAULT_VOLUME,
+        position_secs: 0.0,
+        duration_secs: 0.0,
+        started_at: Instant::now(),
+        tx,
+    }
+}
+
+/// Render the bar's "shuffle is hunting for a track" state — shown while
+/// shuffle is armed with nothing loaded (pool refill in flight), so an armed
+/// mode is never invisible and the off toggle stays discoverable.
+pub fn render_search_bar(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
+    let spans = vec![
+        Span::styled("♪ ⋯ ", theme.accent_style().add_modifier(Modifier::BOLD)),
+        Span::styled("shuffle · finding a jukebox post…", theme.base()),
+        Span::styled("  ·  S shuffle off", theme.muted_style()),
+    ];
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
 /// Format a second count as `m:ss` (e.g. 67.0 → "1:07"). Tracks over an hour
 /// just keep counting minutes, which is fine for songs.
 fn fmt_time(secs: f64) -> String {
@@ -343,8 +382,18 @@ fn fmt_time(secs: f64) -> String {
 
 /// Render the now-playing bar (a single row): track, play/pause state, elapsed /
 /// total time, a progress gauge (when there's room and a known duration), and the
-/// control keys. The gauge is dropped on narrow terminals so the line never wraps.
-pub fn render_bar(frame: &mut Frame<'_>, area: Rect, handle: &Handle, theme: &Theme) {
+/// control keys. The gauge — and before it the shuffle hint, which the help
+/// overlay also documents — are dropped on narrow terminals so the essential
+/// controls (stop, volume) survive an 80-column window without wrapping.
+/// `shuffle` flips the `S` hint between turning the mode on and off (mirroring
+/// how `p` shows the action it would perform, not the current state).
+pub fn render_bar(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    handle: &Handle,
+    shuffle: bool,
+    theme: &Theme,
+) {
     let state = if handle.paused { "⏸" } else { "▶" };
     let track = match (handle.title.is_empty(), handle.artist.is_empty()) {
         (false, false) => format!("{} · {}", handle.title, handle.artist),
@@ -353,12 +402,13 @@ pub fn render_bar(frame: &mut Frame<'_>, area: Rect, handle: &Handle, theme: &Th
         (true, true) => "jukebox".to_string(),
     };
     let resume_or_pause = if handle.paused { "p resume" } else { "p pause" };
+    let shuffle_hint = if shuffle {
+        "S shuffle off"
+    } else {
+        "S shuffle on"
+    };
 
     let left = format!("♪ {state} ");
-    let controls = format!(
-        "  ·  {resume_or_pause} · s stop · [ ] vol {}%",
-        handle.volume
-    );
 
     let dur = handle.duration_secs;
     let pos = if dur > 0.0 {
@@ -376,10 +426,28 @@ pub fn render_bar(frame: &mut Frame<'_>, area: Rect, handle: &Handle, theme: &Th
         String::new()
     };
 
+    // Include the shuffle hint only when the full control set still fits the
+    // row; otherwise fall back to the short set so "s stop" and the volume
+    // hint stay visible on an 80-column terminal.
+    let total = area.width as usize;
+    let controls_full = format!(
+        "  ·  {resume_or_pause} · s stop · {shuffle_hint} · [ ] vol {}%",
+        handle.volume
+    );
+    let controls_short = format!(
+        "  ·  {resume_or_pause} · s stop · [ ] vol {}%",
+        handle.volume
+    );
+    let base = left.width() + track.width() + time.width();
+    let controls = if base + controls_full.width() <= total {
+        controls_full
+    } else {
+        controls_short
+    };
+
     // Fit a gauge into whatever width is left, but only when a duration is known
     // and the rest of the bar already fits with room to spare.
-    let fixed = left.width() + track.width() + time.width() + controls.width();
-    let total = area.width as usize;
+    let fixed = base + controls.width();
     let gauge = if dur > 0.0 && total > fixed + 8 {
         let cells = (total - fixed - 4).min(20); // interior, minus "  ▕" and "▏"
         let filled = (((pos / dur).clamp(0.0, 1.0) * cells as f64).round() as usize).min(cells);
@@ -414,22 +482,74 @@ mod tests {
             volume,
             position_secs: 0.0,
             duration_secs: 0.0,
+            started_at: Instant::now(),
             tx,
         }
     }
 
     fn bar_text(h: &Handle, width: u16) -> String {
+        bar_text_shuffled(h, width, false)
+    }
+
+    fn bar_text_shuffled(h: &Handle, width: u16, shuffle: bool) -> String {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         let theme = Theme::cyber();
         let mut term = Terminal::new(TestBackend::new(width, 1)).unwrap();
-        term.draw(|f| render_bar(f, f.area(), h, &theme)).unwrap();
+        term.draw(|f| render_bar(f, f.area(), h, shuffle, &theme))
+            .unwrap();
         term.backend()
             .buffer()
             .content
             .iter()
             .map(|c| c.symbol())
             .collect()
+    }
+
+    #[test]
+    fn bar_shuffle_hint_shows_the_action_it_performs() {
+        let h = handle(50);
+        let off = bar_text_shuffled(&h, 110, false);
+        assert!(off.contains("S shuffle on"), "hint to enable: {off:?}");
+        let on = bar_text_shuffled(&h, 110, true);
+        assert!(on.contains("S shuffle off"), "hint to disable: {on:?}");
+    }
+
+    #[test]
+    fn bar_drops_the_shuffle_hint_before_the_essential_controls() {
+        let mut h = handle(50);
+        h.position_secs = 67.0;
+        h.duration_secs = 253.0;
+        // 80 columns: with the time readout in, the full control set no
+        // longer fits; the shuffle hint goes first so stop/volume survive.
+        let text = bar_text_shuffled(&h, 80, true);
+        assert!(
+            !text.contains("shuffle"),
+            "hint dropped when tight: {text:?}"
+        );
+        assert!(text.contains("vol 50%"), "volume hint survives: {text:?}");
+        // With room to spare the hint is back.
+        let wide = bar_text_shuffled(&h, 120, true);
+        assert!(wide.contains("S shuffle off"), "hint when roomy: {wide:?}");
+    }
+
+    #[test]
+    fn search_bar_shows_the_hunting_state() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let theme = Theme::cyber();
+        let mut term = Terminal::new(TestBackend::new(60, 1)).unwrap();
+        term.draw(|f| render_search_bar(f, f.area(), &theme))
+            .unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("finding a jukebox post"), "{text:?}");
+        assert!(text.contains("S shuffle off"), "{text:?}");
     }
 
     #[test]
@@ -464,7 +584,7 @@ mod tests {
         let mut h = handle(50);
         h.position_secs = 67.0;
         h.duration_secs = 253.0;
-        let text = bar_text(&h, 90);
+        let text = bar_text(&h, 120);
         assert!(text.contains("1:07 / 4:13"), "time readout: {text:?}");
         assert!(text.contains('█'), "gauge filled cells: {text:?}");
         assert!(text.contains('░'), "gauge empty cells: {text:?}");

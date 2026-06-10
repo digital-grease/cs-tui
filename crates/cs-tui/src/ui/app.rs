@@ -30,11 +30,27 @@ use super::notifications::{NotificationsIntent, NotificationsScreen};
 use super::post_detail::{PostDetailIntent, PostDetailScreen};
 use super::profile::{ProfileIntent, ProfileScreen, ProfileTab};
 use super::settings_screen::{SettingsIntent, SettingsScreen};
+use super::shuffle::ShufflePool;
 use super::theme::{ColorMode, Theme, ThemeKind};
 use super::toast::Toast;
 use super::topic_feed::{TopicFeedIntent, TopicFeedScreen};
 use super::topics::{TopicsIntent, TopicsScreen};
 use crate::session::Session;
+
+/// A shuffled track that ends with less than this much reported progress is
+/// counted as a failed play (yt-dlp resolution errors kill mpv near-instantly,
+/// before any position report lands) — but only when the wall-clock check
+/// below agrees, since a broken IPC socket also leaves the position at zero
+/// for a track that actually played in full.
+const SUSPECT_END_SECS: f64 = 5.0;
+
+/// Wall-clock corroboration for [`SUSPECT_END_SECS`]: an end only counts as a
+/// failure when the mpv process also lived for less than this long.
+const SUSPECT_WALL_TIME: Duration = Duration::from_secs(10);
+
+/// Turn shuffle off after this many consecutive suspect endings, so a mass
+/// failure (network down, yt-dlp broken) can't spin mpv in a loop.
+const SUSPECT_END_LIMIT: u8 = 3;
 
 /// Connectivity / auth signal distilled from a background `ApiError`, delivered
 /// out-of-band via [`BgEvent::ApiSignal`]. This is the typed side-channel that
@@ -95,6 +111,15 @@ pub enum BgEvent {
         token: u64,
         position_secs: f64,
         duration_secs: f64,
+    },
+    /// Tracks collected by the background shuffle refill (a bounded walk of the
+    /// global feed, filtered client-side for audio attachments), plus the feed
+    /// cursor where the next walk should resume. `Err` only when a whole walk
+    /// produced nothing (a partial walk that found tracks reports `Ok`).
+    /// `epoch` guards against a walk superseded by logout or shuffle-off.
+    ShuffleTracks {
+        epoch: u64,
+        result: Result<(Vec<super::audio::JukeboxTrack>, Option<String>), String>,
     },
     /// A page from the background topics warm-up. `complete` is true on the last
     /// page (or when the fill gives up); `epoch` guards against a superseded run.
@@ -492,6 +517,20 @@ pub struct App {
     next_play_token: u64,
     /// Volume carried across tracks (0..=130), updated by the volume keys.
     player_volume: i64,
+    /// Shuffle mode (`S`): when the current track ends naturally, play a random
+    /// jukebox post instead of stopping. Session-scoped, like the volume.
+    shuffle: bool,
+    /// Candidate tracks for shuffle plus the refill bookkeeping (in-flight
+    /// flag, feed cursor, play-on-arrival latch).
+    shuffle_pool: ShufflePool,
+    /// Consecutive shuffled tracks that ended without ever reporting progress —
+    /// almost always failed URL resolution. Breaker that turns shuffle off
+    /// rather than spinning mpv through an endless run of dead tracks.
+    shuffle_suspect_ends: u8,
+    /// Generation counter for the shuffle refill walk (mirrors `topics_epoch`):
+    /// bumped on logout and on shuffle-off so a superseded walk aborts and its
+    /// result event is dropped instead of mutating the reset pool.
+    shuffle_epoch: Arc<AtomicU64>,
 }
 
 impl App {
@@ -546,6 +585,10 @@ impl App {
             ytdlp_available: None,
             next_play_token: 0,
             player_volume: crate::config::get().audio_volume,
+            shuffle: false,
+            shuffle_pool: ShufflePool::new(),
+            shuffle_suspect_ends: 0,
+            shuffle_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -685,8 +728,12 @@ impl App {
                 s.render(frame, full_area, &self.theme);
             }
         } else {
-            // Reserve a bottom row for the now-playing bar while a track is loaded.
-            let playing = self.now_playing.is_some();
+            // Reserve a bottom row for the now-playing bar while a track is
+            // loaded — or while shuffle is hunting for one, so the armed mode
+            // is never invisible (music starting with no on-screen cue is the
+            // surprise we want to avoid).
+            let playing =
+                self.now_playing.is_some() || (self.shuffle && self.shuffle_pool.pending_play);
             let mut constraints = vec![Constraint::Length(1), Constraint::Min(1)];
             if playing {
                 constraints.push(Constraint::Length(1));
@@ -730,7 +777,10 @@ impl App {
 
             // Now-playing bar in the reserved bottom row (added to `constraints`).
             if let Some(handle) = &self.now_playing {
-                super::player::render_bar(frame, layout[2], handle, &self.theme);
+                super::player::render_bar(frame, layout[2], handle, self.shuffle, &self.theme);
+            } else if playing {
+                // Shuffle armed with nothing loaded yet (refill in flight).
+                super::player::render_search_bar(frame, layout[2], &self.theme);
             }
         }
 
@@ -1162,6 +1212,19 @@ impl App {
             }
         }
 
+        // Shuffle toggle (`S`): global on any non-text screen, and unlike the
+        // other player keys it works while idle too — enabling shuffle with
+        // nothing playing starts a random jukebox track. Crossterm reports an
+        // uppercase letter with a SHIFT modifier (or none, terminal-dependent),
+        // so accept both.
+        if !self.screen.accepts_text_input()
+            && key.code == KeyCode::Char('S')
+            && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+        {
+            self.toggle_shuffle();
+            return;
+        }
+
         // Jukebox player controls, active only while something is playing and no
         // field is capturing text. `p` is left to the browse screens that bind it
         // to play/switch a focused track; on every other screen it toggles pause.
@@ -1569,16 +1632,26 @@ impl App {
                 }
             }
             BgEvent::FeedInitial(result) => {
+                // Every entry page the user browses feeds the shuffle pool's
+                // candidate list (here and in the other entry-carrying arms) —
+                // free material for shuffle mode, at zero extra API cost.
+                if let Ok((entries, _)) = &result {
+                    self.shuffle_pool.harvest(entries);
+                }
                 if let Screen::Feed(s) = &mut self.screen {
                     s.apply_initial(result);
                 }
             }
             BgEvent::FeedMore(result) => {
+                if let Ok((entries, _)) = &result {
+                    self.shuffle_pool.harvest(entries);
+                }
                 if let Screen::Feed(s) = &mut self.screen {
                     s.apply_more(result);
                 }
             }
             BgEvent::FeedHead(entries) => {
+                self.shuffle_pool.harvest(&entries);
                 // Apply only if the feed is still on screen (the user may have
                 // navigated away between the poll and now).
                 if let Screen::Feed(s) = &mut self.screen {
@@ -1655,8 +1728,77 @@ impl App {
             BgEvent::PlaybackEnded { token } => {
                 // Clear the now-playing bar only if this is still the current
                 // track (a superseded track's exit must not clear a newer one).
-                if self.now_playing.as_ref().is_some_and(|h| h.token == token) {
-                    self.now_playing = None;
+                // An explicit stop or track switch invalidates the token before
+                // this arrives, so a matching token means the track ended on
+                // its own — exactly when shuffle should chain to the next one.
+                if let Some(ended) = self.now_playing.take_if(|h| h.token == token) {
+                    if self.shuffle {
+                        // A track that dies quickly without reporting progress
+                        // almost certainly failed to resolve (dead link,
+                        // yt-dlp error). Both clauses matter: position alone
+                        // would also flag a full song played with a broken IPC
+                        // socket (position never updates), so wall-clock time
+                        // must corroborate. Skipping past one bad track is the
+                        // point of chaining; skipping forever through a mass
+                        // failure (network down, yt-dlp broken) would spin
+                        // mpv in a loop, so give up after a few in a row.
+                        if ended.position_secs < SUSPECT_END_SECS
+                            && ended.started_at.elapsed() < SUSPECT_WALL_TIME
+                        {
+                            self.shuffle_suspect_ends += 1;
+                            // The link is likely dead for good; stop offering
+                            // it (it stays in the seen-set, so refills won't
+                            // re-add it either).
+                            self.shuffle_pool.remove(&ended.url);
+                        } else {
+                            self.shuffle_suspect_ends = 0;
+                        }
+                        if self.shuffle_suspect_ends >= SUSPECT_END_LIMIT {
+                            self.shuffle = false;
+                            self.toast =
+                                Some(Toast::warning("shuffle off: tracks keep failing to play"));
+                        } else {
+                            self.shuffle_advance(Some(&ended.url));
+                        }
+                    }
+                }
+            }
+            BgEvent::ShuffleTracks { epoch, result } => {
+                // A walk from a superseded shuffle generation (logout, or the
+                // mode toggled off and the bookkeeping reset) must not touch
+                // the pool — mirrors the topics warm-up's epoch guard.
+                if epoch != self.shuffle_epoch.load(Ordering::SeqCst) {
+                    return;
+                }
+                match result {
+                    Ok((tracks, cursor)) => {
+                        let added = self.shuffle_pool.add_tracks(tracks);
+                        self.shuffle_pool.finish_refill(added, cursor);
+                        // The play-on-arrival latch: shuffle wanted a track
+                        // while the pool was empty. Don't hijack a track the
+                        // user has started by hand in the meantime.
+                        if std::mem::take(&mut self.shuffle_pool.pending_play)
+                            && self.shuffle
+                            && self.now_playing.is_none()
+                        {
+                            self.shuffle_advance(None);
+                        }
+                    }
+                    Err(_) => {
+                        self.shuffle_pool.fetch_inflight = false;
+                        let was_pending = std::mem::take(&mut self.shuffle_pool.pending_play);
+                        // We promised music we can't deliver; don't leave a
+                        // silent mode armed — and when the mode does flip off,
+                        // say so unconditionally (warn_toast_unless_signalled
+                        // can be swallowed by a rate-limit/offline toast,
+                        // which is exactly when this path fires).
+                        if was_pending && self.now_playing.is_none() {
+                            self.shuffle = false;
+                            self.toast = Some(Toast::warning("shuffle off: couldn't fetch tracks"));
+                        } else {
+                            self.warn_toast_unless_signalled("shuffle: couldn't fetch tracks");
+                        }
+                    }
                 }
             }
             BgEvent::PlaybackProgress {
@@ -1710,6 +1852,9 @@ impl App {
                 }
             }
             BgEvent::TopicFeedInitial { slug, result } => {
+                if let Ok((entries, _)) = &result {
+                    self.shuffle_pool.harvest(entries);
+                }
                 if let Screen::TopicFeed(s) = &mut self.screen {
                     if s.slug == slug {
                         s.apply_initial(result);
@@ -1717,6 +1862,9 @@ impl App {
                 }
             }
             BgEvent::TopicFeedMore { slug, result } => {
+                if let Ok((entries, _)) = &result {
+                    self.shuffle_pool.harvest(entries);
+                }
                 if let Screen::TopicFeed(s) = &mut self.screen {
                     if s.slug == slug {
                         s.apply_more(result);
@@ -1743,7 +1891,10 @@ impl App {
                 result,
                 highlight_reply_id,
             } => match result {
-                Ok(entry) => self.enter_post_detail(entry, highlight_reply_id),
+                Ok(entry) => {
+                    self.shuffle_pool.harvest(std::slice::from_ref(&entry));
+                    self.enter_post_detail(entry, highlight_reply_id);
+                }
                 Err(msg) => {
                     // Don't swallow it: a notification pointing at a missing /
                     // non-post target would otherwise look like a dead key.
@@ -1771,6 +1922,9 @@ impl App {
                 }
             }
             BgEvent::ProfilePosts { more, result } => {
+                if let Ok((entries, _)) = &result {
+                    self.shuffle_pool.harvest(entries);
+                }
                 if let Screen::Profile(s) = &mut self.screen {
                     if more {
                         s.posts.apply_more(result);
@@ -2097,8 +2251,15 @@ impl App {
         if let Err(e) = crate::session::Session::clear() {
             tracing::warn!(error = %e, "session clear failed");
         }
-        // Stop any music so it doesn't keep playing on the login screen.
+        // Stop any music so it doesn't keep playing on the login screen, and
+        // drop shuffle's session-scoped state with it (the pool was built from
+        // this account's view of the feed). The epoch bump cancels any
+        // in-flight refill walk so its result can't repopulate the cleared
+        // pool after (re-)login.
         self.player_stop();
+        self.shuffle = false;
+        self.shuffle_pool.clear();
+        self.shuffle_epoch.fetch_add(1, Ordering::SeqCst);
         self.back_stack.clear();
         self.current_root = None;
         self.unread_count = 0;
@@ -2848,8 +3009,154 @@ impl App {
     fn player_stop(&mut self) {
         if let Some(handle) = self.now_playing.take() {
             handle.stop();
-            self.toast = Some(Toast::confirmation("stopped"));
+            // An explicit stop also ends shuffle — "keep playing random
+            // tracks" is exactly what the user just declined.
+            if self.shuffle {
+                self.shuffle = false;
+                self.toast = Some(Toast::confirmation("stopped · shuffle off"));
+            } else {
+                self.toast = Some(Toast::confirmation("stopped"));
+            }
         }
+    }
+
+    /// Toggle shuffle mode (`S`). Turning it on mid-track lets the current
+    /// song finish and chains from there; turning it on while idle starts a
+    /// random jukebox track right away — the "jukebox radio" entry point.
+    fn toggle_shuffle(&mut self) {
+        if self.shuffle {
+            self.shuffle = false;
+            self.shuffle_pool.pending_play = false;
+            // Cancel any in-flight refill walk: bumping the epoch makes the
+            // task bail at its next page (and its result be dropped), so the
+            // inflight flag can be reset here without risking a stale event
+            // flipping state later.
+            self.shuffle_epoch.fetch_add(1, Ordering::SeqCst);
+            self.shuffle_pool.fetch_inflight = false;
+            self.toast = Some(Toast::confirmation("shuffle off"));
+            return;
+        }
+        // Without mpv (and yt-dlp — jukebox tracks are nearly always YouTube
+        // links) shuffle could never play anything; say so instead of turning
+        // on a mode that silently does nothing.
+        if !self.mpv_available() || !self.ytdlp_available() {
+            self.toast = Some(Toast::warning("install mpv + yt-dlp to use shuffle"));
+            return;
+        }
+        self.shuffle = true;
+        self.shuffle_suspect_ends = 0;
+        // Re-enabling is an explicit "try again", even if the last refill walk
+        // came up dry.
+        self.shuffle_pool.retry_refills();
+        if self.now_playing.is_some() {
+            self.toast = Some(Toast::confirmation("shuffle on"));
+            if self.shuffle_pool.needs_refill() {
+                self.spawn_shuffle_refill();
+            }
+        } else {
+            self.shuffle_advance(None);
+        }
+    }
+
+    /// Start the next random jukebox track, topping the pool up in the
+    /// background when it runs low. `just_ended` is the URL of the track whose
+    /// end triggered the chain, so the pick can avoid an instant repeat (the
+    /// handle is already taken out of `now_playing` by then). With an empty
+    /// pool, latch `pending_play` so the refill's arrival starts playback.
+    fn shuffle_advance(&mut self, just_ended: Option<&str>) {
+        match self.shuffle_pool.pick(just_ended) {
+            Some(track) => {
+                self.start_playback(track);
+                if self.now_playing.is_none() {
+                    // start_playback bailed (player gone mid-session, spawn
+                    // failure). No PlaybackEnded will ever arrive to continue
+                    // the chain, so don't leave a dead mode armed and
+                    // invisible.
+                    self.shuffle = false;
+                    self.toast = Some(Toast::warning("shuffle off: couldn't start playback"));
+                } else if self.shuffle_pool.needs_refill() {
+                    self.spawn_shuffle_refill();
+                }
+            }
+            None if self.shuffle_pool.fetch_inflight => {
+                self.shuffle_pool.pending_play = true;
+                self.toast = Some(Toast::confirmation("shuffle on · finding a jukebox post…"));
+            }
+            None if self.shuffle_pool.needs_refill() => {
+                self.shuffle_pool.pending_play = true;
+                self.toast = Some(Toast::confirmation("shuffle on · finding a jukebox post…"));
+                self.spawn_shuffle_refill();
+            }
+            None => {
+                // Empty pool and the last walk was dry: the feed has no (new)
+                // jukebox posts to offer. Turn the mode back off rather than
+                // leaving it armed and silent.
+                self.shuffle = false;
+                self.toast = Some(Toast::warning("shuffle off: no jukebox posts found"));
+            }
+        }
+    }
+
+    /// Walk a few pages of the global feed in the background, collecting posts
+    /// with audio attachments for the shuffle pool. Bounded (at most
+    /// [`super::shuffle::REFILL_MAX_PAGES`] pages per walk, early-out at
+    /// [`super::shuffle::REFILL_TARGET`] finds) and paced, on top of the
+    /// client's own per-endpoint rate limiting — shuffle must stay a music
+    /// mode, not a crawler.
+    fn spawn_shuffle_refill(&mut self) {
+        if self.shuffle_pool.fetch_inflight {
+            return;
+        }
+        self.shuffle_pool.fetch_inflight = true;
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        let mut cursor = self.shuffle_pool.cursor.clone();
+        // Generation guard: logout / toggling shuffle off bumps the epoch, so
+        // a superseded walk stops fetching and its result is dropped by the
+        // handler instead of repopulating a cleared pool.
+        let epoch_ref = Arc::clone(&self.shuffle_epoch);
+        let epoch = epoch_ref.load(Ordering::SeqCst);
+        tokio::spawn(async move {
+            let mut found: Vec<super::audio::JukeboxTrack> = Vec::new();
+            for page in 0..super::shuffle::REFILL_MAX_PAGES {
+                if page > 0 {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                if epoch_ref.load(Ordering::SeqCst) != epoch {
+                    return;
+                }
+                match client.list_entries(cursor.as_deref(), Some(50)).await {
+                    Ok((entries, next)) => {
+                        found.extend(
+                            entries
+                                .iter()
+                                .filter_map(|e| super::audio::jukebox_track(&e.attachments)),
+                        );
+                        cursor = next;
+                        if cursor.is_none() || found.len() >= super::shuffle::REFILL_TARGET {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        let msg = note_api_err(&tx, e);
+                        // A partial walk that found tracks still counts; only
+                        // a walk that produced nothing surfaces as an error.
+                        if found.is_empty() {
+                            let _ = tx.send(BgEvent::ShuffleTracks {
+                                epoch,
+                                result: Err(msg),
+                            });
+                            return;
+                        }
+                        break;
+                    }
+                }
+            }
+            let _ = tx.send(BgEvent::ShuffleTracks {
+                epoch,
+                result: Ok((found, cursor)),
+            });
+        });
     }
 
     fn player_volume(&mut self, delta: i64) {
@@ -4117,5 +4424,265 @@ mod tests {
         // Direction changes are kept; a key breaks the run and passes through.
         let out = coalesce_scroll(vec![down(), down(), up(), up(), keyev, down()]);
         assert_eq!(out.len(), 4, "expected down, up, key, down");
+    }
+
+    // Shuffle mode ------------------------------------------------------------
+
+    /// A test entry carrying a jukebox (audio) attachment.
+    fn audio_entry(post_id: &str, url: &str) -> cs_api::Entry {
+        let mut e = test_entry(post_id);
+        e.attachments = vec![cs_api::Attachment::Audio {
+            src: url.into(),
+            origin: "youtube".into(),
+            artist: "a".into(),
+            title: "t".into(),
+            genre: String::new(),
+        }];
+        e
+    }
+
+    fn jukebox_track(url: &str) -> super::super::audio::JukeboxTrack {
+        super::super::audio::JukeboxTrack {
+            url: url.into(),
+            artist: "a".into(),
+            title: "t".into(),
+        }
+    }
+
+    #[test]
+    fn entry_pages_harvest_into_the_shuffle_pool() {
+        let mut app = test_app();
+        // Harvesting must work regardless of the active screen — pages are
+        // scanned as they arrive, not when shuffle is enabled.
+        app.handle_bg_event(BgEvent::FeedInitial(Ok((
+            vec![
+                audio_entry("p1", "https://youtu.be/one"),
+                test_entry("p2"), // no attachment
+            ],
+            None,
+        ))));
+        assert_eq!(app.shuffle_pool.len(), 1);
+        // A topic-feed page adds (and dedups against) the same pool.
+        app.handle_bg_event(BgEvent::TopicFeedInitial {
+            slug: "music".into(),
+            result: Ok((
+                vec![
+                    audio_entry("p1", "https://youtu.be/one"), // already seen
+                    audio_entry("p3", "https://youtu.be/two"),
+                ],
+                None,
+            )),
+        });
+        assert_eq!(app.shuffle_pool.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn shuffle_toggle_without_mpv_warns_and_stays_off() {
+        let mut app = test_app();
+        app.screen = Screen::Feed(FeedScreen::new());
+        app.current_root = Some(RootKind::Feed);
+        app.mpv_available = Some(false);
+        app.ytdlp_available = Some(false);
+        app.handle_terminal_event(key_event(KeyCode::Char('S')))
+            .await;
+        assert!(!app.shuffle, "shuffle must not arm without a player");
+        let text = render_to_string(&app);
+        assert!(text.contains("mpv"), "missing-player toast: {text:?}");
+    }
+
+    #[tokio::test]
+    async fn shuffle_chains_when_a_track_ends_and_disarms_on_a_failed_start() {
+        let mut app = test_app();
+        app.screen = Screen::Feed(FeedScreen::new());
+        app.current_root = Some(RootKind::Feed);
+        // mpv "missing" makes the chained start_playback bail — observable
+        // proof the chain reached the play step without spawning a real
+        // process, and exercising the no-dead-armed-mode guard in one go.
+        app.mpv_available = Some(false);
+        app.ytdlp_available = Some(false);
+        app.shuffle = true;
+        app.shuffle_pool
+            .add_tracks(vec![jukebox_track("https://youtu.be/next")]);
+        let mut h = super::super::player::test_handle("https://youtu.be/current", 7);
+        h.position_secs = 200.0; // played well past the suspect threshold
+        app.now_playing = Some(h);
+
+        app.handle_bg_event(BgEvent::PlaybackEnded { token: 7 });
+
+        assert!(app.now_playing.is_none(), "ended track clears the bar");
+        assert!(
+            !app.shuffle,
+            "a chain that cannot start playback must not stay armed"
+        );
+        let text = render_to_string(&app);
+        assert!(
+            text.contains("shuffle off"),
+            "disarm reaches start_playback and is announced: {text:?}"
+        );
+    }
+
+    #[test]
+    fn shuffle_ignores_a_superseded_tracks_end() {
+        let mut app = test_app();
+        app.shuffle = true;
+        app.shuffle_pool
+            .add_tracks(vec![jukebox_track("https://youtu.be/next")]);
+        app.now_playing = Some(super::super::player::test_handle("u", 9));
+        // Token 8 is a previous track's exit racing in; the current track (9)
+        // keeps playing and no advance happens.
+        app.handle_bg_event(BgEvent::PlaybackEnded { token: 8 });
+        assert!(app.now_playing.is_some(), "current track must survive");
+    }
+
+    #[tokio::test]
+    async fn shuffle_gives_up_after_repeated_instant_failures() {
+        let mut app = test_app();
+        app.screen = Screen::Feed(FeedScreen::new());
+        app.current_root = Some(RootKind::Feed);
+        app.mpv_available = Some(false);
+        app.ytdlp_available = Some(false);
+        app.shuffle = true;
+        app.shuffle_pool.add_tracks(vec![
+            jukebox_track("https://youtu.be/a"),
+            jukebox_track("https://youtu.be/b"),
+        ]);
+        for token in 1..=u64::from(SUSPECT_END_LIMIT) {
+            // Re-arm by hand each round: with mpv stubbed out the chained
+            // start_playback fails and disarms the mode (covered by its own
+            // test), which would otherwise mask the breaker under test here.
+            // The suspect counter survives, which is the part that matters.
+            app.shuffle = true;
+            // position_secs stays 0.0 and the handle is seconds old: the
+            // track died before reporting progress — a suspect ending.
+            app.now_playing = Some(super::super::player::test_handle("u", token));
+            app.handle_bg_event(BgEvent::PlaybackEnded { token });
+        }
+        assert!(!app.shuffle, "breaker must trip after consecutive failures");
+        let text = render_to_string(&app);
+        assert!(text.contains("failing"), "breaker toast: {text:?}");
+    }
+
+    #[tokio::test]
+    async fn shuffle_plays_on_refill_arrival_when_latched() {
+        let mut app = test_app();
+        app.screen = Screen::Feed(FeedScreen::new());
+        app.current_root = Some(RootKind::Feed);
+        app.mpv_available = Some(false);
+        app.ytdlp_available = Some(false);
+        app.shuffle = true;
+        app.shuffle_pool.fetch_inflight = true;
+        app.shuffle_pool.pending_play = true;
+
+        app.handle_bg_event(BgEvent::ShuffleTracks {
+            epoch: 0,
+            result: Ok((
+                vec![jukebox_track("https://youtu.be/found")],
+                Some("c123".into()),
+            )),
+        });
+
+        assert!(!app.shuffle_pool.pending_play, "latch consumed");
+        assert_eq!(app.shuffle_pool.cursor.as_deref(), Some("c123"));
+        let text = render_to_string(&app);
+        assert!(
+            text.contains("shuffle off"),
+            "latch triggered playback (which then failed and disarmed, mpv \
+             being stubbed out): {text:?}"
+        );
+    }
+
+    #[test]
+    fn shuffle_stale_refill_results_are_dropped() {
+        let mut app = test_app();
+        app.shuffle_pool.fetch_inflight = true;
+        // The walk was superseded (logout, or shuffle toggled off) before its
+        // result landed.
+        app.shuffle_epoch.fetch_add(1, Ordering::SeqCst);
+        app.handle_bg_event(BgEvent::ShuffleTracks {
+            epoch: 0,
+            result: Ok((
+                vec![jukebox_track("https://youtu.be/stale")],
+                Some("stale-cursor".into()),
+            )),
+        });
+        assert_eq!(
+            app.shuffle_pool.len(),
+            0,
+            "stale tracks must not repopulate the pool"
+        );
+        assert!(
+            app.shuffle_pool.cursor.is_none(),
+            "stale cursor must not install"
+        );
+    }
+
+    #[test]
+    fn toggling_shuffle_off_cancels_the_refill_walk() {
+        let mut app = test_app();
+        app.shuffle = true;
+        app.shuffle_pool.fetch_inflight = true;
+        let epoch_before = app.shuffle_epoch.load(Ordering::SeqCst);
+        app.toggle_shuffle();
+        assert!(!app.shuffle);
+        assert!(
+            !app.shuffle_pool.fetch_inflight,
+            "the cancelled walk's flag must reset so re-enabling can refill"
+        );
+        assert!(
+            app.shuffle_epoch.load(Ordering::SeqCst) > epoch_before,
+            "the epoch bump is what invalidates the in-flight walk"
+        );
+    }
+
+    #[test]
+    fn armed_idle_shuffle_shows_the_search_bar() {
+        let mut app = test_app();
+        app.screen = Screen::Feed(FeedScreen::new());
+        app.current_root = Some(RootKind::Feed);
+        app.shuffle = true;
+        app.shuffle_pool.pending_play = true;
+        let text = render_to_string(&app);
+        assert!(
+            text.contains("finding a jukebox post"),
+            "armed-idle shuffle must stay visible: {text:?}"
+        );
+    }
+
+    #[test]
+    fn shuffle_refill_error_disarms_an_idle_shuffle() {
+        let mut app = test_app();
+        app.screen = Screen::Feed(FeedScreen::new());
+        app.current_root = Some(RootKind::Feed);
+        app.shuffle = true;
+        app.shuffle_pool.fetch_inflight = true;
+        app.shuffle_pool.pending_play = true;
+        app.handle_bg_event(BgEvent::ShuffleTracks {
+            epoch: 0,
+            result: Err("boom".into()),
+        });
+        assert!(
+            !app.shuffle,
+            "no music to deliver — mode must not stay armed"
+        );
+        assert!(!app.shuffle_pool.fetch_inflight);
+        let text = render_to_string(&app);
+        assert!(
+            text.contains("shuffle off"),
+            "the self-disarm must be announced, not just the fetch failure: {text:?}"
+        );
+    }
+
+    #[test]
+    fn explicit_stop_turns_shuffle_off() {
+        let mut app = test_app();
+        app.screen = Screen::Feed(FeedScreen::new());
+        app.current_root = Some(RootKind::Feed);
+        app.shuffle = true;
+        app.now_playing = Some(super::super::player::test_handle("u", 1));
+        app.player_stop();
+        assert!(app.now_playing.is_none());
+        assert!(!app.shuffle, "stop means stop — no chained follow-up");
+        let text = render_to_string(&app);
+        assert!(text.contains("shuffle off"), "stop toast: {text:?}");
     }
 }
