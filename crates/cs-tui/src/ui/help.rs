@@ -135,7 +135,11 @@ const JUKEBOX: &[Row] = &[
     },
     Row {
         keys: "s",
-        desc: "stop playback",
+        desc: "stop playback (also turns shuffle off)",
+    },
+    Row {
+        keys: "S",
+        desc: "shuffle: play random jukebox posts (press while idle to start)",
     },
     Row {
         keys: "[ / ]",
