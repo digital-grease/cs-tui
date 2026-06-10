@@ -99,6 +99,7 @@ installed and on your `PATH`. Without them the card and link still render, and
 | `o` | open the jukebox link in your browser |
 | `s` | stop playback (also turns shuffle off) |
 | `S` | toggle shuffle mode |
+| `<` / `>` | previous / next track |
 | `[` / `]` | volume down / up |
 
 A now-playing bar shows at the bottom while audio plays. Set the starting volume
@@ -109,7 +110,12 @@ post instead of stopping, indefinitely. Candidates come from the posts you've
 already browsed, topped up now and then from the public feed. Pressing `S` with
 nothing playing starts a random track right away; `s` stops the music and the
 mode together. Picking a different track by hand keeps shuffle armed, and it
-chains onward from whatever ends next.
+chains onward from whatever ends next. Set `shuffle = true` in `config.toml`
+to start every session with the mode armed (playback still begins by hand).
+
+`<` and `>` step through the play history, mpv-style: `<` replays earlier
+tracks, `>` moves forward again, and at the newest entry `>` skips to a fresh
+random pick from the same pool shuffle uses.
 
 ## Files
 
