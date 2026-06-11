@@ -72,6 +72,10 @@ const GLOBAL: &[Row] = &[
         desc: "drag to select/copy · click opens links (run --mouse for wheel scroll)",
     },
     Row {
+        keys: "i",
+        desc: "toggle inline images (turn off to recover if a post renders as garbage)",
+    },
+    Row {
         keys: "?",
         desc: "this help",
     },

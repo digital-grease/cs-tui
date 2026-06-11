@@ -453,6 +453,12 @@ pub struct App {
     /// Terminal image protocol picker, if the terminal supports graphics.
     /// `None` disables image rendering (the text placeholder is shown instead).
     picker: Option<Picker>,
+    /// Runtime gate for inline image rendering, toggled with `i`. Starts on.
+    /// Turning it off forces a screen clear and suppresses both fetching and
+    /// drawing — the escape hatch when a terminal over-reports its graphics
+    /// support and an image post renders as a screenful of garbage. Independent
+    /// of `picker`: effective rendering needs `picker.is_some() && images_on`.
+    images_on: bool,
     /// Email cached for re-displaying on the login screen after logout.
     last_email: String,
     /// Whether the last network attempt hit a transport error (no server
@@ -571,6 +577,7 @@ impl App {
             menu: None,
             help: false,
             picker: None,
+            images_on: true,
             last_email,
             offline: false,
             toast: None,
@@ -606,6 +613,36 @@ impl App {
     /// image rendering disabled.
     pub fn set_image_picker(&mut self, picker: Option<Picker>) {
         self.picker = picker;
+    }
+
+    /// Toggle inline image rendering at runtime (the `i` key). Forces a full
+    /// terminal clear so a mis-rendered image (raw graphics-protocol bytes from a
+    /// terminal that over-reported its support) is wiped immediately. When
+    /// re-enabling on a post whose image never loaded — it was opened while
+    /// images were off, so no fetch ran — kick the fetch now so it appears
+    /// without reopening the post.
+    fn toggle_images(&mut self) {
+        self.images_on = !self.images_on;
+        self.force_clear = true;
+        if !self.images_on || self.picker.is_none() {
+            return;
+        }
+        let fetch = if let Screen::PostDetail(s) = &self.screen {
+            if s.image.borrow().is_none() {
+                super::images::entry_image_urls(&s.entry)
+                    .into_iter()
+                    .next()
+                    .or_else(|| super::audio::entry_cover_art_url(&s.entry))
+                    .map(|url| (s.entry.post_id.clone(), url))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some((id, url)) = fetch {
+            self.spawn_fetch_image(id, url);
+        }
     }
 
     /// Skip the login screen — used when a valid session was restored at launch.
@@ -779,7 +816,7 @@ impl App {
                 Screen::Bookmarks(s) => s.render(frame, screen_area, &self.theme),
                 Screen::Topics(s) => s.render(frame, screen_area, &self.theme),
                 Screen::TopicFeed(s) => s.render(frame, screen_area, &self.theme),
-                Screen::PostDetail(s) => s.render(frame, screen_area, &self.theme),
+                Screen::PostDetail(s) => s.render(frame, screen_area, &self.theme, self.images_on),
                 Screen::Profile(s) => s.render(frame, screen_area, &self.theme),
                 Screen::EditProfile(s) => s.render(frame, screen_area, &self.theme),
                 Screen::Compose(s) => s.render(frame, screen_area, &self.theme),
@@ -1236,6 +1273,15 @@ impl App {
             && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
         {
             self.toggle_shuffle();
+            return;
+        }
+
+        // Image toggle (`i`): global on any non-text screen. Flips inline image
+        // rendering off/on and forces a full clear — both a personal preference
+        // and the recovery key when a terminal mis-reports its graphics support
+        // and an image post renders as a screenful of raw protocol bytes.
+        if !self.screen.accepts_text_input() && key.code == KeyCode::Char('i') {
+            self.toggle_images();
             return;
         }
 
@@ -2934,7 +2980,7 @@ impl App {
         // Prefer a real image attachment; for a jukebox post (which carries no
         // image) fall back to the track's YouTube thumbnail as cover art. Both
         // flow through the same fetch/decode/render path.
-        let first_image = if self.picker.is_some() {
+        let first_image = if self.picker.is_some() && self.images_on {
             super::images::entry_image_urls(&entry)
                 .into_iter()
                 .next()
@@ -4599,6 +4645,38 @@ mod tests {
         assert!(!app.shuffle, "shuffle must not arm without a player");
         let text = render_to_string(&app);
         assert!(text.contains("mpv"), "missing-player toast: {text:?}");
+    }
+
+    #[tokio::test]
+    async fn i_toggles_inline_images_and_forces_a_clear() {
+        let mut app = test_app();
+        app.screen = Screen::Feed(FeedScreen::new());
+        app.current_root = Some(RootKind::Feed);
+        assert!(app.images_on, "images start on");
+
+        app.handle_terminal_event(key_event(KeyCode::Char('i')))
+            .await;
+        assert!(!app.images_on, "i turns images off");
+        assert!(
+            app.force_clear,
+            "toggling forces a clear so mis-rendered garbage is wiped"
+        );
+
+        app.force_clear = false;
+        app.handle_terminal_event(key_event(KeyCode::Char('i')))
+            .await;
+        assert!(app.images_on, "i turns images back on");
+        assert!(app.force_clear, "re-enabling also forces a clear");
+    }
+
+    #[tokio::test]
+    async fn i_is_ignored_while_a_text_field_is_focused() {
+        // On a text-capturing screen `i` must reach the field, not toggle images.
+        let mut app = test_app();
+        assert!(app.screen.accepts_text_input(), "login captures text");
+        app.handle_terminal_event(key_event(KeyCode::Char('i')))
+            .await;
+        assert!(app.images_on, "i typed into a field must not toggle images");
     }
 
     #[tokio::test]
