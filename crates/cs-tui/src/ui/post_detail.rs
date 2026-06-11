@@ -262,7 +262,7 @@ impl PostDetailScreen {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
+    pub fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme, images_on: bool) {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(theme.border_style())
@@ -282,11 +282,12 @@ impl PostDetailScreen {
 
         let lines = self.compose_body(theme);
 
-        // When an image is loaded, reserve a strip at the top of the body for it
-        // and flow the text below. Terminals without graphics never reach here
-        // (no protocol is ever built) and just see the text.
+        // When an image is loaded AND images are on, reserve a strip at the top
+        // of the body for it and flow the text below. Terminals without graphics
+        // never build a protocol, and the `i` toggle (`images_on`) forces
+        // text-only too; either way the body uses the full area.
         let mut img = self.image.borrow_mut();
-        let has_image = img.is_some() && body_area.height > 4;
+        let has_image = images_on && img.is_some() && body_area.height > 4;
         let img_h = if has_image {
             (body_area.height / 2).clamp(1, crate::config::get().image_height)
         } else {
