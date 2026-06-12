@@ -661,6 +661,10 @@ impl App {
         } else {
             self.spawn_unread_count_poller();
             self.poller_started = true;
+            // Populate the badge right away: the poller idles a few seconds
+            // before its first tick, so without this the count would stay blank
+            // for that whole settle window at launch.
+            self.spawn_unread_count_once();
         }
         // The topics warm-up IS re-spawned every login: logout cleared the cache
         // and bumped the epoch, so this starts a fresh fill for the new session
@@ -1749,8 +1753,11 @@ impl App {
             }
             BgEvent::NotificationMarkedRead | BgEvent::AllNotificationsMarked => {
                 // Server confirmed the mark; local UI already updated optimistically.
-                // Refresh unread count to converge on truth.
-                self.spawn_unread_count_once();
+                // Converge on truth with a *delayed* re-read: the count endpoint
+                // is cached server-side (~5s), so an immediate poll would return
+                // the pre-mark value and flick the just-cleared badge back to its
+                // old number. The resync waits past that cache window.
+                self.spawn_unread_count_resync();
             }
             BgEvent::NotificationMarkFailed { notification_id } => {
                 // Undo the optimistic mark so the UI matches the server.
@@ -3339,6 +3346,29 @@ impl App {
         });
     }
 
+    /// Re-read the unread count after a short delay, to converge on truth
+    /// following an optimistic mark-read. The count endpoint is cached
+    /// server-side (~5s); reading it immediately would return the pre-mark
+    /// value and clobber the optimistic update (the badge would flick back to
+    /// its old number until the next poll). Waiting past the cache window reads
+    /// the post-mark truth instead.
+    fn spawn_unread_count_resync(&self) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            match client.unread_notification_count().await {
+                Ok(n) => {
+                    let _ = tx.send(BgEvent::UnreadCount(n));
+                }
+                Err(e) => {
+                    let msg = note_api_err(&tx, e);
+                    tracing::debug!(error = %msg, "unread_count resync failed");
+                }
+            }
+        });
+    }
+
     fn spawn_profile_user_me(&self) {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
@@ -3756,6 +3786,7 @@ impl App {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         let wake = self.offline_notify.clone();
+        let online_delay = crate::config::get().notifications_refresh_secs;
         tokio::spawn(async move {
             // Brief settle delay so the initial render lands before the first poll.
             tokio::time::sleep(Duration::from_secs(3)).await;
@@ -3764,15 +3795,16 @@ impl App {
             // `note_api_err` exactly like every instrumented request — so a
             // transport drop raises the offline marker and a terminal 401 logs
             // an *idle* user out (the poller is their only traffic). While
-            // offline we poll faster (5s vs 60s), and a `wake` notification cuts
-            // the sleep short so the marker clears promptly on reconnect.
+            // offline we poll faster (5s vs the configured interval), and a
+            // `wake` notification cuts the sleep short so the marker clears
+            // promptly on reconnect.
             loop {
                 let next_delay = match client.unread_notification_count().await {
                     Ok(n) => {
                         if tx.send(BgEvent::UnreadCount(n)).is_err() {
                             return; // app gone
                         }
-                        60
+                        online_delay
                     }
                     Err(e) => {
                         let transport = e.is_transport();
@@ -3781,7 +3813,7 @@ impl App {
                         if transport {
                             5
                         } else {
-                            60
+                            online_delay
                         }
                     }
                 };

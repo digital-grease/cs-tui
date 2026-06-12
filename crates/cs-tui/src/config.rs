@@ -51,6 +51,9 @@ pub struct Config {
     pub feed_autorefresh: Option<bool>,
     /// Seconds between background feed refreshes (clamped to a 10s minimum).
     pub feed_refresh_secs: Option<u64>,
+    /// Seconds between background unread-notification-count polls (clamped to a
+    /// 5s minimum).
+    pub notifications_refresh_secs: Option<u64>,
     /// Initial jukebox volume for a fresh session (0..=130).
     pub audio_volume: Option<i64>,
     /// Start each session with shuffle mode already armed.
@@ -96,6 +99,9 @@ pub struct Runtime {
     pub confirm_deletes: bool,
     pub feed_autorefresh: bool,
     pub feed_refresh_secs: u64,
+    /// Seconds between background unread-notification-count polls. Drives how
+    /// quickly the header badge reflects new notifications.
+    pub notifications_refresh_secs: u64,
     /// Initial jukebox volume (0..=130) the player opens at each session.
     pub audio_volume: i64,
     /// Whether sessions begin with shuffle mode armed (never auto-playing:
@@ -117,6 +123,7 @@ impl Default for Runtime {
             confirm_deletes: true,
             feed_autorefresh: true,
             feed_refresh_secs: 60,
+            notifications_refresh_secs: 20,
             // Single-sourced with the player so the two never drift.
             audio_volume: crate::ui::player::DEFAULT_VOLUME,
             shuffle: false,
@@ -213,6 +220,11 @@ const TEMPLATE: &str = r##"# cs-tui configuration. Edit and restart cs-tui.
 # How often (seconds) the background feed poll checks for new entries.
 # Minimum 10; lower values use more of the read rate limit.
 #feed_refresh_secs = 60
+
+# How often (seconds) the background poll refreshes the unread-notification
+# count shown in the header. Minimum 5; lower values surface new notifications
+# (and clear marked-read ones) sooner but use more of the read rate limit.
+#notifications_refresh_secs = 20
 
 # Editor for composing posts/notes. Defaults to $VISUAL, then $EDITOR, then nano.
 #editor = "nvim"
@@ -333,6 +345,10 @@ impl Config {
                 .feed_refresh_secs
                 .unwrap_or(d.feed_refresh_secs)
                 .clamp(10, 3600),
+            notifications_refresh_secs: self
+                .notifications_refresh_secs
+                .unwrap_or(d.notifications_refresh_secs)
+                .clamp(5, 3600),
             audio_volume: self.audio_volume.unwrap_or(d.audio_volume).clamp(0, 130),
             shuffle: self.shuffle.unwrap_or(d.shuffle),
         }
