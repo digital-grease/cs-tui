@@ -469,11 +469,11 @@ mod tests {
     #[test]
     fn osc8_bytes_reach_the_crossterm_wire() {
         // The in-memory buffer tests prove apply_link_targets sets the symbol; this
-        // proves the real crossterm backend actually EMITS the escape bytes (via the
-        // frame diff) so a terminal can act on them.
-        use ratatui::backend::CrosstermBackend;
-        use ratatui::widgets::Paragraph;
-        use ratatui::Terminal;
+        // proves the real crossterm backend actually EMITS the escape bytes — the
+        // diff drives `Print(symbol)` — so a terminal can act on them. The backend
+        // is driven directly (not via `Terminal`) so the test needs no TTY: a real
+        // `Terminal` would query the terminal size and fail in headless CI.
+        use ratatui::backend::{Backend, CrosstermBackend};
         use std::cell::RefCell;
         use std::rc::Rc;
 
@@ -489,16 +489,20 @@ mod tests {
             }
         }
 
+        // Paint the URL glyphs into a buffer (as a paragraph would), then overlay.
+        let area = Rect::new(0, 0, 30, 1);
+        let lines = vec![line(vec![Span::raw("  https://x.example/page")])];
+        let targets = find_link_targets(&lines, area.width);
+        let prev = Buffer::empty(area);
+        let mut next = Buffer::empty(area);
+        next.set_string(0, 0, "  https://x.example/page", Style::default());
+        apply_link_targets(&mut next, area, 0, &targets);
+
+        // Drive the crossterm backend with the diff and capture what it writes.
         let sink = Sink(Rc::new(RefCell::new(Vec::new())));
-        let mut term = Terminal::new(CrosstermBackend::new(sink.clone())).unwrap();
-        term.draw(|f| {
-            let area = f.area();
-            let lines = vec![Line::from(Span::raw("  https://x.example/page"))];
-            let targets = find_link_targets(&lines, area.width);
-            f.render_widget(Paragraph::new(lines), area);
-            apply_link_targets(f.buffer_mut(), area, 0, &targets);
-        })
-        .unwrap();
+        let mut backend = CrosstermBackend::new(sink.clone());
+        backend.draw(prev.diff(&next).into_iter()).unwrap();
+        backend.flush().unwrap();
 
         let bytes = sink.0.borrow().clone();
         let wire = String::from_utf8_lossy(&bytes);
