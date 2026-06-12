@@ -465,4 +465,46 @@ mod tests {
             "nothing linked when scrolled past"
         );
     }
+
+    #[test]
+    fn osc8_bytes_reach_the_crossterm_wire() {
+        // The in-memory buffer tests prove apply_link_targets sets the symbol; this
+        // proves the real crossterm backend actually EMITS the escape bytes (via the
+        // frame diff) so a terminal can act on them.
+        use ratatui::backend::CrosstermBackend;
+        use ratatui::widgets::Paragraph;
+        use ratatui::Terminal;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        #[derive(Clone)]
+        struct Sink(Rc<RefCell<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let sink = Sink(Rc::new(RefCell::new(Vec::new())));
+        let mut term = Terminal::new(CrosstermBackend::new(sink.clone())).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            let lines = vec![Line::from(Span::raw("  https://x.example/page"))];
+            let targets = find_link_targets(&lines, area.width);
+            f.render_widget(Paragraph::new(lines), area);
+            apply_link_targets(f.buffer_mut(), area, 0, &targets);
+        })
+        .unwrap();
+
+        let bytes = sink.0.borrow().clone();
+        let wire = String::from_utf8_lossy(&bytes);
+        assert!(
+            wire.contains("\u{1b}]8;;https://x.example/page\u{1b}\\"),
+            "OSC 8 open sequence must be written to the terminal: {wire:?}"
+        );
+    }
 }
