@@ -14,7 +14,7 @@ use ratatui_image::protocol::Protocol;
 use ratatui_image::{Image, Resize};
 
 use super::images::{entry_image_urls, reply_image_urls};
-use super::markdown::{render_markdown_collect, ImageUrls};
+use super::markdown::{render_markdown_with, ImageUrls};
 use super::theme::Theme;
 
 /// An inline image reserved in the post-detail body: its source URL and the
@@ -24,17 +24,6 @@ use super::theme::Theme;
 struct ImageSlot {
     url: String,
     start_line: usize,
-}
-
-/// A surfaced link/image URL reserved in the post-detail body: its target `url`,
-/// the logical `start_line` carrying the bare URL text, and the `col` that text
-/// begins at. `render` overlays an OSC 8 hyperlink onto that row so the link is
-/// clickable even when the URL is long enough to wrap, which defeats a terminal's
-/// own URL detection. Recomputed every frame, like [`ImageSlot`].
-struct LinkSlot {
-    url: String,
-    start_line: usize,
-    col: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,9 +96,6 @@ pub struct PostDetailScreen {
     /// line where its reserved blank-row gap starts), consumed by `render` to
     /// overlay each image onto its gap. Recomputed every frame.
     image_slots: RefCell<Vec<ImageSlot>>,
-    /// Surfaced link/image URLs recorded by `compose_body`, consumed by `render`
-    /// to overlay an OSC 8 hyperlink onto each URL row. Recomputed every frame.
-    link_slots: RefCell<Vec<LinkSlot>>,
 }
 
 impl PostDetailScreen {
@@ -131,7 +117,6 @@ impl PostDetailScreen {
             image_bytes: RefCell::new(HashMap::new()),
             requested: RefCell::new(HashSet::new()),
             image_slots: RefCell::new(Vec::new()),
-            link_slots: RefCell::new(Vec::new()),
         }
     }
 
@@ -380,11 +365,11 @@ impl PostDetailScreen {
             0
         };
 
-        // OSC 8 hyperlinks make surfaced URLs clickable even when long enough to
-        // wrap (which defeats the terminal's own URL detection); off falls back to
-        // the bare URL text. Independent of graphics support.
+        // OSC 8 hyperlinks make URLs in the body clickable even when long enough
+        // to wrap (which defeats the terminal's own URL detection); off falls back
+        // to plain text. Independent of graphics support.
         let hyperlinks_on = crate::config::get().hyperlinks;
-        let lines = self.compose_body(theme, inline_images, img_rows, hyperlinks_on);
+        let lines = self.compose_body(theme, inline_images, img_rows);
 
         // The whole body is the text area; images overlay the blank gaps within it.
         let text_area = body_area;
@@ -399,16 +384,11 @@ impl PostDetailScreen {
         // offset (so it can be overlaid at the right screen row).
         let reply_starts = self.reply_starts.borrow();
         let slots = self.image_slots.borrow();
-        let link_slots = self.link_slots.borrow();
         let mut anchors: Vec<u16> = Vec::with_capacity(reply_starts.len());
         let mut slot_offsets: Vec<u32> = Vec::with_capacity(slots.len());
-        // Wrapped-row offset of each link slot's URL row (its first row, where the
-        // URL glyphs begin), so the overlay lands on the right screen row.
-        let mut link_offsets: Vec<u32> = Vec::with_capacity(link_slots.len());
         let mut acc: u32 = 0;
         let mut si = 0;
         let mut sj = 0;
-        let mut sk = 0;
         let row_count = |w: u32| if w <= cols { 1 } else { w.div_ceil(cols) + 1 };
         for (idx, l) in lines.iter().enumerate() {
             while si < reply_starts.len() && reply_starts[si] == idx {
@@ -418,10 +398,6 @@ impl PostDetailScreen {
             while sj < slots.len() && slots[sj].start_line == idx {
                 slot_offsets.push(acc);
                 sj += 1;
-            }
-            while sk < link_slots.len() && link_slots[sk].start_line == idx {
-                link_offsets.push(acc);
-                sk += 1;
             }
             acc += row_count(l.width() as u32);
         }
@@ -433,10 +409,6 @@ impl PostDetailScreen {
             slot_offsets.push(acc);
             sj += 1;
         }
-        while sk < link_slots.len() {
-            link_offsets.push(acc);
-            sk += 1;
-        }
         drop(reply_starts);
         *self.reply_anchors.borrow_mut() = anchors;
         let wrapped_rows = acc;
@@ -445,6 +417,14 @@ impl PostDetailScreen {
             .min(u32::from(u16::MAX)) as u16;
         self.max_scroll.set(max_scroll);
         let scroll = self.scroll.min(max_scroll);
+
+        // Find every URL in the body before the paragraph consumes the lines, so
+        // `render` can overlay OSC 8 hyperlinks once the glyphs are on screen.
+        let link_targets = if hyperlinks_on {
+            super::hyperlink::find_link_targets(&lines, text_area.width)
+        } else {
+            Vec::new()
+        };
 
         let para = Paragraph::new(lines)
             .wrap(Wrap { trim: false })
@@ -508,33 +488,18 @@ impl PostDetailScreen {
         }
         drop(slots);
 
-        // Overlay an OSC 8 hyperlink onto each surfaced URL row that's in view.
-        // The paragraph already painted the bare URL glyphs; `linkify_run` wraps
-        // exactly those cells so the URL is clickable, including when it's long
-        // enough to wrap (the link covers the first row's glyphs, with the full
-        // URL as the target). Independent of graphics — works on any terminal.
+        // Overlay an OSC 8 hyperlink onto every URL the paragraph painted that's
+        // in view — markdown links, image/jukebox URLs, raw URLs alike. The link
+        // covers the visible glyphs with the full URL as the target, so it works
+        // even when a long URL wraps. Independent of graphics — any terminal.
         if hyperlinks_on {
-            let buf = frame.buffer_mut();
-            for (slot, &offset) in link_slots.iter().zip(link_offsets.iter()) {
-                let rel = offset as i64 - i64::from(scroll);
-                if rel < 0 || rel >= i64::from(text_area.height) {
-                    continue;
-                }
-                if slot.col >= text_area.width {
-                    continue;
-                }
-                let x = text_area.x + slot.col;
-                let max_cols = text_area.width - slot.col;
-                super::hyperlink::linkify_run(
-                    buf,
-                    x,
-                    text_area.y + rel as u16,
-                    &slot.url,
-                    max_cols,
-                );
-            }
+            super::hyperlink::apply_link_targets(
+                frame.buffer_mut(),
+                text_area,
+                scroll,
+                &link_targets,
+            );
         }
-        drop(link_slots);
 
         // Surface the jukebox keys only when there's a track to act on.
         let open_hint = if self.jukebox_url().is_some() {
@@ -566,36 +531,16 @@ impl PostDetailScreen {
     /// Build the scrollable body. When `inline_images` is set, image URLs are
     /// suppressed (the image is drawn as graphics) and a blank-row gap of
     /// `img_rows` is reserved at each image's position for `render` to overlay;
-    /// otherwise image URLs are surfaced as text and no gaps are reserved. When
-    /// `hyperlinks` is set, each surfaced URL is recorded as a [`LinkSlot`] so
-    /// `render` can overlay an OSC 8 hyperlink onto its row.
-    fn compose_body(
-        &self,
-        theme: &Theme,
-        inline_images: bool,
-        img_rows: u16,
-        hyperlinks: bool,
-    ) -> Vec<Line<'_>> {
+    /// otherwise image URLs are surfaced as text and no gaps are reserved. Any
+    /// URL in the result is made clickable by `render` via
+    /// [`super::hyperlink::find_link_targets`].
+    fn compose_body(&self, theme: &Theme, inline_images: bool, img_rows: u16) -> Vec<Line<'_>> {
         let mut lines = Vec::new();
         let mut slots: Vec<ImageSlot> = Vec::new();
-        let mut link_slots: Vec<LinkSlot> = Vec::new();
         let image_urls = if inline_images {
             ImageUrls::Hide
         } else {
             ImageUrls::Show
-        };
-        // Fold a markdown block's links (positions relative to that block) into
-        // absolute `LinkSlot`s anchored at `base`, the block's first line index.
-        let mut push_links = |base: usize, refs: Vec<super::markdown::LinkRef>| {
-            if hyperlinks {
-                for r in refs {
-                    link_slots.push(LinkSlot {
-                        url: r.url,
-                        start_line: base + r.line,
-                        col: r.col,
-                    });
-                }
-            }
         };
 
         // Header
@@ -642,10 +587,9 @@ impl PostDetailScreen {
         // When images are drawn inline, the image URL is hidden here (the graphic
         // appears in the reserved gap below); otherwise it's surfaced as text.
         // Links always surface their URL.
-        let base = lines.len();
-        let (md_lines, md_links) = render_markdown_collect(&self.entry.content, theme, image_urls);
-        lines.extend(md_lines);
-        push_links(base, md_links);
+        for md_line in render_markdown_with(&self.entry.content, theme, image_urls) {
+            lines.push(md_line);
+        }
 
         // The post's own image (or, for a jukebox post, its cover art) drawn
         // inline right after the body it belongs to.
@@ -714,9 +658,7 @@ impl PostDetailScreen {
                 Span::styled(format!(" · {when}{parent}"), theme.muted_style()),
             ]));
             // Reply body — markdown-rendered. Highlight overrides via the loop below.
-            let base = lines.len();
-            let (md_lines, md_links) = render_markdown_collect(&reply.content, theme, image_urls);
-            for md_line in md_lines {
+            for md_line in render_markdown_with(&reply.content, theme, image_urls) {
                 if highlight {
                     let restyled: Vec<Span<'_>> = md_line
                         .spans
@@ -728,7 +670,6 @@ impl PostDetailScreen {
                     lines.push(md_line);
                 }
             }
-            push_links(base, md_links);
             // The reply's own image, drawn inline right after its text.
             if inline_images {
                 if let Some(url) = reply_image_urls(reply).into_iter().next() {
@@ -757,7 +698,6 @@ impl PostDetailScreen {
 
         *self.reply_starts.borrow_mut() = reply_starts;
         *self.image_slots.borrow_mut() = slots;
-        *self.link_slots.borrow_mut() = link_slots;
         lines
     }
 }
@@ -849,7 +789,7 @@ mod tests {
     fn body_text_mode(s: &PostDetailScreen, inline_images: bool) -> Vec<String> {
         let theme = Theme::cyber();
         let img_rows = if inline_images { 6 } else { 0 };
-        s.compose_body(&theme, inline_images, img_rows, false)
+        s.compose_body(&theme, inline_images, img_rows)
             .iter()
             .map(|l| {
                 l.spans
@@ -1111,9 +1051,6 @@ mod tests {
         terminal
             .draw(|f| s.render(f, f.area(), &Theme::cyber(), false, None))
             .expect("draw");
-
-        // One link slot was recorded for the surfaced URL.
-        assert_eq!(s.link_slots.borrow().len(), 1, "one link slot recorded");
 
         // A buffer cell carries the OSC 8 open sequence targeting the full URL.
         let buf = terminal.backend().buffer();
@@ -1391,7 +1328,7 @@ mod tests {
     fn compose_body_includes_separator_when_replies_present() {
         let mut s = PostDetailScreen::new(entry("p1"));
         s.apply_replies_initial(Ok((vec![reply("r1", "p1")], None)));
-        let lines = s.compose_body(&Theme::dark(), false, 0, false);
+        let lines = s.compose_body(&Theme::dark(), false, 0);
         // Look for the replies separator marker.
         let body_text: String = lines
             .iter()

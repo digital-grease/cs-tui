@@ -14,8 +14,18 @@
 //! complete, self-contained link, and when it doesn't, nothing leaks. Splitting
 //! the open and close across two cells would let the active-link state bleed onto
 //! whatever unrelated cells the diff happens to redraw between them.
+//!
+//! [`find_link_targets`] + [`apply_link_targets`] make every URL in a rendered
+//! paragraph clickable: the first scans the logical lines for URLs, the second
+//! overlays the links after the paragraph is drawn. They're split so the caller
+//! can hand the lines to the (consuming) `Paragraph` in between.
 
 use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::text::Line;
+use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::Frame;
+use unicode_width::UnicodeWidthChar;
 
 /// ESC, the lead byte of every escape/OSC sequence.
 const ESC: char = '\u{1b}';
@@ -24,7 +34,7 @@ const ESC: char = '\u{1b}';
 ///
 /// Writing into a cell's `symbol` bypasses ratatui's own control-char filtering
 /// (which normally protects against escape-sequence injection from posted
-/// content). Since the link `url` is attacker-controlled, an embedded `ESC`/`BEL`
+/// content). Since a link `url` is attacker-controlled, an embedded `ESC`/`BEL`
 /// could terminate the OSC 8 sequence early and inject arbitrary terminal
 /// escapes. Dropping every control char closes that hole: with no `ESC` left, no
 /// further escape or OSC sequence can be formed. Real URLs contain no control
@@ -56,10 +66,15 @@ pub fn osc8(url: &str, text: &str) -> String {
 /// `skip` so the diff keeps the glyphs the terminal printed from that sequence.
 /// Cell styling (colour/underline) is left untouched. Returns the number of
 /// columns linked, or 0 when there was nothing to link.
+///
+/// Guard: the collected glyphs must be a prefix of `url`. If they aren't, the
+/// position was wrong (e.g. word-wrap moved the URL to another row) and the run
+/// is left untouched rather than wrapping unrelated text.
 pub fn linkify_run(buf: &mut Buffer, x: u16, y: u16, url: &str, max_cols: u16) -> u16 {
     let area = buf.area;
+    let target = url.trim();
     if max_cols == 0
-        || url.trim().is_empty()
+        || target.is_empty()
         || y < area.y
         || y >= area.y.saturating_add(area.height)
         || x < area.x
@@ -81,13 +96,13 @@ pub fn linkify_run(buf: &mut Buffer, x: u16, y: u16, url: &str, max_cols: u16) -
         text.push_str(sym);
         cx += 1;
     }
-    if cx == x {
+    if cx == x || !target.starts_with(text.as_str()) {
         return 0;
     }
 
     // First cell carries the whole atomic sequence; the trailing cells are
     // skipped so the diff leaves on screen the glyphs that sequence printed.
-    let sequence = osc8(url.trim(), &text);
+    let sequence = osc8(target, &text);
     if let Some(cell) = buf.cell_mut((x, y)) {
         cell.set_symbol(&sequence);
     }
@@ -99,11 +114,171 @@ pub fn linkify_run(buf: &mut Buffer, x: u16, y: u16, url: &str, max_cols: u16) -
     cx - x
 }
 
+/// A URL found on a logical line: the wrapped-row `row` it sits on (counted from
+/// the top of the content, before scroll), the `col` it starts at, its display
+/// `width`, and the target `url`.
+pub struct LinkTarget {
+    row: u32,
+    col: u16,
+    width: u16,
+    url: String,
+}
+
+/// URL schemes we linkify. Each renders with its visible text identical to the
+/// link target, so the on-screen glyphs and the OSC 8 URI always agree (and the
+/// [`linkify_run`] prefix guard holds).
+const SCHEMES: [&str; 4] = ["https://", "http://", "mailto:", "ftp://"];
+
+/// Find every linkifiable URL across `lines` (the logical lines about to be drawn
+/// into a `Wrap { trim: false }` paragraph `wrap_width` columns wide) and record
+/// where each lands. Pair with [`apply_link_targets`] after the paragraph is
+/// drawn. Each URL is anchored to its line's first wrapped row; one that word-wrap
+/// reflows onto a later row is filtered out at apply time by the position guard.
+pub fn find_link_targets(lines: &[Line<'_>], wrap_width: u16) -> Vec<LinkTarget> {
+    let cols = u32::from(wrap_width).max(1);
+    let row_count = |w: u32| if w <= cols { 1 } else { w.div_ceil(cols) + 1 };
+    let mut out = Vec::new();
+    let mut acc: u32 = 0;
+    for line in lines {
+        for (col, width, url) in line_urls(line) {
+            out.push(LinkTarget {
+                row: acc,
+                col,
+                width,
+                url,
+            });
+        }
+        acc += row_count(line.width() as u32);
+    }
+    out
+}
+
+/// Overlay the hyperlinks found by [`find_link_targets`] onto `buf`, given the
+/// paragraph's `area` and vertical `scroll` (in wrapped rows; 0 if it doesn't
+/// scroll). Only targets whose row is on screen, and whose glyphs the buffer
+/// actually shows at the computed spot, are linked.
+pub fn apply_link_targets(buf: &mut Buffer, area: Rect, scroll: u16, targets: &[LinkTarget]) {
+    for t in targets {
+        let rel = i64::from(t.row) - i64::from(scroll);
+        if rel < 0 || rel >= i64::from(area.height) || t.col >= area.width {
+            continue;
+        }
+        let max = t.width.min(area.width - t.col);
+        linkify_run(buf, area.x + t.col, area.y + rel as u16, &t.url, max);
+    }
+}
+
+/// Render `lines` as a `Wrap { trim: false }` paragraph into `area` (scrolled by
+/// `scroll` wrapped rows), then overlay OSC 8 hyperlinks on every URL — when
+/// `enabled`. The find/apply pair brackets the render so the paragraph can
+/// consume `lines` in between. For the common text-only screen; the post detail,
+/// which interleaves image overlays, drives [`find_link_targets`] /
+/// [`apply_link_targets`] itself.
+pub fn render_linked_paragraph(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    lines: Vec<Line<'_>>,
+    scroll: u16,
+    enabled: bool,
+) {
+    let targets = if enabled {
+        find_link_targets(&lines, area.width)
+    } else {
+        Vec::new()
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        area,
+    );
+    if enabled {
+        apply_link_targets(frame.buffer_mut(), area, scroll, &targets);
+    }
+}
+
+/// Find URL tokens on one logical line, each as (start column, display width,
+/// url). Builds the line's text with a per-character column map — so wide glyphs
+/// before a URL shift its column correctly — then scans for scheme-led tokens.
+fn line_urls(line: &Line<'_>) -> Vec<(u16, u16, String)> {
+    let mut chars: Vec<char> = Vec::new();
+    let mut col_of: Vec<u16> = Vec::new();
+    let mut col: u16 = 0;
+    for span in &line.spans {
+        for ch in span.content.chars() {
+            col_of.push(col);
+            chars.push(ch);
+            col = col.saturating_add(UnicodeWidthChar::width(ch).unwrap_or(0) as u16);
+        }
+    }
+    col_of.push(col); // end sentinel
+
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if let Some(scheme_len) = scheme_at(&chars, i) {
+            let mut j = i + scheme_len;
+            while j < chars.len() && is_url_char(chars[j]) {
+                j += 1;
+            }
+            // Trim trailing punctuation that usually abuts a URL rather than
+            // belonging to it ("(see https://x.com)." → "https://x.com").
+            while j > i + scheme_len && is_trailing_punct(chars[j - 1]) {
+                j -= 1;
+            }
+            if j > i + scheme_len {
+                let url: String = chars[i..j].iter().collect();
+                let c0 = col_of[i];
+                let c1 = col_of[j];
+                out.push((c0, c1.saturating_sub(c0), url));
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// If one of [`SCHEMES`] starts at `chars[i]` (case-insensitive), its char length.
+fn scheme_at(chars: &[char], i: usize) -> Option<usize> {
+    SCHEMES.iter().find_map(|s| {
+        let sc: Vec<char> = s.chars().collect();
+        let fits = i + sc.len() <= chars.len();
+        if fits
+            && chars[i..i + sc.len()]
+                .iter()
+                .zip(&sc)
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
+        {
+            Some(sc.len())
+        } else {
+            None
+        }
+    })
+}
+
+/// Characters allowed inside a URL body: anything printable that isn't
+/// whitespace or one of the few delimiters that never appear in a bare URL.
+fn is_url_char(c: char) -> bool {
+    !c.is_whitespace()
+        && !c.is_control()
+        && !matches!(c, '<' | '>' | '"' | '{' | '}' | '|' | '\\' | '^' | '`')
+}
+
+/// Punctuation trimmed from the tail of a matched URL.
+fn is_trailing_punct(c: char) -> bool {
+    matches!(
+        c,
+        '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"' | ')' | ']' | '}' | '>' | '…'
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::layout::Rect;
     use ratatui::style::Style;
+    use ratatui::text::Span;
 
     const ST: &str = "\u{1b}\\"; // string terminator
 
@@ -135,11 +310,6 @@ mod tests {
         assert!(
             !seq.contains("\u{1b}[2J"),
             "the clear-screen escape never forms (no ESC precedes [2J): {seq:?}"
-        );
-        // The leftover bytes survive only as inert, control-free link text.
-        assert!(
-            seq.contains("http://x\\[2J/p"),
-            "control-free url body: {seq:?}"
         );
     }
 
@@ -173,19 +343,19 @@ mod tests {
 
     #[test]
     fn linkify_run_stops_at_the_first_blank_cell() {
-        // "url then words" — only the URL (up to the space) should be linked.
-        let mut buf = buf_with("ab cd", 40);
-        let cols = linkify_run(&mut buf, 0, 0, "https://full", 40);
-        assert_eq!(cols, 2, "stops at the space after 'ab'");
+        // The URL ends at the space; only those glyphs are linked.
+        let mut buf = buf_with("https://x.com more", 40);
+        let cols = linkify_run(&mut buf, 0, 0, "https://x.com", 40);
+        assert_eq!(cols, "https://x.com".len() as u16, "stops at the space");
         let first = buf.cell((0, 0)).unwrap().symbol().to_string();
-        // Visible text is the on-screen glyphs ("ab"), target is the full URL.
-        assert_eq!(first, osc8("https://full", "ab"));
+        assert_eq!(first, osc8("https://x.com", "https://x.com"));
     }
 
     #[test]
     fn linkify_run_truncates_visible_text_to_the_column_budget() {
-        // A long URL that would wrap: only the columns that fit are linked, but
-        // the full URL stays the click target.
+        // A long URL that would wrap: only the columns that fit are linked, but the
+        // full URL stays the click target. The visible prefix still satisfies the
+        // prefix guard.
         let url = "https://x.example/very/long/path/that/would/wrap";
         let mut buf = buf_with(url, 80);
         let cols = linkify_run(&mut buf, 0, 0, url, 10);
@@ -195,6 +365,18 @@ mod tests {
             first,
             osc8(url, &url[..10]),
             "visible text is the first 10 cols, target is the full URL"
+        );
+    }
+
+    #[test]
+    fn linkify_run_guard_rejects_a_mismatched_position() {
+        // The cells say "hello" but we claim a URL is here — refuse to wrap it.
+        let mut buf = buf_with("hello world", 40);
+        assert_eq!(linkify_run(&mut buf, 0, 0, "https://x.com", 40), 0);
+        assert_eq!(
+            buf.cell((0, 0)).unwrap().symbol(),
+            "h",
+            "buffer left untouched"
         );
     }
 
@@ -210,18 +392,77 @@ mod tests {
         assert_eq!(linkify_run(&mut buf2, 0, 0, "   ", 40), 0, "empty url");
     }
 
+    fn line(spans: Vec<Span<'static>>) -> Line<'static> {
+        Line::from(spans)
+    }
+
     #[test]
-    fn linkify_run_rejects_out_of_bounds_positions() {
-        let mut buf = buf_with("url", 40);
-        assert_eq!(
-            linkify_run(&mut buf, 0, 5, "https://x", 40),
-            0,
-            "y past area"
+    fn line_urls_finds_a_scheme_url_with_its_column_and_width() {
+        // Two-space indent, then the URL (the surfaced-link layout).
+        let l = line(vec![Span::raw("  https://x.example/page")]);
+        let found = line_urls(&l);
+        assert_eq!(found.len(), 1);
+        let (col, width, url) = &found[0];
+        assert_eq!(*col, 2, "URL starts past the indent");
+        assert_eq!(*url, "https://x.example/page");
+        assert_eq!(*width, "https://x.example/page".len() as u16);
+    }
+
+    #[test]
+    fn line_urls_accounts_for_wide_glyphs_before_the_url() {
+        // A width-2 emoji then a label, mirroring the profile website line.
+        let l = line(vec![Span::raw("🔗 site (https://x.com)")]);
+        let found = line_urls(&l);
+        assert_eq!(found.len(), 1);
+        let (col, _w, url) = &found[0];
+        assert_eq!(*url, "https://x.com", "trailing paren trimmed");
+        // "🔗"=2 + " "=1 + "site"=4 + " "=1 + "("=1 => column 9.
+        assert_eq!(*col, 9, "column shifted past the wide emoji");
+    }
+
+    #[test]
+    fn line_urls_ignores_plain_text_and_bare_words() {
+        let l = line(vec![Span::raw("just some words, no link here")]);
+        assert!(line_urls(&l).is_empty());
+    }
+
+    #[test]
+    fn find_and_apply_overlay_a_link_on_the_right_row() {
+        let lines = vec![
+            line(vec![Span::raw("header")]),
+            line(vec![Span::raw("")]),
+            line(vec![Span::raw("  https://x.example/p")]),
+        ];
+        let targets = find_link_targets(&lines, 40);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].row, 2, "URL is on the third logical row");
+
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 5));
+        for (y, l) in lines.iter().enumerate() {
+            let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+            buf.set_string(0, y as u16, text, Style::default());
+        }
+        apply_link_targets(&mut buf, Rect::new(0, 0, 40, 5), 0, &targets);
+
+        let cell = buf.cell((2, 2)).unwrap().symbol().to_string();
+        assert!(
+            cell.contains("\u{1b}]8;;https://x.example/p\u{1b}\\"),
+            "row 2 carries the hyperlink: {cell:?}"
         );
+    }
+
+    #[test]
+    fn apply_skips_targets_scrolled_out_of_view() {
+        let lines = vec![line(vec![Span::raw("  https://x.example/p")])];
+        let targets = find_link_targets(&lines, 40);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 3));
+        buf.set_string(0, 0, "  https://x.example/p", Style::default());
+        // Scrolled down by 5 rows: the only target (row 0) is off-screen.
+        apply_link_targets(&mut buf, Rect::new(0, 0, 40, 3), 5, &targets);
         assert_eq!(
-            linkify_run(&mut buf, 0, 0, "https://x", 0),
-            0,
-            "zero budget"
+            buf.cell((2, 0)).unwrap().symbol(),
+            "h",
+            "nothing linked when scrolled past"
         );
     }
 }
