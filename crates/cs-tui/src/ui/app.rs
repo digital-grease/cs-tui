@@ -619,29 +619,49 @@ impl App {
     /// terminal clear so a mis-rendered image (raw graphics-protocol bytes from a
     /// terminal that over-reported its support) is wiped immediately. When
     /// re-enabling on a post whose image never loaded — it was opened while
-    /// images were off, so no fetch ran — kick the fetch now so it appears
-    /// without reopening the post.
+    /// images were off, so no fetch ran — `reconcile_detail_image` kicks the
+    /// fetch now so it appears without reopening the post.
     fn toggle_images(&mut self) {
         self.images_on = !self.images_on;
         self.force_clear = true;
-        if !self.images_on || self.picker.is_none() {
+        self.reconcile_detail_image();
+    }
+
+    /// Bring the focused image (the post's, or the selected reply's) into the
+    /// top strip on the post-detail screen. Cheap no-op everywhere else, when
+    /// images are off, or when the right image is already loaded/awaited; called
+    /// after each key so a `J`/`K` reply-selection change swaps the strip. Decodes
+    /// from the byte cache when possible, otherwise spawns a fetch.
+    fn reconcile_detail_image(&self) {
+        if !self.images_on {
             return;
         }
-        let fetch = if let Screen::PostDetail(s) = &self.screen {
-            if s.image.borrow().is_none() {
-                super::images::entry_image_urls(&s.entry)
-                    .into_iter()
-                    .next()
-                    .or_else(|| super::audio::entry_cover_art_url(&s.entry))
-                    .map(|url| (s.entry.post_id.clone(), url))
-            } else {
-                None
-            }
-        } else {
-            None
+        let Some(picker) = &self.picker else {
+            return;
         };
-        if let Some((id, url)) = fetch {
-            self.spawn_fetch_image(id, url);
+        let Screen::PostDetail(s) = &self.screen else {
+            return;
+        };
+        let desired = s.focused_image_url();
+        if s.pending_url() == desired {
+            return;
+        }
+        match desired {
+            None => s.clear_image(),
+            Some(url) => {
+                if let Some(bytes) = s.cached_image_bytes(&url) {
+                    match image::load_from_memory(&bytes) {
+                        Ok(img) => s.set_image(url, picker.new_resize_protocol(img)),
+                        Err(e) => {
+                            tracing::debug!(error = %e, %url, "image decode failed");
+                            s.set_pending_image(url);
+                        }
+                    }
+                } else {
+                    s.set_pending_image(url.clone());
+                    self.spawn_fetch_image(s.entry.post_id.clone(), url);
+                }
+            }
         }
     }
 
@@ -1338,6 +1358,10 @@ impl App {
 
         // Phase 1: derive an Action with a mutable borrow on the active screen.
         let action = Self::route_key(&mut self.screen, key);
+
+        // A `J`/`K` reply selection changes which image is focused; swap the
+        // top strip to it (no-op off the post-detail screen or with images off).
+        self.reconcile_detail_image();
 
         // Phase 2: apply the action with full mutable access to self.
         match action {
@@ -2307,11 +2331,23 @@ impl App {
                 result,
             } => match result {
                 Ok(bytes) => {
-                    if let (Some(picker), Screen::PostDetail(s)) = (&self.picker, &self.screen) {
+                    if let Screen::PostDetail(s) = &self.screen {
                         if s.entry.post_id == post_id {
-                            match image::load_from_memory(&bytes) {
-                                Ok(img) => s.set_image(picker.new_resize_protocol(img)),
-                                Err(e) => tracing::debug!(error = %e, url, "image decode failed"),
+                            // Cache regardless so re-focusing this image skips the
+                            // network even if the focus has since moved on.
+                            s.cache_image_bytes(url.clone(), bytes.clone());
+                            // Only display it if it's still the focused image and
+                            // images are on (the selection may have changed, or
+                            // images toggled off, while the fetch was in flight).
+                            let still_wanted =
+                                self.images_on && s.pending_url().as_deref() == Some(url.as_str());
+                            if let (true, Some(picker)) = (still_wanted, &self.picker) {
+                                match image::load_from_memory(&bytes) {
+                                    Ok(img) => s.set_image(url, picker.new_resize_protocol(img)),
+                                    Err(e) => {
+                                        tracing::debug!(error = %e, "image decode failed");
+                                    }
+                                }
                             }
                         }
                     }
@@ -3000,6 +3036,11 @@ impl App {
         self.push_screen(Screen::PostDetail(screen));
         self.spawn_detail_replies_initial(&id);
         if let Some(url) = first_image {
+            // Mark it as the awaited image so the fetch result knows to display it
+            // (and doesn't if the user navigates into a reply image first).
+            if let Screen::PostDetail(s) = &self.screen {
+                s.set_pending_image(url.clone());
+            }
             self.spawn_fetch_image(id, url);
         }
     }

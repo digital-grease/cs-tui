@@ -1,5 +1,6 @@
 //! Post detail screen — entry header + content + scrollable replies (oldest first).
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use cs_api::{Entry, Reply};
@@ -11,7 +12,8 @@ use ratatui::Frame;
 use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::StatefulImage;
 
-use super::markdown::render_markdown;
+use super::images::{entry_image_urls, reply_image_urls};
+use super::markdown::{render_markdown, render_markdown_with, ImageUrls};
 use super::theme::Theme;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,10 +69,20 @@ pub struct PostDetailScreen {
     reply_anchors: RefCell<Vec<u16>>,
     /// Two-step delete: first `d` arms confirmation; `y` confirms.
     pub confirming_delete: bool,
-    /// First image of the post, decoded into a terminal-graphics protocol once
-    /// fetched (only on terminals that support images). `RefCell` because the
-    /// stateful image widget mutates while rendering, and render takes `&self`.
+    /// The focused image, decoded into a terminal-graphics protocol once fetched
+    /// (only on terminals that support images): the post's first image, or — when
+    /// a reply with its own image is selected — that reply's first image.
+    /// `RefCell` because the stateful image widget mutates while rendering, and
+    /// render takes `&self`.
     pub image: RefCell<Option<StatefulProtocol>>,
+    /// URL of the image currently in `image` (or the one being fetched for it).
+    /// Lets the fetch result confirm the focus hasn't moved on before it displays,
+    /// and lets selection changes detect when the strip needs a different image.
+    image_url: RefCell<Option<String>>,
+    /// Raw fetched image bytes by URL, so re-selecting a reply (or returning to
+    /// the post) re-decodes from memory instead of re-fetching. Lives and dies
+    /// with the screen, bounding it to one thread's images.
+    image_bytes: RefCell<HashMap<String, Vec<u8>>>,
 }
 
 impl PostDetailScreen {
@@ -89,13 +101,60 @@ impl PostDetailScreen {
             reply_anchors: RefCell::new(Vec::new()),
             confirming_delete: false,
             image: RefCell::new(None),
+            image_url: RefCell::new(None),
+            image_bytes: RefCell::new(HashMap::new()),
         }
     }
 
-    /// Store a decoded image protocol for rendering. Called on the UI thread
-    /// after the image bytes are fetched and decoded.
-    pub fn set_image(&self, protocol: StatefulProtocol) {
+    /// Display a decoded image protocol for `url` in the top strip. Called on the
+    /// UI thread after the image bytes are fetched and decoded.
+    pub fn set_image(&self, url: String, protocol: StatefulProtocol) {
+        *self.image_url.borrow_mut() = Some(url);
         *self.image.borrow_mut() = Some(protocol);
+    }
+
+    /// Mark `url` as the image we want shown, clearing any stale graphic so the
+    /// strip blanks until the fetch/decode completes.
+    pub fn set_pending_image(&self, url: String) {
+        *self.image_url.borrow_mut() = Some(url);
+        *self.image.borrow_mut() = None;
+    }
+
+    /// Drop the focused image entirely (the focus has no image).
+    pub fn clear_image(&self) {
+        *self.image_url.borrow_mut() = None;
+        *self.image.borrow_mut() = None;
+    }
+
+    /// The URL currently displayed or awaited in the image strip.
+    pub fn pending_url(&self) -> Option<String> {
+        self.image_url.borrow().clone()
+    }
+
+    /// Remember fetched bytes for `url` so a later re-focus skips the network.
+    pub fn cache_image_bytes(&self, url: String, bytes: Vec<u8>) {
+        self.image_bytes.borrow_mut().insert(url, bytes);
+    }
+
+    /// Previously-fetched bytes for `url`, if any (cloned for decoding).
+    pub fn cached_image_bytes(&self, url: &str) -> Option<Vec<u8>> {
+        self.image_bytes.borrow().get(url).cloned()
+    }
+
+    /// The image that should occupy the top strip: the selected reply's first
+    /// image when it has one, otherwise the post's first image (or, for a jukebox
+    /// post, its cover art). Mirrors how `o`/`p` target the selected reply before
+    /// falling back to the post.
+    pub fn focused_image_url(&self) -> Option<String> {
+        if let Some(reply) = self.selected_reply.and_then(|i| self.replies.get(i)) {
+            if let Some(url) = reply_image_urls(reply).into_iter().next() {
+                return Some(url);
+            }
+        }
+        entry_image_urls(&self.entry)
+            .into_iter()
+            .next()
+            .or_else(|| super::audio::entry_cover_art_url(&self.entry))
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> PostDetailIntent {
@@ -419,7 +478,9 @@ impl PostDetailScreen {
         lines.push(Line::from(""));
 
         // Body — rendered with pulldown-cmark (markdown + @mention highlighting).
-        for md_line in render_markdown(&self.entry.content, theme) {
+        // The post's image is drawn as graphics in the top strip, so its URL is
+        // hidden here (links still surface their URL).
+        for md_line in render_markdown_with(&self.entry.content, theme, ImageUrls::Hide) {
             lines.push(md_line);
         }
 
@@ -599,6 +660,101 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    fn image_attachment(src: &str) -> cs_api::Attachment {
+        cs_api::Attachment::Image {
+            src: src.into(),
+            width: 0,
+            height: 0,
+        }
+    }
+
+    #[test]
+    fn focused_image_url_tracks_reply_selection() {
+        let mut e = entry("p1");
+        e.attachments = vec![image_attachment("https://x/post.png")];
+        let r0 = reply("r0", "p1"); // no image
+        let mut r1 = reply("r1", "p1");
+        r1.attachments = vec![image_attachment("https://x/reply.png")];
+        let mut s = PostDetailScreen::new(e);
+        s.apply_replies_initial(Ok((vec![r0, r1], None)));
+
+        // No selection → the post's image.
+        assert_eq!(s.focused_image_url().as_deref(), Some("https://x/post.png"));
+        // A selected reply WITHOUT an image falls back to the post's image.
+        s.selected_reply = Some(0);
+        assert_eq!(s.focused_image_url().as_deref(), Some("https://x/post.png"));
+        // A selected reply WITH an image focuses that image.
+        s.selected_reply = Some(1);
+        assert_eq!(
+            s.focused_image_url().as_deref(),
+            Some("https://x/reply.png")
+        );
+    }
+
+    #[test]
+    fn reply_body_surfaces_image_url_as_clickable_text() {
+        let mut s = PostDetailScreen::new(entry("p1"));
+        let mut r = reply("r1", "p1");
+        r.content = "look ![a cat](https://x/cat.png)".into();
+        s.apply_replies_initial(Ok((vec![r], None)));
+        let body = body_text(&s).join("\n");
+        assert!(body.contains("[image: a cat]"), "alt tag shown: {body:?}");
+        assert!(
+            body.contains("https://x/cat.png"),
+            "reply image url surfaced as text: {body:?}"
+        );
+    }
+
+    #[test]
+    fn post_body_hides_image_url_since_it_is_drawn_as_graphics() {
+        let mut e = entry("p1");
+        e.content = "hero ![a cat](https://x/cat.png)".into();
+        let body = body_text(&PostDetailScreen::new(e)).join("\n");
+        assert!(body.contains("[image: a cat]"), "alt tag shown: {body:?}");
+        assert!(
+            !body.contains("https://x/cat.png"),
+            "post image url hidden (the image is drawn): {body:?}"
+        );
+    }
+
+    #[test]
+    fn pending_image_url_tracks_latest_focus_so_stale_fetches_are_ignored() {
+        // The ImageFetched race guard displays a fetched image only when its URL
+        // still matches pending_url(). This verifies pending_url() reflects the
+        // LATEST focus, so a late-arriving fetch for a superseded URL won't match.
+        let s = PostDetailScreen::new(entry("p1"));
+        assert_eq!(s.pending_url(), None, "nothing awaited initially");
+        s.set_pending_image("https://x/a.png".into());
+        assert_eq!(s.pending_url().as_deref(), Some("https://x/a.png"));
+        // Focus moves on (e.g. user selects another reply) before A's fetch lands.
+        s.set_pending_image("https://x/b.png".into());
+        assert_eq!(s.pending_url().as_deref(), Some("https://x/b.png"));
+        assert_ne!(
+            s.pending_url().as_deref(),
+            Some("https://x/a.png"),
+            "a stale fetch for A no longer matches the awaited URL"
+        );
+        s.clear_image();
+        assert_eq!(s.pending_url(), None, "clear drops the awaited URL");
+    }
+
+    #[test]
+    fn image_bytes_cache_round_trips_and_misses_unknown_urls() {
+        // Backs the reconcile cache-hit path: re-focusing a reply re-decodes from
+        // memory instead of re-fetching.
+        let s = PostDetailScreen::new(entry("p1"));
+        assert!(s.cached_image_bytes("https://x/a.png").is_none());
+        s.cache_image_bytes("https://x/a.png".into(), vec![1, 2, 3]);
+        assert_eq!(
+            s.cached_image_bytes("https://x/a.png").as_deref(),
+            Some(&[1u8, 2, 3][..])
+        );
+        assert!(
+            s.cached_image_bytes("https://x/other.png").is_none(),
+            "unknown url misses the cache"
+        );
     }
 
     #[test]
