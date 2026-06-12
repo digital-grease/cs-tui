@@ -3,7 +3,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use cs_api::{Entry, Follow, Reply, User};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, ListItem, Paragraph};
 use ratatui::Frame;
 use time::OffsetDateTime;
 
@@ -457,8 +457,13 @@ impl ProfileScreen {
                 theme.accent_style(),
             )));
         }
-        let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-        frame.render_widget(para, area);
+        super::hyperlink::render_linked_paragraph(
+            frame,
+            area,
+            lines,
+            0,
+            crate::config::get().hyperlinks,
+        );
     }
 
     fn render_posts(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
@@ -684,6 +689,31 @@ mod tests {
                 pin: true,
             }
         );
+    }
+
+    #[test]
+    fn render_makes_the_website_url_clickable() {
+        let mut s = ProfileScreen::new_own();
+        let mut u = user("me");
+        u.website_url = Some("https://example.com".into());
+        s.apply_user(Ok(u));
+        s.tab = ProfileTab::Info;
+
+        let backend = ratatui::backend::TestBackend::new(60, 20);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| s.render(f, f.area(), &Theme::cyber()))
+            .expect("draw");
+
+        let buf = terminal.backend().buffer();
+        let linked = (0..buf.area.height).any(|y| {
+            (0..buf.area.width).any(|x| {
+                buf[(x, y)]
+                    .symbol()
+                    .contains("\u{1b}]8;;https://example.com\u{1b}\\")
+            })
+        });
+        assert!(linked, "the profile website URL is an OSC 8 hyperlink");
     }
 
     #[test]

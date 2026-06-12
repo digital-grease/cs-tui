@@ -3,7 +3,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use cs_api::{Note, NoteRevision};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 use time::OffsetDateTime;
 
@@ -326,7 +326,13 @@ impl JournalScreen {
         for md_line in render_markdown(&n.content, theme) {
             lines.push(md_line);
         }
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        super::hyperlink::render_linked_paragraph(
+            frame,
+            area,
+            lines,
+            0,
+            crate::config::get().hyperlinks,
+        );
     }
 
     fn render_revisions_detail(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
@@ -392,7 +398,13 @@ impl JournalScreen {
             for md_line in render_markdown(&rev.content, theme) {
                 lines.push(md_line);
             }
-            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), split[1]);
+            super::hyperlink::render_linked_paragraph(
+                frame,
+                split[1],
+                lines,
+                0,
+                crate::config::get().hyperlinks,
+            );
         }
     }
 }
@@ -492,6 +504,34 @@ mod tests {
         assert_eq!(
             s.handle_key(key(KeyCode::Char('c'))),
             JournalIntent::Compose
+        );
+    }
+
+    #[test]
+    fn render_makes_a_note_link_clickable() {
+        let mut s = JournalScreen::new();
+        s.apply_initial(Ok((
+            vec![note("n1", "see [site](https://x.example/page)")],
+            None,
+        )));
+
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| s.render(f, f.area(), &Theme::cyber()))
+            .expect("draw");
+
+        let buf = terminal.backend().buffer();
+        let linked = (0..buf.area.height).any(|y| {
+            (0..buf.area.width).any(|x| {
+                buf[(x, y)]
+                    .symbol()
+                    .contains("\u{1b}]8;;https://x.example/page\u{1b}\\")
+            })
+        });
+        assert!(
+            linked,
+            "a markdown link in a journal note is an OSC 8 hyperlink"
         );
     }
 

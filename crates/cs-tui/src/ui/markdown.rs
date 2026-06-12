@@ -31,20 +31,10 @@ pub enum ImageUrls {
     Hide,
 }
 
-/// A surfaced link/image URL and where it landed: `line` is its index into the
-/// returned lines, `col` the column the bare URL text starts at (past any
-/// blockquote prefix and the indent). A scrolling renderer uses these to overlay
-/// an OSC 8 hyperlink onto exactly the URL glyphs — see [`super::hyperlink`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LinkRef {
-    pub line: usize,
-    pub col: u16,
-    pub url: String,
-}
-
 /// Render markdown source into a vector of styled ratatui lines. Image URLs are
 /// surfaced as plain text (see [`ImageUrls`]); use [`render_markdown_with`] to
-/// suppress them where the image is drawn as graphics.
+/// suppress them where the image is drawn as graphics. URLs in the result are
+/// made clickable by the rendering screen via [`super::hyperlink`].
 pub fn render_markdown(input: &str, theme: &Theme) -> Vec<Line<'static>> {
     render_markdown_with(input, theme, ImageUrls::Show)
 }
@@ -55,19 +45,7 @@ pub fn render_markdown_with(
     theme: &Theme,
     image_urls: ImageUrls,
 ) -> Vec<Line<'static>> {
-    render_markdown_collect(input, theme, image_urls).0
-}
-
-/// Render markdown and also report every surfaced link/image URL (see
-/// [`LinkRef`]) so a scrolling renderer can make those rows clickable via OSC 8.
-/// Callers that don't need the links use [`render_markdown_with`].
-pub fn render_markdown_collect(
-    input: &str,
-    theme: &Theme,
-    image_urls: ImageUrls,
-) -> (Vec<Line<'static>>, Vec<LinkRef>) {
     let mut out: Vec<Line<'static>> = Vec::new();
-    let mut links: Vec<LinkRef> = Vec::new();
     let mut current_line: Vec<Span<'static>> = Vec::new();
     let mut style_stack: Vec<Style> = vec![theme.base()];
     let mut list_depth: u32 = 0;
@@ -105,14 +83,7 @@ pub fn render_markdown_collect(
                 // inline in the body itself.
                 if let Some(url) = image_url.take() {
                     if image_urls == ImageUrls::Show && !url.trim().is_empty() {
-                        surface_url(
-                            &url,
-                            &mut current_line,
-                            &mut out,
-                            blockquote_depth,
-                            theme,
-                            &mut links,
-                        );
+                        surface_url(&url, &mut current_line, &mut out, blockquote_depth, theme);
                     }
                 }
             }
@@ -130,14 +101,7 @@ pub fn render_markdown_collect(
                 if let Some(url) = link_url.take() {
                     let text = std::mem::take(&mut link_text);
                     if !url.trim().is_empty() && !link_suffix_redundant(&text, &url) {
-                        surface_url(
-                            &url,
-                            &mut current_line,
-                            &mut out,
-                            blockquote_depth,
-                            theme,
-                            &mut links,
-                        );
+                        surface_url(&url, &mut current_line, &mut out, blockquote_depth, theme);
                     }
                 }
             }
@@ -205,7 +169,7 @@ pub fn render_markdown_collect(
         }
     }
     flush(&mut current_line, &mut out, blockquote_depth, theme);
-    (out, links)
+    out
 }
 
 /// A single-line plain-text preview of post content for list views: markdown is
@@ -290,40 +254,26 @@ fn handle_start(
     }
 }
 
-/// Width of the indent `surface_url` puts before the bare URL.
-const URL_INDENT: u16 = 2;
-
 /// Surface a link/image's destination `url` on its own line. Flushes whatever
 /// text precedes it (the link text or `[image]` placeholder) as a finished line,
 /// then emits the bare URL — indented, in the accent colour rather than muted —
 /// alone on the next line. On its own line the URL can't be wrapped mid-string
 /// across two rows, so the terminal's URL detector links the whole thing (a
-/// wrapped URL is unclickable in every terminal); a scrolling renderer can also
-/// overlay a proper OSC 8 hyperlink onto it from the recorded [`LinkRef`].
+/// wrapped URL is unclickable in every terminal); the rendering screen also
+/// overlays a proper OSC 8 hyperlink onto it via [`super::hyperlink`].
 fn surface_url(
     url: &str,
     line: &mut Vec<Span<'static>>,
     out: &mut Vec<Line<'static>>,
     blockquote_depth: u32,
     theme: &Theme,
-    links: &mut Vec<LinkRef>,
 ) {
     flush(line, out, blockquote_depth, theme);
     let mut url_line = vec![Span::styled(
-        format!("{}{}", " ".repeat(URL_INDENT as usize), url.trim()),
+        format!("  {}", url.trim()),
         Style::default().fg(theme.accent),
     )];
     flush(&mut url_line, out, blockquote_depth, theme);
-    // The URL is now the last line in `out`. `flush` prepended a `│ ` (2-col)
-    // blockquote bar per depth, then our indent — so the URL glyphs start there.
-    let col = (blockquote_depth as u16)
-        .saturating_mul(2)
-        .saturating_add(URL_INDENT);
-    links.push(LinkRef {
-        line: out.len().saturating_sub(1),
-        col,
-        url: url.trim().to_string(),
-    });
 }
 
 /// Whether the link's visible `text` already conveys the `url`, so surfacing the
@@ -587,48 +537,6 @@ mod tests {
             !text.contains("https://x/cat.png"),
             "url not inlined: {text:?}"
         );
-    }
-
-    #[test]
-    fn collect_reports_surfaced_link_url_position() {
-        let (lines, links) = render_markdown_collect(
-            "see [the site](https://x.example/page)",
-            &Theme::dark(),
-            ImageUrls::Show,
-        );
-        assert_eq!(links.len(), 1, "one link recorded: {links:?}");
-        let lr = &links[0];
-        assert_eq!(lr.url, "https://x.example/page");
-        assert_eq!(lr.col, 2, "URL starts past the 2-space indent");
-        // The recorded line index points at the bare-URL line.
-        let line_text: String = lines[lr.line]
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
-        assert_eq!(line_text.trim(), "https://x.example/page");
-        // The recorded column is exactly where the URL glyphs begin on that line.
-        assert_eq!(&line_text[lr.col as usize..], "https://x.example/page");
-    }
-
-    #[test]
-    fn collect_reports_no_links_for_plain_text() {
-        let (_lines, links) =
-            render_markdown_collect("just words, no links", &Theme::dark(), ImageUrls::Show);
-        assert!(links.is_empty(), "no links recorded: {links:?}");
-    }
-
-    #[test]
-    fn collect_records_image_url_position_when_shown() {
-        // Graphics-off contexts surface the image URL as text; it gets a LinkRef
-        // too, so the row can be made clickable.
-        let (_lines, links) = render_markdown_collect(
-            "![a cat](https://x/cat.png)",
-            &Theme::dark(),
-            ImageUrls::Show,
-        );
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0].url, "https://x/cat.png");
     }
 
     #[test]
