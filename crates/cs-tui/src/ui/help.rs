@@ -69,7 +69,7 @@ const GLOBAL: &[Row] = &[
     },
     Row {
         keys: "mouse",
-        desc: "drag to select/copy · click opens links (run --mouse for wheel scroll)",
+        desc: "drag to select/copy · ctrl/⌘-click opens links (run --mouse for wheel scroll)",
     },
     Row {
         keys: "i",

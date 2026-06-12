@@ -255,7 +255,8 @@ const TEMPLATE: &str = r##"# cs-tui configuration. Edit and restart cs-tui.
 # ── Input / connection ───────────────────────────────────────────────────────
 
 # Capture the scroll wheel for in-app scrolling. Off keeps native terminal mouse
-# behavior (drag to select/copy, click to open links). --mouse forces this on.
+# behavior (drag to select/copy, ctrl/cmd-click to open links). --mouse forces
+# this on.
 #mouse = false
 
 # Render inline images on graphics-capable terminals. --no-images forces off.

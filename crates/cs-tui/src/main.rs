@@ -32,7 +32,7 @@ struct Cli {
 
     /// Capture the scroll wheel for in-app scrolling. OFF by default so the
     /// terminal keeps native mouse behavior — drag to select/copy text and
-    /// click to open links. With `--mouse`, the wheel scrolls but text
+    /// ctrl/cmd-click to open links. With `--mouse`, the wheel scrolls but text
     /// selection then needs Shift+drag.
     #[arg(long)]
     mouse: bool,
@@ -135,10 +135,10 @@ async fn main() -> Result<()> {
         app.enter_feed_initial();
     }
     // By default we do NOT grab the mouse, so the terminal keeps native
-    // selection (drag to copy) and link handling (click to open). `--mouse` or
-    // config `mouse = true` opts into button + SGR scroll-wheel reporting (no
-    // motion tracking, so the wheel is one event per notch); text selection then
-    // needs Shift+drag.
+    // selection (drag to copy) and link handling (ctrl/cmd-click to open OSC 8
+    // links). `--mouse` or config `mouse = true` opts into button + SGR
+    // scroll-wheel reporting (no motion tracking, so the wheel is one event per
+    // notch); text selection then needs Shift+drag.
     let capture_mouse = cli.mouse || cfg.mouse.unwrap_or(false);
     if capture_mouse {
         set_mouse_scroll_reporting(true);
