@@ -1,20 +1,41 @@
 //! Post detail screen — entry header + content + scrollable replies (oldest first).
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use cs_api::{Entry, Reply};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
-use ratatui_image::protocol::StatefulProtocol;
-use ratatui_image::StatefulImage;
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::Protocol;
+use ratatui_image::{Image, Resize};
 
 use super::images::{entry_image_urls, reply_image_urls};
-use super::markdown::{render_markdown, render_markdown_with, ImageUrls};
+use super::markdown::{render_markdown_collect, ImageUrls};
 use super::theme::Theme;
+
+/// An inline image reserved in the post-detail body: its source URL and the
+/// logical line index where its blank-row gap begins. `render` overlays the
+/// graphic onto the gap, clipped (not resized) against the viewport edges so it
+/// scrolls like the rest of the body.
+struct ImageSlot {
+    url: String,
+    start_line: usize,
+}
+
+/// A surfaced link/image URL reserved in the post-detail body: its target `url`,
+/// the logical `start_line` carrying the bare URL text, and the `col` that text
+/// begins at. `render` overlays an OSC 8 hyperlink onto that row so the link is
+/// clickable even when the URL is long enough to wrap, which defeats a terminal's
+/// own URL detection. Recomputed every frame, like [`ImageSlot`].
+struct LinkSlot {
+    url: String,
+    start_line: usize,
+    col: u16,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PostDetailIntent {
@@ -69,20 +90,26 @@ pub struct PostDetailScreen {
     reply_anchors: RefCell<Vec<u16>>,
     /// Two-step delete: first `d` arms confirmation; `y` confirms.
     pub confirming_delete: bool,
-    /// The focused image, decoded into a terminal-graphics protocol once fetched
-    /// (only on terminals that support images): the post's first image, or — when
-    /// a reply with its own image is selected — that reply's first image.
-    /// `RefCell` because the stateful image widget mutates while rendering, and
-    /// render takes `&self`.
-    pub image: RefCell<Option<StatefulProtocol>>,
-    /// URL of the image currently in `image` (or the one being fetched for it).
-    /// Lets the fetch result confirm the focus hasn't moved on before it displays,
-    /// and lets selection changes detect when the strip needs a different image.
-    image_url: RefCell<Option<String>>,
-    /// Raw fetched image bytes by URL, so re-selecting a reply (or returning to
-    /// the post) re-decodes from memory instead of re-fetching. Lives and dies
-    /// with the screen, bounding it to one thread's images.
+    /// Fixed-size, render-ready image protocols by URL, paired with the
+    /// (width, height) cell box they were encoded for so a terminal resize forces
+    /// a rebuild. Built lazily from `image_bytes` the first time an image scrolls
+    /// into view, then reused every frame (so scrolling doesn't re-encode). The
+    /// fixed size lets the static `Image` widget clip — rather than resize — the
+    /// image at the viewport edge. Only populated on graphics-capable terminals.
+    protocols: RefCell<HashMap<String, (Protocol, Size)>>,
+    /// Raw fetched image bytes by URL. Filled by the background fetch event;
+    /// decoded into `protocols` on demand. Lives and dies with the screen.
     image_bytes: RefCell<HashMap<String, Vec<u8>>>,
+    /// Image URLs already requested from the network, so the fetch driver doesn't
+    /// re-spawn a fetch for one already in flight or cached.
+    requested: RefCell<HashSet<String>>,
+    /// Inline image placeholders recorded by `compose_body` (URL + the logical
+    /// line where its reserved blank-row gap starts), consumed by `render` to
+    /// overlay each image onto its gap. Recomputed every frame.
+    image_slots: RefCell<Vec<ImageSlot>>,
+    /// Surfaced link/image URLs recorded by `compose_body`, consumed by `render`
+    /// to overlay an OSC 8 hyperlink onto each URL row. Recomputed every frame.
+    link_slots: RefCell<Vec<LinkSlot>>,
 }
 
 impl PostDetailScreen {
@@ -100,61 +127,54 @@ impl PostDetailScreen {
             reply_starts: RefCell::new(Vec::new()),
             reply_anchors: RefCell::new(Vec::new()),
             confirming_delete: false,
-            image: RefCell::new(None),
-            image_url: RefCell::new(None),
+            protocols: RefCell::new(HashMap::new()),
             image_bytes: RefCell::new(HashMap::new()),
+            requested: RefCell::new(HashSet::new()),
+            image_slots: RefCell::new(Vec::new()),
+            link_slots: RefCell::new(Vec::new()),
         }
     }
 
-    /// Display a decoded image protocol for `url` in the top strip. Called on the
-    /// UI thread after the image bytes are fetched and decoded.
-    pub fn set_image(&self, url: String, protocol: StatefulProtocol) {
-        *self.image_url.borrow_mut() = Some(url);
-        *self.image.borrow_mut() = Some(protocol);
-    }
-
-    /// Mark `url` as the image we want shown, clearing any stale graphic so the
-    /// strip blanks until the fetch/decode completes.
-    pub fn set_pending_image(&self, url: String) {
-        *self.image_url.borrow_mut() = Some(url);
-        *self.image.borrow_mut() = None;
-    }
-
-    /// Drop the focused image entirely (the focus has no image).
-    pub fn clear_image(&self) {
-        *self.image_url.borrow_mut() = None;
-        *self.image.borrow_mut() = None;
-    }
-
-    /// The URL currently displayed or awaited in the image strip.
-    pub fn pending_url(&self) -> Option<String> {
-        self.image_url.borrow().clone()
-    }
-
-    /// Remember fetched bytes for `url` so a later re-focus skips the network.
+    /// Remember fetched bytes for `url`. Drops any stale decoded protocol so the
+    /// next render rebuilds it from the fresh bytes.
     pub fn cache_image_bytes(&self, url: String, bytes: Vec<u8>) {
+        self.protocols.borrow_mut().remove(&url);
         self.image_bytes.borrow_mut().insert(url, bytes);
     }
 
-    /// Previously-fetched bytes for `url`, if any (cloned for decoding).
-    pub fn cached_image_bytes(&self, url: &str) -> Option<Vec<u8>> {
-        self.image_bytes.borrow().get(url).cloned()
+    /// Whether `url`'s bytes are already cached (so no fetch is needed).
+    pub fn has_image_bytes(&self, url: &str) -> bool {
+        self.image_bytes.borrow().contains_key(url)
     }
 
-    /// The image that should occupy the top strip: the selected reply's first
-    /// image when it has one, otherwise the post's first image (or, for a jukebox
-    /// post, its cover art). Mirrors how `o`/`p` target the selected reply before
-    /// falling back to the post.
-    pub fn focused_image_url(&self) -> Option<String> {
-        if let Some(reply) = self.selected_reply.and_then(|i| self.replies.get(i)) {
-            if let Some(url) = reply_image_urls(reply).into_iter().next() {
-                return Some(url);
-            }
-        }
+    /// Record that `url` has been requested from the network; returns `true` only
+    /// the first time, so the caller spawns exactly one fetch per URL.
+    pub fn mark_requested(&self, url: String) -> bool {
+        self.requested.borrow_mut().insert(url)
+    }
+
+    /// The post's own inline image: its first markdown/attachment image, or — for
+    /// a jukebox post that carries no image — the track's cover-art thumbnail.
+    fn post_image_url(&self) -> Option<String> {
         entry_image_urls(&self.entry)
             .into_iter()
             .next()
             .or_else(|| super::audio::entry_cover_art_url(&self.entry))
+    }
+
+    /// Every image URL the post detail can show — the post's, then each reply's
+    /// first image — in body order. Drives the fetch loop in `App`.
+    pub fn all_image_urls(&self) -> Vec<String> {
+        let mut urls = Vec::new();
+        if let Some(u) = self.post_image_url() {
+            urls.push(u);
+        }
+        for reply in &self.replies {
+            if let Some(u) = reply_image_urls(reply).into_iter().next() {
+                urls.push(u);
+            }
+        }
+        urls
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> PostDetailIntent {
@@ -321,7 +341,14 @@ impl PostDetailScreen {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme, images_on: bool) {
+    pub fn render(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        theme: &Theme,
+        images_on: bool,
+        picker: Option<&Picker>,
+    ) {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(theme.border_style())
@@ -339,48 +366,76 @@ impl PostDetailScreen {
         let body_area = layout[0];
         let status_area = layout[1];
 
-        let lines = self.compose_body(theme);
-
-        // When an image is loaded AND images are on, reserve a strip at the top
-        // of the body for it and flow the text below. Terminals without graphics
-        // never build a protocol, and the `i` toggle (`images_on`) forces
-        // text-only too; either way the body uses the full area.
-        let mut img = self.image.borrow_mut();
-        let has_image = images_on && img.is_some() && body_area.height > 4;
-        let img_h = if has_image {
-            (body_area.height / 2).clamp(1, crate::config::get().image_height)
+        // Images are drawn inline in the body flow, each into a reserved blank-row
+        // gap, on graphics-capable terminals with images enabled and enough room.
+        // Otherwise the body is plain text and `compose_body` surfaces the image
+        // URL instead. Each gap is capped at half the pane so text stays visible.
+        let inline_images = images_on && picker.is_some() && body_area.height > 4;
+        let img_rows: u16 = if inline_images {
+            crate::config::get()
+                .image_height
+                .min(body_area.height / 2)
+                .max(1)
         } else {
             0
         };
-        let text_area = Rect::new(
-            body_area.x,
-            body_area.y + img_h,
-            body_area.width,
-            body_area.height - img_h,
-        );
+
+        // OSC 8 hyperlinks make surfaced URLs clickable even when long enough to
+        // wrap (which defeats the terminal's own URL detection); off falls back to
+        // the bare URL text. Independent of graphics support.
+        let hyperlinks_on = crate::config::get().hyperlinks;
+        let lines = self.compose_body(theme, inline_images, img_rows, hyperlinks_on);
+
+        // The whole body is the text area; images overlay the blank gaps within it.
+        let text_area = body_area;
 
         // Bound the scroll to the wrapped content height so the body can't be
         // scrolled off into empty space. Count wrapped rows per logical line
         // (ceil(line width / columns)); close enough to ratatui's word wrap to
         // keep `j`/`G` from running past the end.
         let cols = u32::from(text_area.width).max(1);
-        // Single pass: total wrapped rows (for max_scroll) and, at each reply's
-        // start line, the wrapped-row offset (so `J`/`K` can scroll it into view).
+        // Single pass: total wrapped rows (for max_scroll), each reply's start
+        // offset (so `J`/`K` can scroll it into view), and each image gap's start
+        // offset (so it can be overlaid at the right screen row).
         let reply_starts = self.reply_starts.borrow();
+        let slots = self.image_slots.borrow();
+        let link_slots = self.link_slots.borrow();
         let mut anchors: Vec<u16> = Vec::with_capacity(reply_starts.len());
+        let mut slot_offsets: Vec<u32> = Vec::with_capacity(slots.len());
+        // Wrapped-row offset of each link slot's URL row (its first row, where the
+        // URL glyphs begin), so the overlay lands on the right screen row.
+        let mut link_offsets: Vec<u32> = Vec::with_capacity(link_slots.len());
         let mut acc: u32 = 0;
         let mut si = 0;
+        let mut sj = 0;
+        let mut sk = 0;
         let row_count = |w: u32| if w <= cols { 1 } else { w.div_ceil(cols) + 1 };
         for (idx, l) in lines.iter().enumerate() {
             while si < reply_starts.len() && reply_starts[si] == idx {
                 anchors.push(acc.min(u32::from(u16::MAX)) as u16);
                 si += 1;
             }
+            while sj < slots.len() && slots[sj].start_line == idx {
+                slot_offsets.push(acc);
+                sj += 1;
+            }
+            while sk < link_slots.len() && link_slots[sk].start_line == idx {
+                link_offsets.push(acc);
+                sk += 1;
+            }
             acc += row_count(l.width() as u32);
         }
         while si < reply_starts.len() {
             anchors.push(acc.min(u32::from(u16::MAX)) as u16);
             si += 1;
+        }
+        while sj < slots.len() {
+            slot_offsets.push(acc);
+            sj += 1;
+        }
+        while sk < link_slots.len() {
+            link_offsets.push(acc);
+            sk += 1;
         }
         drop(reply_starts);
         *self.reply_anchors.borrow_mut() = anchors;
@@ -394,18 +449,92 @@ impl PostDetailScreen {
         let para = Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0));
+        frame.render_widget(para, text_area);
 
-        if has_image {
-            if let Some(proto) = img.as_mut() {
-                let img_area = Rect::new(body_area.x, body_area.y, body_area.width, img_h);
-                frame.render_stateful_widget(
-                    StatefulImage::<StatefulProtocol>::new(),
-                    img_area,
-                    proto,
+        // Overlay each inline image onto its reserved gap. The protocol is encoded
+        // once at the full gap size, so the image is always drawn full-size; when
+        // only part of its gap is on screen the static `Image` widget *clips* it
+        // (not resizes it) against the viewport's bottom edge, so it scrolls in
+        // smoothly like the surrounding text. Decode/encode lazily — the first
+        // time an image scrolls into view — and rebuild only if the layout (and so
+        // the target size) changed.
+        if let Some(picker) = picker.filter(|_| inline_images) {
+            let target = Size::new(text_area.width, img_rows);
+            let mut protocols = self.protocols.borrow_mut();
+            let bytes = self.image_bytes.borrow();
+            for (slot, &offset) in slots.iter().zip(slot_offsets.iter()) {
+                let rel = offset as i64 - i64::from(scroll);
+                // Skip if the gap top is above the viewport or at/below its bottom.
+                if rel < 0 || rel >= i64::from(text_area.height) {
+                    continue;
+                }
+                let rel = rel as u16;
+                let visible_rows = img_rows.min(text_area.height - rel);
+                let stale = match protocols.get(&slot.url) {
+                    Some((_, built)) => *built != target,
+                    None => true,
+                };
+                if stale {
+                    let Some(raw) = bytes.get(&slot.url) else {
+                        continue;
+                    };
+                    let proto = image::load_from_memory(raw)
+                        .map_err(|e| e.to_string())
+                        .and_then(|img| {
+                            picker
+                                .new_protocol(img, target, Resize::Fit(None))
+                                .map_err(|e| e.to_string())
+                        });
+                    match proto {
+                        Ok(proto) => {
+                            protocols.insert(slot.url.clone(), (proto, target));
+                        }
+                        Err(e) => {
+                            tracing::debug!(error = %e, url = %slot.url, "image encode failed");
+                            continue;
+                        }
+                    }
+                }
+                if let Some((proto, _)) = protocols.get(&slot.url) {
+                    let img_area = Rect::new(
+                        text_area.x,
+                        text_area.y + rel,
+                        text_area.width,
+                        visible_rows,
+                    );
+                    frame.render_widget(Image::new(proto).allow_clipping(true), img_area);
+                }
+            }
+        }
+        drop(slots);
+
+        // Overlay an OSC 8 hyperlink onto each surfaced URL row that's in view.
+        // The paragraph already painted the bare URL glyphs; `linkify_run` wraps
+        // exactly those cells so the URL is clickable, including when it's long
+        // enough to wrap (the link covers the first row's glyphs, with the full
+        // URL as the target). Independent of graphics — works on any terminal.
+        if hyperlinks_on {
+            let buf = frame.buffer_mut();
+            for (slot, &offset) in link_slots.iter().zip(link_offsets.iter()) {
+                let rel = offset as i64 - i64::from(scroll);
+                if rel < 0 || rel >= i64::from(text_area.height) {
+                    continue;
+                }
+                if slot.col >= text_area.width {
+                    continue;
+                }
+                let x = text_area.x + slot.col;
+                let max_cols = text_area.width - slot.col;
+                super::hyperlink::linkify_run(
+                    buf,
+                    x,
+                    text_area.y + rel as u16,
+                    &slot.url,
+                    max_cols,
                 );
             }
         }
-        frame.render_widget(para, text_area);
+        drop(link_slots);
 
         // Surface the jukebox keys only when there's a track to act on.
         let open_hint = if self.jukebox_url().is_some() {
@@ -434,8 +563,40 @@ impl PostDetailScreen {
         frame.render_widget(status, status_area);
     }
 
-    fn compose_body(&self, theme: &Theme) -> Vec<Line<'_>> {
+    /// Build the scrollable body. When `inline_images` is set, image URLs are
+    /// suppressed (the image is drawn as graphics) and a blank-row gap of
+    /// `img_rows` is reserved at each image's position for `render` to overlay;
+    /// otherwise image URLs are surfaced as text and no gaps are reserved. When
+    /// `hyperlinks` is set, each surfaced URL is recorded as a [`LinkSlot`] so
+    /// `render` can overlay an OSC 8 hyperlink onto its row.
+    fn compose_body(
+        &self,
+        theme: &Theme,
+        inline_images: bool,
+        img_rows: u16,
+        hyperlinks: bool,
+    ) -> Vec<Line<'_>> {
         let mut lines = Vec::new();
+        let mut slots: Vec<ImageSlot> = Vec::new();
+        let mut link_slots: Vec<LinkSlot> = Vec::new();
+        let image_urls = if inline_images {
+            ImageUrls::Hide
+        } else {
+            ImageUrls::Show
+        };
+        // Fold a markdown block's links (positions relative to that block) into
+        // absolute `LinkSlot`s anchored at `base`, the block's first line index.
+        let mut push_links = |base: usize, refs: Vec<super::markdown::LinkRef>| {
+            if hyperlinks {
+                for r in refs {
+                    link_slots.push(LinkSlot {
+                        url: r.url,
+                        start_line: base + r.line,
+                        col: r.col,
+                    });
+                }
+            }
+        };
 
         // Header
         let when = self
@@ -478,10 +639,26 @@ impl PostDetailScreen {
         lines.push(Line::from(""));
 
         // Body — rendered with pulldown-cmark (markdown + @mention highlighting).
-        // The post's image is drawn as graphics in the top strip, so its URL is
-        // hidden here (links still surface their URL).
-        for md_line in render_markdown_with(&self.entry.content, theme, ImageUrls::Hide) {
-            lines.push(md_line);
+        // When images are drawn inline, the image URL is hidden here (the graphic
+        // appears in the reserved gap below); otherwise it's surfaced as text.
+        // Links always surface their URL.
+        let base = lines.len();
+        let (md_lines, md_links) = render_markdown_collect(&self.entry.content, theme, image_urls);
+        lines.extend(md_lines);
+        push_links(base, md_links);
+
+        // The post's own image (or, for a jukebox post, its cover art) drawn
+        // inline right after the body it belongs to.
+        if inline_images {
+            if let Some(url) = self.post_image_url() {
+                slots.push(ImageSlot {
+                    url,
+                    start_line: lines.len(),
+                });
+                for _ in 0..img_rows {
+                    lines.push(Line::from(""));
+                }
+            }
         }
 
         // Jukebox (audio) attachment — usually a YouTube link. We can't stream it
@@ -537,7 +714,9 @@ impl PostDetailScreen {
                 Span::styled(format!(" · {when}{parent}"), theme.muted_style()),
             ]));
             // Reply body — markdown-rendered. Highlight overrides via the loop below.
-            for md_line in render_markdown(&reply.content, theme) {
+            let base = lines.len();
+            let (md_lines, md_links) = render_markdown_collect(&reply.content, theme, image_urls);
+            for md_line in md_lines {
                 if highlight {
                     let restyled: Vec<Span<'_>> = md_line
                         .spans
@@ -547,6 +726,19 @@ impl PostDetailScreen {
                     lines.push(Line::from(restyled));
                 } else {
                     lines.push(md_line);
+                }
+            }
+            push_links(base, md_links);
+            // The reply's own image, drawn inline right after its text.
+            if inline_images {
+                if let Some(url) = reply_image_urls(reply).into_iter().next() {
+                    slots.push(ImageSlot {
+                        url,
+                        start_line: lines.len(),
+                    });
+                    for _ in 0..img_rows {
+                        lines.push(Line::from(""));
+                    }
                 }
             }
             // A jukebox link on the reply gets the same treatment as the post body.
@@ -564,6 +756,8 @@ impl PostDetailScreen {
         }
 
         *self.reply_starts.borrow_mut() = reply_starts;
+        *self.image_slots.borrow_mut() = slots;
+        *self.link_slots.borrow_mut() = link_slots;
         lines
     }
 }
@@ -649,9 +843,13 @@ mod tests {
         assert_eq!(s.selected_reply, None);
     }
 
-    fn body_text(s: &PostDetailScreen) -> Vec<String> {
+    /// Flatten the body into per-line strings. `inline_images` mirrors the render
+    /// path: when set, image URLs are suppressed (the graphic is drawn in a gap);
+    /// when clear, image URLs are surfaced as text.
+    fn body_text_mode(s: &PostDetailScreen, inline_images: bool) -> Vec<String> {
         let theme = Theme::cyber();
-        s.compose_body(&theme)
+        let img_rows = if inline_images { 6 } else { 0 };
+        s.compose_body(&theme, inline_images, img_rows, false)
             .iter()
             .map(|l| {
                 l.spans
@@ -660,6 +858,12 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    /// Text-mode body (no inline graphics) — the common case for the assertions
+    /// here that only inspect text.
+    fn body_text(s: &PostDetailScreen) -> Vec<String> {
+        body_text_mode(s, false)
     }
 
     fn image_attachment(src: &str) -> cs_api::Attachment {
@@ -671,7 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_image_url_tracks_reply_selection() {
+    fn all_image_urls_lists_post_then_each_replys_first_image() {
         let mut e = entry("p1");
         e.attachments = vec![image_attachment("https://x/post.png")];
         let r0 = reply("r0", "p1"); // no image
@@ -680,38 +884,55 @@ mod tests {
         let mut s = PostDetailScreen::new(e);
         s.apply_replies_initial(Ok((vec![r0, r1], None)));
 
-        // No selection → the post's image.
-        assert_eq!(s.focused_image_url().as_deref(), Some("https://x/post.png"));
-        // A selected reply WITHOUT an image falls back to the post's image.
-        s.selected_reply = Some(0);
-        assert_eq!(s.focused_image_url().as_deref(), Some("https://x/post.png"));
-        // A selected reply WITH an image focuses that image.
-        s.selected_reply = Some(1);
+        // Post image first, then each reply that has one — in body order. The
+        // image-less reply contributes nothing.
         assert_eq!(
-            s.focused_image_url().as_deref(),
-            Some("https://x/reply.png")
+            s.all_image_urls(),
+            vec!["https://x/post.png", "https://x/reply.png"]
         );
     }
 
     #[test]
-    fn reply_body_surfaces_image_url_as_clickable_text() {
+    fn reply_image_renders_inline_so_its_url_is_hidden() {
+        // With graphics on, the reply's image is drawn in a reserved gap, so its
+        // URL is suppressed; a blank-row gap is reserved for the overlay.
         let mut s = PostDetailScreen::new(entry("p1"));
         let mut r = reply("r1", "p1");
         r.content = "look ![a cat](https://x/cat.png)".into();
         s.apply_replies_initial(Ok((vec![r], None)));
-        let body = body_text(&s).join("\n");
+        let body = body_text_mode(&s, true).join("\n");
         assert!(body.contains("[image: a cat]"), "alt tag shown: {body:?}");
         assert!(
-            body.contains("https://x/cat.png"),
-            "reply image url surfaced as text: {body:?}"
+            !body.contains("https://x/cat.png"),
+            "image drawn inline, url hidden: {body:?}"
         );
+        // A slot was recorded for the inline image overlay.
+        assert_eq!(s.image_slots.borrow().len(), 1, "one inline image reserved");
     }
 
     #[test]
-    fn post_body_hides_image_url_since_it_is_drawn_as_graphics() {
+    fn reply_image_url_is_surfaced_when_graphics_are_off() {
+        // No graphics (terminal can't, or `i` toggled off): the image isn't drawn,
+        // so its URL is surfaced as text instead and no gap is reserved.
+        let mut s = PostDetailScreen::new(entry("p1"));
+        let mut r = reply("r1", "p1");
+        r.content = "look ![a cat](https://x/cat.png)".into();
+        s.apply_replies_initial(Ok((vec![r], None)));
+        let body = body_text_mode(&s, false).join("\n");
+        assert!(body.contains("[image: a cat]"), "alt tag shown: {body:?}");
+        assert!(
+            body.contains("https://x/cat.png"),
+            "image url surfaced as text: {body:?}"
+        );
+        assert!(s.image_slots.borrow().is_empty(), "no gap reserved");
+    }
+
+    #[test]
+    fn post_image_url_is_hidden_when_drawn_inline() {
         let mut e = entry("p1");
         e.content = "hero ![a cat](https://x/cat.png)".into();
-        let body = body_text(&PostDetailScreen::new(e)).join("\n");
+        let s = PostDetailScreen::new(e);
+        let body = body_text_mode(&s, true).join("\n");
         assert!(body.contains("[image: a cat]"), "alt tag shown: {body:?}");
         assert!(
             !body.contains("https://x/cat.png"),
@@ -720,41 +941,194 @@ mod tests {
     }
 
     #[test]
-    fn pending_image_url_tracks_latest_focus_so_stale_fetches_are_ignored() {
-        // The ImageFetched race guard displays a fetched image only when its URL
-        // still matches pending_url(). This verifies pending_url() reflects the
-        // LATEST focus, so a late-arriving fetch for a superseded URL won't match.
+    fn image_bytes_cache_and_request_dedup() {
         let s = PostDetailScreen::new(entry("p1"));
-        assert_eq!(s.pending_url(), None, "nothing awaited initially");
-        s.set_pending_image("https://x/a.png".into());
-        assert_eq!(s.pending_url().as_deref(), Some("https://x/a.png"));
-        // Focus moves on (e.g. user selects another reply) before A's fetch lands.
-        s.set_pending_image("https://x/b.png".into());
-        assert_eq!(s.pending_url().as_deref(), Some("https://x/b.png"));
-        assert_ne!(
-            s.pending_url().as_deref(),
-            Some("https://x/a.png"),
-            "a stale fetch for A no longer matches the awaited URL"
+        assert!(!s.has_image_bytes("https://x/a.png"));
+        s.cache_image_bytes("https://x/a.png".into(), vec![1, 2, 3]);
+        assert!(s.has_image_bytes("https://x/a.png"));
+        assert!(!s.has_image_bytes("https://x/other.png"));
+
+        // mark_requested returns true only the first time, so exactly one fetch
+        // is spawned per URL.
+        assert!(s.mark_requested("https://x/a.png".into()), "first request");
+        assert!(
+            !s.mark_requested("https://x/a.png".into()),
+            "second request is a no-op"
         );
-        s.clear_image();
-        assert_eq!(s.pending_url(), None, "clear drops the awaited URL");
+    }
+
+    /// A tiny valid PNG so `render`'s lazy decode succeeds.
+    fn tiny_png() -> Vec<u8> {
+        let buf = image::ImageBuffer::from_pixel(2, 2, image::Rgba([10u8, 20, 30, 255]));
+        let mut cur = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(buf)
+            .write_to(&mut cur, image::ImageFormat::Png)
+            .expect("encode png");
+        cur.into_inner()
     }
 
     #[test]
-    fn image_bytes_cache_round_trips_and_misses_unknown_urls() {
-        // Backs the reconcile cache-hit path: re-focusing a reply re-decodes from
-        // memory instead of re-fetching.
-        let s = PostDetailScreen::new(entry("p1"));
-        assert!(s.cached_image_bytes("https://x/a.png").is_none());
-        s.cache_image_bytes("https://x/a.png".into(), vec![1, 2, 3]);
+    fn inline_image_is_decoded_and_overlaid_once_in_view() {
+        let mut s = PostDetailScreen::new(entry("p1"));
+        let mut r = reply("r1", "p1");
+        r.attachments = vec![image_attachment("https://x/cat.png")];
+        s.apply_replies_initial(Ok((vec![r], None)));
+        s.cache_image_bytes("https://x/cat.png".into(), tiny_png());
+
+        let picker = Picker::halfblocks();
+        let backend = ratatui::backend::TestBackend::new(40, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| s.render(f, f.area(), &Theme::cyber(), true, Some(&picker)))
+            .expect("draw");
+
+        // The reply's gap is near the top and fully in view, so render decoded the
+        // cached bytes and cached a ready protocol — the heart of the inline path.
+        assert!(
+            s.protocols.borrow().contains_key("https://x/cat.png"),
+            "inline image decoded and cached for overlay"
+        );
+    }
+
+    #[test]
+    fn inline_image_is_clipped_not_shrunk_when_partly_off_screen() {
+        // A tall image, so its fitted height exceeds the room left at the bottom
+        // of the viewport and it must be clipped rather than resized.
+        let buf = image::ImageBuffer::from_pixel(120, 600, image::Rgba([80u8, 160, 240, 255]));
+        let mut cur = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(buf)
+            .write_to(&mut cur, image::ImageFormat::Png)
+            .expect("encode png");
+        let png = cur.into_inner();
+
+        let mut s = PostDetailScreen::new(entry("p1"));
+        let mut r = reply("r1", "p1");
+        r.content = "photo:".into();
+        r.attachments = vec![image_attachment("https://x/cat.png")];
+        s.apply_replies_initial(Ok((vec![r], None)));
+        s.cache_image_bytes("https://x/cat.png".into(), png);
+        let picker = Picker::halfblocks();
+
+        // The drawn image's (width, height) in cells — image cells are the only
+        // ones with a non-default background (halfblocks paint).
+        let measure = |s: &mut PostDetailScreen, scroll: u16| -> (u16, u16) {
+            s.scroll = scroll;
+            let backend = ratatui::backend::TestBackend::new(40, 20);
+            let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+            terminal
+                .draw(|f| s.render(f, f.area(), &Theme::cyber(), true, Some(&picker)))
+                .expect("draw");
+            let buf = terminal.backend().buffer();
+            let (mut width, mut height) = (0u16, 0u16);
+            for y in 0..buf.area.height {
+                let row_w = (0..buf.area.width)
+                    .filter(|&x| buf[(x, y)].bg != ratatui::style::Color::Reset)
+                    .count() as u16;
+                if row_w > 0 {
+                    height += 1;
+                    width = width.max(row_w);
+                }
+            }
+            (width, height)
+        };
+
+        let (w_clipped, h_clipped) = measure(&mut s, 0); // gap near the viewport bottom
+        let (w_full, h_full) = measure(&mut s, 4); // scrolled so the gap fully fits
+        assert!(w_full > 0 && h_full > 0, "image renders when fully in view");
         assert_eq!(
-            s.cached_image_bytes("https://x/a.png").as_deref(),
-            Some(&[1u8, 2, 3][..])
+            w_clipped, w_full,
+            "width is identical at both scrolls — the image is clipped, not resized"
         );
         assert!(
-            s.cached_image_bytes("https://x/other.png").is_none(),
-            "unknown url misses the cache"
+            h_clipped < h_full,
+            "the partly-off-screen image shows fewer rows (clipped): {h_clipped} vs {h_full}"
         );
+    }
+
+    #[test]
+    fn off_screen_inline_image_is_not_decoded_until_scrolled_into_view() {
+        // Many image-less replies push the only image-bearing reply far down.
+        let mut replies: Vec<Reply> = (0..30).map(|i| reply(&format!("r{i}"), "p1")).collect();
+        let mut last = reply("rlast", "p1");
+        last.attachments = vec![image_attachment("https://x/cat.png")];
+        replies.push(last);
+        let mut s = PostDetailScreen::new(entry("p1"));
+        s.apply_replies_initial(Ok((replies, None)));
+        s.cache_image_bytes("https://x/cat.png".into(), tiny_png());
+        // Scroll stays at 0 — the trailing image is well below the viewport.
+
+        let picker = Picker::halfblocks();
+        let backend = ratatui::backend::TestBackend::new(40, 12);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| s.render(f, f.area(), &Theme::cyber(), true, Some(&picker)))
+            .expect("draw");
+
+        assert!(
+            !s.protocols.borrow().contains_key("https://x/cat.png"),
+            "an off-screen image must not be decoded until it scrolls into view"
+        );
+    }
+
+    #[test]
+    fn images_disabled_reserves_no_gap_and_decodes_nothing() {
+        // With `images_on = false`, the body is plain text: no gap, no decode.
+        let mut s = PostDetailScreen::new(entry("p1"));
+        let mut r = reply("r1", "p1");
+        r.attachments = vec![image_attachment("https://x/cat.png")];
+        s.apply_replies_initial(Ok((vec![r], None)));
+        s.cache_image_bytes("https://x/cat.png".into(), tiny_png());
+
+        let picker = Picker::halfblocks();
+        let backend = ratatui::backend::TestBackend::new(40, 40);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| s.render(f, f.area(), &Theme::cyber(), false, Some(&picker)))
+            .expect("draw");
+
+        assert!(
+            s.image_slots.borrow().is_empty(),
+            "no gap reserved when off"
+        );
+        assert!(
+            s.protocols.borrow().is_empty(),
+            "nothing decoded when images are off"
+        );
+    }
+
+    #[test]
+    fn render_overlays_an_osc8_hyperlink_on_a_surfaced_url() {
+        // A post body with a markdown link surfaces its URL on its own row; the
+        // render overlay turns that row into a clickable OSC 8 hyperlink (the
+        // first cell carries the open+text+close sequence). Width is wide enough
+        // that the URL doesn't wrap. Hyperlinks default on in the test config.
+        let mut e = entry("p1");
+        e.content = "see [the site](https://x.example/page)".into();
+        let s = PostDetailScreen::new(e);
+
+        let backend = ratatui::backend::TestBackend::new(60, 20);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| s.render(f, f.area(), &Theme::cyber(), false, None))
+            .expect("draw");
+
+        // One link slot was recorded for the surfaced URL.
+        assert_eq!(s.link_slots.borrow().len(), 1, "one link slot recorded");
+
+        // A buffer cell carries the OSC 8 open sequence targeting the full URL.
+        let buf = terminal.backend().buffer();
+        let mut linked = false;
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if buf[(x, y)]
+                    .symbol()
+                    .contains("\u{1b}]8;;https://x.example/page\u{1b}\\")
+                {
+                    linked = true;
+                }
+            }
+        }
+        assert!(linked, "the URL row is wrapped in an OSC 8 hyperlink");
     }
 
     #[test]
@@ -1017,7 +1391,7 @@ mod tests {
     fn compose_body_includes_separator_when_replies_present() {
         let mut s = PostDetailScreen::new(entry("p1"));
         s.apply_replies_initial(Ok((vec![reply("r1", "p1")], None)));
-        let lines = s.compose_body(&Theme::dark());
+        let lines = s.compose_body(&Theme::dark(), false, 0, false);
         // Look for the replies separator marker.
         let body_text: String = lines
             .iter()

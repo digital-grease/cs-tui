@@ -618,49 +618,35 @@ impl App {
     /// Toggle inline image rendering at runtime (the `i` key). Forces a full
     /// terminal clear so a mis-rendered image (raw graphics-protocol bytes from a
     /// terminal that over-reported its support) is wiped immediately. When
-    /// re-enabling on a post whose image never loaded — it was opened while
-    /// images were off, so no fetch ran — `reconcile_detail_image` kicks the
-    /// fetch now so it appears without reopening the post.
+    /// re-enabling, kick fetches for any post-detail images that never loaded
+    /// (the post was opened while images were off) so they appear without
+    /// reopening it.
     fn toggle_images(&mut self) {
         self.images_on = !self.images_on;
         self.force_clear = true;
-        self.reconcile_detail_image();
+        self.ensure_detail_images_fetched();
     }
 
-    /// Bring the focused image (the post's, or the selected reply's) into the
-    /// top strip on the post-detail screen. Cheap no-op everywhere else, when
-    /// images are off, or when the right image is already loaded/awaited; called
-    /// after each key so a `J`/`K` reply-selection change swaps the strip. Decodes
-    /// from the byte cache when possible, otherwise spawns a fetch.
-    fn reconcile_detail_image(&self) {
-        if !self.images_on {
+    /// Spawn fetches for every image the post-detail screen can show — the post's
+    /// and each loaded reply's — skipping any already cached or already requested
+    /// (`mark_requested` dedups, so this is cheap to call repeatedly). The render
+    /// pass decodes and overlays each image inline once its gap scrolls into view.
+    /// No-op off the post-detail screen, with images disabled, or on a terminal
+    /// without graphics support.
+    fn ensure_detail_images_fetched(&self) {
+        if !self.images_on || self.picker.is_none() {
             return;
         }
-        let Some(picker) = &self.picker else {
-            return;
-        };
         let Screen::PostDetail(s) = &self.screen else {
             return;
         };
-        let desired = s.focused_image_url();
-        if s.pending_url() == desired {
-            return;
-        }
-        match desired {
-            None => s.clear_image(),
-            Some(url) => {
-                if let Some(bytes) = s.cached_image_bytes(&url) {
-                    match image::load_from_memory(&bytes) {
-                        Ok(img) => s.set_image(url, picker.new_resize_protocol(img)),
-                        Err(e) => {
-                            tracing::debug!(error = %e, %url, "image decode failed");
-                            s.set_pending_image(url);
-                        }
-                    }
-                } else {
-                    s.set_pending_image(url.clone());
-                    self.spawn_fetch_image(s.entry.post_id.clone(), url);
-                }
+        let post_id = s.entry.post_id.clone();
+        for url in s.all_image_urls() {
+            if s.has_image_bytes(&url) {
+                continue;
+            }
+            if s.mark_requested(url.clone()) {
+                self.spawn_fetch_image(post_id.clone(), url);
             }
         }
     }
@@ -840,7 +826,13 @@ impl App {
                 Screen::Bookmarks(s) => s.render(frame, screen_area, &self.theme),
                 Screen::Topics(s) => s.render(frame, screen_area, &self.theme),
                 Screen::TopicFeed(s) => s.render(frame, screen_area, &self.theme),
-                Screen::PostDetail(s) => s.render(frame, screen_area, &self.theme, self.images_on),
+                Screen::PostDetail(s) => s.render(
+                    frame,
+                    screen_area,
+                    &self.theme,
+                    self.images_on,
+                    self.picker.as_ref(),
+                ),
                 Screen::Profile(s) => s.render(frame, screen_area, &self.theme),
                 Screen::EditProfile(s) => s.render(frame, screen_area, &self.theme),
                 Screen::Compose(s) => s.render(frame, screen_area, &self.theme),
@@ -1358,10 +1350,6 @@ impl App {
 
         // Phase 1: derive an Action with a mutable borrow on the active screen.
         let action = Self::route_key(&mut self.screen, key);
-
-        // A `J`/`K` reply selection changes which image is focused; swap the
-        // top strip to it (no-op off the post-detail screen or with images off).
-        self.reconcile_detail_image();
 
         // Phase 2: apply the action with full mutable access to self.
         match action {
@@ -1996,6 +1984,8 @@ impl App {
                         s.apply_replies_initial(result);
                     }
                 }
+                // The replies (and so their images) are now known — fetch them.
+                self.ensure_detail_images_fetched();
             }
             BgEvent::DetailRepliesMore { post_id, result } => {
                 if let Screen::PostDetail(s) = &mut self.screen {
@@ -2003,6 +1993,7 @@ impl App {
                         s.apply_replies_more(result);
                     }
                 }
+                self.ensure_detail_images_fetched();
             }
             BgEvent::OpenPostDetail {
                 result,
@@ -2331,24 +2322,13 @@ impl App {
                 result,
             } => match result {
                 Ok(bytes) => {
+                    // Cache the bytes on the matching post-detail screen; the
+                    // render pass decodes and overlays them inline once the
+                    // image's gap scrolls into view. If the user navigated away,
+                    // the post id won't match and the bytes are simply dropped.
                     if let Screen::PostDetail(s) = &self.screen {
                         if s.entry.post_id == post_id {
-                            // Cache regardless so re-focusing this image skips the
-                            // network even if the focus has since moved on.
-                            s.cache_image_bytes(url.clone(), bytes.clone());
-                            // Only display it if it's still the focused image and
-                            // images are on (the selection may have changed, or
-                            // images toggled off, while the fetch was in flight).
-                            let still_wanted =
-                                self.images_on && s.pending_url().as_deref() == Some(url.as_str());
-                            if let (true, Some(picker)) = (still_wanted, &self.picker) {
-                                match image::load_from_memory(&bytes) {
-                                    Ok(img) => s.set_image(url, picker.new_resize_protocol(img)),
-                                    Err(e) => {
-                                        tracing::debug!(error = %e, "image decode failed");
-                                    }
-                                }
-                            }
+                            s.cache_image_bytes(url, bytes);
                         }
                     }
                 }
@@ -3017,32 +2997,17 @@ impl App {
     }
 
     /// Push a post-detail screen for `entry`, load its replies, and (when the
-    /// terminal supports graphics) start fetching its first image.
+    /// terminal supports graphics) start fetching the post's inline image.
     fn enter_post_detail(&mut self, entry: Entry, highlight_reply_id: Option<String>) {
         let id = entry.post_id.clone();
-        // Prefer a real image attachment; for a jukebox post (which carries no
-        // image) fall back to the track's YouTube thumbnail as cover art. Both
-        // flow through the same fetch/decode/render path.
-        let first_image = if self.picker.is_some() && self.images_on {
-            super::images::entry_image_urls(&entry)
-                .into_iter()
-                .next()
-                .or_else(|| super::audio::entry_cover_art_url(&entry))
-        } else {
-            None
-        };
         let mut screen = PostDetailScreen::new(entry);
         screen.highlight_reply_id = highlight_reply_id;
         self.push_screen(Screen::PostDetail(screen));
         self.spawn_detail_replies_initial(&id);
-        if let Some(url) = first_image {
-            // Mark it as the awaited image so the fetch result knows to display it
-            // (and doesn't if the user navigates into a reply image first).
-            if let Screen::PostDetail(s) = &self.screen {
-                s.set_pending_image(url.clone());
-            }
-            self.spawn_fetch_image(id, url);
-        }
+        // Kick off the fetch for the post's own image now; the replies' images
+        // follow once `DetailRepliesInitial` lands. Both are decoded and drawn
+        // inline by the render pass as they scroll into view.
+        self.ensure_detail_images_fetched();
     }
 
     fn spawn_fetch_image(&self, post_id: String, url: String) {

@@ -34,6 +34,9 @@ pub struct Config {
     pub mouse: Option<bool>,
     /// Render inline images on graphics-capable terminals.
     pub images: Option<bool>,
+    /// Make links clickable via OSC 8 terminal hyperlinks. Off falls back to
+    /// surfacing the bare URL for the terminal's own URL detection.
+    pub hyperlinks: Option<bool>,
     /// Override the API base URL.
     pub api_base: Option<String>,
 
@@ -97,6 +100,9 @@ pub struct Runtime {
     pub nsfw: bool,
     pub editor: Option<String>,
     pub confirm_deletes: bool,
+    /// Render links as OSC 8 terminal hyperlinks (clickable even when long
+    /// enough to wrap, which defeats a terminal's own URL detection).
+    pub hyperlinks: bool,
     pub feed_autorefresh: bool,
     pub feed_refresh_secs: u64,
     /// Seconds between background unread-notification-count polls. Drives how
@@ -121,6 +127,7 @@ impl Default for Runtime {
             nsfw: false,
             editor: None,
             confirm_deletes: true,
+            hyperlinks: true,
             feed_autorefresh: true,
             feed_refresh_secs: 60,
             notifications_refresh_secs: 20,
@@ -254,6 +261,11 @@ const TEMPLATE: &str = r##"# cs-tui configuration. Edit and restart cs-tui.
 # Render inline images on graphics-capable terminals. --no-images forces off.
 #images = true
 
+# Make links clickable via OSC 8 terminal hyperlinks (works in Ghostty, kitty,
+# WezTerm, iTerm2, foot, recent VTE terminals, Windows Terminal, tmux >= 3.4).
+# Off falls back to surfacing the bare URL for the terminal's own URL detection.
+#hyperlinks = true
+
 # API base URL (overrides the built-in default).
 #api_base = "https://api.cyberspace.online"
 "##;
@@ -340,6 +352,7 @@ impl Config {
             nsfw: self.nsfw.unwrap_or(d.nsfw),
             editor: self.editor.clone().filter(|s| !s.trim().is_empty()),
             confirm_deletes: self.confirm_deletes.unwrap_or(d.confirm_deletes),
+            hyperlinks: self.hyperlinks.unwrap_or(d.hyperlinks),
             feed_autorefresh: self.feed_autorefresh.unwrap_or(d.feed_autorefresh),
             feed_refresh_secs: self
                 .feed_refresh_secs
