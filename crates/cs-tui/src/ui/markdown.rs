@@ -2,30 +2,44 @@
 //!
 //! Handles the subset of GitHub-flavored markdown that appears in cyberspace.online
 //! posts: headings, bold/italic, inline code, code blocks, unordered lists,
-//! blockquotes, links (rendered as `text (url)`), soft/hard breaks, and `@mention`
-//! highlighting. Tables, footnotes, and other advanced features are rendered as
-//! plain text.
+//! blockquotes, links (the visible text, then the bare URL on its own line),
+//! soft/hard breaks, and `@mention` highlighting. Tables, footnotes, and other
+//! advanced features are rendered as plain text.
 use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::theme::Theme;
 
-/// Whether [`render_markdown`] appends an image's destination URL after the
+/// Whether [`render_markdown`] surfaces an image's destination URL below the
 /// `[image]` placeholder. Contexts that draw the image as terminal graphics (the
-/// post body) pass [`ImageUrls::Hide`]; contexts that only show the placeholder
-/// (replies, journal entries) pass [`ImageUrls::Show`] so the URL is visible and
-/// the terminal's own URL detection makes it clickable.
+/// post detail, which now renders images inline) pass [`ImageUrls::Hide`];
+/// contexts that only show the placeholder (journal entries) pass
+/// [`ImageUrls::Show`] so the URL is visible and the terminal's own URL detection
+/// makes it clickable.
 ///
-/// Surfaced URLs are safe to render: ratatui's `Span::styled_graphemes` filters
-/// every grapheme containing a control char, so escape/OSC-8 sequences in a
-/// malicious URL are stripped before they reach the terminal.
+/// Surfaced URLs are safe to render as text: ratatui's `Span::styled_graphemes`
+/// filters every grapheme containing a control char, so escape/OSC-8 sequences in
+/// a malicious URL are stripped before they reach the terminal. The OSC 8
+/// hyperlink overlay ([`super::hyperlink`]) writes the URL into a cell symbol,
+/// which bypasses that filter, so it strips control chars itself.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ImageUrls {
-    /// Append ` (url)` after the placeholder so the link is visible/clickable.
+    /// Surface the URL on its own line below the placeholder (visible/clickable).
     Show,
     /// Suppress the URL — the image itself is drawn elsewhere.
     Hide,
+}
+
+/// A surfaced link/image URL and where it landed: `line` is its index into the
+/// returned lines, `col` the column the bare URL text starts at (past any
+/// blockquote prefix and the indent). A scrolling renderer uses these to overlay
+/// an OSC 8 hyperlink onto exactly the URL glyphs — see [`super::hyperlink`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkRef {
+    pub line: usize,
+    pub col: u16,
+    pub url: String,
 }
 
 /// Render markdown source into a vector of styled ratatui lines. Image URLs are
@@ -41,7 +55,19 @@ pub fn render_markdown_with(
     theme: &Theme,
     image_urls: ImageUrls,
 ) -> Vec<Line<'static>> {
+    render_markdown_collect(input, theme, image_urls).0
+}
+
+/// Render markdown and also report every surfaced link/image URL (see
+/// [`LinkRef`]) so a scrolling renderer can make those rows clickable via OSC 8.
+/// Callers that don't need the links use [`render_markdown_with`].
+pub fn render_markdown_collect(
+    input: &str,
+    theme: &Theme,
+    image_urls: ImageUrls,
+) -> (Vec<Line<'static>>, Vec<LinkRef>) {
     let mut out: Vec<Line<'static>> = Vec::new();
+    let mut links: Vec<LinkRef> = Vec::new();
     let mut current_line: Vec<Span<'static>> = Vec::new();
     let mut style_stack: Vec<Style> = vec![theme.base()];
     let mut list_depth: u32 = 0;
@@ -52,8 +78,8 @@ pub fn render_markdown_with(
     let mut image_alt: Option<String> = None;
     let mut image_url: Option<String> = None;
     // While inside a link, hold the destination URL and accumulate the visible
-    // text so the closing tag can append `(url)` — unless the text already
-    // conveys the URL (autolinks), which would render as `url (url)`.
+    // text so the closing tag can surface the URL on its own line — unless the
+    // text already conveys the URL (autolinks), which would render it twice.
     let mut link_url: Option<String> = None;
     let mut link_text = String::new();
 
@@ -73,13 +99,20 @@ pub fn render_markdown_with(
                         .fg(theme.accent)
                         .add_modifier(Modifier::UNDERLINED),
                 ));
-                // Where the image isn't drawn as graphics (replies, journal),
-                // surface its URL as plain text so it's visible and the terminal
-                // can make it clickable — same treatment as links and jukebox
-                // tracks. The post body passes `Hide`: it draws the image above.
+                // Where the image isn't drawn as graphics (journal), surface its
+                // URL on its own line so it's visible and the terminal can make it
+                // clickable. The post detail passes `Hide`: it draws the image
+                // inline in the body itself.
                 if let Some(url) = image_url.take() {
                     if image_urls == ImageUrls::Show && !url.trim().is_empty() {
-                        current_line.push(Span::styled(format!(" ({url})"), theme.muted_style()));
+                        surface_url(
+                            &url,
+                            &mut current_line,
+                            &mut out,
+                            blockquote_depth,
+                            theme,
+                            &mut links,
+                        );
                     }
                 }
             }
@@ -97,7 +130,14 @@ pub fn render_markdown_with(
                 if let Some(url) = link_url.take() {
                     let text = std::mem::take(&mut link_text);
                     if !url.trim().is_empty() && !link_suffix_redundant(&text, &url) {
-                        current_line.push(Span::styled(format!(" ({url})"), theme.muted_style()));
+                        surface_url(
+                            &url,
+                            &mut current_line,
+                            &mut out,
+                            blockquote_depth,
+                            theme,
+                            &mut links,
+                        );
                     }
                 }
             }
@@ -165,7 +205,7 @@ pub fn render_markdown_with(
         }
     }
     flush(&mut current_line, &mut out, blockquote_depth, theme);
-    out
+    (out, links)
 }
 
 /// A single-line plain-text preview of post content for list views: markdown is
@@ -250,10 +290,45 @@ fn handle_start(
     }
 }
 
-/// Whether surfacing `url` after the link's visible `text` would be redundant —
-/// the text already conveys the destination, so a ` (url)` suffix would render as
-/// `url (url)`. Covers plain autolinks (`<https://x>` → text == url) and email
-/// autolinks (`<a@b>` → text `a@b`, url `mailto:a@b`).
+/// Width of the indent `surface_url` puts before the bare URL.
+const URL_INDENT: u16 = 2;
+
+/// Surface a link/image's destination `url` on its own line. Flushes whatever
+/// text precedes it (the link text or `[image]` placeholder) as a finished line,
+/// then emits the bare URL — indented, in the accent colour rather than muted —
+/// alone on the next line. On its own line the URL can't be wrapped mid-string
+/// across two rows, so the terminal's URL detector links the whole thing (a
+/// wrapped URL is unclickable in every terminal); a scrolling renderer can also
+/// overlay a proper OSC 8 hyperlink onto it from the recorded [`LinkRef`].
+fn surface_url(
+    url: &str,
+    line: &mut Vec<Span<'static>>,
+    out: &mut Vec<Line<'static>>,
+    blockquote_depth: u32,
+    theme: &Theme,
+    links: &mut Vec<LinkRef>,
+) {
+    flush(line, out, blockquote_depth, theme);
+    let mut url_line = vec![Span::styled(
+        format!("{}{}", " ".repeat(URL_INDENT as usize), url.trim()),
+        Style::default().fg(theme.accent),
+    )];
+    flush(&mut url_line, out, blockquote_depth, theme);
+    // The URL is now the last line in `out`. `flush` prepended a `│ ` (2-col)
+    // blockquote bar per depth, then our indent — so the URL glyphs start there.
+    let col = (blockquote_depth as u16)
+        .saturating_mul(2)
+        .saturating_add(URL_INDENT);
+    links.push(LinkRef {
+        line: out.len().saturating_sub(1),
+        col,
+        url: url.trim().to_string(),
+    });
+}
+
+/// Whether the link's visible `text` already conveys the `url`, so surfacing the
+/// URL again would render it twice. Covers plain autolinks (`<https://x>` → text
+/// == url) and email autolinks (`<a@b>` → text `a@b`, url `mailto:a@b`).
 fn link_suffix_redundant(text: &str, url: &str) -> bool {
     let text = text.trim();
     let url = url.trim();
@@ -515,6 +590,48 @@ mod tests {
     }
 
     #[test]
+    fn collect_reports_surfaced_link_url_position() {
+        let (lines, links) = render_markdown_collect(
+            "see [the site](https://x.example/page)",
+            &Theme::dark(),
+            ImageUrls::Show,
+        );
+        assert_eq!(links.len(), 1, "one link recorded: {links:?}");
+        let lr = &links[0];
+        assert_eq!(lr.url, "https://x.example/page");
+        assert_eq!(lr.col, 2, "URL starts past the 2-space indent");
+        // The recorded line index points at the bare-URL line.
+        let line_text: String = lines[lr.line]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(line_text.trim(), "https://x.example/page");
+        // The recorded column is exactly where the URL glyphs begin on that line.
+        assert_eq!(&line_text[lr.col as usize..], "https://x.example/page");
+    }
+
+    #[test]
+    fn collect_reports_no_links_for_plain_text() {
+        let (_lines, links) =
+            render_markdown_collect("just words, no links", &Theme::dark(), ImageUrls::Show);
+        assert!(links.is_empty(), "no links recorded: {links:?}");
+    }
+
+    #[test]
+    fn collect_records_image_url_position_when_shown() {
+        // Graphics-off contexts surface the image URL as text; it gets a LinkRef
+        // too, so the row can be made clickable.
+        let (_lines, links) = render_markdown_collect(
+            "![a cat](https://x/cat.png)",
+            &Theme::dark(),
+            ImageUrls::Show,
+        );
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].url, "https://x/cat.png");
+    }
+
+    #[test]
     fn image_without_alt_is_a_plain_tag() {
         let lines = render_markdown_with("![](https://x/cat.png)", &Theme::dark(), ImageUrls::Hide);
         let text = flat_text(&lines);
@@ -526,13 +643,19 @@ mod tests {
     }
 
     #[test]
-    fn link_surfaces_its_url_after_the_text() {
+    fn link_surfaces_its_url_on_its_own_line() {
         let lines = render_markdown("see [the site](https://x.example/page)", &Theme::dark());
         let text = flat_text(&lines);
         assert!(text.contains("the site"), "link text shown: {text:?}");
+        // The URL is surfaced bare (no parens) on its own line below the text, so
+        // it can't wrap mid-string and the terminal can linkify the whole thing.
         assert!(
-            text.contains("(https://x.example/page)"),
-            "url surfaced after the text: {text:?}"
+            text.lines().any(|l| l.trim() == "https://x.example/page"),
+            "url is alone on its own line: {text:?}"
+        );
+        assert!(
+            !text.contains("(https://x.example/page)"),
+            "url is no longer parenthesised inline: {text:?}"
         );
     }
 
@@ -590,8 +713,8 @@ mod tests {
         assert!(text.contains("run "), "text shown: {text:?}");
         assert!(text.contains("`cmd`"), "code shown: {text:?}");
         assert!(
-            text.contains("(https://x.example/p)"),
-            "distinct url surfaced: {text:?}"
+            text.lines().any(|l| l.trim() == "https://x.example/p"),
+            "distinct url surfaced on its own line: {text:?}"
         );
     }
 
