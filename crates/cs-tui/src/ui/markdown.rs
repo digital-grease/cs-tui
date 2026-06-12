@@ -11,26 +11,59 @@ use ratatui::text::{Line, Span};
 
 use super::theme::Theme;
 
-/// Render markdown source into a vector of styled ratatui lines.
+/// Whether [`render_markdown`] appends an image's destination URL after the
+/// `[image]` placeholder. Contexts that draw the image as terminal graphics (the
+/// post body) pass [`ImageUrls::Hide`]; contexts that only show the placeholder
+/// (replies, journal entries) pass [`ImageUrls::Show`] so the URL is visible and
+/// the terminal's own URL detection makes it clickable.
+///
+/// Surfaced URLs are safe to render: ratatui's `Span::styled_graphemes` filters
+/// every grapheme containing a control char, so escape/OSC-8 sequences in a
+/// malicious URL are stripped before they reach the terminal.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ImageUrls {
+    /// Append ` (url)` after the placeholder so the link is visible/clickable.
+    Show,
+    /// Suppress the URL — the image itself is drawn elsewhere.
+    Hide,
+}
+
+/// Render markdown source into a vector of styled ratatui lines. Image URLs are
+/// surfaced as plain text (see [`ImageUrls`]); use [`render_markdown_with`] to
+/// suppress them where the image is drawn as graphics.
 pub fn render_markdown(input: &str, theme: &Theme) -> Vec<Line<'static>> {
+    render_markdown_with(input, theme, ImageUrls::Show)
+}
+
+/// Render markdown, choosing whether image placeholders carry their URL.
+pub fn render_markdown_with(
+    input: &str,
+    theme: &Theme,
+    image_urls: ImageUrls,
+) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     let mut current_line: Vec<Span<'static>> = Vec::new();
     let mut style_stack: Vec<Style> = vec![theme.base()];
     let mut list_depth: u32 = 0;
     let mut blockquote_depth: u32 = 0;
     // While inside an image tag, accumulate the alt text so the placeholder can
-    // carry it (the alt is the only accessible description of the image).
+    // carry it (the alt is the only accessible description of the image), and
+    // hold the destination URL so it can be surfaced after the placeholder.
     let mut image_alt: Option<String> = None;
+    let mut image_url: Option<String> = None;
+    // While inside a link, hold the destination URL and accumulate the visible
+    // text so the closing tag can append `(url)` — unless the text already
+    // conveys the URL (autolinks), which would render as `url (url)`.
+    let mut link_url: Option<String> = None;
+    let mut link_text = String::new();
 
     let parser = Parser::new(input);
     for event in parser {
         match event {
-            Event::Start(Tag::Image { .. }) => {
-                // Capture the alt text; the placeholder is emitted at End. The
-                // actual image is rendered above the text (post detail) on
-                // graphics-capable terminals; the URL is intentionally not
-                // inlined — it's long and the image itself is shown.
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                // Capture the alt text and URL; the placeholder is emitted at End.
                 image_alt = Some(String::new());
+                image_url = Some(dest_url.to_string());
             }
             Event::End(TagEnd::Image) => {
                 let alt = image_alt.take().unwrap_or_default();
@@ -40,6 +73,33 @@ pub fn render_markdown(input: &str, theme: &Theme) -> Vec<Line<'static>> {
                         .fg(theme.accent)
                         .add_modifier(Modifier::UNDERLINED),
                 ));
+                // Where the image isn't drawn as graphics (replies, journal),
+                // surface its URL as plain text so it's visible and the terminal
+                // can make it clickable — same treatment as links and jukebox
+                // tracks. The post body passes `Hide`: it draws the image above.
+                if let Some(url) = image_url.take() {
+                    if image_urls == ImageUrls::Show && !url.trim().is_empty() {
+                        current_line.push(Span::styled(format!(" ({url})"), theme.muted_style()));
+                    }
+                }
+            }
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                style_stack.push(
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::UNDERLINED),
+                );
+                link_url = Some(dest_url.to_string());
+                link_text.clear();
+            }
+            Event::End(TagEnd::Link) => {
+                style_stack.pop();
+                if let Some(url) = link_url.take() {
+                    let text = std::mem::take(&mut link_text);
+                    if !url.trim().is_empty() && !link_suffix_redundant(&text, &url) {
+                        current_line.push(Span::styled(format!(" ({url})"), theme.muted_style()));
+                    }
+                }
             }
             Event::Start(tag) => handle_start(
                 tag,
@@ -63,6 +123,9 @@ pub fn render_markdown(input: &str, theme: &Theme) -> Vec<Line<'static>> {
                 if let Some(alt) = &mut image_alt {
                     alt.push_str(t.as_ref());
                 } else {
+                    if link_url.is_some() {
+                        link_text.push_str(t.as_ref());
+                    }
                     let style = current_style(&style_stack, theme);
                     for span in mention_aware_spans(t.as_ref(), style, theme) {
                         current_line.push(span);
@@ -70,10 +133,20 @@ pub fn render_markdown(input: &str, theme: &Theme) -> Vec<Line<'static>> {
                 }
             }
             Event::Code(t) => {
-                current_line.push(Span::styled(
-                    format!("`{t}`"),
-                    Style::default().fg(theme.accent),
-                ));
+                // Inside an image's alt, or a link's visible text, the code
+                // content is part of the accumulated string used for the
+                // placeholder / autolink-dedup comparison.
+                if let Some(alt) = &mut image_alt {
+                    alt.push_str(t.as_ref());
+                } else {
+                    if link_url.is_some() {
+                        link_text.push_str(t.as_ref());
+                    }
+                    current_line.push(Span::styled(
+                        format!("`{t}`"),
+                        Style::default().fg(theme.accent),
+                    ));
+                }
             }
             Event::SoftBreak => {
                 flush(&mut current_line, &mut out, blockquote_depth, theme);
@@ -171,20 +244,20 @@ fn handle_start(
             *blockquote_depth += 1;
             stack.push(theme.muted_style().add_modifier(Modifier::ITALIC));
         }
-        Tag::Link { dest_url, .. } => {
-            stack.push(
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::UNDERLINED),
-            );
-            // Stash URL via a hidden tag — appended after the link text in End.
-            // We piggy-back on a temporary span containing the URL, marked with a
-            // sentinel style we can identify later. Simpler: just store it in stack
-            // metadata. For now, append after closing.
-            let _ = dest_url;
-        }
+        // Links and images are handled inline in `render_markdown_with` so they
+        // can surface the destination URL.
         _ => {}
     }
+}
+
+/// Whether surfacing `url` after the link's visible `text` would be redundant —
+/// the text already conveys the destination, so a ` (url)` suffix would render as
+/// `url (url)`. Covers plain autolinks (`<https://x>` → text == url) and email
+/// autolinks (`<a@b>` → text `a@b`, url `mailto:a@b`).
+fn link_suffix_redundant(text: &str, url: &str) -> bool {
+    let text = text.trim();
+    let url = url.trim();
+    text == url || url.strip_prefix("mailto:").is_some_and(|addr| addr == text)
 }
 
 fn handle_end(
@@ -228,9 +301,6 @@ fn handle_end(
             if *blockquote_depth > 0 {
                 *blockquote_depth -= 1;
             }
-            stack.pop();
-        }
-        TagEnd::Link => {
             stack.pop();
         }
         _ => {}
@@ -410,25 +480,119 @@ mod tests {
     }
 
     #[test]
-    fn image_placeholder_carries_alt_text() {
+    fn image_placeholder_carries_alt_text_and_url_when_shown() {
+        // Default (Show): the alt rides the tag and the URL is surfaced so the
+        // terminal can make it clickable (replies/journal, which draw no graphics).
         let lines = render_markdown("![a cat](https://x/cat.png)", &Theme::dark());
         let text = flat_text(&lines);
         assert!(
             text.contains("[image: a cat]"),
             "alt is in the tag: {text:?}"
         );
-        assert!(!text.contains("https://x/cat.png"), "url no longer inlined");
+        assert!(
+            text.contains("https://x/cat.png"),
+            "url is surfaced as text: {text:?}"
+        );
+    }
+
+    #[test]
+    fn image_url_is_hidden_when_image_is_drawn_as_graphics() {
+        // The post body draws the image itself, so the long URL is suppressed.
+        let lines = render_markdown_with(
+            "![a cat](https://x/cat.png)",
+            &Theme::dark(),
+            ImageUrls::Hide,
+        );
+        let text = flat_text(&lines);
+        assert!(
+            text.contains("[image: a cat]"),
+            "alt is in the tag: {text:?}"
+        );
+        assert!(
+            !text.contains("https://x/cat.png"),
+            "url not inlined: {text:?}"
+        );
     }
 
     #[test]
     fn image_without_alt_is_a_plain_tag() {
-        let lines = render_markdown("![](https://x/cat.png)", &Theme::dark());
+        let lines = render_markdown_with("![](https://x/cat.png)", &Theme::dark(), ImageUrls::Hide);
         let text = flat_text(&lines);
         assert!(
             text.contains("[image]"),
             "no-alt image is a plain tag: {text:?}"
         );
         assert!(!text.contains("[image:"), "no empty alt suffix");
+    }
+
+    #[test]
+    fn link_surfaces_its_url_after_the_text() {
+        let lines = render_markdown("see [the site](https://x.example/page)", &Theme::dark());
+        let text = flat_text(&lines);
+        assert!(text.contains("the site"), "link text shown: {text:?}");
+        assert!(
+            text.contains("(https://x.example/page)"),
+            "url surfaced after the text: {text:?}"
+        );
+    }
+
+    #[test]
+    fn autolink_does_not_duplicate_the_url() {
+        // The visible text already IS the URL — don't render `url (url)`.
+        let lines = render_markdown("<https://x.example/page>", &Theme::dark());
+        let text = flat_text(&lines);
+        assert!(
+            text.contains("https://x.example/page"),
+            "url shown: {text:?}"
+        );
+        assert_eq!(
+            text.matches("https://x.example/page").count(),
+            1,
+            "url appears exactly once: {text:?}"
+        );
+    }
+
+    #[test]
+    fn email_autolink_does_not_duplicate_with_mailto() {
+        // `<a@b>` => visible text "a@b", dest_url "mailto:a@b" — the suffix would
+        // read `a@b (mailto:a@b)`; the mailto-aware dedup suppresses it.
+        let lines = render_markdown("<user@example.com>", &Theme::dark());
+        let text = flat_text(&lines);
+        assert!(text.contains("user@example.com"), "address shown: {text:?}");
+        assert!(
+            !text.contains("mailto:"),
+            "no redundant mailto suffix: {text:?}"
+        );
+    }
+
+    #[test]
+    fn link_with_inline_code_matching_url_is_not_duplicated() {
+        // `[`url`](url)`: the code content IS the URL, so the visible text already
+        // conveys it — the suffix must be suppressed (code is accumulated to the
+        // dedup string).
+        let lines = render_markdown(
+            "[`https://x.example/p`](https://x.example/p)",
+            &Theme::dark(),
+        );
+        let text = flat_text(&lines);
+        assert_eq!(
+            text.matches("https://x.example/p").count(),
+            1,
+            "code-as-url link not duplicated: {text:?}"
+        );
+    }
+
+    #[test]
+    fn link_with_inline_code_and_distinct_url_still_surfaces_url() {
+        // Mixed link text including code, distinct from the URL — surface the URL.
+        let lines = render_markdown("[run `cmd` now](https://x.example/p)", &Theme::dark());
+        let text = flat_text(&lines);
+        assert!(text.contains("run "), "text shown: {text:?}");
+        assert!(text.contains("`cmd`"), "code shown: {text:?}");
+        assert!(
+            text.contains("(https://x.example/p)"),
+            "distinct url surfaced: {text:?}"
+        );
     }
 
     #[test]
