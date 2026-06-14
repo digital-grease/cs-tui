@@ -129,6 +129,16 @@ async fn main() -> Result<()> {
     };
 
     let terminal = ratatui::init();
+    // ratatui's panic hook restores raw mode and the alternate screen, but not
+    // the terminal-global modes we toggle below (bracketed paste, mouse
+    // reporting). Chain a hook that resets them first, so a panic doesn't leave
+    // the user's shell wrapping every paste in ESC[200~ markers.
+    install_terminal_cleanup_panic_hook();
+    // Bracketed paste: the terminal wraps pasted text so it arrives as one
+    // `Event::Paste` instead of a flood of keystrokes. The built-in editor and
+    // the single-line input fields consume it; multi-line clipboards no longer
+    // replay as individual Enter presses.
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
     let mut app = App::with_theme(client, prefill_email, theme_kind, custom_theme);
     app.set_image_picker(picker);
     if has_session {
@@ -147,9 +157,27 @@ async fn main() -> Result<()> {
     if capture_mouse {
         set_mouse_scroll_reporting(false);
     }
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
     ratatui::restore();
 
     run_result
+}
+
+/// Chain a panic hook (over the one `ratatui::init()` installed) that resets the
+/// terminal-global modes we toggle — bracketed paste and mouse reporting — which
+/// ratatui's own restore does not touch. Runs before ratatui's hook, so the
+/// modes are cleared while the alternate screen is still active.
+fn install_terminal_cleanup_panic_hook() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        let _ = crossterm::execute!(out, crossterm::event::DisableBracketedPaste);
+        // Mirror set_mouse_scroll_reporting(false) (modes 1006/1000).
+        let _ = out.write_all(b"\x1b[?1006l\x1b[?1000l");
+        let _ = out.flush();
+        prev(info);
+    }));
 }
 
 /// Toggle xterm button + SGR mouse reporting (modes 1000/1006). Crossterm's

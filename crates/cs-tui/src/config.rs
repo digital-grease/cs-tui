@@ -98,6 +98,8 @@ pub struct Runtime {
     pub image_height: u16,
     pub start_section: RootKind,
     pub nsfw: bool,
+    /// External editor command. `None` (the default) uses the built-in editor;
+    /// `$VISUAL`/`$EDITOR` are deliberately not consulted.
     pub editor: Option<String>,
     pub confirm_deletes: bool,
     /// Render links as OSC 8 terminal hyperlinks (clickable even when long
@@ -233,7 +235,11 @@ const TEMPLATE: &str = r##"# cs-tui configuration. Edit and restart cs-tui.
 # (and clear marked-read ones) sooner but use more of the read rate limit.
 #notifications_refresh_secs = 20
 
-# Editor for composing posts/notes. Defaults to $VISUAL, then $EDITOR, then nano.
+# External editor for composing posts/notes. Unset by default: composing uses
+# the built-in editor (soft-wrapping, multi-line paste, no external program).
+# Set this to compose in an external editor instead. GUI editors must block
+# until the file is closed, so pass a wait flag, e.g. "code --wait" or "subl -w".
+# ($VISUAL/$EDITOR are intentionally NOT consulted.)
 #editor = "nvim"
 
 # Characters of post content shown in list previews.

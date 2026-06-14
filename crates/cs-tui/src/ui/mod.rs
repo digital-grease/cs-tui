@@ -3,6 +3,7 @@ pub mod audio;
 pub mod bookmarks;
 pub mod compose;
 pub mod edit_profile;
+pub mod editor;
 pub mod feed;
 pub mod guild_detail;
 pub mod guilds;

@@ -305,10 +305,14 @@ impl ProfileScreen {
                     reply_id: r.reply_id.clone(),
                 })
                 .unwrap_or(ProfileIntent::None),
+            // The follows API returns IDs without usernames, so a row may have
+            // no username to open. Skip navigation in that case (opening by an
+            // empty username would request `/v1/users/` and fail).
             ListTarget::Followers => self
                 .followers
                 .items
                 .get(self.followers.selected)
+                .filter(|f| !f.follower_username.is_empty())
                 .map(|f| ProfileIntent::OpenUser {
                     username: f.follower_username.clone(),
                 })
@@ -317,6 +321,7 @@ impl ProfileScreen {
                 .following
                 .items
                 .get(self.following.selected)
+                .filter(|f| !f.followed_username.is_empty())
                 .map(|f| ProfileIntent::OpenUser {
                     username: f.followed_username.clone(),
                 })
@@ -519,12 +524,7 @@ impl ProfileScreen {
             theme,
             &self.followers,
             "followers",
-            |f: &Follow| {
-                vec![Line::from(Span::styled(
-                    format!("@{}", f.follower_username),
-                    theme.accent_style(),
-                ))]
-            },
+            |f: &Follow| vec![follow_row(&f.follower_username, &f.follower_id, theme)],
         );
     }
 
@@ -535,12 +535,7 @@ impl ProfileScreen {
             theme,
             &self.following,
             "following",
-            |f: &Follow| {
-                vec![Line::from(Span::styled(
-                    format!("@{}", f.followed_username),
-                    theme.accent_style(),
-                ))]
-            },
+            |f: &Follow| vec![follow_row(&f.followed_username, &f.followed_id, theme)],
         );
     }
 
@@ -549,7 +544,7 @@ impl ProfileScreen {
         if self.follow_action_pending {
             parts.push("follow pending…".into());
         }
-        parts.push("tab tabs".into());
+        parts.push("tab/shift+tab tabs".into());
         let nav_hint = if self.is_root {
             "backspace quit · esc menu"
         } else {
@@ -584,6 +579,24 @@ enum ListTarget {
     Replies,
     Followers,
     Following,
+}
+
+/// Render one follower/following row. The follows API (v0.5.0) returns only
+/// user IDs, not `followerUsername`/`followedUsername`, so those fields decode
+/// to empty strings. When the username is missing, fall back to a truncated
+/// user ID in a muted style rather than printing a bare "@".
+fn follow_row(username: &str, user_id: &str, theme: &Theme) -> Line<'static> {
+    if username.is_empty() {
+        let id = super::text::truncate_to_width(user_id, 18);
+        let shown = if id.is_empty() {
+            "(unknown user)".to_string()
+        } else {
+            id
+        };
+        Line::from(Span::styled(shown, theme.muted_style()))
+    } else {
+        Line::from(Span::styled(format!("@{username}"), theme.accent_style()))
+    }
 }
 
 fn render_list_with_state<T, F>(
@@ -899,6 +912,40 @@ mod tests {
                 username: "bob".into()
             }
         );
+    }
+
+    #[test]
+    fn enter_on_following_without_username_is_noop() {
+        // The follows API returns IDs only (no usernames). Enter must not try
+        // to open a profile with an empty username.
+        let mut s = ProfileScreen::new_for("alice".into());
+        s.apply_user(Ok(user("alice")));
+        s.tab = ProfileTab::Following;
+        s.following.items = vec![Follow {
+            follow_id: "f1".into(),
+            follower_id: "u1".into(),
+            followed_id: "u2".into(),
+            follower_username: String::new(),
+            followed_username: String::new(),
+            created_at: None,
+        }];
+        s.following.loading = false;
+        s.following.loaded = true;
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), ProfileIntent::None);
+    }
+
+    #[test]
+    fn follow_row_falls_back_to_id_without_username() {
+        let theme = Theme::default();
+        // Username present -> rendered as "@name".
+        let with_name = follow_row("bob", "u2", &theme);
+        assert_eq!(with_name.spans[0].content.as_ref(), "@bob");
+        // Username missing -> truncated id, not a bare "@".
+        let no_name = follow_row("", "user-id-1234", &theme);
+        assert_eq!(no_name.spans[0].content.as_ref(), "user-id-1234");
+        // Neither username nor id -> explicit placeholder.
+        let empty = follow_row("", "", &theme);
+        assert_eq!(empty.spans[0].content.as_ref(), "(unknown user)");
     }
 
     #[test]

@@ -11,6 +11,17 @@ use ratatui::text::{Line, Span};
 
 use super::theme::Theme;
 
+/// Collapse newlines and carriage returns to single spaces. Used when a
+/// bracketed-paste (which may carry a multi-line clipboard) is inserted into a
+/// single-line field, so the field stays on one line and a pasted newline can't
+/// trigger an Enter/submit.
+#[must_use]
+pub fn collapse_newlines(text: &str) -> String {
+    text.chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect()
+}
+
 /// Render a focused input value into a `Line`, windowed to `width` cells so the
 /// caret at char index `cursor` (`0..=len`) stays in view, with a reverse-video
 /// block caret.

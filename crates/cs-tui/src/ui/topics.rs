@@ -136,6 +136,16 @@ impl TopicsScreen {
 
     /// Exit the search box, clearing the query and restoring the pre-search
     /// browse position. Returns `true` if it was open.
+    /// Append bracketed-paste text to the active search query (the caller
+    /// collapses newlines, since the filter is single-line). No-op when the
+    /// search box is closed. Mirrors the per-char handler's selection reset.
+    pub fn paste_filter(&mut self, text: &str) {
+        if let Some(q) = self.filter.as_mut() {
+            q.push_str(text);
+            self.selected = 0;
+        }
+    }
+
     pub fn clear_filter(&mut self) -> bool {
         if self.filter.take().is_some() {
             self.selected = self
@@ -422,6 +432,31 @@ mod tests {
                 slug: "music".into()
             }
         );
+    }
+
+    #[test]
+    fn paste_filter_appends_to_the_active_query() {
+        // Bracketed paste must reach the open search box (regression: it used to
+        // be dropped once bracketed paste arrived as one Event::Paste).
+        let mut s = TopicsScreen::new();
+        s.set_topics(vec![topic("music", 5), topic("linux", 9)], true);
+        s.handle_key(key(KeyCode::Char('/')));
+        s.paste_filter("mus");
+        assert_eq!(s.filter.as_deref(), Some("mus"));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            TopicsIntent::OpenSelected {
+                slug: "music".into()
+            }
+        );
+    }
+
+    #[test]
+    fn paste_filter_is_a_noop_when_search_is_closed() {
+        let mut s = TopicsScreen::new();
+        s.set_topics(vec![topic("music", 5)], true);
+        s.paste_filter("x");
+        assert!(!s.is_filtering());
     }
 
     #[test]
