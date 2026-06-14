@@ -17,7 +17,7 @@ Early development. Most of the documented v0.5.0 REST surface is implemented; li
 - **Notifications** with read/unread filtering and an unread badge
 - **Bookmarks**, **Topics**, and per-topic feeds
 - **Profiles** (info / posts / replies / followers / following) with follow & unfollow
-- **Compose** posts and replies via your `$EDITOR`; delete your own entries
+- **Compose** posts and replies in the built-in editor (soft-wrapping, multi-line paste, no external editor required); delete your own entries
 - **Guilds** — browse member groups, view threads/members, join/leave, and post threads
 - **Journal** (private notes) with revision history
 - **Settings** round-trip that preserves fields the client doesn't model
@@ -159,7 +159,7 @@ Every option is optional and shown at its default; restart to apply changes.
 | `confirm_deletes` | `true` | Require the two-step `d` then `y` confirmation before deleting a post or note. |
 | `feed_autorefresh` | `true` | Auto-refresh the feed in the background: new entries are prepended at the top without moving your scroll position (only while the feed is on screen). |
 | `feed_refresh_secs` | `60` | Seconds between background feed polls. Minimum 10; lower values use more of the read rate limit. |
-| `editor` | `$VISUAL`, then `$EDITOR`, then `nano` | Editor for composing posts and notes. |
+| `editor` | _(unset — use the built-in editor)_ | Set to an external editor command (e.g. `nvim`) to compose in it instead of the built-in editor. GUI editors must block until the file is closed, so use a wait flag: `code --wait`, `subl -w`, `gnome-text-editor --standalone`. Leave unset to use the built-in editor. `$VISUAL`/`$EDITOR` are no longer consulted (an environment editor that forks or is missing was silently aborting composes). |
 | `preview_length` | `200` | Characters of post content shown in list previews (clamped 20 to 2000). |
 | `image_height` | `20` | Max rows for the inline image strip in post detail (clamped 1 to 60). |
 

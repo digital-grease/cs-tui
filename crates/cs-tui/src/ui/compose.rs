@@ -58,6 +58,20 @@ impl ComposeKind {
     fn has_slug(&self) -> bool {
         matches!(self, Self::NewEntry | Self::GuildThread { .. })
     }
+
+    /// The bordered-box title for this compose kind, shared by the confirm
+    /// screen and the built-in editor.
+    pub fn title(&self) -> String {
+        match self {
+            Self::NewEntry => " cs-tui • new post ".to_string(),
+            Self::Reply { post_id, .. } => format!(" cs-tui • reply to {post_id} "),
+            Self::NewNote => " cs-tui • new note ".to_string(),
+            Self::UpdateNote { note_id } => format!(" cs-tui • edit note {note_id} "),
+            Self::GuildThread { guild_slug } => {
+                format!(" cs-tui • new thread in {guild_slug} ")
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +169,19 @@ impl ComposeScreen {
             _ => {}
         }
         ComposeIntent::None
+    }
+
+    /// Insert bracketed-paste text into the focused single-line field, with
+    /// newlines collapsed to spaces (these fields stay single-line, and a stray
+    /// pasted newline must not trigger the Enter-to-submit path).
+    pub fn paste_into_focused(&mut self, text: &str) {
+        if self.submitting {
+            return;
+        }
+        let cleaned = super::input::collapse_newlines(text);
+        if let Some(field) = self.focused_text_mut() {
+            field.push_str(&cleaned);
+        }
     }
 
     /// Whether the focused field accepts typed characters.
@@ -299,15 +326,7 @@ impl ComposeScreen {
     }
 
     pub fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
-        let title = match &self.kind {
-            ComposeKind::NewEntry => " cs-tui • new post ".to_string(),
-            ComposeKind::Reply { post_id, .. } => format!(" cs-tui • reply to {post_id} "),
-            ComposeKind::NewNote => " cs-tui • new note ".to_string(),
-            ComposeKind::UpdateNote { note_id } => format!(" cs-tui • edit note {note_id} "),
-            ComposeKind::GuildThread { guild_slug } => {
-                format!(" cs-tui • new thread in {guild_slug} ")
-            }
-        };
+        let title = self.kind.title();
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(theme.border_style())
@@ -495,20 +514,23 @@ pub enum ComposeError {
     Io(#[from] io::Error),
 }
 
-/// Suspend the ratatui terminal, run `$EDITOR` (falling back to `nano`) on a
+/// Suspend the ratatui terminal, run the configured external editor on a
 /// tempfile pre-filled with `initial`, restore the terminal, and return the
 /// final file contents.
+///
+/// Only reached when the user set `editor` in their config (the built-in editor
+/// is the default). The implicit `$VISUAL`/`$EDITOR` fallback was removed: an
+/// environment editor that GUI-forks or is missing silently aborted the compose
+/// flow, so shelling out is now opt-in. `nano` remains a last-resort default if
+/// the config value is somehow empty.
 ///
 /// This must run on a blocking thread (use `tokio::task::spawn_blocking`) so
 /// the tokio runtime stays responsive — but in practice the editor owns the TTY
 /// while it's open, so no other terminal I/O happens.
 pub fn launch_editor(initial: &str, suffix: &str) -> Result<String, ComposeError> {
-    // Config `editor` wins, then $VISUAL, then $EDITOR, then nano.
     let editor = crate::config::get()
         .editor
         .clone()
-        .or_else(|| std::env::var("VISUAL").ok())
-        .or_else(|| std::env::var("EDITOR").ok())
         .unwrap_or_else(|| "nano".to_string());
     let path = tmp_compose_path(suffix);
     fs::write(&path, initial)?;
@@ -540,6 +562,9 @@ fn tmp_compose_path(suffix: &str) -> PathBuf {
 
 fn suspend_terminal() -> Result<(), io::Error> {
     let mut out = io::stdout();
+    // Hand the external editor a clean terminal: it manages its own bracketed
+    // paste, and would otherwise leave ours in an unknown state on exit.
+    execute!(out, crossterm::event::DisableBracketedPaste)?;
     execute!(out, LeaveAlternateScreen)?;
     disable_raw_mode()?;
     Ok(())
@@ -549,6 +574,10 @@ fn resume_terminal() -> Result<(), io::Error> {
     enable_raw_mode()?;
     let mut out = io::stdout();
     execute!(out, EnterAlternateScreen)?;
+    // Re-assert bracketed paste: most editors reset it on exit, which would
+    // otherwise silently break the app's multi-line paste handling for the rest
+    // of the session.
+    execute!(out, crossterm::event::EnableBracketedPaste)?;
     Ok(())
 }
 

@@ -123,6 +123,18 @@ impl EditProfileScreen {
         self.error = None;
     }
 
+    /// Insert bracketed-paste text at the cursor, newlines collapsed to spaces
+    /// (profile fields are single-line). Keeps the cursor/clear bookkeeping
+    /// consistent by routing through `insert_char`.
+    pub fn paste_into_focused(&mut self, text: &str) {
+        if self.submitting {
+            return;
+        }
+        for c in super::input::collapse_newlines(text).chars() {
+            self.insert_char(c);
+        }
+    }
+
     /// Delete the char before the cursor (Backspace).
     fn delete_before_cursor(&mut self) {
         if self.cursor == 0 {

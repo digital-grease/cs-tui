@@ -2,7 +2,7 @@
 //!
 //! Feed, topic feed, bookmarks, notifications (and any future list) all move a
 //! selection cursor with `j/k`, `g/G`, arrows, `Home/End`, and pull the next
-//! page when the user scrolls past the bottom (`j`/`Down`/`n`/`Space`/`PageDown`).
+//! page when the user scrolls past the bottom (`j`/`Down`/`n`/`PageDown`).
 //! That block used to be copy-pasted per screen, so a fix had to be ported by
 //! hand to each one. This centralizes it: `selected` always indexes the *visible*
 //! view of length `view_len`, so the model is identical whether or not a screen
@@ -51,9 +51,7 @@ pub fn navigate(key: KeyCode, selected: &mut usize, view_len: usize, has_more: b
             *selected = view_len.saturating_sub(1);
             ListNav::Moved
         }
-        KeyCode::Char('n') | KeyCode::Char(' ') | KeyCode::PageDown if has_more => {
-            ListNav::LoadMore
-        }
+        KeyCode::Char('n') | KeyCode::PageDown if has_more => ListNav::LoadMore,
         _ => ListNav::Ignored,
     }
 }
@@ -123,12 +121,8 @@ mod tests {
     }
 
     #[test]
-    fn space_and_n_and_pagedown_load_more_only_with_a_cursor() {
+    fn n_and_pagedown_load_more_only_with_a_cursor() {
         let mut sel = 0;
-        assert_eq!(
-            navigate(KeyCode::Char(' '), &mut sel, 3, true),
-            ListNav::LoadMore
-        );
         assert_eq!(
             navigate(KeyCode::Char('n'), &mut sel, 3, true),
             ListNav::LoadMore
@@ -142,6 +136,18 @@ mod tests {
             navigate(KeyCode::Char('n'), &mut sel, 3, false),
             ListNav::Ignored
         );
+    }
+
+    #[test]
+    fn space_is_not_a_load_more_key() {
+        // Load-on-scroll (j/Down at the bottom) covers paging, so Space is a
+        // no-op the screen is free to handle, not a hidden load-more trigger.
+        let mut sel = 0;
+        assert_eq!(
+            navigate(KeyCode::Char(' '), &mut sel, 3, true),
+            ListNav::Ignored
+        );
+        assert_eq!(sel, 0);
     }
 
     #[test]

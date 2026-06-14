@@ -88,6 +88,18 @@ impl LoginScreen {
         LoginIntent::None
     }
 
+    /// Insert bracketed-paste text into the focused field, newlines collapsed to
+    /// spaces (these fields are single-line). Without this, enabling bracketed
+    /// paste would make pasting into email/password stop working.
+    pub fn paste_into_focused(&mut self, text: &str) {
+        if self.submitting {
+            return;
+        }
+        let cleaned = super::input::collapse_newlines(text);
+        self.field_mut().push_str(&cleaned);
+        self.error = None;
+    }
+
     /// Called after the async login attempt completes.
     pub fn finish_submit(&mut self, result: Result<(), String>) {
         self.submitting = false;

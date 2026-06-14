@@ -19,6 +19,7 @@ use tokio::time::MissedTickBehavior;
 use super::bookmarks::{BookmarksIntent, BookmarksScreen};
 use super::compose::{launch_editor, ComposeIntent, ComposeKind, ComposeScreen};
 use super::edit_profile::{EditProfileIntent, EditProfileScreen};
+use super::editor::{EditorIntent, EditorPurpose, EditorScreen};
 use super::feed::{FeedIntent, FeedScreen, HeadUpdate};
 use super::guild_detail::{GuildIntent, GuildScreen, GuildTab};
 use super::guilds::{GuildsIntent, GuildsScreen};
@@ -244,6 +245,7 @@ pub enum Screen {
     Profile(ProfileScreen),
     EditProfile(EditProfileScreen),
     Compose(ComposeScreen),
+    Editor(EditorScreen),
     Journal(JournalScreen),
     Settings(SettingsScreen),
     Guilds(GuildsScreen),
@@ -259,7 +261,9 @@ impl Screen {
     /// reach the focused field rather than triggering global shortcuts.
     fn accepts_text_input(&self) -> bool {
         match self {
-            Screen::Login(_) | Screen::Compose(_) | Screen::EditProfile(_) => true,
+            Screen::Login(_) | Screen::Compose(_) | Screen::EditProfile(_) | Screen::Editor(_) => {
+                true
+            }
             // The topics search box captures printable keys while open.
             Screen::Topics(s) => s.is_filtering(),
             // Settings has only toggles, cyclable choices, and read-only fields —
@@ -385,6 +389,10 @@ enum Action {
     },
     ComposeSubmit,
     ComposeReEdit,
+    /// Built-in editor: Ctrl+S accepted the body.
+    EditorSave,
+    /// Built-in editor: Esc/Ctrl+C discarded.
+    EditorCancel,
     DeleteEntry {
         post_id: String,
     },
@@ -836,6 +844,7 @@ impl App {
                 Screen::Profile(s) => s.render(frame, screen_area, &self.theme),
                 Screen::EditProfile(s) => s.render(frame, screen_area, &self.theme),
                 Screen::Compose(s) => s.render(frame, screen_area, &self.theme),
+                Screen::Editor(s) => s.render(frame, screen_area, &self.theme),
                 Screen::Journal(s) => s.render(frame, screen_area, &self.theme),
                 Screen::Settings(s) => s.render(frame, screen_area, &self.theme),
                 Screen::Guilds(s) => s.render(frame, screen_area, &self.theme),
@@ -1005,6 +1014,11 @@ impl App {
                 ComposeIntent::Edit => Action::ComposeReEdit,
                 ComposeIntent::None => Action::None,
             },
+            Screen::Editor(s) => match s.handle_key(key) {
+                EditorIntent::Save => Action::EditorSave,
+                EditorIntent::Cancel => Action::EditorCancel,
+                EditorIntent::None => Action::None,
+            },
             Screen::Settings(s) => match s.handle_key(key) {
                 SettingsIntent::Quit => Action::Quit,
                 SettingsIntent::Cancel => Action::PopScreen,
@@ -1158,6 +1172,24 @@ impl App {
     }
 
     async fn handle_terminal_event(&mut self, ev: Event) {
+        // Bracketed paste (enabled in main) arrives as one atomic event. The
+        // editor inserts it verbatim; single-line fields take it with newlines
+        // collapsed so a multi-line clipboard can't break out of the field or
+        // trigger Enter/submit. Handled before the key conversion below since a
+        // Paste carries no KeyEvent.
+        if let Event::Paste(data) = ev {
+            match &mut self.screen {
+                Screen::Editor(s) => s.paste(&data),
+                Screen::Login(s) => s.paste_into_focused(&data),
+                Screen::Compose(s) => s.paste_into_focused(&data),
+                Screen::EditProfile(s) => s.paste_into_focused(&data),
+                Screen::Topics(s) if s.is_filtering() => {
+                    s.paste_filter(&super::input::collapse_newlines(&data));
+                }
+                _ => {}
+            }
+            return;
+        }
         let key = match ev {
             Event::Key(k) if k.kind == event::KeyEventKind::Press => k,
             // Mouse wheel → one selection step per notch. Button+scroll reporting
@@ -1637,6 +1669,8 @@ impl App {
                 self.spawn_compose_submit();
             }
             Action::ComposeReEdit => self.re_edit_compose().await,
+            Action::EditorSave => self.editor_save(),
+            Action::EditorCancel => self.pop_screen(),
             Action::DeleteEntry { post_id } => {
                 self.spawn_delete_entry(post_id);
             }
@@ -3490,12 +3524,10 @@ impl App {
         });
     }
 
-    /// Launch $EDITOR on a tempfile (synchronously, off the runtime thread),
-    /// then push a `Compose` screen with the resulting content. Empty content
-    /// cancels the flow.
-    /// Launch `$EDITOR` on `initial`, pausing the input reader so the editor
-    /// owns the terminal exclusively (otherwise it loses keystrokes that then
-    /// replay onto the TUI). Returns the edited content or an error string.
+    /// Launch the external editor on `initial` (off the runtime thread), pausing
+    /// the input reader so the editor owns the terminal exclusively (otherwise it
+    /// loses keystrokes that then replay onto the TUI). Returns the edited content
+    /// or an error string. Only reached on the `external_editor_set()` path.
     async fn run_editor(&mut self, initial: String) -> Result<String, String> {
         self.input_paused.store(true, Ordering::SeqCst);
         let result = tokio::task::spawn_blocking(move || launch_editor(&initial, ".md"))
@@ -3508,45 +3540,101 @@ impl App {
         result
     }
 
-    async fn start_compose(&mut self, kind: ComposeKind, prefill: String) {
-        let initial = if prefill.is_empty() {
-            String::new()
-        } else {
-            prefill
-        };
-        let editor_result = self.run_editor(initial).await;
-
-        let content = match editor_result {
-            Ok(c) => c,
-            Err(msg) => {
-                tracing::warn!(error = %msg, "compose: editor failed");
-                return;
-            }
-        };
-        if content.trim().is_empty() {
-            tracing::debug!("compose: empty content, cancelled");
-            return;
-        }
-        let screen = ComposeScreen::new(kind, content);
-        self.push_screen(Screen::Compose(screen));
+    /// Whether the user opted into an external editor by setting `editor` in the
+    /// config. When unset (the default) the built-in editor is used. The implicit
+    /// `$VISUAL`/`$EDITOR` auto-launch was deliberately dropped: an environment
+    /// editor that GUI-forks or is missing was the cause of "compose flashes and
+    /// does nothing", so shelling out is now opt-in only.
+    fn external_editor_set() -> bool {
+        crate::config::get().editor.is_some()
     }
 
-    /// Re-open `$EDITOR` on the body of the active compose screen (Ctrl+E),
-    /// preserving the title/slug/topics/visibility fields.
+    fn toast_editor_failed(&mut self, err: &str) {
+        tracing::warn!(error = %err, "compose: external editor failed");
+        self.toast = Some(Toast::warning(
+            "editor failed — check the `editor` config (GUI editors need a blocking flag, e.g. `code --wait`)",
+        ));
+    }
+
+    fn toast_editor_empty(&mut self) {
+        self.toast = Some(Toast::warning("editor returned nothing — post discarded"));
+    }
+
+    async fn start_compose(&mut self, kind: ComposeKind, prefill: String) {
+        if Self::external_editor_set() {
+            match self.run_editor(prefill).await {
+                Ok(content) if !content.trim().is_empty() => {
+                    self.push_screen(Screen::Compose(ComposeScreen::new(kind, content)));
+                }
+                Ok(_) => self.toast_editor_empty(),
+                Err(msg) => self.toast_editor_failed(&msg),
+            }
+            return;
+        }
+        let screen = EditorScreen::new(
+            EditorPurpose::NewBody {
+                kind,
+                prefill_topics: Vec::new(),
+            },
+            &prefill,
+        );
+        self.push_screen(Screen::Editor(screen));
+    }
+
+    /// Apply a built-in editor save, routing its content to the next screen by
+    /// the editor's purpose: a fresh body opens the compose confirm view; a
+    /// Ctrl+E re-edit returns to the compose screen it came from.
+    fn editor_save(&mut self) {
+        let (content, purpose) = match &self.screen {
+            Screen::Editor(s) => (s.content(), s.purpose().clone()),
+            _ => return,
+        };
+        match purpose {
+            EditorPurpose::NewBody {
+                kind,
+                prefill_topics,
+            } => {
+                let mut screen = ComposeScreen::new(kind, content);
+                if !prefill_topics.is_empty() {
+                    screen.topics_input = prefill_topics.join(", ");
+                }
+                // Replace the editor with the confirm screen; back_stack already
+                // holds the originating screen, so Esc from Compose returns there.
+                self.screen = Screen::Compose(screen);
+            }
+            EditorPurpose::ReEditBody => {
+                // The compose screen we re-edited is the top of the back stack.
+                self.pop_screen();
+                if let Screen::Compose(c) = &mut self.screen {
+                    c.content = content;
+                    c.error = None;
+                }
+            }
+        }
+    }
+
+    /// Re-edit the body of the active compose screen (Ctrl+E), preserving the
+    /// title/slug/topics/visibility fields. Uses the built-in editor by default,
+    /// or the configured external editor.
     async fn re_edit_compose(&mut self) {
         let Screen::Compose(s) = &self.screen else {
             return;
         };
         let current = s.content.clone();
-        match self.run_editor(current).await {
-            Ok(content) => {
-                if let Screen::Compose(s) = &mut self.screen {
-                    s.content = content;
-                    s.error = None;
+        if Self::external_editor_set() {
+            match self.run_editor(current).await {
+                Ok(content) => {
+                    if let Screen::Compose(s) = &mut self.screen {
+                        s.content = content;
+                        s.error = None;
+                    }
                 }
+                Err(msg) => self.toast_editor_failed(&msg),
             }
-            Err(msg) => tracing::warn!(error = %msg, "compose: re-edit editor failed"),
+            return;
         }
+        let screen = EditorScreen::new(EditorPurpose::ReEditBody, &current);
+        self.push_screen(Screen::Editor(screen));
     }
 
     fn spawn_compose_submit(&self) {
@@ -3646,20 +3734,27 @@ impl App {
         prefill: String,
         topics: Vec<String>,
     ) {
-        let editor_result = self.run_editor(prefill).await;
-        let content = match editor_result {
-            Ok(c) => c,
-            Err(msg) => {
-                tracing::warn!(error = %msg, "compose-note-edit: editor failed");
-                return;
+        if Self::external_editor_set() {
+            match self.run_editor(prefill).await {
+                Ok(content) if !content.trim().is_empty() => {
+                    let mut screen =
+                        ComposeScreen::new(ComposeKind::UpdateNote { note_id }, content);
+                    screen.topics_input = topics.join(", ");
+                    self.push_screen(Screen::Compose(screen));
+                }
+                Ok(_) => self.toast_editor_empty(),
+                Err(msg) => self.toast_editor_failed(&msg),
             }
-        };
-        if content.trim().is_empty() {
             return;
         }
-        let mut screen = ComposeScreen::new(ComposeKind::UpdateNote { note_id }, content);
-        screen.topics_input = topics.join(", ");
-        self.push_screen(Screen::Compose(screen));
+        let screen = EditorScreen::new(
+            EditorPurpose::NewBody {
+                kind: ComposeKind::UpdateNote { note_id },
+                prefill_topics: topics,
+            },
+            &prefill,
+        );
+        self.push_screen(Screen::Editor(screen));
     }
 
     fn spawn_notes_initial(&self) {
@@ -4142,6 +4237,153 @@ mod tests {
         assert_eq!(
             App::route_key(&mut screen, kev(KeyCode::Char('x'))),
             Action::None
+        );
+    }
+
+    fn kev_ctrl(code: KeyCode) -> event::KeyEvent {
+        event::KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+
+    fn editor(initial: &str) -> Screen {
+        Screen::Editor(EditorScreen::new(EditorPurpose::ReEditBody, initial))
+    }
+
+    #[test]
+    fn editor_screen_accepts_text_input() {
+        // Printable keys (digits, ?, i, S, ...) must reach the editor, not the
+        // global shortcuts.
+        assert!(editor("").accepts_text_input());
+    }
+
+    #[test]
+    fn route_key_maps_editor_intents_to_actions() {
+        let mut screen = editor("hello");
+        assert_eq!(
+            App::route_key(&mut screen, kev_ctrl(KeyCode::Char('s'))),
+            Action::EditorSave
+        );
+        assert_eq!(
+            App::route_key(&mut screen, kev_ctrl(KeyCode::Char('c'))),
+            Action::EditorCancel
+        );
+        assert_eq!(
+            App::route_key(&mut screen, kev(KeyCode::Char('x'))),
+            Action::None
+        );
+    }
+
+    #[tokio::test]
+    async fn compose_entry_opens_the_builtin_editor_over_the_feed() {
+        let mut app = test_app();
+        let mut feed = FeedScreen::new();
+        feed.apply_initial(Ok((vec![test_entry("p1")], None)));
+        app.screen = Screen::Feed(feed);
+        app.current_root = Some(RootKind::Feed);
+        app.handle_terminal_event(key_event(KeyCode::Char('c')))
+            .await;
+        assert!(
+            matches!(app.screen, Screen::Editor(_)),
+            "c opens the built-in editor"
+        );
+        assert!(
+            matches!(app.back_stack.last(), Some(Screen::Feed(_))),
+            "the originating feed is preserved beneath the editor"
+        );
+    }
+
+    #[test]
+    fn editor_save_newbody_opens_compose_confirm_and_keeps_originator() {
+        let mut app = test_app();
+        app.screen = Screen::Feed(FeedScreen::new());
+        let mut ed = EditorScreen::new(
+            EditorPurpose::NewBody {
+                kind: ComposeKind::NewEntry,
+                prefill_topics: vec!["music".into()],
+            },
+            "",
+        );
+        ed.paste("hello world");
+        app.push_screen(Screen::Editor(ed));
+        app.editor_save();
+        let Screen::Compose(c) = &app.screen else {
+            panic!("expected compose confirm after save");
+        };
+        assert_eq!(c.content, "hello world");
+        assert_eq!(c.topics_input, "music");
+        assert!(
+            matches!(app.back_stack.last(), Some(Screen::Feed(_))),
+            "Esc from the confirm screen must return to the feed"
+        );
+    }
+
+    #[test]
+    fn editor_reedit_roundtrip_preserves_compose_fields() {
+        let mut app = test_app();
+        let mut compose = ComposeScreen::new(ComposeKind::NewEntry, "old body".to_string());
+        compose.title_input = "My Title".into();
+        compose.topics_input = "a, b".into();
+        app.screen = Screen::Compose(compose);
+        // Ctrl+E pushed the editor over the compose screen.
+        app.push_screen(editor("old body"));
+        if let Screen::Editor(s) = &mut app.screen {
+            s.paste(" + new");
+        }
+        app.editor_save();
+        let Screen::Compose(c) = &app.screen else {
+            panic!("expected to land back on compose");
+        };
+        assert_eq!(c.content, "old body + new");
+        assert_eq!(c.title_input, "My Title", "title preserved");
+        assert_eq!(c.topics_input, "a, b", "topics preserved");
+    }
+
+    #[tokio::test]
+    async fn paste_event_routes_to_the_editor() {
+        let mut app = test_app();
+        app.screen = editor("");
+        app.handle_terminal_event(Event::Paste("a\nb".into())).await;
+        let Screen::Editor(s) = &app.screen else {
+            panic!("still on editor");
+        };
+        assert_eq!(s.content(), "a\nb");
+    }
+
+    #[tokio::test]
+    async fn paste_event_into_login_stays_single_line() {
+        // Bracketed paste into a single-line field collapses newlines so it can't
+        // break out of the field or trigger submit.
+        let mut app = test_app();
+        assert!(app.screen.is_login());
+        app.handle_terminal_event(Event::Paste("a\nb".into())).await;
+        let text = render_to_string(&app);
+        assert!(
+            text.contains("a b"),
+            "newline collapsed to a space: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn editor_ctrl_c_cancels_back_to_originator() {
+        let mut app = test_app();
+        app.screen = Screen::Feed(FeedScreen::new());
+        app.push_screen(editor("draft"));
+        app.handle_terminal_event(Event::Key(kev_ctrl(KeyCode::Char('c'))))
+            .await;
+        assert!(
+            matches!(app.screen, Screen::Feed(_)),
+            "Ctrl+C discards and returns to the feed"
+        );
+    }
+
+    #[tokio::test]
+    async fn editor_esc_cancels_back_to_originator() {
+        let mut app = test_app();
+        app.screen = Screen::Feed(FeedScreen::new());
+        app.push_screen(editor("draft"));
+        app.handle_terminal_event(key_event(KeyCode::Esc)).await;
+        assert!(
+            matches!(app.screen, Screen::Feed(_)),
+            "Esc pops the editor via the global back handler"
         );
     }
 

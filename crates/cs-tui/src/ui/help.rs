@@ -103,7 +103,7 @@ const COMMON: &[Row] = &[
         desc: "jump to bottom",
     },
     Row {
-        keys: "n / Space",
+        keys: "n / PgDn",
         desc: "next page",
     },
     Row {
@@ -155,6 +155,29 @@ const JUKEBOX: &[Row] = &[
     },
 ];
 
+const EDITOR: &[Row] = &[
+    Row {
+        keys: "type / Enter",
+        desc: "write the post/reply/note body (built-in editor, no $EDITOR needed)",
+    },
+    Row {
+        keys: "↑↓←→",
+        desc: "move the cursor · lines soft-wrap · PgUp/PgDn page",
+    },
+    Row {
+        keys: "Ctrl+S",
+        desc: "save the body and continue to the post options",
+    },
+    Row {
+        keys: "Esc / Ctrl+C",
+        desc: "cancel and discard",
+    },
+    Row {
+        keys: "paste",
+        desc: "paste multi-line text directly (set `editor` in config for an external editor)",
+    },
+];
+
 /// Build the help body. Kept separate from rendering so tests can assert on the
 /// content without a terminal backend.
 fn help_lines(theme: &Theme) -> Vec<Line<'static>> {
@@ -173,6 +196,7 @@ fn help_lines(theme: &Theme) -> Vec<Line<'static>> {
     group(&mut lines, "Sections", SECTIONS);
     group(&mut lines, "Global", GLOBAL);
     group(&mut lines, "Lists & reading", COMMON);
+    group(&mut lines, "Editor (compose)", EDITOR);
     group(&mut lines, "Jukebox", JUKEBOX);
     lines.push(Line::from(Span::styled(
         "Each screen shows its own keys in the status bar.",
