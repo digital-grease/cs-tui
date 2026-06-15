@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/cs-api", "crates/cs-tui"]
 
 [workspace.package]
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 rust-version = "1.81"
 license = "MIT OR Apache-2.0"
