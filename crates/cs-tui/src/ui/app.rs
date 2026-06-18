@@ -573,6 +573,34 @@ pub struct App {
     play_history_pos: usize,
 }
 
+/// The background override for the active `background_mode`, given the palette's
+/// own background. `None` leaves it alone; `Some(Reset)` lets the terminal's
+/// transparency show through; `Some(Black)` forces a solid backdrop for a theme
+/// that would otherwise be transparent (an already-opaque theme is left as-is).
+fn background_override(base_bg: ratatui::style::Color) -> Option<ratatui::style::Color> {
+    use ratatui::style::Color;
+    match crate::config::get().background_mode {
+        crate::config::BackgroundMode::Theme => None,
+        crate::config::BackgroundMode::Transparent => Some(Color::Reset),
+        crate::config::BackgroundMode::Opaque => {
+            (base_bg == Color::Reset).then_some(Color::Black)
+        }
+    }
+}
+
+/// Resolve a theme kind to its concrete palette, apply the `background_mode`
+/// override, then adapt to the terminal's color capability. Shared by startup
+/// ([`App::with_theme`]) and runtime theme-cycling ([`App::resolve_theme`]) so
+/// the transparency preference applies in both.
+fn build_theme(kind: ThemeKind, custom: Option<&Theme>, color_mode: ColorMode) -> Theme {
+    let base = match kind {
+        ThemeKind::Custom => custom.cloned().unwrap_or_else(Theme::cyber),
+        k => k.theme(),
+    };
+    let bg = background_override(base.background);
+    base.with_background(bg).adapt(color_mode)
+}
+
 impl App {
     pub fn with_theme(
         client: Client,
@@ -583,11 +611,7 @@ impl App {
         let (bg_tx, bg_rx) = mpsc::unbounded_channel();
         let last_email = prefill_email.clone();
         let color_mode = ColorMode::detect();
-        let theme = match theme_kind {
-            ThemeKind::Custom => custom_theme.clone().unwrap_or_else(Theme::cyber),
-            k => k.theme(),
-        }
-        .adapt(color_mode);
+        let theme = build_theme(theme_kind, custom_theme.as_ref(), color_mode);
         Self {
             client,
             theme,
@@ -809,6 +833,18 @@ impl App {
 
     fn render(&self, frame: &mut ratatui::Frame<'_>) {
         let full_area = frame.area();
+
+        // Paint a uniform backdrop first so `background_mode` is authoritative.
+        // `self.theme.background` already encodes the mode (Reset → let the
+        // terminal's transparency show through; an opaque color → solid backdrop;
+        // otherwise the palette's own background). Without this, only cells that a
+        // widget paints with `base()` get the theme background, so a translucent
+        // terminal shows through everywhere else regardless of theme.
+        frame.render_widget(
+            ratatui::widgets::Block::default()
+                .style(ratatui::style::Style::default().bg(self.theme.background)),
+            full_area,
+        );
 
         if self.screen.is_login() {
             if let Screen::Login(s) = &self.screen {
@@ -2608,11 +2644,7 @@ impl App {
     /// Resolve a kind to its concrete palette (`Custom` comes from `config.toml`),
     /// adapted to the terminal's color capability.
     fn resolve_theme(&self, kind: ThemeKind) -> Theme {
-        match kind {
-            ThemeKind::Custom => self.custom_theme.clone().unwrap_or_else(Theme::cyber),
-            k => k.theme(),
-        }
-        .adapt(self.color_mode)
+        build_theme(kind, self.custom_theme.as_ref(), self.color_mode)
     }
 
     /// Advance to the next theme palette, apply it live, and persist the choice

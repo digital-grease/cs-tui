@@ -30,6 +30,11 @@ pub struct Config {
     pub theme: Option<String>,
     /// Custom palette (used when the theme is `custom`).
     pub colors: Option<Colors>,
+    /// Selected-row emphasis: `fill` (default) | `bar`.
+    pub selection: Option<String>,
+    /// Screen background / terminal transparency: `theme` (default) |
+    /// `transparent` | `opaque`.
+    pub background_mode: Option<String>,
     /// Capture the scroll wheel for in-app scrolling (loses native select/copy).
     pub mouse: Option<bool>,
     /// Render inline images on graphics-capable terminals.
@@ -76,6 +81,32 @@ pub struct Colors {
     pub error: Option<String>,
     pub warning: Option<String>,
     pub border: Option<String>,
+    /// Background fill for the selected list row (the `fill` selection style).
+    pub selection: Option<String>,
+}
+
+/// How the selected row in a list is emphasized.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelectionStyle {
+    /// Full-row background fill (+ the `▌` bar). The default.
+    #[default]
+    Fill,
+    /// Just the `▌` bar and bold-accent text, no fill (the pre-fill look).
+    Bar,
+}
+
+/// Whether the app paints a screen background, controlling terminal transparency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackgroundMode {
+    /// Use whatever the chosen theme defines (cyber/vt320/dark are already
+    /// transparent; c64/vapor are opaque). The default.
+    #[default]
+    Theme,
+    /// Never paint a backdrop — let the terminal's transparency/opacity show
+    /// through, regardless of theme.
+    Transparent,
+    /// Always paint a solid backdrop, ignoring terminal transparency.
+    Opaque,
 }
 
 /// How list timestamps render.
@@ -115,6 +146,11 @@ pub struct Runtime {
     /// Whether sessions begin with shuffle mode armed (never auto-playing:
     /// the first track is still started by hand, it just chains from there).
     pub shuffle: bool,
+    /// How the selected list row is emphasized.
+    pub selection: SelectionStyle,
+    /// Screen background / terminal-transparency handling. Read when the active
+    /// theme is resolved (at startup and on each runtime theme-cycle).
+    pub background_mode: BackgroundMode,
 }
 
 impl Default for Runtime {
@@ -136,6 +172,8 @@ impl Default for Runtime {
             // Single-sourced with the player so the two never drift.
             audio_volume: crate::ui::player::DEFAULT_VOLUME,
             shuffle: false,
+            selection: SelectionStyle::Fill,
+            background_mode: BackgroundMode::Theme,
         }
     }
 }
@@ -194,6 +232,21 @@ const TEMPLATE: &str = r##"# cs-tui configuration. Edit and restart cs-tui.
 #error      = "#f38ba8"
 #warning    = "#f9e2af"
 #border     = "#585b70"
+#selection  = "#313244"   # background fill of the selected list row
+
+# Selected-row emphasis:
+#   "fill" — fill the whole selected row with the `selection` color (default)
+#   "bar"  — just the ▌ bar + bold-accent text, no fill
+#selection = "fill"
+
+# Screen background and terminal transparency:
+#   "theme"       — use the theme's own background (cyber/vt320/dark are already
+#                   transparent; c64/vapor are opaque). Default.
+#   "transparent" — never paint a backdrop; let the terminal's transparency show
+#                   through, whatever theme is active
+#   "opaque"      — always paint a solid backdrop (black for transparent themes),
+#                   ignoring terminal transparency
+#background_mode = "theme"
 
 # Compact mode: drop the blank-line / rule separators between list items for a
 # denser feed. true | false
@@ -371,6 +424,29 @@ impl Config {
                 .clamp(5, 3600),
             audio_volume: self.audio_volume.unwrap_or(d.audio_volume).clamp(0, 130),
             shuffle: self.shuffle.unwrap_or(d.shuffle),
+            selection: match self.selection.as_deref().map(str::to_ascii_lowercase) {
+                Some(s) if s == "fill" => SelectionStyle::Fill,
+                Some(s) if s == "bar" => SelectionStyle::Bar,
+                Some(other) => {
+                    tracing::warn!(value = other, "unknown selection; using fill");
+                    d.selection
+                }
+                None => d.selection,
+            },
+            background_mode: match self
+                .background_mode
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+            {
+                Some(s) if s == "theme" => BackgroundMode::Theme,
+                Some(s) if s == "transparent" => BackgroundMode::Transparent,
+                Some(s) if s == "opaque" => BackgroundMode::Opaque,
+                Some(other) => {
+                    tracing::warn!(value = other, "unknown background_mode; using theme");
+                    d.background_mode
+                }
+                None => d.background_mode,
+            },
         }
     }
 }
@@ -386,6 +462,7 @@ impl Colors {
         apply(&mut t.error, self.error.as_deref());
         apply(&mut t.warning, self.warning.as_deref());
         apply(&mut t.border, self.border.as_deref());
+        apply(&mut t.selection, self.selection.as_deref());
         t
     }
 }
@@ -573,6 +650,42 @@ mod tests {
     }
 
     #[test]
+    fn template_documents_every_option() {
+        // Guards against drift: a new Config field must be shown (commented) in
+        // the starter template so users can discover and edit it. If you add a
+        // field, add its line to the template and this list.
+        for key in [
+            "theme",
+            "[colors]",
+            "selection",
+            "background_mode",
+            "compact",
+            "time_format",
+            "timezone",
+            "start_section",
+            "nsfw",
+            "confirm_deletes",
+            "feed_autorefresh",
+            "feed_refresh_secs",
+            "notifications_refresh_secs",
+            "editor",
+            "preview_length",
+            "image_height",
+            "audio_volume",
+            "shuffle",
+            "mouse",
+            "images",
+            "hyperlinks",
+            "api_base",
+        ] {
+            assert!(
+                TEMPLATE.contains(key),
+                "starter template is missing the `{key}` option"
+            );
+        }
+    }
+
+    #[test]
     fn template_is_valid_toml_and_inert() {
         let cfg: Config = toml::from_str(TEMPLATE).expect("template parses");
         assert!(cfg.theme.is_none());
@@ -617,6 +730,51 @@ mod tests {
         assert!(rt.shuffle);
         // Unset defaults to off (sessions start with shuffle disarmed).
         assert!(!Config::default().to_runtime().shuffle);
+    }
+
+    #[test]
+    fn selection_and_background_mode_parse_and_default() {
+        // Defaults when unset.
+        let d = Config::default().to_runtime();
+        assert_eq!(d.selection, SelectionStyle::Fill);
+        assert_eq!(d.background_mode, BackgroundMode::Theme);
+
+        let cfg: Config = toml::from_str(
+            r#"
+            selection = "bar"
+            background_mode = "transparent"
+            "#,
+        )
+        .unwrap();
+        let rt = cfg.to_runtime();
+        assert_eq!(rt.selection, SelectionStyle::Bar);
+        assert_eq!(rt.background_mode, BackgroundMode::Transparent);
+
+        // Unknown values fall back to the defaults.
+        let bad: Config = toml::from_str(
+            r#"
+            selection = "sparkle"
+            background_mode = "translucent"
+            "#,
+        )
+        .unwrap();
+        let rt = bad.to_runtime();
+        assert_eq!(rt.selection, SelectionStyle::Fill);
+        assert_eq!(rt.background_mode, BackgroundMode::Theme);
+    }
+
+    #[test]
+    fn custom_theme_overrides_selection_fill() {
+        let cfg: Config = toml::from_str(
+            r##"
+            theme = "custom"
+            [colors]
+            selection = "#222244"
+            "##,
+        )
+        .unwrap();
+        let t = cfg.custom_theme().expect("has colors");
+        assert_eq!(t.selection, Color::Rgb(0x22, 0x22, 0x44));
     }
 
     #[test]

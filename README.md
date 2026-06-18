@@ -1,6 +1,6 @@
 # cs-tui
 
-A terminal client for [cyberspace.online](https://cyberspace.online), targeting the v0.5.0 API.
+A terminal client for [cyberspace.online](https://cyberspace.online), targeting the v0.5.1 API.
 
 ![cs-tui screenshot](docs/screenshot.png)
 
@@ -8,17 +8,18 @@ A terminal client for [cyberspace.online](https://cyberspace.online), targeting 
 
 ## Status
 
-Early development. Most of the documented v0.5.0 REST surface is implemented; live testing against the API is ongoing. Chat and DMs await the published Firebase RTDB schema.
+Early development. Most of the documented v0.5.1 REST surface is implemented; live testing against the API is ongoing. Chat and DMs await the published Firebase RTDB schema.
 
 ## Features
 
 - **Feed** with cursor-based infinite scroll and entry titles
 - **Post detail** with threaded replies
 - **Notifications** with read/unread filtering and an unread badge
+- **Thread watching**: `w` in post detail watches/unwatches a thread for `thread_reply` notifications; replying or being `@mentioned` auto-watches (toggle with `autoWatchOnReply` in Settings)
 - **Bookmarks**, **Topics**, and per-topic feeds
 - **Profiles** (info / posts / replies / followers / following) with follow & unfollow
 - **Compose** posts and replies in the built-in editor (soft-wrapping, multi-line paste, no external editor required); delete your own entries
-- **Guilds** — browse member groups, view threads/members, join/leave, and post threads
+- **Guilds**: browse member groups, view threads/members, join/leave, and post threads
 - **Journal** (private notes) with revision history
 - **Settings** round-trip that preserves fields the client doesn't model
 - Markdown rendering with `@mention` highlighting
@@ -131,16 +132,20 @@ random pick from the same pool shuffle uses.
 ## Configuration
 
 On first run, cs-tui writes a commented `config.toml` to
-`~/.config/cs-tui/config.toml` (override with `--config <path>` or
-`$CS_TUI_CONFIG`). It is never overwritten, so your edits and comments are safe.
-Every option is optional and shown at its default; restart to apply changes.
+`~/.config/cs-tui/config.toml`, listing every option at its default. It is never
+overwritten, so your edits and comments are safe. Every option is optional;
+restart to apply changes. Point at a different file with `--config <path>` or
+`$CS_TUI_CONFIG`; an explicit path must already exist (only the default
+location is auto-created).
 
 ### Appearance
 
 | Option | Default | Notes |
 |---|---|---|
 | `theme` | `cyber` | One of `cyber`, `c64`, `vt320`, `dark`, `vapor`, `custom`. The in-app Esc → Theme menu overrides this and is remembered separately. |
-| `[colors]` | built-in | Custom palette, used when `theme = "custom"`. Keys: `background`, `foreground`, `muted`, `accent`, `success`, `error`, `warning`, `border`. Each is a hex (`"#1e1e2e"`), `"reset"`, or an ANSI index (`"0"` to `"255"`); omitted keys keep the default. |
+| `[colors]` | built-in | Custom palette, used when `theme = "custom"`. Keys: `background`, `foreground`, `muted`, `accent`, `success`, `error`, `warning`, `border`, `selection`. Each is a hex (`"#1e1e2e"`), `"reset"`, or an ANSI index (`"0"` to `"255"`); omitted keys keep the default. |
+| `selection` | `fill` | Selected-row emphasis: `fill` (a full-row background fill, the `selection` color) or `bar` (just the `▌` bar + bold-accent text). |
+| `background_mode` | `theme` | Screen background / terminal transparency. `theme` uses the palette's own background (`cyber`/`vt320`/`dark` are transparent, `c64`/`vapor` solid); `transparent` never paints a backdrop so the terminal's transparency shows through on any theme; `opaque` always paints a solid backdrop (black for the transparent themes). |
 | `compact` | `false` | Drop the blank-line / rule separators between list items for a denser feed. |
 
 ### Time
@@ -159,7 +164,10 @@ Every option is optional and shown at its default; restart to apply changes.
 | `confirm_deletes` | `true` | Require the two-step `d` then `y` confirmation before deleting a post or note. |
 | `feed_autorefresh` | `true` | Auto-refresh the feed in the background: new entries are prepended at the top without moving your scroll position (only while the feed is on screen). |
 | `feed_refresh_secs` | `60` | Seconds between background feed polls. Minimum 10; lower values use more of the read rate limit. |
-| `editor` | _(unset — use the built-in editor)_ | Set to an external editor command (e.g. `nvim`) to compose in it instead of the built-in editor. GUI editors must block until the file is closed, so use a wait flag: `code --wait`, `subl -w`, `gnome-text-editor --standalone`. Leave unset to use the built-in editor. `$VISUAL`/`$EDITOR` are no longer consulted (an environment editor that forks or is missing was silently aborting composes). |
+| `notifications_refresh_secs` | `20` | Seconds between background polls of the unread-notification count (the header badge). Minimum 5; lower values surface new notifications sooner but use more of the read rate limit. |
+| `audio_volume` | `50` | Starting jukebox volume for a fresh session (0 to 130; above 100 is soft amplification). Adjust live with `[` / `]`. |
+| `shuffle` | `false` | Start each session with shuffle mode armed (playback still begins by hand). See [Jukebox playback](#jukebox-playback-optional). |
+| `editor` | _(unset, uses the built-in editor)_ | Set to an external editor command (e.g. `nvim`) to compose in it instead of the built-in editor. GUI editors must block until the file is closed, so use a wait flag: `code --wait`, `subl -w`, `gnome-text-editor --standalone`. Leave unset to use the built-in editor. `$VISUAL`/`$EDITOR` are no longer consulted (an environment editor that forks or is missing was silently aborting composes). |
 | `preview_length` | `200` | Characters of post content shown in list previews (clamped 20 to 2000). |
 | `image_height` | `20` | Max rows for the inline image strip in post detail (clamped 1 to 60). |
 
@@ -169,6 +177,7 @@ Every option is optional and shown at its default; restart to apply changes.
 |---|---|---|
 | `mouse` | `false` | Capture the scroll wheel for in-app scrolling. Off keeps native terminal select/copy. `--mouse` forces it on. |
 | `images` | `true` | Render inline images on graphics-capable terminals. `--no-images` forces it off. |
+| `hyperlinks` | `true` | Make links clickable via OSC 8 terminal hyperlinks (Ghostty, kitty, WezTerm, iTerm2, foot, recent VTE terminals, Windows Terminal, tmux ≥ 3.4). Off surfaces the bare URL for the terminal's own URL detection instead. |
 | `api_base` | `https://api.cyberspace.online` | Override the API base URL. |
 
 ## Layout
@@ -177,7 +186,7 @@ Every option is optional and shown at its default; restart to apply changes.
 |---|---|
 | `crates/cs-api/` | HTTP client + types for the Cyberspace REST API |
 | `crates/cs-tui/` | Ratatui application (binary) |
-| `docs/api-v0.5.0.md` | Authoritative API specification (do not modify) |
+| `docs/api-v0.5.1.md` | Authoritative API specification (do not modify) |
 
 ## License
 
