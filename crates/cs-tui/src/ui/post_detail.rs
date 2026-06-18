@@ -46,6 +46,9 @@ pub enum PostDetailIntent {
     BookmarkReply {
         reply_id: String,
     },
+    /// Toggle watching this thread (subscribe to / unsubscribe from
+    /// `thread_reply` notifications).
+    ToggleWatch,
     /// Open a URL (the jukebox link) in the user's default browser.
     OpenUrl(String),
     /// Play (or toggle) the focused jukebox track. `None` when there's none —
@@ -69,6 +72,10 @@ pub struct PostDetailScreen {
     pub max_scroll: Cell<u16>,
     /// Optional reply id to highlight (set when arriving from a reply notification).
     pub highlight_reply_id: Option<String>,
+    /// Whether the viewer currently watches this thread (subscribed to its
+    /// `thread_reply` notifications). `None` until the background status fetch
+    /// resolves; set optimistically on `w` and reconciled by the toggle result.
+    pub watching: Option<bool>,
     /// Currently selected reply (index into `replies`), driven by `J`/`K`. `None`
     /// means the post itself is the focus. Selecting a reply lets `b` bookmark it.
     pub selected_reply: Option<usize>,
@@ -109,6 +116,7 @@ impl PostDetailScreen {
             scroll: 0,
             max_scroll: Cell::new(0),
             highlight_reply_id: None,
+            watching: None,
             selected_reply: None,
             reply_starts: RefCell::new(Vec::new()),
             reply_anchors: RefCell::new(Vec::new()),
@@ -118,6 +126,12 @@ impl PostDetailScreen {
             requested: RefCell::new(HashSet::new()),
             image_slots: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Record the latest known watch state for this thread (from the status
+    /// fetch on open or a watch/unwatch toggle result).
+    pub fn set_watching(&mut self, watching: bool) {
+        self.watching = Some(watching);
     }
 
     /// Remember fetched bytes for `url`. Drops any stale decoded protocol so the
@@ -204,6 +218,8 @@ impl PostDetailScreen {
                 },
                 None => PostDetailIntent::Bookmark,
             },
+            // `w` watches / unwatches the thread (post-level, ignores reply selection).
+            KeyCode::Char('w') => PostDetailIntent::ToggleWatch,
             // `o` opens the jukebox link in the browser — the selected reply's
             // link when one is selected, otherwise the post's.
             KeyCode::Char('o') => match self.jukebox_url() {
@@ -507,6 +523,11 @@ impl PostDetailScreen {
         } else {
             ""
         };
+        let watch_hint = if self.watching == Some(true) {
+            " · w unwatch"
+        } else {
+            " · w watch"
+        };
         let status_text = if self.confirming_delete {
             "really delete this post? y=yes, any other key=cancel".to_string()
         } else if self.loading_replies && self.replies.is_empty() {
@@ -515,12 +536,12 @@ impl PostDetailScreen {
             format!("error: {msg} · esc back · r retry")
         } else if self.next_replies_cursor.is_some() {
             format!(
-                "{} replies · scroll down for more · esc back · J/K select reply · R reply · Q quote · b bookmark{open_hint} · d delete · r refresh",
+                "{} replies · scroll down for more · esc back · J/K select reply · R reply · Q quote · b bookmark{open_hint}{watch_hint} · d delete · r refresh",
                 self.replies.len()
             )
         } else {
             format!(
-                "{} replies · end · esc back · J/K select reply · R reply · Q quote · b bookmark{open_hint} · d delete · r refresh",
+                "{} replies · end · esc back · J/K select reply · R reply · Q quote · b bookmark{open_hint}{watch_hint} · d delete · r refresh",
                 self.replies.len()
             )
         };
@@ -574,10 +595,15 @@ impl PostDetailScreen {
         ]));
         lines.push(Line::from(Span::styled(
             format!(
-                "{} replies · {} bookmarks{}",
+                "{} replies · {} bookmarks{}{}",
                 self.entry.replies_count,
                 self.entry.bookmarks_count,
-                if self.entry.is_nsfw { " · NSFW" } else { "" }
+                if self.entry.is_nsfw { " · NSFW" } else { "" },
+                if self.watching == Some(true) {
+                    " · ★ watching"
+                } else {
+                    ""
+                }
             ),
             theme.muted_style(),
         )));
@@ -781,6 +807,39 @@ mod tests {
         // A fresh reply page clears the selection.
         s.apply_replies_initial(Ok((vec![reply("r1", "p1")], None)));
         assert_eq!(s.selected_reply, None);
+    }
+
+    #[test]
+    fn w_toggles_watch_at_thread_level_even_with_a_reply_selected() {
+        let mut s = PostDetailScreen::new(entry("p1"));
+        s.apply_replies_initial(Ok((vec![reply("r1", "p1")], None)));
+
+        // No selection → w is a thread-level toggle.
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('w'))),
+            PostDetailIntent::ToggleWatch
+        );
+
+        // Selecting a reply doesn't retarget w (unlike b, which targets the reply).
+        s.handle_key(key(KeyCode::Char('J')));
+        assert_eq!(s.selected_reply, Some(0));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('w'))),
+            PostDetailIntent::ToggleWatch
+        );
+    }
+
+    #[test]
+    fn watching_indicator_shows_only_when_watching() {
+        let mut s = PostDetailScreen::new(entry("p1"));
+        // Unknown state: no indicator.
+        assert!(!body_text(&s).iter().any(|l| l.contains("watching")));
+        // Watching: the meta line gains the indicator.
+        s.set_watching(true);
+        assert!(body_text(&s).iter().any(|l| l.contains("★ watching")));
+        // Not watching: indicator hidden again.
+        s.set_watching(false);
+        assert!(!body_text(&s).iter().any(|l| l.contains("watching")));
     }
 
     /// Flatten the body into per-line strings. `inline_images` mirrors the render

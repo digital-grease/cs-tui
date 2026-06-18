@@ -162,7 +162,7 @@ impl GuildScreen {
                 return GuildIntent::None;
             }
             KeyCode::Char('c') => {
-                // v0.5.0: guild forums are open — any authenticated user can
+                // v0.5.1: guild forums are open — any authenticated user can
                 // start a thread, membership not required.
                 if self.guild.is_some() {
                     return GuildIntent::Compose;
@@ -704,7 +704,7 @@ mod tests {
 
     #[test]
     fn c_requests_compose_for_members_and_outsiders() {
-        // v0.5.0: guild forums are open, so non-members can start threads too.
+        // v0.5.1: guild forums are open, so non-members can start threads too.
         let mut member = with_guild(true, Some(GuildRole::Member));
         assert_eq!(
             member.handle_key(key(KeyCode::Char('c'))),

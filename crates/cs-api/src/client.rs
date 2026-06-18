@@ -242,8 +242,8 @@ impl Client {
         }
     }
 
-    /// Make an UN-authenticated request (login, register, check-username) and
-    /// decode a `{ "data": T }` envelope.
+    /// Make an UN-authenticated request (e.g. login) and decode a
+    /// `{ "data": T }` envelope.
     pub(crate) async fn request_public<T, B>(
         &self,
         key: EndpointKey,

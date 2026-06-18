@@ -1,13 +1,13 @@
 //! Endpoint keys for rate-limiter accounting. One variant per documented endpoint.
 //!
-//! Rate-limit values come from `docs/api-v0.5.0.md`. Where the consolidated table
+//! Rate-limit values come from `docs/api-v0.5.1.md`. Where the consolidated table
 //! and the per-endpoint section disagree, the lower (more restrictive) value is
 //! used so the client cannot self-trigger 429s.
 use crate::rate_limit::RateLimit;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EndpointKey {
-    // Auth (registration is out of scope — login + refresh only)
+    // Auth — login + refresh only (the API exposes no registration endpoint).
     AuthLogin,
     AuthRefresh,
 
@@ -64,7 +64,13 @@ pub enum EndpointKey {
     SettingsGet,
     SettingsUpdate,
 
-    // Guilds (v0.5.0)
+    // Thread watching (v0.5.1)
+    WatchStatus,
+    WatchCreate,
+    WatchDelete,
+    WatchesList,
+
+    // Guilds (v0.5.1)
     GuildsList,
     GuildsGet,
     GuildsMembersList,
@@ -88,14 +94,14 @@ impl EndpointKey {
             NotificationsMarkRead, NotificationsUnreadCount, RepliesCreate, RepliesDelete,
             RepliesGet, RepliesList, SettingsGet, SettingsUpdate, TopicsList, TopicsListPosts,
             UsersGet, UsersGetMe, UsersGetPostBySlug, UsersListPosts, UsersListReplies,
-            UsersUpdateMe,
+            UsersUpdateMe, WatchCreate, WatchDelete, WatchStatus, WatchesList,
         };
 
         match self {
             // Auth — login/refresh carry no documented limit.
             AuthLogin | AuthRefresh => RateLimit::none(),
 
-            // Reads — table values from § Anti-Scraping (v0.5.0).
+            // Reads — table values from § Anti-Scraping (v0.5.1).
             EntriesList | RepliesList | UsersListPosts | UsersListReplies | TopicsListPosts => {
                 RateLimit::per_minute(45)
             }
@@ -105,7 +111,9 @@ impl EndpointKey {
             | FollowsList
             | UsersGet
             | NotificationsList
-            | NotificationsUnreadCount => RateLimit::per_minute(30),
+            | NotificationsUnreadCount
+            | WatchStatus
+            | WatchesList => RateLimit::per_minute(30),
             // Single-post-by-slug isn't in the table; keep a conservative read cap.
             UsersGetPostBySlug => RateLimit::per_minute(30),
 
@@ -113,22 +121,25 @@ impl EndpointKey {
             EntriesGet | RepliesGet | UsersGetMe | NotesGet | NotesGetRevision
             | NotesListRevisions | SettingsGet => RateLimit::none(),
 
-            // Writes — lower of (table, section) values (v0.5.0).
+            // Writes — lower of (table, section) values (v0.5.1).
             EntriesCreate | UsersUpdateMe | SettingsUpdate => RateLimit::with_day(2, 15),
             RepliesCreate | FollowsCreate | FollowsDelete => RateLimit::with_day(3, 15),
             NotesCreate => RateLimit::with_day(3, 30),
             BookmarksCreate => RateLimit::with_day(5, 75),
+            // Thread watching (v0.5.1 § Rate Limits — "Watch thread" 10/min, 100/day).
+            WatchCreate => RateLimit::with_day(10, 100),
 
             // Deletes — not documented; no client-side cap.
             EntriesDelete
             | RepliesDelete
             | BookmarksDelete
+            | WatchDelete
             | NotesUpdate
             | NotesDelete
             | NotificationsMarkRead
             | NotificationsMarkAllRead => RateLimit::none(),
 
-            // Guilds (v0.5.0) — per-endpoint sections + § Anti-Scraping table.
+            // Guilds (v0.5.1) — per-endpoint sections + § Anti-Scraping table.
             GuildsList | GuildsMembersList => RateLimit::per_minute(30),
             GuildsThreadsList => RateLimit::per_minute(45),
             GuildsGet => RateLimit::none(),
