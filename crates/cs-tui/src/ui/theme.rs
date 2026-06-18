@@ -375,7 +375,14 @@ mod tests {
     #[test]
     fn monochrome_drops_all_color() {
         let m = Theme::vapor().adapt(ColorMode::Monochrome);
-        for c in [m.foreground, m.accent, m.error, m.muted, m.border, m.selection] {
+        for c in [
+            m.foreground,
+            m.accent,
+            m.error,
+            m.muted,
+            m.border,
+            m.selection,
+        ] {
             assert_eq!(c, Color::Reset);
         }
     }
@@ -384,15 +391,24 @@ mod tests {
     fn with_background_overrides_only_when_some() {
         let base = Theme::cyber();
         // Some(_) forces the background (transparency override).
-        assert_eq!(base.clone().with_background(Some(Color::Reset)).background, Color::Reset);
+        assert_eq!(
+            base.clone().with_background(Some(Color::Reset)).background,
+            Color::Reset
+        );
         assert_eq!(
             base.clone().with_background(Some(Color::Black)).background,
             Color::Black
         );
         // None leaves the palette's own background untouched.
-        assert_eq!(base.clone().with_background(None).background, base.background);
+        assert_eq!(
+            base.clone().with_background(None).background,
+            base.background
+        );
         // Only the background slot moves; selection (and the rest) are unchanged.
-        assert_eq!(base.clone().with_background(Some(Color::Black)).selection, base.selection);
+        assert_eq!(
+            base.clone().with_background(Some(Color::Black)).selection,
+            base.selection
+        );
     }
 
     #[test]

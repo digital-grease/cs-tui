@@ -582,9 +582,7 @@ fn background_override(base_bg: ratatui::style::Color) -> Option<ratatui::style:
     match crate::config::get().background_mode {
         crate::config::BackgroundMode::Theme => None,
         crate::config::BackgroundMode::Transparent => Some(Color::Reset),
-        crate::config::BackgroundMode::Opaque => {
-            (base_bg == Color::Reset).then_some(Color::Black)
-        }
+        crate::config::BackgroundMode::Opaque => (base_bg == Color::Reset).then_some(Color::Black),
     }
 }
 
