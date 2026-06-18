@@ -156,6 +156,19 @@ pub enum BgEvent {
         result: Result<Entry, String>,
         highlight_reply_id: Option<String>,
     },
+    /// Current watch state for an open post detail, fetched on open. `Err` is
+    /// ignored (the indicator just stays unknown); connectivity is noted via the
+    /// usual signal path.
+    WatchStatus {
+        post_id: String,
+        result: Result<bool, String>,
+    },
+    /// Result of a watch/unwatch toggle. `Ok(watching)` is the authoritative new
+    /// state; `Err` rolls back the optimistic flip and warns.
+    WatchToggled {
+        post_id: String,
+        result: Result<bool, String>,
+    },
     UnreadCount(u32),
     ProfileUser(Result<User, String>),
     ProfilePosts {
@@ -375,6 +388,11 @@ enum Action {
     },
     BookmarkReply {
         reply_id: String,
+    },
+    /// Watch (`watch == true`) or unwatch the given thread.
+    SetThreadWatch {
+        post_id: String,
+        watch: bool,
     },
     StartComposeReply {
         post_id: String,
@@ -1004,6 +1022,11 @@ impl App {
                     post_id: s.entry.post_id.clone(),
                 },
                 PostDetailIntent::BookmarkReply { reply_id } => Action::BookmarkReply { reply_id },
+                PostDetailIntent::ToggleWatch => Action::SetThreadWatch {
+                    post_id: s.entry.post_id.clone(),
+                    // Unknown state defaults to "start watching".
+                    watch: !s.watching.unwrap_or(false),
+                },
                 PostDetailIntent::OpenUrl(url) => Action::OpenUrl { url },
                 PostDetailIntent::PlayJukebox(track) => Action::PlayPressed { track },
                 PostDetailIntent::None => Action::None,
@@ -1650,6 +1673,19 @@ impl App {
                 }
                 self.spawn_bookmark_reply(reply_id);
             }
+            Action::SetThreadWatch { post_id, watch } => {
+                if self.block_write_if_offline() {
+                    return;
+                }
+                // Optimistically reflect the new state; the toggle result
+                // reconciles (or rolls back) once it lands.
+                if let Screen::PostDetail(s) = &mut self.screen {
+                    if s.entry.post_id == post_id {
+                        s.set_watching(watch);
+                    }
+                }
+                self.spawn_set_thread_watch(post_id, watch);
+            }
             Action::StartComposeReply {
                 post_id,
                 parent_reply_id,
@@ -1849,6 +1885,42 @@ impl App {
                     Err(msg) => Toast::warning(format!("bookmark failed: {}", first_line(&msg))),
                 });
             }
+            BgEvent::WatchStatus { post_id, result } => {
+                // Passive fetch on open: update the indicator on success, stay
+                // quiet on failure (no toast — the key still works).
+                if let Ok(watching) = result {
+                    if let Screen::PostDetail(s) = &mut self.screen {
+                        if s.entry.post_id == post_id {
+                            s.set_watching(watching);
+                        }
+                    }
+                }
+            }
+            BgEvent::WatchToggled { post_id, result } => match result {
+                Ok(watching) => {
+                    if let Screen::PostDetail(s) = &mut self.screen {
+                        if s.entry.post_id == post_id {
+                            s.set_watching(watching);
+                        }
+                    }
+                    self.toast = Some(Toast::confirmation(if watching {
+                        "watching thread"
+                    } else {
+                        "unwatched thread"
+                    }));
+                }
+                Err(msg) => {
+                    // Roll back the optimistic flip from a fresh status fetch so
+                    // the indicator can't lie about the server state.
+                    self.warn_toast_unless_signalled(&format!(
+                        "watch failed: {}",
+                        first_line(&msg)
+                    ));
+                    if matches!(&self.screen, Screen::PostDetail(s) if s.entry.post_id == post_id) {
+                        self.spawn_watch_status(&post_id);
+                    }
+                }
+            },
             BgEvent::PlaybackEnded { token } => {
                 // Clear the now-playing bar only if this is still the current
                 // track (a superseded track's exit must not clear a newer one).
@@ -2792,6 +2864,38 @@ impl App {
         });
     }
 
+    /// Fetch the current watch state for an open post detail (human-driven: runs
+    /// when the user opens the thread). Non-blocking; the indicator updates when
+    /// `WatchStatus` lands.
+    fn spawn_watch_status(&self, post_id: &str) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        let post_id = post_id.to_string();
+        tokio::spawn(async move {
+            let result = client
+                .watch_status(&post_id)
+                .await
+                .map_err(|e| note_api_err(&tx, e));
+            let _ = tx.send(BgEvent::WatchStatus { post_id, result });
+        });
+    }
+
+    /// Watch or unwatch a thread, reporting the authoritative new state via
+    /// `WatchToggled`.
+    fn spawn_set_thread_watch(&self, post_id: String, watch: bool) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = if watch {
+                client.watch_thread(&post_id).await
+            } else {
+                client.unwatch_thread(&post_id).await
+            }
+            .map_err(|e| note_api_err(&tx, e));
+            let _ = tx.send(BgEvent::WatchToggled { post_id, result });
+        });
+    }
+
     /// Warm the topics cache in the background: page through every topic with a
     /// gentle trickle so a later search covers them all without a foreground
     /// load. Self-paced and rate-limited; resumes through transient errors and
@@ -3038,6 +3142,8 @@ impl App {
         screen.highlight_reply_id = highlight_reply_id;
         self.push_screen(Screen::PostDetail(screen));
         self.spawn_detail_replies_initial(&id);
+        // Resolve the watch indicator (subscribed to thread_reply notifications?).
+        self.spawn_watch_status(&id);
         // Kick off the fetch for the post's own image now; the replies' images
         // follow once `DetailRepliesInitial` lands. Both are decoded and drawn
         // inline by the render pass as they scroll into view.

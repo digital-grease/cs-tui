@@ -5,6 +5,7 @@
 .DS_Store
 .env
 .env.local
+docs/
 
 # Local runtime fallbacks (the app normally writes these under XDG dirs)
 /cs-tui.log

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// Tokens returned by `POST /v1/auth/login`, `/refresh`, and `/register`.
+/// Tokens returned by `POST /v1/auth/login` and `/refresh`.
 ///
 /// - `id_token` — Bearer token for REST requests; short-lived.
 /// - `refresh_token` — exchanges for a new id_token via `/v1/auth/refresh`.

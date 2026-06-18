@@ -581,7 +581,7 @@ enum ListTarget {
     Following,
 }
 
-/// Render one follower/following row. The follows API (v0.5.0) returns only
+/// Render one follower/following row. The follows API (v0.5.1) returns only
 /// user IDs, not `followerUsername`/`followedUsername`, so those fields decode
 /// to empty strings. When the username is missing, fall back to a truncated
 /// user ID in a muted style rather than printing a bare "@".

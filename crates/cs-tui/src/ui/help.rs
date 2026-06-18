@@ -123,6 +123,10 @@ const COMMON: &[Row] = &[
         desc: "bookmark (feed / post)",
     },
     Row {
+        keys: "w",
+        desc: "watch / unwatch thread (post detail)",
+    },
+    Row {
         keys: "/",
         desc: "search (topics)",
     },
