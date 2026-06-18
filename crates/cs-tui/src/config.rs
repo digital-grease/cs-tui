@@ -433,11 +433,7 @@ impl Config {
                 }
                 None => d.selection,
             },
-            background_mode: match self
-                .background_mode
-                .as_deref()
-                .map(str::to_ascii_lowercase)
-            {
+            background_mode: match self.background_mode.as_deref().map(str::to_ascii_lowercase) {
                 Some(s) if s == "theme" => BackgroundMode::Theme,
                 Some(s) if s == "transparent" => BackgroundMode::Transparent,
                 Some(s) if s == "opaque" => BackgroundMode::Opaque,
