@@ -15,6 +15,11 @@ pub struct Theme {
     /// Caution accent — drives the rate-limit toast (and any future warnings).
     pub warning: Color,
     pub border: Color,
+    /// Background fill for the selected row in lists (the `selection = "fill"`
+    /// style). A subtle tint that reads as "you are here" while preserving each
+    /// span's own foreground color. Collapses to `Reset` in monochrome mode, where
+    /// the `▌` bar + bold carry the selection instead.
+    pub selection: Color,
 }
 
 impl Theme {
@@ -31,6 +36,7 @@ impl Theme {
             error: Color::LightRed,
             warning: Color::LightYellow,
             border: Color::Green,
+            selection: Color::Indexed(238), // neutral dark gray
         }
     }
 
@@ -45,6 +51,7 @@ impl Theme {
             error: Color::LightRed,
             warning: Color::Indexed(227), // light yellow
             border: Color::Indexed(75),
+            selection: Color::Indexed(19), // medium blue, lighter than the bg
         }
     }
 
@@ -59,6 +66,7 @@ impl Theme {
             error: Color::LightRed,
             warning: Color::Indexed(214), // amber
             border: Color::Indexed(94),
+            selection: Color::Indexed(238), // neutral dark gray
         }
     }
 
@@ -79,6 +87,7 @@ impl Theme {
             error: Color::Rgb(0xff, 0x3b, 0x6b),      // neon red
             warning: Color::Rgb(0xff, 0xe1, 0x6b),    // pale gold
             border: Color::Rgb(0x00, 0xe0, 0xff),     // electric cyan
+            selection: Color::Rgb(0x33, 0x24, 0x5a),  // lighter indigo than the bg
         }
     }
 
@@ -95,6 +104,7 @@ impl Theme {
             error: Color::Indexed(203),      // soft red
             warning: Color::Indexed(215),    // amber
             border: Color::Indexed(240),     // neutral gray
+            selection: Color::Indexed(238),  // dark gray, just under the border
         }
     }
 
@@ -132,6 +142,18 @@ impl Theme {
         Style::default().fg(self.border)
     }
 
+    /// Highlight style for the selected list row in the `selection = "fill"`
+    /// style: a background fill plus bold. Deliberately sets **only** the
+    /// background (not the foreground), so ratatui patches it over each cell and
+    /// every span keeps its own color — the row reads as one filled block, not a
+    /// recolored monotone. In monochrome mode `selection` is `Reset`, so the fill
+    /// disappears and the `▌` bar + bold carry the selection.
+    pub fn selection_style(&self) -> Style {
+        Style::default()
+            .bg(self.selection)
+            .add_modifier(Modifier::BOLD)
+    }
+
     /// Adapt the palette to what the terminal can actually display. `Full` is a
     /// no-op; `Indexed256` downsamples any truecolor (`vapor`, `#hex` customs) to
     /// the nearest 256-color index; `Monochrome` drops all color (NO_COLOR),
@@ -158,7 +180,19 @@ impl Theme {
             error: f(self.error),
             warning: f(self.warning),
             border: f(self.border),
+            selection: f(self.selection),
         }
+    }
+
+    /// Force the background per the user's transparency preference. `Some(Reset)`
+    /// lets the terminal's own transparency/opacity show through; `Some(opaque)`
+    /// paints a solid backdrop; `None` keeps the palette's own background.
+    #[must_use]
+    pub fn with_background(mut self, bg: Option<Color>) -> Self {
+        if let Some(c) = bg {
+            self.background = c;
+        }
+        self
     }
 }
 
@@ -341,9 +375,24 @@ mod tests {
     #[test]
     fn monochrome_drops_all_color() {
         let m = Theme::vapor().adapt(ColorMode::Monochrome);
-        for c in [m.foreground, m.accent, m.error, m.muted, m.border] {
+        for c in [m.foreground, m.accent, m.error, m.muted, m.border, m.selection] {
             assert_eq!(c, Color::Reset);
         }
+    }
+
+    #[test]
+    fn with_background_overrides_only_when_some() {
+        let base = Theme::cyber();
+        // Some(_) forces the background (transparency override).
+        assert_eq!(base.clone().with_background(Some(Color::Reset)).background, Color::Reset);
+        assert_eq!(
+            base.clone().with_background(Some(Color::Black)).background,
+            Color::Black
+        );
+        // None leaves the palette's own background untouched.
+        assert_eq!(base.clone().with_background(None).background, base.background);
+        // Only the background slot moves; selection (and the rest) are unchanged.
+        assert_eq!(base.clone().with_background(Some(Color::Black)).selection, base.selection);
     }
 
     #[test]

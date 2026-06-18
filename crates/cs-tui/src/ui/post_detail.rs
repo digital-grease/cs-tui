@@ -673,9 +673,16 @@ impl PostDetailScreen {
             } else {
                 ""
             };
-            // The selected reply's header is reverse-video so it stands out.
+            // The selected reply's header is marked to match the list style:
+            // `fill` tints it with the selection background, `bar` reverse-videos
+            // it (the older look).
             let author_style = if selected {
-                theme.accent_style().add_modifier(Modifier::REVERSED)
+                match crate::config::get().selection {
+                    crate::config::SelectionStyle::Fill => theme.selection_style(),
+                    crate::config::SelectionStyle::Bar => {
+                        theme.accent_style().add_modifier(Modifier::REVERSED)
+                    }
+                }
             } else {
                 theme.accent_style()
             };

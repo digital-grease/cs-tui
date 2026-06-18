@@ -38,6 +38,7 @@ struct Cli {
     mouse: bool,
 
     /// Path to the config file (default: <XDG_CONFIG_HOME>/cs-tui/config.toml).
+    /// When given explicitly, the file must exist — it is never auto-created.
     #[arg(long, env = "CS_TUI_CONFIG")]
     config: Option<PathBuf>,
 }
@@ -52,15 +53,27 @@ async fn main() -> Result<()> {
         anyhow::bail!("--mock flag is not yet implemented (lands in phase 7)");
     }
 
-    // Config: resolve the path (--config / $CS_TUI_CONFIG override the default),
-    // drop a commented template on first run, then load it and install the
-    // runtime display/behavior prefs.
+    // Config: resolve the path (--config / $CS_TUI_CONFIG override the default).
+    // An explicit path must already exist — we never auto-create a template
+    // there, so a typo'd `--config` fails loudly instead of silently writing
+    // defaults and loading them. Only the default location gets a starter
+    // template dropped on first run.
+    let explicit_config = cli.config.is_some();
     let config_path = cli
         .config
         .clone()
         .or_else(Config::default_path)
         .unwrap_or_else(|| PathBuf::from("config.toml"));
-    Config::write_template_if_absent(&config_path);
+    if explicit_config {
+        if !config_path.exists() {
+            anyhow::bail!(
+                "config file not found: {} (an explicit --config path must exist)",
+                config_path.display()
+            );
+        }
+    } else {
+        Config::write_template_if_absent(&config_path);
+    }
     let cfg = Config::load_from(&config_path);
     config::init(cfg.to_runtime());
     config::set_config_path(config_path.clone());

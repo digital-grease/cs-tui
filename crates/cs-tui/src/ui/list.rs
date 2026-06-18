@@ -10,8 +10,10 @@ use std::cell::Cell;
 
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{HighlightSpacing, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
+
+use crate::config::SelectionStyle;
 
 use super::theme::Theme;
 
@@ -147,9 +149,19 @@ pub fn render_body<T, F>(
     if !visible.is_empty() {
         let items: Vec<ListItem<'static>> =
             visible.iter().map(|&i| item(&state.items[i])).collect();
+        // `fill` paints the whole selected row (bg only, so each span keeps its
+        // color); `bar` keeps the older bold-accent recolor. Both repeat the `▌`
+        // bar down every line of a multi-line item and reserve the gutter always,
+        // so selection doesn't shift the row sideways.
+        let highlight = match crate::config::get().selection {
+            SelectionStyle::Fill => theme.selection_style(),
+            SelectionStyle::Bar => theme.accent_style(),
+        };
         let list = List::new(items)
-            .highlight_style(theme.accent_style())
-            .highlight_symbol("▌ ");
+            .highlight_style(highlight)
+            .highlight_symbol("▌ ")
+            .repeat_highlight_symbol(true)
+            .highlight_spacing(HighlightSpacing::Always);
         let sel = state.selected.min(visible.len().saturating_sub(1));
         let mut list_state = ListState::default()
             .with_offset(state.list_offset.get())

@@ -175,9 +175,15 @@ impl MenuOverlay {
                 ]))
             })
             .collect();
+        let highlight = match crate::config::get().selection {
+            crate::config::SelectionStyle::Fill => theme.selection_style(),
+            crate::config::SelectionStyle::Bar => theme.accent_style(),
+        };
         let list = List::new(items)
-            .highlight_style(theme.accent_style())
-            .highlight_symbol("▌ ");
+            .highlight_style(highlight)
+            .highlight_symbol("▌ ")
+            .repeat_highlight_symbol(true)
+            .highlight_spacing(ratatui::widgets::HighlightSpacing::Always);
         let mut state = ListState::default();
         state.select(Some(self.selected.min(self.items.len().saturating_sub(1))));
         frame.render_stateful_widget(list, list_area, &mut state);
