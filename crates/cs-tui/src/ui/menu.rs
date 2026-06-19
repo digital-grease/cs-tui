@@ -148,7 +148,7 @@ impl MenuOverlay {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(theme.accent_style())
-            .title(Span::styled(" menu ", theme.accent_style()));
+            .title(Span::styled(" menu ", theme.heading_style()));
         let inner = block.inner(card);
         frame.render_widget(block, card);
 

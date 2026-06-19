@@ -2,13 +2,18 @@ use ratatui::style::{Color, Modifier, Style};
 
 /// Visual theme. The default is `cyber` (bright green on black), matching the
 /// retro aesthetic of cyberspace.online. Alternate palettes ship as `c64`,
-/// `vt320`, `dark`, and `vapor`.
+/// `vt320`, `dark`, `vapor`, `paper` (the one light theme), and `gruvbox`.
 #[derive(Debug, Clone)]
 pub struct Theme {
     pub background: Color,
     pub foreground: Color,
     pub muted: Color,
     pub accent: Color,
+    /// Panel/screen titles (the `" cs-tui • feed "` strings that sit on the
+    /// border). Defaults to `accent` for most palettes, but `vapor` points it at
+    /// its cyan so the title + border read as one frame and cyan co-leads with
+    /// the pink content accent.
+    pub heading: Color,
     /// Confirmation toasts (e.g. "bookmarked").
     pub success: Color,
     pub error: Color,
@@ -32,6 +37,7 @@ impl Theme {
             // stays legible against a black background.
             muted: Color::Indexed(245),
             accent: Color::LightGreen,
+            heading: Color::LightGreen,
             success: Color::Green,
             error: Color::LightRed,
             warning: Color::LightYellow,
@@ -47,6 +53,7 @@ impl Theme {
             foreground: Color::Indexed(153), // very light blue
             muted: Color::Indexed(75),       // medium blue
             accent: Color::Indexed(159),     // pale cyan
+            heading: Color::Indexed(159),    // pale cyan
             success: Color::LightCyan,
             error: Color::LightRed,
             warning: Color::Indexed(227), // light yellow
@@ -62,9 +69,12 @@ impl Theme {
             foreground: Color::Indexed(214), // amber
             muted: Color::Indexed(94),       // dim amber
             accent: Color::Indexed(220),     // bright amber
+            heading: Color::Indexed(220),    // bright amber
             success: Color::Yellow,
             error: Color::LightRed,
-            warning: Color::Indexed(214), // amber
+            // Pale gold, distinct from the body amber (214) so a caution toast
+            // reads as caution and not just bolded body text.
+            warning: Color::Indexed(222),
             border: Color::Indexed(94),
             selection: Color::Indexed(238), // neutral dark gray
         }
@@ -79,15 +89,16 @@ impl Theme {
     /// it to the nearest indexed color (see [`ColorMode`]).
     pub fn vapor() -> Self {
         Self {
-            background: Color::Rgb(0x1a, 0x12, 0x2e), // deep indigo
-            foreground: Color::Rgb(0xf2, 0xec, 0xff), // near-white lavender
-            muted: Color::Rgb(0x9a, 0x8c, 0xc4),      // muted lavender-gray
-            accent: Color::Rgb(0xff, 0x5f, 0xd1),     // hot pink
+            background: Color::Rgb(0x12, 0x1a, 0x2e), // deep teal-indigo (cooled)
+            foreground: Color::Rgb(0xea, 0xf5, 0xff), // cool ice-white
+            muted: Color::Rgb(0x82, 0xa4, 0xc4),      // slate-cyan gray (cooled)
+            accent: Color::Rgb(0xff, 0x5f, 0xd1),     // hot pink (the content accent)
+            heading: Color::Rgb(0x00, 0xe0, 0xff),    // electric cyan — titles join the frame
             success: Color::Rgb(0x5d, 0xff, 0xbf),    // mint
             error: Color::Rgb(0xff, 0x3b, 0x6b),      // neon red
             warning: Color::Rgb(0xff, 0xe1, 0x6b),    // pale gold
             border: Color::Rgb(0x00, 0xe0, 0xff),     // electric cyan
-            selection: Color::Rgb(0x33, 0x24, 0x5a),  // lighter indigo than the bg
+            selection: Color::Rgb(0x22, 0x30, 0x4f),  // cool indigo, lighter than the bg
         }
     }
 
@@ -100,11 +111,53 @@ impl Theme {
             foreground: Color::Indexed(252), // soft light gray
             muted: Color::Indexed(245),      // medium gray
             accent: Color::Indexed(75),      // sky blue
+            heading: Color::Indexed(75),     // sky blue
             success: Color::Indexed(114),    // soft green
             error: Color::Indexed(203),      // soft red
             warning: Color::Indexed(215),    // amber
             border: Color::Indexed(240),     // neutral gray
             selection: Color::Indexed(238),  // dark gray, just under the border
+        }
+    }
+
+    /// The one light theme: warm paper cream with dark ink, for bright rooms. Like
+    /// `vapor`, it follows the "chrome is one color" rule — titles and borders are
+    /// the same teal so the frame reads as a unit, while the raspberry `accent`
+    /// carries content (usernames, links, the selection bar). Status colors are
+    /// darkened from the usual neons so they stay legible on a light background
+    /// (a pale yellow warning would vanish on cream). Truecolor; downsamples on a
+    /// 256-color terminal.
+    pub fn paper() -> Self {
+        Self {
+            background: Color::Rgb(0xfd, 0xf6, 0xe3), // warm paper cream
+            foreground: Color::Rgb(0x3a, 0x35, 0x2c), // dark warm ink
+            muted: Color::Rgb(0x76, 0x6c, 0x5c),      // warm gray
+            accent: Color::Rgb(0xc1, 0x3b, 0x5b),     // raspberry (content)
+            heading: Color::Rgb(0x0e, 0x7c, 0x86),    // teal — titles join the frame
+            success: Color::Rgb(0x4c, 0x8a, 0x2e),    // forest green
+            error: Color::Rgb(0xc0, 0x2a, 0x2a),      // red
+            warning: Color::Rgb(0xb0, 0x76, 0x00),    // ochre (darkened to read on cream)
+            border: Color::Rgb(0x0e, 0x7c, 0x86),     // teal (matches heading)
+            selection: Color::Rgb(0xec, 0xdf, 0xc2),  // deeper cream, darker than the bg
+        }
+    }
+
+    /// Gruvbox-inspired: warm, matte, earthy dark — the low-saturation counterpoint
+    /// to `vapor`'s neon. Aqua frame (titles + borders) with an orange content
+    /// `accent`; green/yellow/red round out the status colors. Truecolor;
+    /// downsamples on a 256-color terminal.
+    pub fn gruvbox() -> Self {
+        Self {
+            background: Color::Rgb(0x28, 0x28, 0x28), // dark warm gray (bg0)
+            foreground: Color::Rgb(0xeb, 0xdb, 0xb2), // cream
+            muted: Color::Rgb(0x92, 0x83, 0x74),      // warm gray
+            accent: Color::Rgb(0xfe, 0x80, 0x19),     // orange (content)
+            heading: Color::Rgb(0x8e, 0xc0, 0x7c),    // aqua — titles join the frame
+            success: Color::Rgb(0xb8, 0xbb, 0x26),    // green
+            error: Color::Rgb(0xfb, 0x49, 0x34),      // red
+            warning: Color::Rgb(0xfa, 0xbd, 0x2f),    // yellow
+            border: Color::Rgb(0x8e, 0xc0, 0x7c),     // aqua (matches heading)
+            selection: Color::Rgb(0x3c, 0x38, 0x36),  // bg1, lighter than the bg
         }
     }
 
@@ -119,6 +172,15 @@ impl Theme {
     pub fn accent_style(&self) -> Style {
         Style::default()
             .fg(self.accent)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// Bold style for panel/screen titles. Same weight as `accent_style` but its
+    /// own color slot, so a palette (e.g. `vapor`) can give titles a distinct
+    /// hue from inline emphasis.
+    pub fn heading_style(&self) -> Style {
+        Style::default()
+            .fg(self.heading)
             .add_modifier(Modifier::BOLD)
     }
 
@@ -176,6 +238,7 @@ impl Theme {
             foreground: f(self.foreground),
             muted: f(self.muted),
             accent: f(self.accent),
+            heading: f(self.heading),
             success: f(self.success),
             error: f(self.error),
             warning: f(self.warning),
@@ -271,13 +334,23 @@ pub enum ThemeKind {
     Vt320,
     Dark,
     Vapor,
+    Paper,
+    Gruvbox,
     Custom,
 }
 
 impl ThemeKind {
     /// The built-in palettes, in cycle order. (`Custom` is appended by the App
     /// when configured.)
-    pub const ALL: [ThemeKind; 5] = [Self::Cyber, Self::C64, Self::Vt320, Self::Dark, Self::Vapor];
+    pub const ALL: [ThemeKind; 7] = [
+        Self::Cyber,
+        Self::C64,
+        Self::Vt320,
+        Self::Dark,
+        Self::Vapor,
+        Self::Paper,
+        Self::Gruvbox,
+    ];
 
     /// Stable lowercase name — matches the persisted prefs value and the
     /// `config.toml` `theme` key.
@@ -288,6 +361,8 @@ impl ThemeKind {
             Self::Vt320 => "vt320",
             Self::Dark => "dark",
             Self::Vapor => "vapor",
+            Self::Paper => "paper",
+            Self::Gruvbox => "gruvbox",
             Self::Custom => "custom",
         }
     }
@@ -299,6 +374,8 @@ impl ThemeKind {
             "vt320" => Self::Vt320,
             "dark" => Self::Dark,
             "vapor" => Self::Vapor,
+            "paper" => Self::Paper,
+            "gruvbox" => Self::Gruvbox,
             "custom" => Self::Custom,
             _ => Self::Cyber,
         }
@@ -314,6 +391,8 @@ impl ThemeKind {
             Self::Vt320 => Theme::vt320(),
             Self::Dark => Theme::dark(),
             Self::Vapor => Theme::vapor(),
+            Self::Paper => Theme::paper(),
+            Self::Gruvbox => Theme::gruvbox(),
         }
     }
 }
@@ -432,6 +511,78 @@ mod tests {
         assert_eq!(ThemeKind::from_name("vapor"), ThemeKind::Vapor);
         assert_eq!(ThemeKind::Vapor.name(), "vapor");
         assert_eq!(ThemeKind::Vapor.theme().accent, Theme::vapor().accent);
+    }
+
+    #[test]
+    fn vapor_titles_are_cyan_not_pink() {
+        // Cyan's "second job": titles share the cyan border instead of the pink
+        // accent, so the frame reads as one color and cyan co-leads with pink.
+        let t = Theme::vapor();
+        assert_eq!(t.heading, t.border, "vapor titles join the cyan frame");
+        assert_ne!(t.heading, t.accent, "titles must not be the pink accent");
+    }
+
+    #[test]
+    fn legacy_palettes_keep_titles_on_their_accent() {
+        // The original four palettes were single-hue (or accent-titled) before the
+        // `heading` slot existed, so titles stay on their accent — unchanged look.
+        for t in [Theme::cyber(), Theme::c64(), Theme::vt320(), Theme::dark()] {
+            assert_eq!(t.heading, t.accent);
+        }
+    }
+
+    #[test]
+    fn framed_palettes_put_titles_on_the_border() {
+        // vapor/paper/gruvbox follow the "chrome is one color" rule: the title
+        // shares the border color and is distinct from the content accent.
+        for t in [Theme::vapor(), Theme::paper(), Theme::gruvbox()] {
+            assert_eq!(t.heading, t.border, "title joins the frame");
+            assert_ne!(t.heading, t.accent, "title is not the content accent");
+        }
+    }
+
+    #[test]
+    fn new_palettes_keep_status_colors_distinct() {
+        // Same usability guarantee as vapor: a toast's meaning must read at a
+        // glance, so accent and the three status colors can't collide.
+        for t in [Theme::paper(), Theme::gruvbox()] {
+            let slots = [t.accent, t.success, t.error, t.warning];
+            for (i, a) in slots.iter().enumerate() {
+                for b in &slots[i + 1..] {
+                    assert_ne!(a, b, "status colors must be distinct");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn warning_never_collides_with_body_text() {
+        // A caution toast must read as caution, not as bolded body text. (vt320
+        // previously had warning == foreground; this guards the fix.)
+        for k in ThemeKind::ALL {
+            let t = k.theme();
+            assert_ne!(
+                t.warning,
+                t.foreground,
+                "{}: warning == foreground",
+                k.name()
+            );
+        }
+    }
+
+    #[test]
+    fn paper_is_the_one_light_theme() {
+        // Its background must be lighter than its foreground (the only built-in
+        // where that holds), and every other built-in stays dark.
+        let lum = |c: Color| match c {
+            Color::Rgb(r, g, b) => Some(u16::from(r) * 30 + u16::from(g) * 59 + u16::from(b) * 11),
+            _ => None,
+        };
+        let p = Theme::paper();
+        assert!(
+            lum(p.background) > lum(p.foreground),
+            "paper is light-on-dark-ink"
+        );
     }
 
     #[test]

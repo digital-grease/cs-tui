@@ -271,7 +271,7 @@ impl EditProfileScreen {
             .border_style(theme.border_style())
             .title(Span::styled(
                 " cs-tui • edit profile ",
-                theme.accent_style(),
+                theme.heading_style(),
             ));
         let inner = block.inner(area);
         frame.render_widget(block, area);

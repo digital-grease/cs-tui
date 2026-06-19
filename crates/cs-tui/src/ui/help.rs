@@ -226,7 +226,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme.accent_style())
-        .title(Span::styled(" help ", theme.accent_style()));
+        .title(Span::styled(" help ", theme.heading_style()));
     let inner = block.inner(card);
     frame.render_widget(block, card);
     frame.render_widget(Paragraph::new(lines), inner);

@@ -134,7 +134,7 @@ impl LoginScreen {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(theme.border_style())
-            .title(Span::styled(" cs-tui • login ", theme.accent_style()));
+            .title(Span::styled(" cs-tui • login ", theme.heading_style()));
         let inner = block.inner(card);
         frame.render_widget(block, card);
 

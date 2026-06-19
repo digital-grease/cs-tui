@@ -26,7 +26,8 @@ use crate::ui::theme::Theme;
 #[serde(default)]
 pub struct Config {
     // --- startup ---
-    /// Default theme: `cyber` | `c64` | `vt320` | `dark` | `custom`.
+    /// Default theme: `cyber` | `c64` | `vt320` | `dark` | `vapor` | `paper` |
+    /// `gruvbox` | `custom`.
     pub theme: Option<String>,
     /// Custom palette (used when the theme is `custom`).
     pub colors: Option<Colors>,
@@ -77,6 +78,8 @@ pub struct Colors {
     pub foreground: Option<String>,
     pub muted: Option<String>,
     pub accent: Option<String>,
+    /// Panel/screen titles. Defaults to `accent` when unset.
+    pub heading: Option<String>,
     pub success: Option<String>,
     pub error: Option<String>,
     pub warning: Option<String>,
@@ -99,7 +102,7 @@ pub enum SelectionStyle {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BackgroundMode {
     /// Use whatever the chosen theme defines (cyber/vt320/dark are already
-    /// transparent; c64/vapor are opaque). The default.
+    /// transparent; c64/vapor/paper/gruvbox are opaque). The default.
     #[default]
     Theme,
     /// Never paint a backdrop — let the terminal's transparency/opacity show
@@ -212,7 +215,7 @@ const TEMPLATE: &str = r##"# cs-tui configuration. Edit and restart cs-tui.
 
 # ── Appearance ───────────────────────────────────────────────────────────────
 
-# Default theme: cyber | c64 | vt320 | dark | vapor | custom
+# Default theme: cyber | c64 | vt320 | dark | vapor | paper | gruvbox | custom
 # (You can also cycle themes at runtime via the Esc menu; that choice is
 #  remembered separately and overrides this on the next launch.)
 #theme = "cyber"
@@ -228,6 +231,7 @@ const TEMPLATE: &str = r##"# cs-tui configuration. Edit and restart cs-tui.
 #foreground = "#cdd6f4"
 #muted      = "#6c7086"
 #accent     = "#89b4fa"
+#heading    = "#89b4fa"   # panel/screen titles; defaults to accent when unset
 #success    = "#a6e3a1"
 #error      = "#f38ba8"
 #warning    = "#f9e2af"
@@ -241,7 +245,7 @@ const TEMPLATE: &str = r##"# cs-tui configuration. Edit and restart cs-tui.
 
 # Screen background and terminal transparency:
 #   "theme"       — use the theme's own background (cyber/vt320/dark are already
-#                   transparent; c64/vapor are opaque). Default.
+#                   transparent; c64/vapor/paper/gruvbox are opaque). Default.
 #   "transparent" — never paint a backdrop; let the terminal's transparency show
 #                   through, whatever theme is active
 #   "opaque"      — always paint a solid backdrop (black for transparent themes),
@@ -454,6 +458,7 @@ impl Colors {
         apply(&mut t.foreground, self.foreground.as_deref());
         apply(&mut t.muted, self.muted.as_deref());
         apply(&mut t.accent, self.accent.as_deref());
+        apply(&mut t.heading, self.heading.as_deref());
         apply(&mut t.success, self.success.as_deref());
         apply(&mut t.error, self.error.as_deref());
         apply(&mut t.warning, self.warning.as_deref());

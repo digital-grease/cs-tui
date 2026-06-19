@@ -87,7 +87,7 @@ impl GuildsScreen {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(theme.border_style())
-            .title(Span::styled(" cs-tui • guilds ", theme.accent_style()));
+            .title(Span::styled(" cs-tui • guilds ", theme.heading_style()));
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
