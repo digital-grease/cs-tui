@@ -320,7 +320,7 @@ impl GuildScreen {
             .border_style(theme.border_style())
             .title(Span::styled(
                 format!(" cs-tui • {name} "),
-                theme.accent_style(),
+                theme.heading_style(),
             ));
         let inner = block.inner(area);
         frame.render_widget(block, area);

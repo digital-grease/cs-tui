@@ -4,7 +4,7 @@ A terminal client for [cyberspace.online](https://cyberspace.online), targeting 
 
 ![cs-tui screenshot](docs/screenshot.png)
 
-*The feed in the `vapor` theme (one of five built-in themes; see [Configuration](#configuration)).*
+*The feed in the `vapor` theme (one of seven built-in themes; see [Configuration](#configuration)).*
 
 ## Status
 
@@ -24,7 +24,7 @@ Early development. Most of the documented v0.5.1 REST surface is implemented; li
 - **Settings** round-trip that preserves fields the client doesn't model
 - Markdown rendering with `@mention` highlighting
 - Inline image rendering in post detail on graphics-capable terminals (Kitty/iTerm2/Sixel); `[image] url` placeholder elsewhere
-- Five built-in themes (`cyber`, `c64`, `vt320`, `dark`, `vapor`), switchable at runtime, plus a `custom` palette defined in `config.toml`
+- Seven built-in themes (`cyber`, `c64`, `vt320`, `dark`, `vapor`, `paper` (light), `gruvbox`), switchable at runtime, plus a `custom` palette defined in `config.toml`
 - Per-endpoint rate limiting and one-shot token refresh on 401
 
 ## Install
@@ -142,10 +142,10 @@ location is auto-created).
 
 | Option | Default | Notes |
 |---|---|---|
-| `theme` | `cyber` | One of `cyber`, `c64`, `vt320`, `dark`, `vapor`, `custom`. The in-app Esc → Theme menu overrides this and is remembered separately. |
-| `[colors]` | built-in | Custom palette, used when `theme = "custom"`. Keys: `background`, `foreground`, `muted`, `accent`, `success`, `error`, `warning`, `border`, `selection`. Each is a hex (`"#1e1e2e"`), `"reset"`, or an ANSI index (`"0"` to `"255"`); omitted keys keep the default. |
+| `theme` | `cyber` | One of `cyber`, `c64`, `vt320`, `dark`, `vapor`, `paper` (light), `gruvbox`, `custom`. The in-app Esc → Theme menu overrides this and is remembered separately. |
+| `[colors]` | built-in | Custom palette, used when `theme = "custom"`. Keys: `background`, `foreground`, `muted`, `accent`, `heading` (panel titles; defaults to `accent`), `success`, `error`, `warning`, `border`, `selection`. Each is a hex (`"#1e1e2e"`), `"reset"`, or an ANSI index (`"0"` to `"255"`); omitted keys keep the default. |
 | `selection` | `fill` | Selected-row emphasis: `fill` (a full-row background fill, the `selection` color) or `bar` (just the `▌` bar + bold-accent text). |
-| `background_mode` | `theme` | Screen background / terminal transparency. `theme` uses the palette's own background (`cyber`/`vt320`/`dark` are transparent, `c64`/`vapor` solid); `transparent` never paints a backdrop so the terminal's transparency shows through on any theme; `opaque` always paints a solid backdrop (black for the transparent themes). |
+| `background_mode` | `theme` | Screen background / terminal transparency. `theme` uses the palette's own background (`cyber`/`vt320`/`dark` are transparent, `c64`/`vapor`/`paper`/`gruvbox` solid); `transparent` never paints a backdrop so the terminal's transparency shows through on any theme; `opaque` always paints a solid backdrop (black for the transparent themes). |
 | `compact` | `false` | Drop the blank-line / rule separators between list items for a denser feed. |
 
 ### Time
