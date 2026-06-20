@@ -407,7 +407,7 @@ enum Action {
     },
     ComposeSubmit,
     ComposeReEdit,
-    /// Built-in editor: Ctrl+S accepted the body.
+    /// Built-in editor: Ctrl+D accepted the body.
     EditorSave,
     /// Built-in editor: Esc/Ctrl+C discarded.
     EditorCancel,
@@ -1393,7 +1393,7 @@ impl App {
         // Jukebox player controls, active only while something is playing and no
         // field is capturing text. `p` is left to the browse screens that bind it
         // to play/switch a focused track; on every other screen it toggles pause.
-        // Allow no modifiers (so `Ctrl+s` Settings-save etc. still pass through)
+        // Allow no modifiers (so `Ctrl+d` Settings-save etc. still pass through)
         // or a bare SHIFT — `<` / `>` arrive shifted, and shifted letters are
         // distinct `Char` values, so the existing lowercase arms can't collide.
         if self.now_playing.is_some()
@@ -4395,7 +4395,7 @@ mod tests {
     fn route_key_maps_editor_intents_to_actions() {
         let mut screen = editor("hello");
         assert_eq!(
-            App::route_key(&mut screen, kev_ctrl(KeyCode::Char('s'))),
+            App::route_key(&mut screen, kev_ctrl(KeyCode::Char('d'))),
             Action::EditorSave
         );
         assert_eq!(

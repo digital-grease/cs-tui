@@ -1,5 +1,5 @@
 //! Edit-profile form — fields for bio, displayName, website*, location*,
-//! pinnedPostId. Tab cycles focus; Enter or Ctrl+S submits; Esc cancels.
+//! pinnedPostId. Tab cycles focus; Enter or Ctrl+D submits; Esc cancels.
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use cs_api::{Patch, ProfileUpdate, User};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -158,8 +158,8 @@ impl EditProfileScreen {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return EditProfileIntent::Quit;
         }
-        // Ctrl+S submits.
-        if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        // Ctrl+D submits.
+        if key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return self.submit();
         }
 
@@ -328,7 +328,7 @@ impl EditProfileScreen {
             Line::from(Span::styled(msg.clone(), theme.error_style()))
         } else {
             Line::from(Span::styled(
-                "tab/shift+tab focus · enter or ctrl+s save · del clear · esc cancel",
+                "tab/shift+tab focus · enter or ctrl+d save · del clear · esc cancel",
                 theme.muted_style(),
             ))
         };
@@ -426,10 +426,10 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_s_with_no_changes_cancels() {
+    fn ctrl_d_with_no_changes_cancels() {
         let u = user_with(Some("Alice"), Some("hi"));
         let mut s = EditProfileScreen::from_user(&u);
-        let i = s.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let i = s.handle_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL));
         assert_eq!(i, EditProfileIntent::Cancel);
     }
 

@@ -135,7 +135,7 @@ impl ComposeScreen {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return ComposeIntent::Quit;
         }
-        if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return self.try_submit();
         }
         // Ctrl+E re-opens the editor on the body (plain `e` is a typed char in
@@ -498,7 +498,7 @@ impl ComposeScreen {
             Line::from(Span::styled(msg.clone(), theme.error_style()))
         } else {
             Line::from(Span::styled(
-                "tab focus · space toggle · ctrl+e edit body · enter/ctrl+s submit · esc cancel",
+                "tab focus · space toggle · ctrl+e edit body · enter/ctrl+d submit · esc cancel",
                 theme.muted_style(),
             ))
         };
