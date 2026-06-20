@@ -169,7 +169,7 @@ const EDITOR: &[Row] = &[
         desc: "move the cursor · lines soft-wrap · PgUp/PgDn page",
     },
     Row {
-        keys: "Ctrl+S",
+        keys: "Ctrl+D",
         desc: "save the body and continue to the post options",
     },
     Row {

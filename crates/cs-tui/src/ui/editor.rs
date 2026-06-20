@@ -483,7 +483,7 @@ impl EditorScreen {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> EditorIntent {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if ctrl && key.code == KeyCode::Char('s') {
+        if ctrl && key.code == KeyCode::Char('d') {
             if self.buffer.is_blank() {
                 self.error = Some("nothing to save yet · type something · esc cancels".into());
                 return EditorIntent::None;
@@ -604,7 +604,7 @@ impl EditorScreen {
             Line::from(Span::styled(msg.clone(), theme.error_style()))
         } else {
             Line::from(Span::styled(
-                "ctrl+s save · esc cancel · enter newline · paste ok",
+                "ctrl+d save · esc cancel · enter newline · paste ok",
                 theme.muted_style(),
             ))
         };
@@ -1142,19 +1142,19 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_s_saves_when_non_blank() {
+    fn ctrl_d_saves_when_non_blank() {
         let mut s = screen("hello");
         assert_eq!(
-            s.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            s.handle_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL)),
             EditorIntent::Save
         );
     }
 
     #[test]
-    fn ctrl_s_on_blank_sets_error_and_stays() {
+    fn ctrl_d_on_blank_sets_error_and_stays() {
         let mut s = screen("   \n  ");
         assert_eq!(
-            s.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+            s.handle_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL)),
             EditorIntent::None
         );
         assert!(s.error.is_some());
@@ -1172,7 +1172,7 @@ mod tests {
     #[test]
     fn editing_clears_a_previous_error() {
         let mut s = screen("");
-        s.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        s.handle_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL));
         assert!(s.error.is_some());
         s.handle_key(key(KeyCode::Char('x'), KeyModifiers::empty()));
         assert!(s.error.is_none());

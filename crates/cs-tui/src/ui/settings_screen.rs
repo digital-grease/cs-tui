@@ -175,7 +175,7 @@ impl SettingsScreen {
         if !self.loaded {
             return SettingsIntent::None;
         }
-        if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return self.try_submit();
         }
         match key.code {
@@ -367,7 +367,7 @@ impl SettingsScreen {
             format!("error: {msg} · esc to cancel")
         } else {
             format!(
-                "{dirty_count} unsaved · space toggle/cycle · 1-8/←→ section · enter/ctrl+s save · esc menu"
+                "{dirty_count} unsaved · space toggle/cycle · 1-8/←→ section · enter/ctrl+d save · esc menu"
             )
         };
         frame.render_widget(
@@ -484,7 +484,7 @@ mod tests {
     fn submit_with_no_dirty_cancels() {
         let mut s = SettingsScreen::new();
         s.apply_loaded(Ok(Settings::default()));
-        let i = s.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let i = s.handle_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL));
         assert_eq!(i, SettingsIntent::Cancel);
     }
 
@@ -494,7 +494,7 @@ mod tests {
         s.apply_loaded(Ok(Settings::default()));
         s.focused = 0;
         s.handle_key(key(KeyCode::Char(' '), KeyModifiers::empty()));
-        let i = s.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let i = s.handle_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL));
         match i {
             SettingsIntent::Submit { update } => {
                 assert_eq!(update.filter_nsfw, Some(true));
