@@ -158,6 +158,14 @@ impl FeedScreen {
         self.list.apply_more(result);
     }
 
+    /// True when the user's cursor sits on the newest entry — the top of the
+    /// feed. The background head-poll uses this to decide whether it may reveal
+    /// freshly arrived posts in place (safe at the top) or must defer to a toast
+    /// hint so a scrolled-down reader doesn't lose their place.
+    pub fn is_at_top(&self) -> bool {
+        self.list.selected == 0
+    }
+
     /// Fold a background head-poll (the newest page) into the feed without
     /// moving the user's scroll position. Strictly-new entries (the prefix of
     /// `head` ahead of the first entry we already have) are prepended at the
@@ -689,6 +697,20 @@ mod tests {
         // "a" is now at index 1 and carries the refreshed count.
         assert_eq!(s.list.items[1].post_id, "a");
         assert_eq!(s.list.items[1].replies_count, 5);
+    }
+
+    #[test]
+    fn is_at_top_tracks_selection() {
+        let mut s = FeedScreen::new();
+        s.apply_initial(Ok((
+            vec![entry("a", "a", false), entry("b", "b", false)],
+            None,
+        )));
+        assert!(s.is_at_top(), "selection starts on the newest entry");
+        s.list.selected = 1;
+        assert!(!s.is_at_top(), "scrolled down is not at top");
+        s.list.selected = 0;
+        assert!(s.is_at_top(), "back at the newest entry");
     }
 
     #[test]
