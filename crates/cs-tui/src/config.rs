@@ -170,7 +170,7 @@ impl Default for Runtime {
             confirm_deletes: true,
             hyperlinks: true,
             feed_autorefresh: true,
-            feed_refresh_secs: 60,
+            feed_refresh_secs: 30,
             notifications_refresh_secs: 20,
             // Single-sourced with the player so the two never drift.
             audio_volume: crate::ui::player::DEFAULT_VOLUME,
@@ -285,7 +285,7 @@ const TEMPLATE: &str = r##"# cs-tui configuration. Edit and restart cs-tui.
 
 # How often (seconds) the background feed poll checks for new entries.
 # Minimum 10; lower values use more of the read rate limit.
-#feed_refresh_secs = 60
+#feed_refresh_secs = 30
 
 # How often (seconds) the background poll refreshes the unread-notification
 # count shown in the header. Minimum 5; lower values surface new notifications

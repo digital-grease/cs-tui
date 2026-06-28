@@ -1845,16 +1845,31 @@ impl App {
                 self.shuffle_pool.harvest(&entries);
                 // Apply only if the feed is still on screen (the user may have
                 // navigated away between the poll and now).
+                let mut reload_head = false;
                 if let Screen::Feed(s) = &mut self.screen {
                     match s.apply_new_head(entries) {
                         HeadUpdate::Prepended(n) => {
                             self.toast = Some(Toast::confirmation(format!("↑ {n} new")));
                         }
                         HeadUpdate::Gap => {
-                            self.toast = Some(Toast::confirmation("new posts · r to refresh"));
+                            // More than a page of new posts arrived, so a clean
+                            // prepend would leave a hole in the timeline. If the
+                            // user is parked at the very top, reload from scratch
+                            // so the newest posts surface without a manual `r`;
+                            // if they're scrolled down reading, keep their place
+                            // and just hint that a refresh is available.
+                            if s.is_at_top() {
+                                reload_head = true;
+                            } else {
+                                self.toast = Some(Toast::confirmation("new posts · r to refresh"));
+                            }
                         }
                         HeadUpdate::None => {}
                     }
+                }
+                if reload_head {
+                    self.spawn_feed_initial();
+                    self.toast = Some(Toast::confirmation("↑ new posts"));
                 }
             }
             BgEvent::NotificationsInitial(result) => {
