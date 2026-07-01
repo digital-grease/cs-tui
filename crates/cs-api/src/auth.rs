@@ -1,9 +1,9 @@
 //! Authentication endpoints (`/v1/auth/*`).
 //!
 //! Wraps `POST /v1/auth/login` and `/refresh`. `login` stores the returned token
-//! bundle on `Client`; `refresh` updates only the `id_token` (and `rtdb_token`,
-//! if present) while preserving the `refresh_token`. Account registration is out
-//! of scope — this client is for users who already have a cyberspace account.
+//! bundle on `Client`; `refresh` updates only the short-lived auth/RTDB fields
+//! while preserving the `refresh_token`. Account registration is out of scope —
+//! this client is for users who already have a cyberspace account.
 use reqwest::Method;
 use serde::Serialize;
 
@@ -41,8 +41,9 @@ impl Client {
         Ok(tokens)
     }
 
-    /// `POST /v1/auth/refresh` — exchange the stored `refresh_token` for a fresh
-    /// `id_token` (and `rtdb_token`). The `refresh_token` itself is preserved.
+    /// `POST /v1/auth/refresh` — exchange the stored `refresh_token` for fresh
+    /// `id_token`, `rtdb_token`, and `rtdb_url` fields. The `refresh_token` itself
+    /// is preserved.
     pub async fn refresh(&self) -> Result<()> {
         let refresh_token = self.tokens().await.refresh_token;
         if refresh_token.is_empty() {
@@ -64,7 +65,13 @@ impl Client {
         } else {
             Some(updated.rtdb_token)
         };
-        self.update_id_token(updated.id_token, new_rtdb).await;
+        let new_rtdb_url = if updated.rtdb_url.is_empty() {
+            None
+        } else {
+            Some(updated.rtdb_url)
+        };
+        self.update_id_token(updated.id_token, new_rtdb, new_rtdb_url)
+            .await;
         Ok(())
     }
 }

@@ -18,7 +18,7 @@ use crate::config::SelectionStyle;
 use super::theme::Theme;
 
 /// Paged list state, generic over the item type.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TabState<T> {
     pub items: Vec<T>,
     pub selected: usize,

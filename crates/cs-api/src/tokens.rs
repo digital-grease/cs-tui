@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 ///
 /// - `id_token` — Bearer token for REST requests; short-lived.
 /// - `refresh_token` — exchanges for a new id_token via `/v1/auth/refresh`.
-/// - `rtdb_token` — Firebase JWT used for Realtime Database (chat/DMs).
+/// - `rtdb_token` — optional Firebase custom token for SDK RTDB access.
+/// - `rtdb_url` — RTDB endpoint for direct reads with `id_token` auth.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Tokens {
     #[serde(rename = "idToken", default, skip_serializing_if = "String::is_empty")]
@@ -23,6 +24,9 @@ pub struct Tokens {
         skip_serializing_if = "String::is_empty"
     )]
     pub rtdb_token: String,
+
+    #[serde(rename = "rtdbUrl", default, skip_serializing_if = "String::is_empty")]
+    pub rtdb_url: String,
 }
 
 impl Tokens {
@@ -38,22 +42,27 @@ mod tests {
 
     #[test]
     fn deserializes_login_response_shape() {
-        let raw = r#"{"idToken":"id","refreshToken":"r","rtdbToken":"rt"}"#;
+        let raw = r#"{"idToken":"id","refreshToken":"r","rtdbToken":"rt","rtdbUrl":"https://cyberspace-cyberspace-default-rtdb.europe-west1.firebasedatabase.app"}"#;
         let t: Tokens = serde_json::from_str(raw).unwrap();
         assert_eq!(t.id_token, "id");
         assert_eq!(t.refresh_token, "r");
         assert_eq!(t.rtdb_token, "rt");
+        assert_eq!(
+            t.rtdb_url,
+            "https://cyberspace-cyberspace-default-rtdb.europe-west1.firebasedatabase.app"
+        );
         assert!(t.is_authenticated());
     }
 
     #[test]
     fn refresh_response_with_missing_refresh_token_decodes() {
-        // /v1/auth/refresh returns only { idToken, rtdbToken }
-        let raw = r#"{"idToken":"id2","rtdbToken":"rt2"}"#;
+        // /v1/auth/refresh returns { idToken, rtdbToken, rtdbUrl }.
+        let raw = r#"{"idToken":"id2","rtdbToken":"rt2","rtdbUrl":"https://db.example"}"#;
         let t: Tokens = serde_json::from_str(raw).unwrap();
         assert_eq!(t.id_token, "id2");
         assert_eq!(t.refresh_token, "");
         assert_eq!(t.rtdb_token, "rt2");
+        assert_eq!(t.rtdb_url, "https://db.example");
     }
 
     #[test]

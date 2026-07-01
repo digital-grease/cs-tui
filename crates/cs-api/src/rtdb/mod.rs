@@ -1,17 +1,16 @@
 //! Firebase Realtime Database transport client.
 //!
-//! Pure plumbing — no cyberspace.online-specific paths or message shapes. The
-//! cs-online RTDB schema (cIRC rooms, C-Mail conversations, presence) is not
-//! yet officially documented, so the typed application layer waits for the spec
-//! and lives in Phase 8.
+//! Pure plumbing — no cyberspace.online-specific paths or message shapes. API
+//! v0.6.0 documents the C-Mail RTDB paths (`dm_messages/<conversationId>` and
+//! `user_conversations/<uid>`); cIRC/presence typed layers still wait for a
+//! fuller schema.
 //!
 //! Usage:
 //! ```ignore
-//! let project = rtdb::project_id_from_jwt(&tokens.rtdb_token)?;
-//! let base = rtdb::base_url_for(&project);
-//! let client = rtdb::Client::new(base, tokens.rtdb_token);
-//! let value: serde_json::Value = client.get("/users/me", &[]).await?;
-//! let mut events = client.subscribe("/users/me").await?;
+//! let client = rtdb::Client::new(tokens.rtdb_url, tokens.id_token);
+//! let params = [("orderBy", "%22timestamp%22"), ("limitToLast", "50")];
+//! let value: serde_json::Value = client.get("/dm_messages/conversationId", &params).await?;
+//! let mut events = client.subscribe("/dm_messages/conversationId", &params).await?;
 //! while let Some(ev) = events.recv().await { /* ... */ }
 //! ```
 mod client;

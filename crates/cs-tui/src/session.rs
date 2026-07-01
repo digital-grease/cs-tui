@@ -121,6 +121,7 @@ mod tests {
                 id_token: "id".into(),
                 refresh_token: "r".into(),
                 rtdb_token: "rt".into(),
+                rtdb_url: "https://db.example".into(),
             },
             email: "you@example.com".into(),
         };
@@ -130,6 +131,7 @@ mod tests {
         assert_eq!(loaded.tokens.id_token, "id");
         assert_eq!(loaded.tokens.refresh_token, "r");
         assert_eq!(loaded.tokens.rtdb_token, "rt");
+        assert_eq!(loaded.tokens.rtdb_url, "https://db.example");
         assert_eq!(loaded.email, "you@example.com");
 
         let _ = fs::remove_file(&path);
@@ -143,6 +145,7 @@ mod tests {
                 id_token: "id".into(),
                 refresh_token: "r".into(),
                 rtdb_token: "rt".into(),
+                rtdb_url: "https://db.example".into(),
             },
             email: String::new(),
         };
@@ -151,6 +154,7 @@ mod tests {
         assert!(text.contains("\"idToken\""));
         assert!(text.contains("\"refreshToken\""));
         assert!(text.contains("\"rtdbToken\""));
+        assert!(text.contains("\"rtdbUrl\""));
         // Empty email should be omitted.
         assert!(!text.contains("\"email\""));
         let _ = fs::remove_file(&path);

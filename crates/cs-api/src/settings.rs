@@ -1,6 +1,6 @@
 //! User settings (`/v1/settings`).
 //!
-//! The v0.3.6 spec lists known fields, but some (`keyboardBindings`,
+//! The spec lists known fields, but some (`keyboardBindings`,
 //! `mutedUsersByRoom`) are opaque JSON. `Settings` decodes everything verbatim
 //! via `#[serde(flatten)]` into `extra`, so a round-trip preserves anything the
 //! client doesn't model.

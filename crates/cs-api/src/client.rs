@@ -133,13 +133,21 @@ impl Client {
         *self.inner.tokens.write().await = t;
     }
 
-    /// Update just the `id_token` (and optionally `rtdb_token`). Used by the
-    /// refresh flow which doesn't return a new `refresh_token`.
-    pub async fn update_id_token(&self, id_token: String, rtdb_token: Option<String>) {
+    /// Update just the short-lived auth fields returned by `/v1/auth/refresh`.
+    /// The `refresh_token` itself is preserved.
+    pub async fn update_id_token(
+        &self,
+        id_token: String,
+        rtdb_token: Option<String>,
+        rtdb_url: Option<String>,
+    ) {
         let mut t = self.inner.tokens.write().await;
         t.id_token = id_token;
         if let Some(rt) = rtdb_token {
             t.rtdb_token = rt;
+        }
+        if let Some(url) = rtdb_url {
+            t.rtdb_url = url;
         }
     }
 
@@ -468,15 +476,22 @@ mod tests {
             id_token: "id".into(),
             refresh_token: "r".into(),
             rtdb_token: "rt".into(),
+            rtdb_url: "https://db1.example".into(),
         })
         .await;
         assert!(c.tokens().await.is_authenticated());
 
-        c.update_id_token("id2".into(), Some("rt2".into())).await;
+        c.update_id_token(
+            "id2".into(),
+            Some("rt2".into()),
+            Some("https://db2.example".into()),
+        )
+        .await;
         let t = c.tokens().await;
         assert_eq!(t.id_token, "id2");
         assert_eq!(t.refresh_token, "r");
         assert_eq!(t.rtdb_token, "rt2");
+        assert_eq!(t.rtdb_url, "https://db2.example");
 
         c.clear_tokens().await;
         assert!(!c.tokens().await.is_authenticated());

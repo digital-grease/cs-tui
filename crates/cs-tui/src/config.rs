@@ -63,6 +63,9 @@ pub struct Config {
     /// Seconds between background unread-notification-count polls (clamped to a
     /// 5s minimum).
     pub notifications_refresh_secs: Option<u64>,
+    /// Seconds between background C-Mail unread-count polls (clamped to a 5s
+    /// minimum).
+    pub cmail_refresh_secs: Option<u64>,
     /// Initial jukebox volume for a fresh session (0..=130).
     pub audio_volume: Option<i64>,
     /// Start each session with shuffle mode already armed.
@@ -144,6 +147,9 @@ pub struct Runtime {
     /// Seconds between background unread-notification-count polls. Drives how
     /// quickly the header badge reflects new notifications.
     pub notifications_refresh_secs: u64,
+    /// Seconds between background C-Mail unread-count polls. Drives how quickly
+    /// the header badge reflects new private mail.
+    pub cmail_refresh_secs: u64,
     /// Initial jukebox volume (0..=130) the player opens at each session.
     pub audio_volume: i64,
     /// Whether sessions begin with shuffle mode armed (never auto-playing:
@@ -172,6 +178,7 @@ impl Default for Runtime {
             feed_autorefresh: true,
             feed_refresh_secs: 30,
             notifications_refresh_secs: 20,
+            cmail_refresh_secs: 20,
             // Single-sourced with the player so the two never drift.
             audio_volume: crate::ui::player::DEFAULT_VOLUME,
             shuffle: false,
@@ -268,8 +275,8 @@ const TEMPLATE: &str = r##"# cs-tui configuration. Edit and restart cs-tui.
 
 # ── Behavior ─────────────────────────────────────────────────────────────────
 
-# Section to open on launch: feed | notifications | bookmarks | topics |
-# profile | journal | settings | guilds
+# Section to open on launch: feed | notifications | c-mail | cmail |
+# bookmarks | topics | profile | journal | guilds | settings
 #start_section = "feed"
 
 # Show NSFW posts by default (otherwise they're hidden until toggled).
@@ -291,6 +298,11 @@ const TEMPLATE: &str = r##"# cs-tui configuration. Edit and restart cs-tui.
 # count shown in the header. Minimum 5; lower values surface new notifications
 # (and clear marked-read ones) sooner but use more of the read rate limit.
 #notifications_refresh_secs = 20
+
+# How often (seconds) the background poll refreshes the unread C-Mail count
+# shown in the header. Minimum 5; lower values surface new private mail sooner
+# but use more of the read rate limit.
+#cmail_refresh_secs = 20
 
 # External editor for composing posts/notes. Unset by default: composing uses
 # the built-in editor (soft-wrapping, multi-line paste, no external program).
@@ -426,6 +438,10 @@ impl Config {
                 .notifications_refresh_secs
                 .unwrap_or(d.notifications_refresh_secs)
                 .clamp(5, 3600),
+            cmail_refresh_secs: self
+                .cmail_refresh_secs
+                .unwrap_or(d.cmail_refresh_secs)
+                .clamp(5, 3600),
             audio_volume: self.audio_volume.unwrap_or(d.audio_volume).clamp(0, 130),
             shuffle: self.shuffle.unwrap_or(d.shuffle),
             selection: match self.selection.as_deref().map(str::to_ascii_lowercase) {
@@ -554,6 +570,7 @@ fn parse_section(s: &str) -> Option<RootKind> {
     Some(match s.trim().to_ascii_lowercase().as_str() {
         "feed" => RootKind::Feed,
         "notifications" | "notifs" | "notes" => RootKind::Notifications,
+        "c-mail" | "cmail" | "mail" => RootKind::Cmail,
         "bookmarks" => RootKind::Bookmarks,
         "topics" => RootKind::Topics,
         "profile" => RootKind::Profile,
@@ -669,6 +686,7 @@ mod tests {
             "feed_autorefresh",
             "feed_refresh_secs",
             "notifications_refresh_secs",
+            "cmail_refresh_secs",
             "editor",
             "preview_length",
             "image_height",

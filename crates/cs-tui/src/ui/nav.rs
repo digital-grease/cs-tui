@@ -12,12 +12,13 @@ use super::theme::Theme;
 pub enum RootKind {
     Feed,
     Notifications,
+    Cmail,
     Bookmarks,
     Topics,
     Profile,
     Journal,
-    Settings,
     Guilds,
+    Settings,
 }
 
 impl RootKind {
@@ -26,12 +27,13 @@ impl RootKind {
         &[
             Self::Feed,
             Self::Notifications,
+            Self::Cmail,
             Self::Bookmarks,
             Self::Topics,
             Self::Profile,
             Self::Journal,
-            Self::Settings,
             Self::Guilds,
+            Self::Settings,
         ]
     }
 
@@ -40,12 +42,13 @@ impl RootKind {
         match self {
             Self::Feed => "Feed",
             Self::Notifications => "Notifications",
+            Self::Cmail => "C-Mail",
             Self::Bookmarks => "Bookmarks",
             Self::Topics => "Topics",
             Self::Profile => "Profile",
             Self::Journal => "Journal",
-            Self::Settings => "Settings",
             Self::Guilds => "Guilds",
+            Self::Settings => "Settings",
         }
     }
 
@@ -70,12 +73,13 @@ impl RootKind {
         match self {
             Self::Feed => '1',
             Self::Notifications => '2',
-            Self::Bookmarks => '3',
-            Self::Topics => '4',
-            Self::Profile => '5',
-            Self::Journal => '6',
-            Self::Settings => '7',
+            Self::Cmail => '3',
+            Self::Bookmarks => '4',
+            Self::Topics => '5',
+            Self::Profile => '6',
+            Self::Journal => '7',
             Self::Guilds => '8',
+            Self::Settings => '9',
         }
     }
 
@@ -84,12 +88,13 @@ impl RootKind {
         match c {
             '1' => Some(Self::Feed),
             '2' => Some(Self::Notifications),
-            '3' => Some(Self::Bookmarks),
-            '4' => Some(Self::Topics),
-            '5' => Some(Self::Profile),
-            '6' => Some(Self::Journal),
-            '7' => Some(Self::Settings),
+            '3' => Some(Self::Cmail),
+            '4' => Some(Self::Bookmarks),
+            '5' => Some(Self::Topics),
+            '6' => Some(Self::Profile),
+            '7' => Some(Self::Journal),
             '8' => Some(Self::Guilds),
+            '9' => Some(Self::Settings),
             _ => None,
         }
     }
@@ -142,26 +147,32 @@ fn tab_window(
     (lo, hi, lo > 0, hi < len)
 }
 
-/// Render the top tab bar. `current` is highlighted; `unread_count` (>0) shows
-/// next to the notifications tab. When the full bar doesn't fit, it scrolls
-/// horizontally to keep the current section in view, marking clipped ends with
-/// `‹`/`›`. When `offline` is set, a red marker replaces the right-hand hint so
-/// the connection loss is always visible.
-pub fn render_tab_bar(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    current: RootKind,
-    unread_count: u32,
-    can_go_back: bool,
-    offline: bool,
-    theme: &Theme,
-) {
+/// Render the top tab bar. `current` is highlighted; unread counts (>0) show
+/// next to their tabs. When the full bar doesn't fit, it scrolls horizontally to
+/// keep the current section in view, marking clipped ends with `‹`/`›`. When
+/// `offline` is set, a red marker replaces the right-hand hint so the connection
+/// loss is always visible.
+#[derive(Debug, Clone, Copy)]
+pub struct TabBarStatus {
+    pub current: RootKind,
+    pub unread_count: u32,
+    pub cmail_unread_count: u32,
+    pub can_go_back: bool,
+    pub offline: bool,
+}
+
+pub fn render_tab_bar(frame: &mut Frame<'_>, area: Rect, status: TabBarStatus, theme: &Theme) {
     let kinds = RootKind::all();
     let tokens: Vec<String> = kinds
         .iter()
         .map(|k| {
-            let badge = if *k == RootKind::Notifications && unread_count > 0 {
-                format!(" ({unread_count})")
+            let count = match *k {
+                RootKind::Notifications => status.unread_count,
+                RootKind::Cmail => status.cmail_unread_count,
+                _ => 0,
+            };
+            let badge = if count > 0 {
+                format!(" ({count})")
             } else {
                 String::new()
             };
@@ -172,13 +183,13 @@ pub fn render_tab_bar(
     let sep_w = TAB_SEP.chars().count();
     let total = widths.iter().sum::<usize>() + sep_w * widths.len().saturating_sub(1);
     let avail = area.width as usize;
-    let hint = if can_go_back {
+    let hint = if status.can_go_back {
         "    esc back · ? help"
     } else {
         "    esc menu · ? help"
     };
     let hint_w = hint.chars().count();
-    let cur = kinds.iter().position(|k| *k == current).unwrap_or(0);
+    let cur = kinds.iter().position(|k| *k == status.current).unwrap_or(0);
 
     // Window of sections to show, and whether to append the hint.
     let (lo, hi, clip_l, clip_r) = if total <= avail {
@@ -201,7 +212,7 @@ pub fn render_tab_bar(
     if clip_r {
         spans.push(Span::styled(" ›", theme.muted_style()));
     }
-    if with_hint && !offline {
+    if with_hint && !status.offline {
         spans.push(Span::styled(hint, theme.muted_style()));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -209,7 +220,7 @@ pub fn render_tab_bar(
     // A dropped connection is the most important thing on the bar, so it's
     // painted as a right-aligned overlay *over* the tabs — guaranteeing it shows
     // even when the tab list already fills the width.
-    if offline {
+    if status.offline {
         let marker = " ⚠ offline ";
         let mw = (marker.chars().count() as u16).min(area.width);
         let mrect = Rect::new(area.x + area.width - mw, area.y, mw, 1);
@@ -236,7 +247,7 @@ mod tests {
     fn unknown_shortcut_returns_none() {
         assert_eq!(RootKind::from_shortcut('x'), None);
         assert_eq!(RootKind::from_shortcut('0'), None);
-        assert_eq!(RootKind::from_shortcut('9'), None);
+        assert_eq!(RootKind::from_shortcut('a'), None);
     }
 
     #[test]
@@ -249,8 +260,8 @@ mod tests {
     #[test]
     fn next_and_prev_cycle_and_wrap() {
         assert_eq!(RootKind::Feed.next(), RootKind::Notifications);
-        assert_eq!(RootKind::Guilds.next(), RootKind::Feed); // wraps
-        assert_eq!(RootKind::Feed.prev(), RootKind::Guilds); // wraps
+        assert_eq!(RootKind::Settings.next(), RootKind::Feed); // wraps
+        assert_eq!(RootKind::Feed.prev(), RootKind::Settings); // wraps
         assert_eq!(RootKind::Notifications.prev(), RootKind::Feed);
     }
 

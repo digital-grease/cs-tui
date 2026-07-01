@@ -1,6 +1,7 @@
 pub mod app;
 pub mod audio;
 pub mod bookmarks;
+pub mod cmail;
 pub mod compose;
 pub mod edit_profile;
 pub mod editor;
