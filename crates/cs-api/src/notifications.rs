@@ -10,7 +10,7 @@ use crate::error::Result;
 const DEFAULT_PAGE_LIMIT: u32 = 20;
 const MAX_PAGE_LIMIT: u32 = 50;
 
-/// The 22 notification types documented in v0.3.6, plus `Unknown` for forward
+/// The documented notification types, plus `Unknown` for forward
 /// compatibility with future types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -75,7 +75,7 @@ impl NotificationType {
 }
 
 /// The user who triggered a notification.
-/// Type-dependent context attached to a notification (API v0.5.1 § Notifications,
+/// Type-dependent context attached to a notification (API v0.6.0 § Notifications,
 /// "Notification object"). The server treats `metadata` as open-ended, so only
 /// the commonly-used keys are modelled here; unknown keys are ignored.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -110,7 +110,7 @@ pub struct NotificationMetadata {
     pub is_guild_thread: Option<bool>,
 }
 
-/// A notification record. Shape per API v0.5.1 § Notifications: the actor is
+/// A notification record. Shape per API v0.6.0 § Notifications: the actor is
 /// denormalized onto `actorId` / `actorUsername`, and type-dependent context
 /// (deep-link slug, reply id, guild/thread info) lives under `metadata`.
 #[derive(Debug, Clone, Deserialize)]

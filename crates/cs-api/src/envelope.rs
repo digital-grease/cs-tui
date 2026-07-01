@@ -1,10 +1,10 @@
 //! Response envelope decoding.
 //!
-//! The v0.3.6 API wraps every payload in one of:
+//! The API wraps every payload in one of:
 //! - `{ "data": T }` — single object
 //! - `{ "data": [T], "cursor": "next|null" }` — paginated list
 //! - `{ "error": { "code": "X", "message": "Y" } }` — error
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::error::ErrorCode;
 
@@ -16,8 +16,23 @@ pub(crate) struct Data<T> {
 #[derive(Debug, Deserialize)]
 pub(crate) struct Page<T> {
     pub data: Vec<T>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_cursor")]
     pub cursor: Option<String>,
+}
+
+fn deserialize_cursor<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let Some(value) = Option::<serde_json::Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    match value {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::String(s) => Ok(Some(s)),
+        serde_json::Value::Number(n) => Ok(Some(n.to_string())),
+        other => Ok(Some(other.to_string())),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,6 +71,13 @@ mod tests {
         let raw = r#"{"data":[],"cursor":"abc"}"#;
         let env: Page<serde_json::Value> = serde_json::from_str(raw).unwrap();
         assert_eq!(env.cursor.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn page_envelope_decodes_numeric_cursor_as_string() {
+        let raw = r#"{"data":[],"cursor":1719700000000}"#;
+        let env: Page<serde_json::Value> = serde_json::from_str(raw).unwrap();
+        assert_eq!(env.cursor.as_deref(), Some("1719700000000"));
     }
 
     #[test]

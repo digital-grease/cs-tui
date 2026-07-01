@@ -159,7 +159,7 @@ location is auto-created).
 
 | Option | Default | Notes |
 |---|---|---|
-| `start_section` | `feed` | Section opened on launch: `feed`, `notifications`, `bookmarks`, `topics`, `profile`, `journal`, `settings`, `guilds`. |
+| `start_section` | `feed` | Section opened on launch: `feed`, `notifications`, `bookmarks`, `topics`, `profile`, `journal`, `guilds`, `settings`. |
 | `nsfw` | `false` | Show NSFW posts by default (otherwise hidden until toggled). |
 | `confirm_deletes` | `true` | Require the two-step `d` then `y` confirmation before deleting a post or note. |
 | `feed_autorefresh` | `true` | Auto-refresh the feed in the background: new entries are prepended at the top without moving your scroll position (only while the feed is on screen). |

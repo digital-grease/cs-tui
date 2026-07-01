@@ -6,9 +6,10 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use cs_api::{
-    ApiError, Bookmark, Client, EndpointKey, Entry, Follow, FollowsDirection, Guild,
-    GuildMembership, GuildThread, JoinedGuild, Note, NoteRevision, Notification, NotificationType,
-    NotificationsFilter, ProfileUpdate, Reply, Settings, SettingsUpdate, Topic, User,
+    ApiError, Bookmark, Client, CmailConversation, CmailMessage, EndpointKey, Entry, Follow,
+    FollowsDirection, Guild, GuildMembership, GuildThread, JoinedGuild, Note, NoteRevision,
+    Notification, NotificationType, NotificationsFilter, ProfileUpdate, Reply, Settings,
+    SettingsUpdate, Topic, User,
 };
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::DefaultTerminal;
@@ -17,6 +18,7 @@ use tokio::sync::{mpsc, Notify};
 use tokio::time::MissedTickBehavior;
 
 use super::bookmarks::{BookmarksIntent, BookmarksScreen};
+use super::cmail::{CmailIntent, CmailScreen};
 use super::compose::{launch_editor, ComposeIntent, ComposeKind, ComposeScreen};
 use super::edit_profile::{EditProfileIntent, EditProfileScreen};
 use super::editor::{EditorIntent, EditorPurpose, EditorScreen};
@@ -26,7 +28,7 @@ use super::guilds::{GuildsIntent, GuildsScreen};
 use super::journal::{JournalIntent, JournalScreen};
 use super::login::{LoginIntent, LoginScreen};
 use super::menu::{MenuIntent, MenuOverlay};
-use super::nav::{render_tab_bar, RootKind};
+use super::nav::{render_tab_bar, RootKind, TabBarStatus};
 use super::notifications::{NotificationsIntent, NotificationsScreen};
 use super::post_detail::{PostDetailIntent, PostDetailScreen};
 use super::profile::{ProfileIntent, ProfileScreen, ProfileTab};
@@ -89,6 +91,17 @@ pub enum BgEvent {
     FeedHead(Vec<Entry>),
     NotificationsInitial(Result<(Vec<Notification>, Option<String>), String>),
     NotificationsMore(Result<(Vec<Notification>, Option<String>), String>),
+    CmailConversations(Result<Vec<CmailConversation>, String>),
+    CmailMessages {
+        conversation_id: String,
+        result: Result<(Vec<CmailMessage>, Option<String>), String>,
+    },
+    CmailStarted(Result<CmailConversation, String>),
+    CmailSent {
+        conversation_id: String,
+        result: Result<(), String>,
+    },
+    CmailUnreadCount(u32),
     NotificationMarkedRead,
     /// A single mark-read failed; roll back the optimistic local change.
     NotificationMarkFailed {
@@ -251,6 +264,7 @@ pub enum Screen {
     Login(LoginScreen),
     Feed(FeedScreen),
     Notifications(NotificationsScreen),
+    Cmail(CmailScreen),
     Bookmarks(BookmarksScreen),
     Topics(TopicsScreen),
     TopicFeed(TopicFeedScreen),
@@ -277,6 +291,7 @@ impl Screen {
             Screen::Login(_) | Screen::Compose(_) | Screen::EditProfile(_) | Screen::Editor(_) => {
                 true
             }
+            Screen::Cmail(s) => s.is_text_input(),
             // The topics search box captures printable keys while open.
             Screen::Topics(s) => s.is_filtering(),
             // Settings has only toggles, cyclable choices, and read-only fields —
@@ -307,6 +322,25 @@ enum Action {
         notification_id: String,
     },
     NotificationsMarkAll,
+    CmailRefresh,
+    CmailOpen {
+        conversation_id: String,
+    },
+    CmailLoadOlder {
+        conversation_id: String,
+        before: Option<i64>,
+    },
+    CmailStart {
+        username: String,
+    },
+    CmailCompose {
+        conversation_id: String,
+    },
+    CmailSend {
+        conversation_id: String,
+        content: String,
+    },
+    CmailBackToConversations,
     BookmarksRefresh,
     BookmarksMore {
         cursor: Option<String>,
@@ -469,6 +503,7 @@ pub struct App {
     back_stack: Vec<Screen>,
     current_root: Option<RootKind>,
     unread_count: u32,
+    cmail_unread_count: u32,
     should_quit: bool,
     bg_tx: mpsc::UnboundedSender<BgEvent>,
     bg_rx: mpsc::UnboundedReceiver<BgEvent>,
@@ -510,6 +545,10 @@ pub struct App {
     /// Whether the long-lived feed head-poller has been spawned (mirrors
     /// `poller_started`; outlives logout).
     feed_poller_started: bool,
+    /// Whether the long-lived C-Mail unread-count poller has been spawned. It
+    /// runs off-screen like the notifications badge so new private mail is
+    /// discoverable from any section.
+    cmail_poller_started: bool,
     /// When set, the input reader thread stops touching crossterm so an external
     /// `$EDITOR` owns the terminal exclusively (otherwise the reader steals the
     /// editor's keystrokes, which then replay onto the TUI when it exits).
@@ -619,6 +658,7 @@ impl App {
             back_stack: Vec::new(),
             current_root: None,
             unread_count: 0,
+            cmail_unread_count: 0,
             should_quit: false,
             bg_tx,
             bg_rx,
@@ -634,6 +674,7 @@ impl App {
             poller_started: false,
             feed_active: Arc::new(AtomicBool::new(false)),
             feed_poller_started: false,
+            cmail_poller_started: false,
             input_paused: Arc::new(AtomicBool::new(false)),
             force_clear: false,
             topics_cache: Vec::new(),
@@ -729,6 +770,11 @@ impl App {
         if crate::config::get().feed_autorefresh && !self.feed_poller_started {
             self.spawn_feed_head_poller();
             self.feed_poller_started = true;
+        }
+        if !self.cmail_poller_started {
+            self.spawn_cmail_unread_poller();
+            self.cmail_poller_started = true;
+            self.spawn_cmail_unread_once();
         }
     }
 
@@ -872,10 +918,13 @@ impl App {
             render_tab_bar(
                 frame,
                 tab_area,
-                current,
-                self.unread_count,
-                !self.back_stack.is_empty(),
-                self.offline,
+                TabBarStatus {
+                    current,
+                    unread_count: self.unread_count,
+                    cmail_unread_count: self.cmail_unread_count,
+                    can_go_back: !self.back_stack.is_empty(),
+                    offline: self.offline,
+                },
                 &self.theme,
             );
 
@@ -883,6 +932,7 @@ impl App {
                 Screen::Login(s) => s.render(frame, screen_area, &self.theme),
                 Screen::Feed(s) => s.render(frame, screen_area, &self.theme),
                 Screen::Notifications(s) => s.render(frame, screen_area, &self.theme),
+                Screen::Cmail(s) => s.render(frame, screen_area, &self.theme),
                 Screen::Bookmarks(s) => s.render(frame, screen_area, &self.theme),
                 Screen::Topics(s) => s.render(frame, screen_area, &self.theme),
                 Screen::TopicFeed(s) => s.render(frame, screen_area, &self.theme),
@@ -976,6 +1026,35 @@ impl App {
                     highlight_reply_id,
                 },
                 NotificationsIntent::None => Action::None,
+            },
+            Screen::Cmail(s) => match s.handle_key(key) {
+                CmailIntent::Quit => Action::Quit,
+                CmailIntent::RefreshConversations => Action::CmailRefresh,
+                CmailIntent::OpenConversation { conversation_id } => {
+                    Action::CmailOpen { conversation_id }
+                }
+                CmailIntent::LoadOlder {
+                    conversation_id,
+                    before,
+                } => Action::CmailLoadOlder {
+                    conversation_id,
+                    before,
+                },
+                CmailIntent::SubmitNew { username } => Action::CmailStart { username },
+                CmailIntent::BackToConversations => Action::CmailBackToConversations,
+                CmailIntent::StartCompose { conversation_id } => {
+                    Action::CmailCompose { conversation_id }
+                }
+                CmailIntent::SendMessage {
+                    conversation_id,
+                    content,
+                } => Action::CmailSend {
+                    conversation_id,
+                    content,
+                },
+                CmailIntent::StartNew | CmailIntent::CancelInput | CmailIntent::None => {
+                    Action::None
+                }
             },
             Screen::Bookmarks(s) => match s.handle_key(key) {
                 BookmarksIntent::Quit => Action::Quit,
@@ -1240,6 +1319,7 @@ impl App {
                 Screen::Login(s) => s.paste_into_focused(&data),
                 Screen::Compose(s) => s.paste_into_focused(&data),
                 Screen::EditProfile(s) => s.paste_into_focused(&data),
+                Screen::Cmail(s) => s.paste_text(&data),
                 Screen::Topics(s) if s.is_filtering() => {
                     s.paste_filter(&super::input::collapse_newlines(&data));
                 }
@@ -1300,6 +1380,14 @@ impl App {
         if key.code == KeyCode::Esc {
             if let Screen::Topics(s) = &mut self.screen {
                 if s.clear_filter() {
+                    return;
+                }
+            }
+            if let Screen::Cmail(s) = &mut self.screen {
+                if let Some(intent) = s.handle_escape() {
+                    if matches!(intent, CmailIntent::BackToConversations) {
+                        self.spawn_cmail_conversations();
+                    }
                     return;
                 }
             }
@@ -1474,6 +1562,42 @@ impl App {
                 }
                 self.unread_count = 0;
                 self.spawn_mark_all_notifications_read();
+            }
+            Action::CmailRefresh => self.spawn_cmail_conversations(),
+            Action::CmailOpen { conversation_id } => {
+                if let Screen::Cmail(s) = &mut self.screen {
+                    s.open_conversation(&conversation_id);
+                }
+                self.spawn_cmail_messages(conversation_id, None);
+            }
+            Action::CmailLoadOlder {
+                conversation_id,
+                before,
+            } => self.spawn_cmail_messages(conversation_id, before),
+            Action::CmailStart { username } => {
+                if self.block_write_if_offline() {
+                    return;
+                }
+                self.spawn_cmail_start(username);
+            }
+            Action::CmailCompose { conversation_id } => {
+                let screen = EditorScreen::new(EditorPurpose::CmailMessage { conversation_id }, "");
+                self.push_screen(Screen::Editor(screen));
+            }
+            Action::CmailSend {
+                conversation_id,
+                content,
+            } => {
+                if self.block_write_if_offline() {
+                    return;
+                }
+                self.spawn_cmail_send(conversation_id, content);
+            }
+            Action::CmailBackToConversations => {
+                if let Screen::Cmail(s) = &mut self.screen {
+                    s.mode = super::cmail::CmailMode::Conversations;
+                }
+                self.spawn_cmail_conversations();
             }
             Action::BookmarksRefresh => self.spawn_bookmarks_initial(),
             Action::BookmarksMore { cursor } => self.spawn_bookmarks_more(cursor),
@@ -1881,6 +2005,52 @@ impl App {
                 if let Screen::Notifications(s) = &mut self.screen {
                     s.apply_more(result);
                 }
+            }
+            BgEvent::CmailConversations(result) => {
+                if let Ok(conversations) = &result {
+                    self.cmail_unread_count = conversations.iter().map(|c| c.unread_count).sum();
+                }
+                if let Screen::Cmail(s) = &mut self.screen {
+                    s.apply_conversations(result);
+                }
+            }
+            BgEvent::CmailMessages {
+                conversation_id,
+                result,
+            } => {
+                let loaded = result.is_ok();
+                if let Screen::Cmail(s) = &mut self.screen {
+                    s.apply_messages(&conversation_id, result);
+                }
+                if loaded {
+                    self.spawn_cmail_mark_read(conversation_id);
+                }
+            }
+            BgEvent::CmailStarted(result) => {
+                if let Screen::Cmail(s) = &mut self.screen {
+                    if let Some(conversation_id) = s.apply_started(result) {
+                        self.spawn_cmail_messages(conversation_id, None);
+                    }
+                }
+            }
+            BgEvent::CmailSent {
+                conversation_id,
+                result,
+            } => {
+                let reload = if let Screen::Cmail(s) = &mut self.screen {
+                    s.finish_send(&conversation_id, result)
+                } else {
+                    false
+                };
+                if reload {
+                    self.spawn_cmail_messages(conversation_id, None);
+                }
+            }
+            BgEvent::CmailUnreadCount(n) => {
+                // A successful poll doubles as an online heartbeat, same as the
+                // notifications unread poller.
+                self.offline = false;
+                self.cmail_unread_count = n;
             }
             BgEvent::NotificationMarkedRead | BgEvent::AllNotificationsMarked => {
                 // Server confirmed the mark; local UI already updated optimistically.
@@ -2529,6 +2699,7 @@ impl App {
         self.back_stack.clear();
         self.current_root = None;
         self.unread_count = 0;
+        self.cmail_unread_count = 0;
         self.offline = false;
         self.toast = None;
         // Invalidate the topics warm-up: bump the epoch so any in-flight prefetch
@@ -2692,6 +2863,10 @@ impl App {
                 self.screen = Screen::Notifications(s);
                 self.spawn_notifications_initial(NotificationsFilter::All, Vec::new());
             }
+            RootKind::Cmail => {
+                self.screen = Screen::Cmail(CmailScreen::new());
+                self.spawn_cmail_conversations();
+            }
             RootKind::Bookmarks => {
                 self.screen = Screen::Bookmarks(BookmarksScreen::new());
                 self.spawn_bookmarks_initial();
@@ -2839,6 +3014,101 @@ impl App {
                     let msg = note_api_err(&tx, e);
                     tracing::warn!(error = %msg, "mark_all_notifications_read failed");
                     let _ = tx.send(BgEvent::AllNotificationsMarkFailed);
+                }
+            }
+        });
+    }
+
+    fn spawn_cmail_conversations(&self) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .list_cmail_conversations()
+                .await
+                .map_err(|e| note_api_err(&tx, e));
+            let _ = tx.send(BgEvent::CmailConversations(result));
+        });
+    }
+
+    fn spawn_cmail_messages(&self, conversation_id: String, before: Option<i64>) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .read_cmail_conversation(&conversation_id, before, None)
+                .await
+                .map_err(|e| note_api_err(&tx, e));
+            let _ = tx.send(BgEvent::CmailMessages {
+                conversation_id,
+                result,
+            });
+        });
+    }
+
+    fn spawn_cmail_start(&self, username: String) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .start_cmail_conversation_by_username(&username)
+                .await
+                .map_err(|e| note_api_err(&tx, e));
+            let _ = tx.send(BgEvent::CmailStarted(result));
+        });
+    }
+
+    fn spawn_cmail_send(&self, conversation_id: String, content: String) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .send_cmail_message(&conversation_id, &content)
+                .await
+                .map(|_| ())
+                .map_err(|e| note_api_err(&tx, e));
+            let _ = tx.send(BgEvent::CmailSent {
+                conversation_id,
+                result,
+            });
+        });
+    }
+
+    fn spawn_cmail_mark_read(&self, conversation_id: String) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            match client.mark_cmail_read(&conversation_id).await {
+                Ok(()) => match client.list_cmail_conversations().await {
+                    Ok(conversations) => {
+                        let n = conversations.iter().map(|c| c.unread_count).sum();
+                        let _ = tx.send(BgEvent::CmailUnreadCount(n));
+                    }
+                    Err(e) => {
+                        let msg = note_api_err(&tx, e);
+                        tracing::debug!(error = %msg, conversation_id, "cmail unread refresh failed");
+                    }
+                },
+                Err(e) => {
+                    let msg = note_api_err(&tx, e);
+                    tracing::debug!(error = %msg, conversation_id, "mark_cmail_read failed");
+                }
+            }
+        });
+    }
+
+    fn spawn_cmail_unread_once(&self) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            match client.list_cmail_conversations().await {
+                Ok(conversations) => {
+                    let n = conversations.iter().map(|c| c.unread_count).sum();
+                    let _ = tx.send(BgEvent::CmailUnreadCount(n));
+                }
+                Err(e) => {
+                    let msg = note_api_err(&tx, e);
+                    tracing::debug!(error = %msg, "cmail unread one-shot failed");
                 }
             }
         });
@@ -3761,6 +4031,12 @@ impl App {
                     c.error = None;
                 }
             }
+            EditorPurpose::CmailMessage { conversation_id } => {
+                self.pop_screen();
+                if let Screen::Cmail(s) = &mut self.screen {
+                    s.confirm_send(&conversation_id, content);
+                }
+            }
         }
     }
 
@@ -4062,6 +4338,43 @@ impl App {
                         let transport = e.is_transport();
                         let msg = note_api_err(&tx, e);
                         tracing::debug!(error = %msg, "unread_count poll failed");
+                        if transport {
+                            5
+                        } else {
+                            online_delay
+                        }
+                    }
+                };
+                tokio::select! {
+                    () = tokio::time::sleep(Duration::from_secs(next_delay)) => {}
+                    () = wake.notified() => {}
+                }
+            }
+        });
+    }
+
+    fn spawn_cmail_unread_poller(&self) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        let wake = self.offline_notify.clone();
+        let online_delay = crate::config::get().cmail_refresh_secs;
+        tokio::spawn(async move {
+            // Same shape as the notifications badge poller: it runs globally so
+            // new private mail is discoverable while the user is elsewhere.
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            loop {
+                let next_delay = match client.list_cmail_conversations().await {
+                    Ok(conversations) => {
+                        let n = conversations.iter().map(|c| c.unread_count).sum();
+                        if tx.send(BgEvent::CmailUnreadCount(n)).is_err() {
+                            return;
+                        }
+                        online_delay
+                    }
+                    Err(e) => {
+                        let transport = e.is_transport();
+                        let msg = note_api_err(&tx, e);
+                        tracing::debug!(error = %msg, "cmail unread poll failed");
                         if transport {
                             5
                         } else {
@@ -4442,6 +4755,94 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cmail_compose_reuses_the_builtin_editor() {
+        let mut app = test_app();
+        let conversation = CmailConversation {
+            conversation_id: "c1".into(),
+            other_user: cs_api::CmailUser {
+                user_id: "u1".into(),
+                username: "alice".into(),
+                display_name: None,
+                profile_picture_url: None,
+            },
+            last_message: None,
+            last_message_at: None,
+            unread_count: 0,
+        };
+        app.screen = Screen::Cmail(CmailScreen {
+            conversations: crate::ui::list::TabState::default(),
+            mode: crate::ui::cmail::CmailMode::Conversation {
+                conversation,
+                messages: crate::ui::list::TabState::default(),
+            },
+        });
+        app.current_root = Some(RootKind::Cmail);
+
+        app.handle_terminal_event(key_event(KeyCode::Char('c')))
+            .await;
+
+        let Screen::Editor(ed) = &app.screen else {
+            panic!("c in C-Mail conversation should open the built-in editor");
+        };
+        assert_eq!(
+            ed.purpose(),
+            &EditorPurpose::CmailMessage {
+                conversation_id: "c1".into()
+            }
+        );
+        assert!(
+            matches!(app.back_stack.last(), Some(Screen::Cmail(_))),
+            "the C-Mail conversation stays beneath the editor for cancel/save"
+        );
+    }
+
+    #[test]
+    fn cmail_editor_save_returns_to_confirm_instead_of_sending() {
+        let mut app = test_app();
+        let conversation = CmailConversation {
+            conversation_id: "c1".into(),
+            other_user: cs_api::CmailUser {
+                user_id: "u1".into(),
+                username: "alice".into(),
+                display_name: None,
+                profile_picture_url: None,
+            },
+            last_message: None,
+            last_message_at: None,
+            unread_count: 0,
+        };
+        app.screen = Screen::Cmail(CmailScreen {
+            conversations: crate::ui::list::TabState::default(),
+            mode: crate::ui::cmail::CmailMode::Conversation {
+                conversation,
+                messages: crate::ui::list::TabState::default(),
+            },
+        });
+        app.push_screen(Screen::Editor(EditorScreen::new(
+            EditorPurpose::CmailMessage {
+                conversation_id: "c1".into(),
+            },
+            "hello from c-mail",
+        )));
+
+        app.editor_save();
+
+        let Screen::Cmail(cmail) = &app.screen else {
+            panic!("editor save should return to C-Mail, not leave the editor");
+        };
+        let crate::ui::cmail::CmailMode::ConfirmSend {
+            conversation_id,
+            content,
+            ..
+        } = &cmail.mode
+        else {
+            panic!("Ctrl+D in C-Mail editor should open a send confirmation step");
+        };
+        assert_eq!(conversation_id, "c1");
+        assert_eq!(content, "hello from c-mail");
+    }
+
     #[test]
     fn editor_save_newbody_opens_compose_confirm_and_keeps_originator() {
         let mut app = test_app();
@@ -4748,7 +5149,7 @@ mod tests {
         app.current_root = Some(RootKind::Settings);
         app.handle_terminal_event(key_event(KeyCode::Left)).await;
         assert!(
-            matches!(app.screen, Screen::Journal(_)),
+            matches!(app.screen, Screen::Guilds(_)),
             "Left on a settings toggle should cycle to the previous section"
         );
     }

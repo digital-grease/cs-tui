@@ -73,9 +73,10 @@ pub struct Client {
 }
 
 impl Client {
-    /// Construct a new client. `base` is the Firebase project's REST root
-    /// (e.g. `https://my-project-default-rtdb.firebaseio.com`); `token` is the
-    /// `rtdbToken` returned by `/v1/auth/login`.
+    /// Construct a new client. `base` is the RTDB REST root (`rtdbUrl` from
+    /// `/v1/auth/login`); `token` is the Firebase `idToken` for direct RTDB REST
+    /// + SSE reads. The separate `rtdbToken` is only needed for SDK
+    ///   `signInWithCustomToken` flows.
     pub fn new(base: impl Into<String>, token: impl Into<String>) -> Result<Self, RtdbError> {
         let http = reqwest::Client::builder()
             .user_agent(DEFAULT_USER_AGENT)

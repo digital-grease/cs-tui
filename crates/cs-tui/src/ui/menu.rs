@@ -142,11 +142,15 @@ impl MenuOverlay {
         let y = area.y + area.height.saturating_sub(h) / 2;
         let card = Rect::new(x, y, w, h);
 
-        // Clear underlying content so the menu is opaque.
+        // Clear underlying content, then repaint the card with the current theme
+        // background. `Clear` alone uses the terminal default, which makes the
+        // menu look like a different opacity/background on non-default themes.
         frame.render_widget(Clear, card);
+        frame.render_widget(Block::default().style(theme.base()), card);
 
         let block = Block::default()
             .borders(Borders::ALL)
+            .style(theme.base())
             .border_style(theme.accent_style())
             .title(Span::styled(" menu ", theme.heading_style()));
         let inner = block.inner(card);

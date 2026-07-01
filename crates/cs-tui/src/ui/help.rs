@@ -26,26 +26,30 @@ const SECTIONS: &[Row] = &[
     },
     Row {
         keys: "3",
-        desc: "Bookmarks",
+        desc: "C-Mail",
     },
     Row {
         keys: "4",
-        desc: "Topics",
+        desc: "Bookmarks",
     },
     Row {
         keys: "5",
-        desc: "Profile",
+        desc: "Topics",
     },
     Row {
         keys: "6",
-        desc: "Journal",
+        desc: "Profile",
     },
     Row {
         keys: "7",
-        desc: "Settings",
+        desc: "Journal",
     },
     Row {
         keys: "8",
+        desc: "Settings",
+    },
+    Row {
+        keys: "9",
         desc: "Guilds",
     },
 ];
@@ -60,7 +64,7 @@ const GLOBAL: &[Row] = &[
         desc: "back",
     },
     Row {
-        keys: "1-8 / ← →",
+        keys: "1-9 / ← →",
         desc: "jump to / cycle sections",
     },
     Row {

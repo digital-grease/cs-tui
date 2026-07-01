@@ -419,6 +419,9 @@ pub enum EditorPurpose {
     /// Ctrl+E re-edit of an existing `ComposeScreen` body. On save the app pops
     /// back to that compose screen and overwrites its content.
     ReEditBody,
+    /// C-Mail message body. On save the app pops back to the conversation and
+    /// sends the content to this conversation id.
+    CmailMessage { conversation_id: String },
 }
 
 /// Outcome of a key for the surrounding app to act on.
@@ -560,6 +563,7 @@ impl EditorScreen {
         match &self.purpose {
             EditorPurpose::NewBody { kind, .. } => kind.title(),
             EditorPurpose::ReEditBody => " cs-tui • edit body ".to_string(),
+            EditorPurpose::CmailMessage { .. } => " cs-tui • c-mail • compose ".to_string(),
         }
     }
 

@@ -1,4 +1,4 @@
-//! Domain types matching the cyberspace.online v0.3.6 response shapes.
+//! Domain types matching the cyberspace.online API response shapes.
 //!
 //! Field names use Rust snake_case via serde `rename_all = "camelCase"`. The one
 //! exception is `isNSFW`, which the API keeps fully uppercase.
@@ -83,7 +83,7 @@ pub struct Reply {
 
 /// Media attachment on an entry or reply.
 ///
-/// The v0.3.6 spec includes `attachments: []` in response examples but does not
+/// The spec includes `attachments: []` in response examples but does not
 /// publish the per-attachment schema. This shape mirrors what reference clients
 /// observe in the wild — image dimensions and YouTube-style audio metadata.
 /// Fields are tolerant of missing values so the type survives spec drift.
