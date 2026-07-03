@@ -65,6 +65,11 @@ pub enum ProfileIntent {
     RefreshCurrentTab,
     /// Toggle follow/unfollow for the viewed user (only meaningful when not self).
     ToggleFollow,
+    /// Start/open a C-Mail conversation with the viewed user (not self).
+    MessageUser {
+        username: String,
+        user_id: Option<String>,
+    },
     /// Enter edit mode (only meaningful when viewing self).
     EditOwnProfile,
     /// Pin (or unpin) one of your own posts to your profile.
@@ -205,6 +210,14 @@ impl ProfileScreen {
         match key.code {
             KeyCode::Char('F') if !self.is_self && self.user.is_some() => {
                 return ProfileIntent::ToggleFollow;
+            }
+            KeyCode::Char('m') if !self.is_self => {
+                if let Some(u) = &self.user {
+                    return ProfileIntent::MessageUser {
+                        username: u.username.clone(),
+                        user_id: Some(u.id.clone()),
+                    };
+                }
             }
             KeyCode::Char('e') if self.is_self => {
                 return ProfileIntent::EditOwnProfile;
@@ -556,6 +569,7 @@ impl ProfileScreen {
             parts.push("e edit".into());
         } else if self.user.is_some() {
             parts.push("F follow/unfollow".into());
+            parts.push("m message".into());
         }
         // List actions only apply on the list tabs.
         if self.tab == ProfileTab::Posts && self.is_self {
@@ -687,6 +701,26 @@ mod tests {
             created_at: None,
             deleted: false,
         }
+    }
+
+    #[test]
+    fn m_messages_another_user() {
+        let mut s = ProfileScreen::new_for("bob".into());
+        s.apply_user(Ok(user("bob")));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('m'))),
+            ProfileIntent::MessageUser {
+                username: "bob".into(),
+                user_id: Some("u".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn m_does_nothing_on_own_profile() {
+        let mut s = ProfileScreen::new_own();
+        s.apply_user(Ok(user("me")));
+        assert_eq!(s.handle_key(key(KeyCode::Char('m'))), ProfileIntent::None);
     }
 
     #[test]

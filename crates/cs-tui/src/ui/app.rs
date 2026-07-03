@@ -5,11 +5,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use cs_api::rtdb::{RtdbClient, SseEvent, SseEventKind};
 use cs_api::{
-    ApiError, Bookmark, Client, CmailConversation, CmailMessage, EndpointKey, Entry, Follow,
-    FollowsDirection, Guild, GuildMembership, GuildThread, JoinedGuild, Note, NoteRevision,
-    Notification, NotificationType, NotificationsFilter, ProfileUpdate, Reply, Settings,
-    SettingsUpdate, Topic, User,
+    updates_from_rtdb_event, ApiError, Bookmark, Client, CmailConversation, CmailLiveUpdate,
+    CmailMessage, EndpointKey, Entry, Follow, FollowsDirection, Guild, GuildMembership,
+    GuildThread, JoinedGuild, Note, NoteRevision, Notification, NotificationType,
+    NotificationsFilter, ProfileUpdate, Reply, Settings, SettingsUpdate, Topic, User,
 };
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::DefaultTerminal;
@@ -94,14 +95,34 @@ pub enum BgEvent {
     CmailConversations(Result<Vec<CmailConversation>, String>),
     CmailMessages {
         conversation_id: String,
+        /// `true` for a fresh load / refresh / post-send reload (`before` was
+        /// `None`); `false` for a scroll-back older page. Drives whether the list
+        /// is replaced or prepended, and whether the open marks the thread read.
+        initial: bool,
         result: Result<(Vec<CmailMessage>, Option<String>), String>,
+    },
+    /// Changes delivered over the live RTDB stream for the open conversation,
+    /// tagged with the stream generation that produced them so a superseded
+    /// stream's late events are dropped.
+    CmailLive {
+        conversation_id: String,
+        epoch: u64,
+        updates: Vec<CmailLiveUpdate>,
     },
     CmailStarted(Result<CmailConversation, String>),
     CmailSent {
         conversation_id: String,
+        /// The sent text, to correlate the result with its optimistic entry.
+        content: String,
         result: Result<(), String>,
     },
-    CmailUnreadCount(u32),
+    /// Result of a background C-Mail unread poll: the total unread count and,
+    /// when any conversation is unread, the display name of the most recently
+    /// active unread sender (drives the "new mail" toast).
+    CmailUnread {
+        count: u32,
+        latest_from: Option<String>,
+    },
     NotificationMarkedRead,
     /// A single mark-read failed; roll back the optimistic local change.
     NotificationMarkFailed {
@@ -323,6 +344,12 @@ enum Action {
     },
     NotificationsMarkAll,
     CmailRefresh,
+    /// Jump to the C-Mail section and start/open a conversation with a specific
+    /// user (from a DM notification or a profile).
+    OpenCmailWith {
+        username: String,
+        user_id: Option<String>,
+    },
     CmailOpen {
         conversation_id: String,
     },
@@ -335,10 +362,15 @@ enum Action {
     },
     CmailCompose {
         conversation_id: String,
+        draft: String,
     },
     CmailSend {
         conversation_id: String,
         content: String,
+    },
+    CmailRetry {
+        conversation_id: String,
+        contents: Vec<String>,
     },
     CmailBackToConversations,
     BookmarksRefresh,
@@ -549,6 +581,15 @@ pub struct App {
     /// runs off-screen like the notifications badge so new private mail is
     /// discoverable from any section.
     cmail_poller_started: bool,
+    /// Generation counter for the live RTDB C-Mail message stream (mirrors
+    /// `topics_epoch`): bumped whenever a conversation is opened or left, so the
+    /// prior conversation's stream aborts and any late events it emits are
+    /// discarded instead of leaking into the newly-open thread.
+    cmail_stream_epoch: Arc<AtomicU64>,
+    /// Whether at least one C-Mail unread poll has landed. Gates the "new mail"
+    /// toast so pre-existing unread at launch is silent — only a later rise
+    /// announces genuinely-new mail.
+    cmail_unread_initialized: bool,
     /// When set, the input reader thread stops touching crossterm so an external
     /// `$EDITOR` owns the terminal exclusively (otherwise the reader steals the
     /// editor's keystrokes, which then replay onto the TUI when it exits).
@@ -675,6 +716,8 @@ impl App {
             feed_active: Arc::new(AtomicBool::new(false)),
             feed_poller_started: false,
             cmail_poller_started: false,
+            cmail_stream_epoch: Arc::new(AtomicU64::new(0)),
+            cmail_unread_initialized: false,
             input_paused: Arc::new(AtomicBool::new(false)),
             force_clear: false,
             topics_cache: Vec::new(),
@@ -1025,6 +1068,9 @@ impl App {
                     post_id,
                     highlight_reply_id,
                 },
+                NotificationsIntent::OpenCmail { username, user_id } => {
+                    Action::OpenCmailWith { username, user_id }
+                }
                 NotificationsIntent::None => Action::None,
             },
             Screen::Cmail(s) => match s.handle_key(key) {
@@ -1042,15 +1088,26 @@ impl App {
                 },
                 CmailIntent::SubmitNew { username } => Action::CmailStart { username },
                 CmailIntent::BackToConversations => Action::CmailBackToConversations,
-                CmailIntent::StartCompose { conversation_id } => {
-                    Action::CmailCompose { conversation_id }
-                }
+                CmailIntent::StartCompose {
+                    conversation_id,
+                    draft,
+                } => Action::CmailCompose {
+                    conversation_id,
+                    draft,
+                },
                 CmailIntent::SendMessage {
                     conversation_id,
                     content,
                 } => Action::CmailSend {
                     conversation_id,
                     content,
+                },
+                CmailIntent::RetryFailed {
+                    conversation_id,
+                    contents,
+                } => Action::CmailRetry {
+                    conversation_id,
+                    contents,
                 },
                 CmailIntent::StartNew | CmailIntent::CancelInput | CmailIntent::None => {
                     Action::None
@@ -1241,6 +1298,9 @@ impl App {
                     } else {
                         Action::None
                     }
+                }
+                ProfileIntent::MessageUser { username, user_id } => {
+                    Action::OpenCmailWith { username, user_id }
                 }
                 ProfileIntent::EditOwnProfile => Action::OpenEditProfile,
                 ProfileIntent::PinPost { post_id, pin } => Action::PinPost { post_id, pin },
@@ -1564,11 +1624,15 @@ impl App {
                 self.spawn_mark_all_notifications_read();
             }
             Action::CmailRefresh => self.spawn_cmail_conversations(),
+            Action::OpenCmailWith { username, user_id } => {
+                self.open_cmail_with(username, user_id);
+            }
             Action::CmailOpen { conversation_id } => {
                 if let Screen::Cmail(s) = &mut self.screen {
                     s.open_conversation(&conversation_id);
                 }
-                self.spawn_cmail_messages(conversation_id, None);
+                self.spawn_cmail_messages(conversation_id.clone(), None);
+                self.spawn_cmail_stream(conversation_id);
             }
             Action::CmailLoadOlder {
                 conversation_id,
@@ -1580,8 +1644,12 @@ impl App {
                 }
                 self.spawn_cmail_start(username);
             }
-            Action::CmailCompose { conversation_id } => {
-                let screen = EditorScreen::new(EditorPurpose::CmailMessage { conversation_id }, "");
+            Action::CmailCompose {
+                conversation_id,
+                draft,
+            } => {
+                let screen =
+                    EditorScreen::new(EditorPurpose::CmailMessage { conversation_id }, &draft);
                 self.push_screen(Screen::Editor(screen));
             }
             Action::CmailSend {
@@ -1592,6 +1660,17 @@ impl App {
                     return;
                 }
                 self.spawn_cmail_send(conversation_id, content);
+            }
+            Action::CmailRetry {
+                conversation_id,
+                contents,
+            } => {
+                if self.block_write_if_offline() {
+                    return;
+                }
+                for content in contents {
+                    self.spawn_cmail_send(conversation_id.clone(), content);
+                }
             }
             Action::CmailBackToConversations => {
                 if let Screen::Cmail(s) = &mut self.screen {
@@ -2016,29 +2095,51 @@ impl App {
             }
             BgEvent::CmailMessages {
                 conversation_id,
+                initial,
                 result,
             } => {
-                let loaded = result.is_ok();
+                let ok = result.is_ok();
                 if let Screen::Cmail(s) = &mut self.screen {
-                    s.apply_messages(&conversation_id, result);
+                    s.apply_messages(&conversation_id, initial, result);
                 }
-                if loaded {
+                // Only mark read (and refresh the badge) when the thread is first
+                // opened / refreshed — not on every scroll-back page, which would
+                // needlessly burn the mark-read and list rate limits.
+                if ok && initial {
                     self.spawn_cmail_mark_read(conversation_id);
                 }
             }
-            BgEvent::CmailStarted(result) => {
-                if let Screen::Cmail(s) = &mut self.screen {
-                    if let Some(conversation_id) = s.apply_started(result) {
-                        self.spawn_cmail_messages(conversation_id, None);
+            BgEvent::CmailLive {
+                conversation_id,
+                epoch,
+                updates,
+            } => {
+                // Drop events from a superseded stream (the user has since opened a
+                // different conversation or left C-Mail).
+                if epoch == self.cmail_stream_epoch.load(Ordering::SeqCst) {
+                    if let Screen::Cmail(s) = &mut self.screen {
+                        s.apply_live(&conversation_id, updates);
                     }
+                }
+            }
+            BgEvent::CmailStarted(result) => {
+                let opened = if let Screen::Cmail(s) = &mut self.screen {
+                    s.apply_started(result)
+                } else {
+                    None
+                };
+                if let Some(conversation_id) = opened {
+                    self.spawn_cmail_messages(conversation_id.clone(), None);
+                    self.spawn_cmail_stream(conversation_id);
                 }
             }
             BgEvent::CmailSent {
                 conversation_id,
+                content,
                 result,
             } => {
                 let reload = if let Screen::Cmail(s) = &mut self.screen {
-                    s.finish_send(&conversation_id, result)
+                    s.finish_send(&conversation_id, &content, result)
                 } else {
                     false
                 };
@@ -2046,11 +2147,31 @@ impl App {
                     self.spawn_cmail_messages(conversation_id, None);
                 }
             }
-            BgEvent::CmailUnreadCount(n) => {
+            BgEvent::CmailUnread { count, latest_from } => {
                 // A successful poll doubles as an online heartbeat, same as the
                 // notifications unread poller.
                 self.offline = false;
-                self.cmail_unread_count = n;
+                // Announce genuinely-new mail: the count rose past a prior poll
+                // (not the first one, so pre-existing unread at launch is silent)
+                // and we're not already looking at that sender's thread.
+                let rose = self.cmail_unread_initialized && count > self.cmail_unread_count;
+                self.cmail_unread_count = count;
+                self.cmail_unread_initialized = true;
+                if rose {
+                    if let Some(from) = latest_from {
+                        let viewing = matches!(
+                            &self.screen,
+                            Screen::Cmail(s) if s.viewing_conversation_with(&from)
+                        );
+                        if !viewing {
+                            self.toast =
+                                Some(Toast::confirmation(format!("✉ new C-Mail from @{from}")));
+                            if crate::config::get().cmail_bell {
+                                ring_terminal_bell();
+                            }
+                        }
+                    }
+                }
             }
             BgEvent::NotificationMarkedRead | BgEvent::AllNotificationsMarked => {
                 // Server confirmed the mark; local UI already updated optimistically.
@@ -2700,6 +2821,11 @@ impl App {
         self.current_root = None;
         self.unread_count = 0;
         self.cmail_unread_count = 0;
+        // A fresh login re-primes the "new mail" baseline, so pre-existing unread
+        // for the next account doesn't toast on its first poll.
+        self.cmail_unread_initialized = false;
+        // Tear down any live C-Mail message stream so it can't outlive the session.
+        self.cmail_stream_epoch.fetch_add(1, Ordering::SeqCst);
         self.offline = false;
         self.toast = None;
         // Invalidate the topics warm-up: bump the epoch so any in-flight prefetch
@@ -3020,6 +3146,11 @@ impl App {
     }
 
     fn spawn_cmail_conversations(&self) {
+        // Returning to the conversation list is the single point every "left the
+        // open conversation" path funnels through (back, list refresh, opening
+        // the section), so bumping the stream generation here tears down any live
+        // message stream without threading a stop call through each caller.
+        self.cmail_stream_epoch.fetch_add(1, Ordering::SeqCst);
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
@@ -3034,6 +3165,9 @@ impl App {
     fn spawn_cmail_messages(&self, conversation_id: String, before: Option<i64>) {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
+        // `before == None` is a fresh load / refresh / post-send reload; anything
+        // else is a scroll-back page.
+        let initial = before.is_none();
         tokio::spawn(async move {
             let result = client
                 .read_cmail_conversation(&conversation_id, before, None)
@@ -3041,21 +3175,70 @@ impl App {
                 .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::CmailMessages {
                 conversation_id,
+                initial,
                 result,
             });
         });
     }
 
+    /// Open the live RTDB stream for `conversation_id` so incoming messages
+    /// appear without a manual refresh (API v0.6.0 § Reading in real time). Bumps
+    /// the stream generation to supersede any prior conversation's stream; the
+    /// task self-terminates once its generation is no longer current.
+    fn spawn_cmail_stream(&self, conversation_id: String) {
+        let epoch = self.cmail_stream_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        let epoch_ref = self.cmail_stream_epoch.clone();
+        tokio::spawn(cmail_stream_loop(
+            client,
+            tx,
+            conversation_id,
+            epoch,
+            epoch_ref,
+        ));
+    }
+
     fn spawn_cmail_start(&self, username: String) {
+        self.spawn_cmail_start_request(cs_api::CmailStartRequest::by_username(username));
+    }
+
+    fn spawn_cmail_start_request(&self, request: cs_api::CmailStartRequest) {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
             let result = client
-                .start_cmail_conversation_by_username(&username)
+                .start_cmail_conversation(&request)
                 .await
                 .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::CmailStarted(result));
         });
+    }
+
+    /// Jump to the C-Mail section and start/open a conversation with a specific
+    /// user (from a DM notification or a profile). The start is idempotent
+    /// server-side, so it reuses an existing thread or creates one; the
+    /// resulting `CmailStarted` opens it.
+    fn open_cmail_with(&mut self, username: String, user_id: Option<String>) {
+        // Prefer the stable user id when we have one; fall back to username.
+        let request = match user_id {
+            Some(id) if !id.is_empty() => cs_api::CmailStartRequest::by_user_id(id),
+            _ => cs_api::CmailStartRequest::by_username(username),
+        };
+        if matches!(self.current_root, Some(RootKind::Cmail)) {
+            // Already in C-Mail: return to the list (this also tears down any open
+            // stream) so the started conversation opens cleanly on top.
+            if let Screen::Cmail(s) = &mut self.screen {
+                s.mode = super::cmail::CmailMode::Conversations;
+            }
+            self.spawn_cmail_conversations();
+        } else {
+            self.goto_root(RootKind::Cmail);
+        }
+        if self.block_write_if_offline() {
+            return;
+        }
+        self.spawn_cmail_start_request(request);
     }
 
     fn spawn_cmail_send(&self, conversation_id: String, content: String) {
@@ -3069,6 +3252,7 @@ impl App {
                 .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::CmailSent {
                 conversation_id,
+                content,
                 result,
             });
         });
@@ -3081,8 +3265,8 @@ impl App {
             match client.mark_cmail_read(&conversation_id).await {
                 Ok(()) => match client.list_cmail_conversations().await {
                     Ok(conversations) => {
-                        let n = conversations.iter().map(|c| c.unread_count).sum();
-                        let _ = tx.send(BgEvent::CmailUnreadCount(n));
+                        let (count, latest_from) = cmail_unread_summary(&conversations);
+                        let _ = tx.send(BgEvent::CmailUnread { count, latest_from });
                     }
                     Err(e) => {
                         let msg = note_api_err(&tx, e);
@@ -3103,8 +3287,8 @@ impl App {
         tokio::spawn(async move {
             match client.list_cmail_conversations().await {
                 Ok(conversations) => {
-                    let n = conversations.iter().map(|c| c.unread_count).sum();
-                    let _ = tx.send(BgEvent::CmailUnreadCount(n));
+                    let (count, latest_from) = cmail_unread_summary(&conversations);
+                    let _ = tx.send(BgEvent::CmailUnread { count, latest_from });
                 }
                 Err(e) => {
                     let msg = note_api_err(&tx, e);
@@ -4032,9 +4216,13 @@ impl App {
                 }
             }
             EditorPurpose::CmailMessage { conversation_id } => {
+                // The editor is an expanded surface for the inline composer: its
+                // text returns to the draft for a final review, and Enter there
+                // sends it. (conversation_id is implicit — only one is open.)
+                let _ = conversation_id;
                 self.pop_screen();
                 if let Screen::Cmail(s) = &mut self.screen {
-                    s.confirm_send(&conversation_id, content);
+                    s.set_draft_and_focus(content);
                 }
             }
         }
@@ -4365,8 +4553,11 @@ impl App {
             loop {
                 let next_delay = match client.list_cmail_conversations().await {
                     Ok(conversations) => {
-                        let n = conversations.iter().map(|c| c.unread_count).sum();
-                        if tx.send(BgEvent::CmailUnreadCount(n)).is_err() {
+                        let (count, latest_from) = cmail_unread_summary(&conversations);
+                        if tx
+                            .send(BgEvent::CmailUnread { count, latest_from })
+                            .is_err()
+                        {
                             return;
                         }
                         online_delay
@@ -4492,6 +4683,137 @@ fn note_api_err(tx: &mpsc::UnboundedSender<BgEvent>, e: ApiError) -> String {
     e.user_message()
 }
 
+/// The lifetime of one live RTDB C-Mail stream. Holds the SSE connection open,
+/// forwards parsed messages tagged with `epoch`, and stops as soon as its
+/// generation is superseded (the user opened another conversation or left).
+///
+/// Reconnection is deliberately conservative: only a token expiry
+/// (`auth_revoked`) triggers a reopen, and only after a successful refresh with a
+/// short pause and a hard cap — never a tight loop (v0.6.0 § "don't reconnect in
+/// a loop"). Any other stream end simply turns live updates off for this view;
+/// the unread poll and manual `r` still keep it current.
+async fn cmail_stream_loop(
+    client: Client,
+    tx: mpsc::UnboundedSender<BgEvent>,
+    conversation_id: String,
+    epoch: u64,
+    epoch_ref: Arc<AtomicU64>,
+) {
+    // A JSON-string value for `orderBy`, percent-encoded, plus a bounded window —
+    // both required by the RTDB security rules (v0.6.0 § Reading in real time).
+    let params: [(&str, &str); 2] = [("orderBy", "%22timestamp%22"), ("limitToLast", "50")];
+    let path = format!("/dm_messages/{conversation_id}");
+    let superseded = |epoch_ref: &Arc<AtomicU64>| epoch != epoch_ref.load(Ordering::SeqCst);
+    // ~1h token life, so this comfortably covers a long session while bounding a
+    // pathological refresh/revoke loop.
+    let mut reconnects: u32 = 0;
+    const MAX_RECONNECTS: u32 = 24;
+
+    loop {
+        if superseded(&epoch_ref) {
+            return;
+        }
+        let tokens = client.tokens().await;
+        if tokens.rtdb_url.is_empty() || tokens.id_token.is_empty() {
+            return;
+        }
+        let rtdb = match RtdbClient::new(tokens.rtdb_url, tokens.id_token) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(error = %e, "cmail rtdb client build failed; live updates off");
+                return;
+            }
+        };
+        let mut rx = match rtdb.subscribe(&path, &params).await {
+            Ok(rx) => rx,
+            Err(e) => {
+                tracing::debug!(error = %e, "cmail rtdb subscribe failed; live updates off");
+                return;
+            }
+        };
+
+        let mut token_expired = false;
+        while let Some(ev) = rx.recv().await {
+            if superseded(&epoch_ref) {
+                return;
+            }
+            match ev {
+                Ok(SseEvent {
+                    kind: SseEventKind::Put | SseEventKind::Patch,
+                    data,
+                }) => {
+                    let path_str = data.get("path").and_then(|p| p.as_str()).unwrap_or("/");
+                    let payload = data.get("data").unwrap_or(&serde_json::Value::Null);
+                    let updates = updates_from_rtdb_event(path_str, payload);
+                    if !updates.is_empty()
+                        && tx
+                            .send(BgEvent::CmailLive {
+                                conversation_id: conversation_id.clone(),
+                                epoch,
+                                updates,
+                            })
+                            .is_err()
+                    {
+                        return; // App is shutting down.
+                    }
+                }
+                Ok(SseEvent {
+                    kind: SseEventKind::AuthRevoked,
+                    ..
+                }) => {
+                    token_expired = true;
+                    break;
+                }
+                // `cancel` means the rules denied the path — retrying won't help.
+                Ok(SseEvent {
+                    kind: SseEventKind::Cancel,
+                    ..
+                }) => return,
+                Ok(SseEvent {
+                    kind: SseEventKind::KeepAlive,
+                    ..
+                }) => {}
+                Err(e) => {
+                    tracing::debug!(error = %e, "cmail rtdb stream error; live updates off");
+                    return;
+                }
+            }
+        }
+
+        if !token_expired || superseded(&epoch_ref) {
+            return;
+        }
+        reconnects += 1;
+        if reconnects > MAX_RECONNECTS || client.refresh().await.is_err() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Summarise a C-Mail conversation list for the unread badge and "new mail"
+/// toast: the total unread count, plus the username of the most-recently-active
+/// unread conversation. The list is ordered unread-first then newest-activity
+/// first, so the first unread entry is the freshest sender.
+fn cmail_unread_summary(conversations: &[CmailConversation]) -> (u32, Option<String>) {
+    let count = conversations.iter().map(|c| c.unread_count).sum();
+    let latest_from = conversations
+        .iter()
+        .find(|c| c.unread_count > 0)
+        .map(|c| c.other_user.username.clone());
+    (count, latest_from)
+}
+
+/// Ring the terminal bell (BEL). Written directly to stdout, out-of-band from the
+/// ratatui draw, so it doesn't disturb the screen buffer; write failures (e.g. a
+/// closed stdout during shutdown) are ignored.
+fn ring_terminal_bell() {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(b"\x07");
+    let _ = out.flush();
+}
+
 fn first_line(s: &str) -> String {
     let line = s.lines().next().unwrap_or("").trim();
     if line.chars().count() <= 100 {
@@ -4549,6 +4871,10 @@ mod tests {
 
     fn key_event(code: KeyCode) -> Event {
         Event::Key(crossterm::event::KeyEvent::new(code, KeyModifiers::empty()))
+    }
+
+    fn ctrl_key_event(code: KeyCode) -> Event {
+        Event::Key(crossterm::event::KeyEvent::new(code, KeyModifiers::CONTROL))
     }
 
     fn test_entry(post_id: &str) -> cs_api::Entry {
@@ -4755,10 +5081,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn cmail_compose_reuses_the_builtin_editor() {
-        let mut app = test_app();
-        let conversation = CmailConversation {
+    fn test_conversation() -> CmailConversation {
+        CmailConversation {
             conversation_id: "c1".into(),
             other_user: cs_api::CmailUser {
                 user_id: "u1".into(),
@@ -4769,21 +5093,27 @@ mod tests {
             last_message: None,
             last_message_at: None,
             unread_count: 0,
-        };
-        app.screen = Screen::Cmail(CmailScreen {
-            conversations: crate::ui::list::TabState::default(),
-            mode: crate::ui::cmail::CmailMode::Conversation {
-                conversation,
-                messages: crate::ui::list::TabState::default(),
-            },
-        });
+        }
+    }
+
+    #[tokio::test]
+    async fn cmail_ctrl_e_expands_the_inline_composer_into_the_builtin_editor() {
+        let mut app = test_app();
+        app.screen = Screen::Cmail(CmailScreen::for_open_conversation(test_conversation()));
         app.current_root = Some(RootKind::Cmail);
 
+        // Focus the inline composer, type a draft, then Ctrl+E to expand.
         app.handle_terminal_event(key_event(KeyCode::Char('c')))
+            .await;
+        app.handle_terminal_event(key_event(KeyCode::Char('h')))
+            .await;
+        app.handle_terminal_event(key_event(KeyCode::Char('i')))
+            .await;
+        app.handle_terminal_event(ctrl_key_event(KeyCode::Char('e')))
             .await;
 
         let Screen::Editor(ed) = &app.screen else {
-            panic!("c in C-Mail conversation should open the built-in editor");
+            panic!("Ctrl+E in the C-Mail composer should open the built-in editor");
         };
         assert_eq!(
             ed.purpose(),
@@ -4791,6 +5121,7 @@ mod tests {
                 conversation_id: "c1".into()
             }
         );
+        assert_eq!(ed.content(), "hi", "the editor is prefilled with the draft");
         assert!(
             matches!(app.back_stack.last(), Some(Screen::Cmail(_))),
             "the C-Mail conversation stays beneath the editor for cancel/save"
@@ -4798,27 +5129,9 @@ mod tests {
     }
 
     #[test]
-    fn cmail_editor_save_returns_to_confirm_instead_of_sending() {
+    fn cmail_editor_save_returns_text_to_the_inline_composer() {
         let mut app = test_app();
-        let conversation = CmailConversation {
-            conversation_id: "c1".into(),
-            other_user: cs_api::CmailUser {
-                user_id: "u1".into(),
-                username: "alice".into(),
-                display_name: None,
-                profile_picture_url: None,
-            },
-            last_message: None,
-            last_message_at: None,
-            unread_count: 0,
-        };
-        app.screen = Screen::Cmail(CmailScreen {
-            conversations: crate::ui::list::TabState::default(),
-            mode: crate::ui::cmail::CmailMode::Conversation {
-                conversation,
-                messages: crate::ui::list::TabState::default(),
-            },
-        });
+        app.screen = Screen::Cmail(CmailScreen::for_open_conversation(test_conversation()));
         app.push_screen(Screen::Editor(EditorScreen::new(
             EditorPurpose::CmailMessage {
                 conversation_id: "c1".into(),
@@ -4831,16 +5144,11 @@ mod tests {
         let Screen::Cmail(cmail) = &app.screen else {
             panic!("editor save should return to C-Mail, not leave the editor");
         };
-        let crate::ui::cmail::CmailMode::ConfirmSend {
-            conversation_id,
-            content,
-            ..
-        } = &cmail.mode
-        else {
-            panic!("Ctrl+D in C-Mail editor should open a send confirmation step");
-        };
-        assert_eq!(conversation_id, "c1");
-        assert_eq!(content, "hello from c-mail");
+        assert!(
+            cmail.is_text_input(),
+            "the composer is focused for a final review"
+        );
+        assert_eq!(cmail.draft_for_test(), "hello from c-mail");
     }
 
     #[test]

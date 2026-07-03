@@ -46,11 +46,11 @@ const SECTIONS: &[Row] = &[
     },
     Row {
         keys: "8",
-        desc: "Settings",
+        desc: "Guilds",
     },
     Row {
         keys: "9",
-        desc: "Guilds",
+        desc: "Settings",
     },
 ];
 
