@@ -1088,7 +1088,15 @@ fn message_lines(m: &CmailMessage, other: &CmailUser, theme: &Theme) -> Vec<Line
     // the two sides of a 1:1 thread are distinct at a glance.
     let from_other = message_from_other(m, other);
     let (prefix, who, who_style) = if from_other {
-        ("  ", display_name_of(other).to_string(), theme.base())
+        // Their name gets their stable avatar colour (same hue as the list
+        // avatar), so the sender line stands out from the base-styled body.
+        (
+            "  ",
+            display_name_of(other).to_string(),
+            Style::default()
+                .fg(avatar_color(&other.username))
+                .add_modifier(Modifier::BOLD),
+        )
     } else {
         ("→ ", "you".to_string(), theme.accent_style())
     };
