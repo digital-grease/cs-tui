@@ -17,4 +17,4 @@ mod client;
 mod jwt;
 
 pub use client::{Client as RtdbClient, RtdbError, SseEvent, SseEventKind};
-pub use jwt::{base_url_for, project_id_from_jwt};
+pub use jwt::{base_url_for, project_id_from_jwt, uid_from_jwt};
