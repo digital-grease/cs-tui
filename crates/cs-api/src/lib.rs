@@ -28,7 +28,10 @@ mod watch;
 
 pub use bookmarks::{Bookmark, BookmarkKind};
 pub use client::{Client, ClientBuilder};
-pub use cmail::{CmailConversation, CmailMessage, CmailSendResponse, CmailStartRequest, CmailUser};
+pub use cmail::{
+    updates_from_rtdb_event, CmailConversation, CmailLiveUpdate, CmailMessage, CmailSendResponse,
+    CmailStartRequest, CmailUser,
+};
 pub use endpoint::EndpointKey;
 pub use entries::CreatedEntry;
 pub use error::{ApiError, ErrorCode, Result};

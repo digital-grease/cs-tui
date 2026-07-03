@@ -136,10 +136,12 @@ impl EndpointKey {
             BookmarksCreate => RateLimit::with_day(5, 75),
             // Thread watching (v0.5.1 § Rate Limits — "Watch thread" 10/min, 100/day).
             WatchCreate => RateLimit::with_day(10, 100),
-            // C-Mail (v0.6.0). The spec also documents hourly caps for start/send;
-            // this limiter currently models minute + day windows only.
-            CmailStart => RateLimit::with_day(5, 50),
-            CmailSend => RateLimit::with_day(15, 300),
+            // C-Mail (v0.6.0). Start/send declare all three windows — the hourly
+            // cap (30/hr start, 150/hr send) is stricter than per_minute * 60, so
+            // it has to be modelled explicitly or the client could self-inflict a
+            // 429. Mark-read has only a per-minute cap.
+            CmailStart => RateLimit::full(5, 30, 50),
+            CmailSend => RateLimit::full(15, 150, 300),
             CmailMarkRead => RateLimit::per_minute(60),
 
             // Deletes — not documented; no client-side cap.
@@ -191,18 +193,22 @@ mod tests {
     fn cmail_endpoints_use_v06_caps() {
         let start = EndpointKey::CmailStart.rate_limit();
         assert_eq!(start.per_minute, Some(5));
+        assert_eq!(start.per_hour, Some(30));
         assert_eq!(start.per_day, Some(50));
 
         let send = EndpointKey::CmailSend.rate_limit();
         assert_eq!(send.per_minute, Some(15));
+        assert_eq!(send.per_hour, Some(150));
         assert_eq!(send.per_day, Some(300));
 
         let read = EndpointKey::CmailRead.rate_limit();
         assert_eq!(read.per_minute, Some(45));
+        assert_eq!(read.per_hour, None);
         assert_eq!(read.per_day, None);
 
         let mark_read = EndpointKey::CmailMarkRead.rate_limit();
         assert_eq!(mark_read.per_minute, Some(60));
+        assert_eq!(mark_read.per_hour, None);
         assert_eq!(mark_read.per_day, None);
     }
 }

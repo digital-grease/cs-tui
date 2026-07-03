@@ -28,6 +28,12 @@ pub enum NotificationsIntent {
         post_id: String,
         highlight_reply_id: Option<String>,
     },
+    /// Open the C-Mail conversation with the sender of a `dm_message`
+    /// notification.
+    OpenCmail {
+        username: String,
+        user_id: Option<String>,
+    },
     Quit,
     None,
 }
@@ -162,6 +168,16 @@ impl NotificationsScreen {
             KeyCode::Char('M') => return NotificationsIntent::MarkAllRead,
             KeyCode::Enter => {
                 if let Some(n) = self.list.items.get(self.list.selected) {
+                    // A DM notification opens the conversation with its sender
+                    // rather than trying to resolve a post.
+                    if n.kind == NotificationType::DmMessage {
+                        if let Some(username) = n.actor_username.clone() {
+                            return NotificationsIntent::OpenCmail {
+                                username,
+                                user_id: n.actor_id.clone(),
+                            };
+                        }
+                    }
                     // Only notifications with a non-empty target_type are
                     // navigable to a post (post/reply); non-navigable ones
                     // (followers, pokes, …) carry an empty target_type and would
@@ -491,6 +507,22 @@ mod tests {
         n.target_type = None;
         s.apply_initial(Ok((vec![n], None)));
         assert_eq!(s.handle_key(key(KeyCode::Enter)), NotificationsIntent::None);
+    }
+
+    #[test]
+    fn enter_on_dm_notification_opens_cmail_with_sender() {
+        let mut s = NotificationsScreen::new();
+        let mut n = notif("n1", NotificationType::DmMessage, None, None);
+        n.actor_username = Some("alice".into());
+        n.actor_id = Some("u-alice".into());
+        s.apply_initial(Ok((vec![n], None)));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            NotificationsIntent::OpenCmail {
+                username: "alice".into(),
+                user_id: Some("u-alice".into()),
+            }
+        );
     }
 
     #[test]

@@ -202,9 +202,7 @@ impl Client {
         Ok((env.data, env.cursor))
     }
 
-    /// Make a request that has no response body (e.g. mark-as-read PATCH).
-    // TODO(phase-2.1): first caller lands with notification mark-read.
-    #[allow(dead_code)]
+    /// Make a request whose response body is ignored (e.g. C-Mail mark-as-read).
     pub(crate) async fn request_unit(
         &self,
         key: EndpointKey,

@@ -25,7 +25,7 @@
 use std::cell::Cell;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
@@ -477,6 +477,28 @@ impl EditorScreen {
         &self.purpose
     }
 
+    /// The server-side character budget for this editor's content, per the
+    /// v0.6.0 spec § Content Limits: C-Mail messages cap at 2,048 chars; entry,
+    /// reply, and note bodies at 32,768.
+    #[must_use]
+    fn max_content_chars(&self) -> usize {
+        match &self.purpose {
+            EditorPurpose::CmailMessage { .. } => 2_048,
+            EditorPurpose::NewBody { .. } | EditorPurpose::ReEditBody => 32_768,
+        }
+    }
+
+    /// Number of characters currently composed (newlines included), for the live
+    /// length counter.
+    #[must_use]
+    fn content_char_count(&self) -> usize {
+        // Sum per line + one newline between lines, avoiding a full String alloc
+        // every frame.
+        let lines = self.buffer.lines();
+        let chars: usize = lines.iter().map(Vec::len).sum();
+        chars + lines.len().saturating_sub(1)
+    }
+
     /// Insert pasted text (bracketed paste). Routed here from the event loop.
     pub fn paste(&mut self, text: &str) {
         self.buffer.paste(text);
@@ -614,6 +636,27 @@ impl EditorScreen {
         };
         frame.render_widget(Paragraph::new(footer_line), footer);
 
+        // Live character counter, right-aligned over the footer. Turns accent
+        // near the cap and error once past it, so an over-length body is caught
+        // here rather than as a server validation error on save.
+        let used = self.content_char_count();
+        let max = self.max_content_chars();
+        let counter_style = if used > max {
+            theme.error_style()
+        } else if used * 10 >= max * 9 {
+            theme.accent_style()
+        } else {
+            theme.muted_style()
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("{used}/{max}"),
+                counter_style,
+            )))
+            .alignment(Alignment::Right),
+            footer,
+        );
+
         // Show the real terminal cursor only for the editor frame. Clamp the
         // column into the body so the caret at the end of a full-width row stays
         // inside the box.
@@ -641,6 +684,23 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::empty(),
         }
+    }
+
+    #[test]
+    fn char_counter_reflects_content_and_purpose_limits() {
+        let cmail = EditorScreen::new(
+            EditorPurpose::CmailMessage {
+                conversation_id: "c1".into(),
+            },
+            "hello",
+        );
+        assert_eq!(cmail.content_char_count(), 5);
+        assert_eq!(cmail.max_content_chars(), 2_048);
+
+        // Newlines count toward the total: 'a' + '\n' + 'bc' = 4.
+        let body = EditorScreen::new(EditorPurpose::ReEditBody, "a\nbc");
+        assert_eq!(body.content_char_count(), 4);
+        assert_eq!(body.max_content_chars(), 32_768);
     }
 
     /// Build a buffer and place the cursor at `(row, col)` (which `new` can't,

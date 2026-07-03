@@ -1,8 +1,9 @@
 //! Client-side token-bucket rate limiting.
 //!
-//! Two independent buckets per endpoint key — one for the per-minute limit,
-//! one for the per-day limit. `acquire()` waits until both can yield a token,
-//! then deducts atomically. Uses `std::sync::Mutex` (never held across `.await`).
+//! Independent buckets per endpoint key — one each for the per-minute, per-hour,
+//! and per-day limits an endpoint declares. `acquire()` waits until every
+//! present bucket can yield a token, then deducts atomically. Uses
+//! `std::sync::Mutex` (never held across `.await`).
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -12,6 +13,7 @@ use crate::endpoint::EndpointKey;
 #[derive(Debug, Clone, Copy)]
 pub struct RateLimit {
     pub per_minute: Option<u32>,
+    pub per_hour: Option<u32>,
     pub per_day: Option<u32>,
 }
 
@@ -20,6 +22,7 @@ impl RateLimit {
     pub const fn none() -> Self {
         Self {
             per_minute: None,
+            per_hour: None,
             per_day: None,
         }
     }
@@ -28,6 +31,7 @@ impl RateLimit {
     pub const fn per_minute(n: u32) -> Self {
         Self {
             per_minute: Some(n),
+            per_hour: None,
             per_day: None,
         }
     }
@@ -36,6 +40,19 @@ impl RateLimit {
     pub const fn with_day(per_minute: u32, per_day: u32) -> Self {
         Self {
             per_minute: Some(per_minute),
+            per_hour: None,
+            per_day: Some(per_day),
+        }
+    }
+
+    /// A limit that declares all three windows — minute, hour, and day. Used by
+    /// the C-Mail write endpoints, whose hourly cap is stricter than
+    /// `per_minute * 60` and so has to be modelled explicitly.
+    #[must_use]
+    pub const fn full(per_minute: u32, per_hour: u32, per_day: u32) -> Self {
+        Self {
+            per_minute: Some(per_minute),
+            per_hour: Some(per_hour),
             per_day: Some(per_day),
         }
     }
@@ -92,11 +109,13 @@ impl Bucket {
     }
 }
 
-type BucketPair = (Option<Bucket>, Option<Bucket>);
+/// Per-endpoint buckets, one slot per window: `(minute, hour, day)`. Any slot
+/// may be `None` when the endpoint declares no limit for that window.
+type BucketSet = (Option<Bucket>, Option<Bucket>, Option<Bucket>);
 
 #[derive(Debug)]
 pub(crate) struct EndpointLimiter {
-    buckets: Mutex<HashMap<EndpointKey, BucketPair>>,
+    buckets: Mutex<HashMap<EndpointKey, BucketSet>>,
 }
 
 impl EndpointLimiter {
@@ -132,11 +151,15 @@ impl EndpointLimiter {
             .0
             .as_ref()
             .map_or(Duration::ZERO, |b| b.wait_for_one_at(now));
-        let wait_day = entry
+        let wait_hour = entry
             .1
             .as_ref()
             .map_or(Duration::ZERO, |b| b.wait_for_one_at(now));
-        wait_min.max(wait_day)
+        let wait_day = entry
+            .2
+            .as_ref()
+            .map_or(Duration::ZERO, |b| b.wait_for_one_at(now));
+        wait_min.max(wait_hour).max(wait_day)
     }
 
     fn try_take_or_wait(&self, key: EndpointKey) -> Duration {
@@ -146,38 +169,45 @@ impl EndpointLimiter {
             (
                 rl.per_minute
                     .map(|c| Bucket::new(c, Duration::from_secs(60))),
+                rl.per_hour
+                    .map(|c| Bucket::new(c, Duration::from_secs(3_600))),
                 rl.per_day
                     .map(|c| Bucket::new(c, Duration::from_secs(86_400))),
             )
         });
 
         let now = Instant::now();
-        if let Some(b) = &mut entry.0 {
-            b.refill(now);
-        }
-        if let Some(b) = &mut entry.1 {
-            b.refill(now);
+        for bucket in [&mut entry.0, &mut entry.1, &mut entry.2]
+            .into_iter()
+            .flatten()
+        {
+            bucket.refill(now);
         }
 
         let wait_min = entry
             .0
             .as_ref()
             .map_or(Duration::ZERO, Bucket::wait_for_one);
-        let wait_day = entry
+        let wait_hour = entry
             .1
             .as_ref()
             .map_or(Duration::ZERO, Bucket::wait_for_one);
+        let wait_day = entry
+            .2
+            .as_ref()
+            .map_or(Duration::ZERO, Bucket::wait_for_one);
 
-        if wait_min.is_zero() && wait_day.is_zero() {
-            if let Some(b) = &mut entry.0 {
-                b.tokens -= 1.0;
-            }
-            if let Some(b) = &mut entry.1 {
-                b.tokens -= 1.0;
+        let wait = wait_min.max(wait_hour).max(wait_day);
+        if wait.is_zero() {
+            for bucket in [&mut entry.0, &mut entry.1, &mut entry.2]
+                .into_iter()
+                .flatten()
+            {
+                bucket.tokens -= 1.0;
             }
             Duration::ZERO
         } else {
-            wait_min.max(wait_day)
+            wait
         }
     }
 }
@@ -217,6 +247,31 @@ mod tests {
         assert!(
             w2 > Duration::from_secs(20),
             "peek must not consume a token"
+        );
+    }
+
+    #[tokio::test]
+    async fn hourly_cap_gates_even_when_the_minute_bucket_has_tokens() {
+        // CmailSend declares 15/min, 150/hour, 300/day. Modelling the hourly
+        // window matters because 15/min * 60 = 900 would let the client blow past
+        // the 150/hour server cap. Verify the hour bucket gates independently:
+        // exhaust just it, leave the minute bucket full, and the wait must be
+        // non-zero.
+        let limiter = EndpointLimiter::new();
+        // Touch the endpoint once so its (minute, hour, day) buckets exist.
+        limiter.acquire(EndpointKey::CmailSend).await;
+        {
+            let mut buckets = limiter.buckets.lock().unwrap();
+            let entry = buckets.get_mut(&EndpointKey::CmailSend).unwrap();
+            let minute = entry.0.as_mut().expect("minute bucket");
+            minute.tokens = minute.capacity;
+            entry.1.as_mut().expect("hour bucket").tokens = 0.0;
+            assert!(entry.2.is_some(), "day bucket should also be present");
+        }
+        let wait = limiter.peek_wait(EndpointKey::CmailSend);
+        assert!(
+            wait > Duration::from_secs(10),
+            "an exhausted hourly bucket must gate sends even with a full minute bucket, got {wait:?}"
         );
     }
 

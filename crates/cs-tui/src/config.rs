@@ -66,6 +66,8 @@ pub struct Config {
     /// Seconds between background C-Mail unread-count polls (clamped to a 5s
     /// minimum).
     pub cmail_refresh_secs: Option<u64>,
+    /// Ring the terminal bell when new C-Mail arrives while you're elsewhere.
+    pub cmail_bell: Option<bool>,
     /// Initial jukebox volume for a fresh session (0..=130).
     pub audio_volume: Option<i64>,
     /// Start each session with shuffle mode already armed.
@@ -150,6 +152,8 @@ pub struct Runtime {
     /// Seconds between background C-Mail unread-count polls. Drives how quickly
     /// the header badge reflects new private mail.
     pub cmail_refresh_secs: u64,
+    /// Whether to ring the terminal bell on a new C-Mail arrival.
+    pub cmail_bell: bool,
     /// Initial jukebox volume (0..=130) the player opens at each session.
     pub audio_volume: i64,
     /// Whether sessions begin with shuffle mode armed (never auto-playing:
@@ -179,6 +183,7 @@ impl Default for Runtime {
             feed_refresh_secs: 30,
             notifications_refresh_secs: 20,
             cmail_refresh_secs: 20,
+            cmail_bell: false,
             // Single-sourced with the player so the two never drift.
             audio_volume: crate::ui::player::DEFAULT_VOLUME,
             shuffle: false,
@@ -303,6 +308,10 @@ const TEMPLATE: &str = r##"# cs-tui configuration. Edit and restart cs-tui.
 # shown in the header. Minimum 5; lower values surface new private mail sooner
 # but use more of the read rate limit.
 #cmail_refresh_secs = 20
+
+# Ring the terminal bell when new C-Mail arrives while you're in another section.
+# A toast is always shown; this adds an audible cue.
+#cmail_bell = false
 
 # External editor for composing posts/notes. Unset by default: composing uses
 # the built-in editor (soft-wrapping, multi-line paste, no external program).
@@ -442,6 +451,7 @@ impl Config {
                 .cmail_refresh_secs
                 .unwrap_or(d.cmail_refresh_secs)
                 .clamp(5, 3600),
+            cmail_bell: self.cmail_bell.unwrap_or(d.cmail_bell),
             audio_volume: self.audio_volume.unwrap_or(d.audio_volume).clamp(0, 130),
             shuffle: self.shuffle.unwrap_or(d.shuffle),
             selection: match self.selection.as_deref().map(str::to_ascii_lowercase) {
@@ -687,6 +697,7 @@ mod tests {
             "feed_refresh_secs",
             "notifications_refresh_secs",
             "cmail_refresh_secs",
+            "cmail_bell",
             "editor",
             "preview_length",
             "image_height",
