@@ -816,6 +816,7 @@ impl App {
         }
         if !self.cmail_poller_started {
             self.spawn_cmail_unread_poller();
+            self.spawn_cmail_conversations_stream();
             self.cmail_poller_started = true;
             self.spawn_cmail_unread_once();
         }
@@ -4541,6 +4542,17 @@ impl App {
         });
     }
 
+    /// Subscribe to the caller's `user_conversations` RTDB node so unread changes
+    /// surface in real time (API v0.6.0 § Reading in real time). The event is used
+    /// only as a "something changed" poke that triggers an accurate REST count —
+    /// so an unknown RTDB payload schema can't corrupt the badge, and if the
+    /// subscription fails the periodic poll still keeps it current.
+    fn spawn_cmail_conversations_stream(&self) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(cmail_conversations_stream_loop(client, tx));
+    }
+
     fn spawn_cmail_unread_poller(&self) {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
@@ -4781,6 +4793,98 @@ async fn cmail_stream_loop(
         }
 
         if !token_expired || superseded(&epoch_ref) {
+            return;
+        }
+        reconnects += 1;
+        if reconnects > MAX_RECONNECTS || client.refresh().await.is_err() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Long-lived subscription to `user_conversations/<uid>`: each change pokes an
+/// accurate REST unread refresh (so the badge/toast are real-time without parsing
+/// the RTDB payload). Errors terminate the stream — the periodic poll remains the
+/// correctness fallback — and only a token expiry reconnects (bounded, no loop).
+async fn cmail_conversations_stream_loop(client: Client, tx: mpsc::UnboundedSender<BgEvent>) {
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let mut reconnects: u32 = 0;
+    const MAX_RECONNECTS: u32 = 24;
+
+    loop {
+        let tokens = client.tokens().await;
+        if tokens.rtdb_url.is_empty() || tokens.id_token.is_empty() {
+            return;
+        }
+        let uid = match cs_api::rtdb::uid_from_jwt(&tokens.id_token) {
+            Ok(uid) => uid,
+            Err(e) => {
+                tracing::debug!(error = %e, "cmail: can't read uid from id_token; badge stays on poll");
+                return;
+            }
+        };
+        let rtdb = match RtdbClient::new(tokens.rtdb_url, tokens.id_token) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(error = %e, "cmail conversations rtdb client build failed");
+                return;
+            }
+        };
+        // The per-user node is small, so an unbounded subscribe is cheap; if the
+        // rules reject it the badge simply stays on the poll.
+        let path = format!("/user_conversations/{uid}");
+        let mut rx = match rtdb.subscribe(&path, &[]).await {
+            Ok(rx) => rx,
+            Err(e) => {
+                tracing::debug!(error = %e, "cmail conversations subscribe failed; badge stays on poll");
+                return;
+            }
+        };
+
+        let mut token_expired = false;
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                Ok(SseEvent {
+                    kind: SseEventKind::Put | SseEventKind::Patch,
+                    ..
+                }) => {
+                    // Poke: recompute the authoritative count via REST.
+                    if let Ok(conversations) = client.list_cmail_conversations().await {
+                        let (count, latest_from) = cmail_unread_summary(&conversations);
+                        if tx
+                            .send(BgEvent::CmailUnread { count, latest_from })
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    // Coalesce bursts so a flurry of changes is one refresh.
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                Ok(SseEvent {
+                    kind: SseEventKind::AuthRevoked,
+                    ..
+                }) => {
+                    token_expired = true;
+                    break;
+                }
+                Ok(SseEvent {
+                    kind: SseEventKind::Cancel,
+                    ..
+                }) => return,
+                Ok(SseEvent {
+                    kind: SseEventKind::KeepAlive,
+                    ..
+                }) => {}
+                Err(e) => {
+                    tracing::debug!(error = %e, "cmail conversations stream error; badge stays on poll");
+                    return;
+                }
+            }
+        }
+
+        if !token_expired {
             return;
         }
         reconnects += 1;

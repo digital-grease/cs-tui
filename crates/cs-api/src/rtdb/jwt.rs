@@ -16,8 +16,38 @@ struct JwtPayload {
     aud: String,
 }
 
-/// Decode the payload of a Firebase JWT and return the `aud` claim.
-pub fn project_id_from_jwt(jwt: &str) -> Result<String, RtdbError> {
+#[derive(Debug, Deserialize)]
+struct UidPayload {
+    /// Firebase-specific uid claim.
+    #[serde(default)]
+    user_id: String,
+    /// Standard subject claim (also the uid for Firebase tokens).
+    #[serde(default)]
+    sub: String,
+}
+
+/// Decode the payload of a Firebase JWT and return the caller's uid (`user_id`,
+/// falling back to `sub`). Used to address the caller's own RTDB nodes
+/// (`user_conversations/<uid>`). The signature is not verified — that's the
+/// server's job; we only read a claim.
+pub fn uid_from_jwt(jwt: &str) -> Result<String, RtdbError> {
+    let payload: UidPayload = decode_jwt_payload(jwt)?;
+    let uid = if payload.user_id.is_empty() {
+        payload.sub
+    } else {
+        payload.user_id
+    };
+    if uid.is_empty() {
+        return Err(RtdbError::InvalidJwt(
+            "missing `user_id`/`sub` claim".to_string(),
+        ));
+    }
+    Ok(uid)
+}
+
+/// Base64url-decode a JWT's payload segment into `T`. Errors if the token isn't
+/// three dot-separated parts or the payload isn't the expected JSON.
+fn decode_jwt_payload<T: serde::de::DeserializeOwned>(jwt: &str) -> Result<T, RtdbError> {
     let parts: Vec<&str> = jwt.split('.').collect();
     if parts.len() != 3 {
         return Err(RtdbError::InvalidJwt(format!(
@@ -28,8 +58,13 @@ pub fn project_id_from_jwt(jwt: &str) -> Result<String, RtdbError> {
     let payload_bytes = URL_SAFE_NO_PAD
         .decode(parts[1])
         .map_err(|e| RtdbError::InvalidJwt(format!("base64 decode: {e}")))?;
-    let payload: JwtPayload = serde_json::from_slice(&payload_bytes)
-        .map_err(|e| RtdbError::InvalidJwt(format!("payload json: {e}")))?;
+    serde_json::from_slice(&payload_bytes)
+        .map_err(|e| RtdbError::InvalidJwt(format!("payload json: {e}")))
+}
+
+/// Decode the payload of a Firebase JWT and return the `aud` claim.
+pub fn project_id_from_jwt(jwt: &str) -> Result<String, RtdbError> {
+    let payload: JwtPayload = decode_jwt_payload(jwt)?;
     if payload.aud.is_empty() {
         return Err(RtdbError::InvalidJwt(
             "missing or empty `aud` claim".to_string(),
@@ -73,6 +108,24 @@ mod tests {
         let jwt = make_jwt(r#"{"aud":""}"#);
         let err = project_id_from_jwt(&jwt).unwrap_err();
         assert!(matches!(err, RtdbError::InvalidJwt(_)));
+    }
+
+    #[test]
+    fn uid_prefers_user_id_then_sub() {
+        let jwt = make_jwt(r#"{"user_id":"uid-123","sub":"other"}"#);
+        assert_eq!(uid_from_jwt(&jwt).unwrap(), "uid-123");
+
+        let jwt = make_jwt(r#"{"sub":"uid-sub"}"#);
+        assert_eq!(uid_from_jwt(&jwt).unwrap(), "uid-sub");
+    }
+
+    #[test]
+    fn uid_rejects_when_no_uid_claim() {
+        let jwt = make_jwt(r#"{"aud":"proj"}"#);
+        assert!(matches!(
+            uid_from_jwt(&jwt).unwrap_err(),
+            RtdbError::InvalidJwt(_)
+        ));
     }
 
     #[test]
