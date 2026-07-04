@@ -448,19 +448,40 @@ impl CircScreen {
             .split(inner);
 
         let visible: Vec<usize> = (0..messages.items.len()).collect();
-        let content_rows = messages.items.len().saturating_mul(2);
+        // Wrap each message body to the pane's content width so long lines flow
+        // onto extra rows instead of being clipped. The list reserves a 2-col
+        // highlight gutter and the body carries a 2-space indent, so the text
+        // wraps within `width - 4`.
+        let body_width = (layout[0].width as usize).saturating_sub(4).max(1);
+        let heights: Vec<u16> = messages
+            .items
+            .iter()
+            .map(|m| circ_message_height(m, body_width))
+            .collect();
+        let content_rows: usize = heights.iter().map(|&h| h as usize).sum();
         let mut messages_area = bottom_aligned_messages_area(layout[0], content_rows);
-        // Every cIRC message is exactly 2 rows. When the history overflows the
-        // pane, ratatui's `List` tiles whole items top-down from the scroll
-        // offset, so an odd pane height leaves a 1-row remainder blank at the
-        // bottom (e.g. the empty gap that appears above the composer while a
-        // send is pending and `out_rows` flips the height to odd). Trim that
-        // remainder off the top so the newest message stays flush above the
+        // When the history overflows the pane, ratatui's `List` tiles whole
+        // items top-down from the scroll offset and can't show a partial item at
+        // the top, so it leaves the leftover rows blank at the *bottom* (e.g. the
+        // gap that appears above the composer while a send is pending). Trim that
+        // leftover off the top — sizing the pane to the tallest suffix of whole
+        // messages that fits — so the newest message stays flush above the
         // composer.
         if content_rows >= messages_area.height as usize {
-            let remainder = messages_area.height % 2;
-            messages_area.y += remainder;
-            messages_area.height -= remainder;
+            let mut suffix = 0u16;
+            for &h in heights.iter().rev() {
+                if suffix + h > messages_area.height {
+                    break;
+                }
+                suffix += h;
+            }
+            // Only trim when at least one whole message fits; a single message
+            // taller than the pane is left to ratatui (shows its top, clipped).
+            if suffix > 0 {
+                let remainder = messages_area.height - suffix;
+                messages_area.y += remainder;
+                messages_area.height -= remainder;
+            }
         }
         list::render_body(
             frame,
@@ -469,7 +490,7 @@ impl CircScreen {
             messages,
             &visible,
             "no messages yet — start typing",
-            |m| ListItem::new(circ_message_lines(m, theme)),
+            |m| ListItem::new(circ_message_lines(m, theme, body_width)),
         );
 
         if out_rows > 0 {
@@ -576,7 +597,7 @@ fn room_item(r: &CircRoom, theme: &Theme) -> ListItem<'static> {
     ])
 }
 
-fn circ_message_lines(m: &CircMessage, theme: &Theme) -> Vec<Line<'static>> {
+fn circ_message_lines(m: &CircMessage, theme: &Theme, body_width: usize) -> Vec<Line<'static>> {
     let when = format_epoch_millis_relative(m.timestamp);
     let name = if m.username.is_empty() {
         "?".to_string()
@@ -598,10 +619,72 @@ fn circ_message_lines(m: &CircMessage, theme: &Theme) -> Vec<Line<'static>> {
         header.push(Span::styled(" ★", theme.warning_style()));
     }
     header.push(Span::styled(format!(" · {when}"), theme.muted_style()));
-    vec![
-        Line::from(header),
-        Line::from(Span::styled(format!("  {}", m.content), theme.base())),
-    ]
+    let mut lines = vec![Line::from(header)];
+    // Body wraps onto as many rows as it needs; each row keeps the 2-space
+    // indent so it aligns under the speaker line.
+    for row in word_wrap(&m.content, body_width) {
+        lines.push(Line::from(Span::styled(format!("  {row}"), theme.base())));
+    }
+    lines
+}
+
+/// Rendered height of a message: one header row plus its wrapped body rows.
+fn circ_message_height(m: &CircMessage, body_width: usize) -> u16 {
+    let body = word_wrap(&m.content, body_width).len();
+    u16::try_from(1 + body).unwrap_or(u16::MAX)
+}
+
+fn char_width(c: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
+/// Word-wrap `content` to `width` display columns (unicode-width aware). Words
+/// longer than a line are hard-broken; embedded newlines start a new line;
+/// always returns at least one (possibly empty) line.
+fn word_wrap(content: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out: Vec<String> = Vec::new();
+    for para in content.split('\n') {
+        let mut cur = String::new();
+        let mut cur_w = 0usize;
+        for word in para.split_whitespace() {
+            let ww: usize = word.chars().map(char_width).sum();
+            let sep = usize::from(!cur.is_empty());
+            if cur_w + sep + ww <= width {
+                if sep == 1 {
+                    cur.push(' ');
+                }
+                cur.push_str(word);
+                cur_w += sep + ww;
+                continue;
+            }
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+                cur_w = 0;
+            }
+            if ww <= width {
+                cur.push_str(word);
+                cur_w = ww;
+            } else {
+                // A word wider than the whole line: hard-break it by columns.
+                for ch in word.chars() {
+                    let cw = char_width(ch);
+                    if cur_w + cw > width && !cur.is_empty() {
+                        out.push(std::mem::take(&mut cur));
+                        cur_w = 0;
+                    }
+                    cur.push(ch);
+                    cur_w += cw;
+                }
+            }
+        }
+        // Push the trailing line (empty for a blank paragraph) to preserve breaks.
+        out.push(cur);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
 }
 
 #[cfg(test)]
@@ -687,7 +770,14 @@ mod tests {
         let mut s = open("general");
         // Enough history to overflow the pane (the active-chat case).
         let msgs: Vec<CircMessage> = (0..6)
-            .map(|i| message(&format!("m{i}"), "neo", &format!("line {i}"), 1_000 + i64::from(i)))
+            .map(|i| {
+                message(
+                    &format!("m{i}"),
+                    "neo",
+                    &format!("line {i}"),
+                    1_000 + i64::from(i),
+                )
+            })
             .collect();
         s.apply_messages("general", true, Ok((msgs, None)));
 
@@ -710,12 +800,66 @@ mod tests {
     }
 
     #[test]
+    fn long_message_wraps_onto_multiple_rows() {
+        let mut s = open("general");
+        let long = "the quick brown fox jumps over the lazy dog and keeps on running well past the edge of the pane";
+        s.apply_messages(
+            "general",
+            true,
+            Ok((vec![message("m0", "neo", long, 1_000)], None)),
+        );
+
+        let rows = render_rows(&s, 14);
+        // The body must span more than one row (wrapped, not clipped): different
+        // words from the same message land on different rendered rows.
+        let wrapped_rows = rows
+            .iter()
+            .filter(|r| r.contains("quick") || r.contains("running") || r.contains("lazy"))
+            .count();
+        assert!(
+            wrapped_rows >= 2,
+            "a long message should wrap across rows, got:\n{}",
+            rows.join("\n"),
+        );
+        // No single rendered row carries the whole message (i.e. not clipped).
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.contains("fox") && r.contains("running")),
+            "message was not wrapped (whole body on one row):\n{}",
+            rows.join("\n"),
+        );
+    }
+
+    #[test]
+    fn word_wrap_breaks_words_newlines_and_long_tokens() {
+        // Greedy word packing to the column budget.
+        assert_eq!(
+            word_wrap("the quick brown fox", 9),
+            vec!["the quick", "brown fox"],
+        );
+        // Embedded newlines force line breaks (and blank paragraphs survive).
+        assert_eq!(word_wrap("a\n\nb", 10), vec!["a", "", "b"]);
+        // A token wider than the whole line is hard-broken by columns.
+        assert_eq!(word_wrap("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
+        // Always at least one (possibly empty) line.
+        assert_eq!(word_wrap("", 5), vec![String::new()]);
+    }
+
+    #[test]
     fn odd_pane_height_has_no_trailing_blank_row() {
         // The parity bug also shows at rest on odd-height terminals (no pending
         // send). The bottom message row must be non-blank right above the footer.
         let mut s = open("general");
         let msgs: Vec<CircMessage> = (0..6)
-            .map(|i| message(&format!("m{i}"), "neo", &format!("line {i}"), 1_000 + i64::from(i)))
+            .map(|i| {
+                message(
+                    &format!("m{i}"),
+                    "neo",
+                    &format!("line {i}"),
+                    1_000 + i64::from(i),
+                )
+            })
             .collect();
         s.apply_messages("general", true, Ok((msgs, None)));
 
