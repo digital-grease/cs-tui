@@ -422,6 +422,9 @@ pub enum EditorPurpose {
     /// C-Mail message body. On save the app pops back to the conversation and
     /// sends the content to this conversation id.
     CmailMessage { conversation_id: String },
+    /// cIRC message body. On save the app pops back to the room and hands the
+    /// content to its inline composer for a final review + send.
+    CircMessage { room_id: String },
 }
 
 /// Outcome of a key for the surrounding app to act on.
@@ -483,7 +486,7 @@ impl EditorScreen {
     #[must_use]
     fn max_content_chars(&self) -> usize {
         match &self.purpose {
-            EditorPurpose::CmailMessage { .. } => 2_048,
+            EditorPurpose::CmailMessage { .. } | EditorPurpose::CircMessage { .. } => 2_048,
             EditorPurpose::NewBody { .. } | EditorPurpose::ReEditBody => 32_768,
         }
     }
@@ -586,6 +589,7 @@ impl EditorScreen {
             EditorPurpose::NewBody { kind, .. } => kind.title(),
             EditorPurpose::ReEditBody => " cs-tui • edit body ".to_string(),
             EditorPurpose::CmailMessage { .. } => " cs-tui • c-mail • compose ".to_string(),
+            EditorPurpose::CircMessage { .. } => " cs-tui • cIRC • compose ".to_string(),
         }
     }
 

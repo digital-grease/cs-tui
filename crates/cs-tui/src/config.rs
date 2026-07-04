@@ -280,7 +280,7 @@ const TEMPLATE: &str = r##"# cs-tui configuration. Edit and restart cs-tui.
 
 # ── Behavior ─────────────────────────────────────────────────────────────────
 
-# Section to open on launch: feed | notifications | c-mail | cmail |
+# Section to open on launch: feed | notifications | c-mail | circ |
 # bookmarks | topics | profile | journal | guilds | settings
 #start_section = "feed"
 
@@ -581,6 +581,7 @@ fn parse_section(s: &str) -> Option<RootKind> {
         "feed" => RootKind::Feed,
         "notifications" | "notifs" | "notes" => RootKind::Notifications,
         "c-mail" | "cmail" | "mail" => RootKind::Cmail,
+        "circ" | "chat" | "irc" => RootKind::Circ,
         "bookmarks" => RootKind::Bookmarks,
         "topics" => RootKind::Topics,
         "profile" => RootKind::Profile,
