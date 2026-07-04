@@ -1794,7 +1794,7 @@ impl App {
                     s.open_room(&room_id);
                 }
                 self.spawn_circ_messages(room_id.clone(), None);
-                self.spawn_circ_stream(room_id);
+                self.spawn_circ_room_watch(room_id);
             }
             Action::CircLoadOlder { room_id, before } => {
                 self.spawn_circ_messages(room_id, before);
@@ -3392,14 +3392,22 @@ impl App {
     /// appear without a manual refresh (API v0.6.0 § Reading in real time). Bumps
     /// the stream generation to supersede any prior conversation's stream; the
     /// task self-terminates once its generation is no longer current.
+    /// Watch the open conversation: the live SSE stream *and* a periodic REST
+    /// re-read, so a DM thread always refreshes even if the SSE subscription
+    /// never fires (both share `cmail_stream_epoch`, so leaving stops them).
     fn spawn_cmail_stream(&self, conversation_id: String) {
         let epoch = self.cmail_stream_epoch.fetch_add(1, Ordering::SeqCst) + 1;
-        let client = self.client.clone();
-        let tx = self.bg_tx.clone();
         let epoch_ref = self.cmail_stream_epoch.clone();
         tokio::spawn(cmail_stream_loop(
-            client,
-            tx,
+            self.client.clone(),
+            self.bg_tx.clone(),
+            conversation_id.clone(),
+            epoch,
+            epoch_ref.clone(),
+        ));
+        tokio::spawn(cmail_conversation_poll_loop(
+            self.client.clone(),
+            self.bg_tx.clone(),
             conversation_id,
             epoch,
             epoch_ref,
@@ -3464,12 +3472,29 @@ impl App {
         });
     }
 
-    fn spawn_circ_stream(&self, room_id: String) {
+    /// Start watching the open room: the live SSE stream (instant when Firebase
+    /// delivers) *and* a periodic REST re-read, so an open channel always
+    /// refreshes even if the SSE subscription never fires. Both share the stream
+    /// generation, so leaving/switching rooms stops them.
+    fn spawn_circ_room_watch(&self, room_id: String) {
         let epoch = self.circ_stream_epoch.fetch_add(1, Ordering::SeqCst) + 1;
-        let client = self.client.clone();
-        let tx = self.bg_tx.clone();
         let epoch_ref = self.circ_stream_epoch.clone();
-        tokio::spawn(circ_stream_loop(client, tx, room_id, epoch, epoch_ref));
+        // Live SSE.
+        tokio::spawn(circ_stream_loop(
+            self.client.clone(),
+            self.bg_tx.clone(),
+            room_id.clone(),
+            epoch,
+            epoch_ref.clone(),
+        ));
+        // Polling fallback (fast, so it feels like instant messaging).
+        tokio::spawn(circ_room_poll_loop(
+            self.client.clone(),
+            self.bg_tx.clone(),
+            room_id,
+            epoch,
+            epoch_ref,
+        ));
     }
 
     fn spawn_search(&self, query: String) {
@@ -4995,6 +5020,50 @@ fn note_api_err(tx: &mpsc::UnboundedSender<BgEvent>, e: ApiError) -> String {
 /// short pause and a hard cap — never a tight loop (v0.6.0 § "don't reconnect in
 /// a loop"). Any other stream end simply turns live updates off for this view;
 /// the unread poll and manual `r` still keep it current.
+/// Periodically re-read the open C-Mail conversation over REST and merge the
+/// newest window in (`apply_live` de-dupes) — the reliable refresh path even
+/// when the SSE stream doesn't deliver. Stops when its generation is superseded.
+async fn cmail_conversation_poll_loop(
+    client: Client,
+    tx: mpsc::UnboundedSender<BgEvent>,
+    conversation_id: String,
+    epoch: u64,
+    epoch_ref: Arc<AtomicU64>,
+) {
+    // 4s: snappy for a DM while staying well under the 45/min read cap.
+    const POLL_SECS: u64 = 4;
+    loop {
+        tokio::time::sleep(Duration::from_secs(POLL_SECS)).await;
+        if epoch != epoch_ref.load(Ordering::SeqCst) {
+            return;
+        }
+        match client
+            .read_cmail_conversation(&conversation_id, None, None)
+            .await
+        {
+            Ok((messages, _cursor)) => {
+                if epoch != epoch_ref.load(Ordering::SeqCst) {
+                    return;
+                }
+                if !messages.is_empty()
+                    && tx
+                        .send(BgEvent::CmailLive {
+                            conversation_id: conversation_id.clone(),
+                            epoch,
+                            messages,
+                        })
+                        .is_err()
+                {
+                    return;
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, conversation_id, "cmail conversation poll failed");
+            }
+        }
+    }
+}
+
 async fn cmail_stream_loop(
     client: Client,
     tx: mpsc::UnboundedSender<BgEvent>,
@@ -5096,6 +5165,48 @@ async fn cmail_stream_loop(
 
 /// Live RTDB stream for a cIRC room (`chat_messages/<roomId>`). Same lifecycle as
 /// [`cmail_stream_loop`]: epoch-guarded, conservative token-expiry-only reconnect.
+/// Periodically re-read an open cIRC room over REST and merge the newest window
+/// into the view (`apply_live` de-dupes). This is the reliable refresh path for
+/// the room — it works even when the SSE stream doesn't — at a fast cadence
+/// suited to chat. Stops when its stream generation is superseded (room left).
+async fn circ_room_poll_loop(
+    client: Client,
+    tx: mpsc::UnboundedSender<BgEvent>,
+    room_id: String,
+    epoch: u64,
+    epoch_ref: Arc<AtomicU64>,
+) {
+    // 3s ≈ 20 reads/min, well under the 45/min cap while feeling near-instant.
+    const POLL_SECS: u64 = 3;
+    loop {
+        tokio::time::sleep(Duration::from_secs(POLL_SECS)).await;
+        if epoch != epoch_ref.load(Ordering::SeqCst) {
+            return;
+        }
+        match client.read_circ_room(&room_id, None, None).await {
+            Ok((messages, _cursor)) => {
+                if epoch != epoch_ref.load(Ordering::SeqCst) {
+                    return;
+                }
+                if !messages.is_empty()
+                    && tx
+                        .send(BgEvent::CircLive {
+                            room_id: room_id.clone(),
+                            epoch,
+                            messages,
+                        })
+                        .is_err()
+                {
+                    return;
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, room_id, "circ room poll failed");
+            }
+        }
+    }
+}
+
 async fn circ_stream_loop(
     client: Client,
     tx: mpsc::UnboundedSender<BgEvent>,
