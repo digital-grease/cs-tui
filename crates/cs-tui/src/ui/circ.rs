@@ -62,10 +62,9 @@ pub enum CircMode {
 pub struct CircScreen {
     pub rooms: TabState<CircRoom>,
     pub mode: CircMode,
-    /// Inline composer buffer for the open room.
+    /// Always-on inline composer buffer for the open room (it's a chat channel,
+    /// so the input is focused the whole time you're in a room).
     draft: String,
-    /// Whether the inline composer is focused (capturing text) vs. browse mode.
-    composing: bool,
     /// Optimistic outgoing messages awaiting their server echo.
     outgoing: Vec<Outgoing>,
 }
@@ -77,32 +76,31 @@ impl CircScreen {
             rooms: TabState::loading(),
             mode: CircMode::Rooms,
             draft: String::new(),
-            composing: false,
             outgoing: Vec::new(),
         }
     }
 
+    /// A room's composer is always focused (instant messaging), so any open room
+    /// captures text.
     pub fn is_text_input(&self) -> bool {
-        self.composing && matches!(self.mode, CircMode::Room { .. })
+        matches!(self.mode, CircMode::Room { .. })
     }
 
     pub fn paste_text(&mut self, text: &str) {
-        if self.composing && matches!(self.mode, CircMode::Room { .. }) {
+        if matches!(self.mode, CircMode::Room { .. }) {
             self.draft.push_str(text);
         }
     }
 
-    /// Prefill the inline composer with `content` and focus it (editor hand-back).
+    /// Set the composer text (used when the full editor hands its content back).
     pub fn set_draft_and_focus(&mut self, content: String) {
         if matches!(self.mode, CircMode::Room { .. }) {
             self.draft = content;
-            self.composing = true;
         }
     }
 
     fn reset_composer(&mut self) {
         self.draft.clear();
-        self.composing = false;
         self.outgoing.clear();
     }
 
@@ -124,10 +122,6 @@ impl CircScreen {
     pub fn handle_escape(&mut self) -> Option<CircIntent> {
         match &mut self.mode {
             CircMode::Rooms => None,
-            CircMode::Room { .. } if self.composing => {
-                self.composing = false;
-                Some(CircIntent::None)
-            }
             CircMode::Room { .. } => {
                 self.reset_composer();
                 self.mode = CircMode::Rooms;
@@ -320,17 +314,11 @@ impl CircScreen {
             return CircIntent::RetryFailed { room_id, contents };
         }
 
-        if self.composing {
-            self.handle_composing_key(key, &room_id, ctrl)
-        } else {
-            self.handle_browse_key(key, &room_id)
-        }
-    }
-
-    fn handle_composing_key(&mut self, key: KeyEvent, room_id: &str, ctrl: bool) -> CircIntent {
+        // The composer is always focused in a room: typed keys go to the draft,
+        // Enter sends, Ctrl+E expands to the editor, and arrows scroll history.
         match key.code {
             KeyCode::Char('e') if ctrl => CircIntent::StartCompose {
-                room_id: room_id.to_string(),
+                room_id,
                 draft: self.draft.clone(),
             },
             KeyCode::Enter => {
@@ -343,10 +331,7 @@ impl CircScreen {
                     failed: false,
                 });
                 self.draft.clear();
-                CircIntent::SendMessage {
-                    room_id: room_id.to_string(),
-                    content,
-                }
+                CircIntent::SendMessage { room_id, content }
             }
             KeyCode::Backspace => {
                 self.draft.pop();
@@ -357,35 +342,12 @@ impl CircScreen {
             | KeyCode::PageUp
             | KeyCode::PageDown
             | KeyCode::Home
-            | KeyCode::End => self.scroll_messages(key.code, room_id),
+            | KeyCode::End => self.scroll_messages(key.code, &room_id),
             KeyCode::Char(c) if !ctrl => {
                 self.draft.push(c);
                 CircIntent::None
             }
             _ => CircIntent::None,
-        }
-    }
-
-    fn handle_browse_key(&mut self, key: KeyEvent, room_id: &str) -> CircIntent {
-        match key.code {
-            KeyCode::Char('c') | KeyCode::Char('i') | KeyCode::Enter => {
-                self.composing = true;
-                CircIntent::None
-            }
-            KeyCode::Char('r') => {
-                if let CircMode::Room { messages, .. } = &mut self.mode {
-                    messages.items.clear();
-                    messages.selected = 0;
-                    messages.next_cursor = None;
-                    messages.loading = true;
-                    messages.loaded = false;
-                    messages.error = None;
-                }
-                CircIntent::OpenRoom {
-                    room_id: room_id.to_string(),
-                }
-            }
-            code => self.scroll_messages(code, room_id),
         }
     }
 
@@ -475,13 +437,13 @@ impl CircScreen {
         frame.render_widget(block, area);
 
         let out_rows = self.outgoing_rows();
-        let footer_rows = if self.composing { 2 } else { 1 };
+        // The composer input is always present (2 rows: input + hint).
         let layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(1),
                 Constraint::Length(out_rows),
-                Constraint::Length(footer_rows),
+                Constraint::Length(2),
             ])
             .split(inner);
 
@@ -494,21 +456,14 @@ impl CircScreen {
             theme,
             messages,
             &visible,
-            "no messages yet — c to chat",
+            "no messages yet — start typing",
             |m| ListItem::new(circ_message_lines(m, theme)),
         );
 
         if out_rows > 0 {
             self.render_outgoing(frame, layout[1], theme);
         }
-        let scrolled_up = messages.selected + 1 < messages.items.len();
-        self.render_footer(
-            frame,
-            layout[2],
-            theme,
-            messages.next_cursor.is_some(),
-            scrolled_up,
-        );
+        self.render_footer(frame, layout[2], theme, messages.next_cursor.is_some());
     }
 
     fn outgoing_rows(&self) -> u16 {
@@ -543,49 +498,30 @@ impl CircScreen {
         frame.render_widget(Paragraph::new(lines), area);
     }
 
-    fn render_footer(
-        &self,
-        frame: &mut Frame<'_>,
-        area: Rect,
-        theme: &Theme,
-        has_older: bool,
-        scrolled_up: bool,
-    ) {
-        if self.composing {
-            let rows = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(1), Constraint::Length(1)])
-                .split(area);
-            let shown = self.draft.replace('\n', " ⏎ ");
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled("› ", theme.accent_style()),
-                    Span::styled(shown, theme.base()),
-                    Span::styled("▏", theme.accent_style()),
-                ])),
-                rows[0],
-            );
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    "enter send · ctrl+e editor · esc unfocus",
-                    theme.muted_style(),
-                ))),
-                rows[1],
-            );
+    fn render_footer(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme, has_older: bool) {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Length(1)])
+            .split(area);
+        // Always-on input line.
+        let shown = self.draft.replace('\n', " ⏎ ");
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("› ", theme.accent_style()),
+                Span::styled(shown, theme.base()),
+                Span::styled("▏", theme.accent_style()),
+            ])),
+            rows[0],
+        );
+        let hint = if has_older {
+            "enter send · ↑ older · ctrl+e editor · esc back"
         } else {
-            let mut hint = String::from("c chat · ");
-            if scrolled_up {
-                hint.push_str("end ↓ newest · ");
-            }
-            if has_older {
-                hint.push_str("scroll up for older · ");
-            }
-            hint.push_str("r refresh · esc back");
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(hint, theme.muted_style()))),
-                area,
-            );
-        }
+            "enter send · ctrl+e editor · esc back"
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(hint, theme.muted_style()))),
+            rows[1],
+        );
     }
 }
 
@@ -723,7 +659,7 @@ mod tests {
     #[test]
     fn typing_and_enter_sends_optimistically() {
         let mut s = open("general");
-        s.handle_key(key(KeyCode::Char('c'))); // focus composer
+        // The composer is always focused in a room — no key to press first.
         assert!(s.is_text_input());
         for c in "hey".chars() {
             s.handle_key(key(KeyCode::Char(c)));
@@ -742,7 +678,6 @@ mod tests {
     #[test]
     fn ctrl_e_expands_to_editor_with_draft() {
         let mut s = open("general");
-        s.handle_key(key(KeyCode::Char('c')));
         for c in "hi".chars() {
             s.handle_key(key(KeyCode::Char(c)));
         }
@@ -758,7 +693,6 @@ mod tests {
     #[test]
     fn failed_send_marks_outgoing_and_ctrl_r_retries() {
         let mut s = open("general");
-        s.handle_key(key(KeyCode::Char('c')));
         for c in "hey".chars() {
             s.handle_key(key(KeyCode::Char(c)));
         }
