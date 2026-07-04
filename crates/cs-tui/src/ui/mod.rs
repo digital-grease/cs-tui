@@ -1,6 +1,7 @@
 pub mod app;
 pub mod audio;
 pub mod bookmarks;
+pub mod circ;
 pub mod cmail;
 pub mod compose;
 pub mod edit_profile;
@@ -24,6 +25,7 @@ pub mod open;
 pub mod player;
 pub mod post_detail;
 pub mod profile;
+pub mod search;
 pub mod settings_screen;
 pub mod shuffle;
 pub mod text;

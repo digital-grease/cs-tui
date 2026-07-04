@@ -7,10 +7,11 @@ use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use cs_api::rtdb::{RtdbClient, SseEvent, SseEventKind};
 use cs_api::{
-    updates_from_rtdb_event, ApiError, Bookmark, Client, CmailConversation, CmailLiveUpdate,
-    CmailMessage, EndpointKey, Entry, Follow, FollowsDirection, Guild, GuildMembership,
-    GuildThread, JoinedGuild, Note, NoteRevision, Notification, NotificationType,
-    NotificationsFilter, ProfileUpdate, Reply, Settings, SettingsUpdate, Topic, User,
+    circ_messages_from_rtdb_event, messages_from_rtdb_event, ApiError, Bookmark, CircMessage,
+    CircRoom, Client, CmailConversation, CmailMessage, EndpointKey, Entry, Follow,
+    FollowsDirection, Guild, GuildMembership, GuildThread, JoinedGuild, Note, NoteRevision,
+    Notification, NotificationType, NotificationsFilter, ProfileUpdate, Reply, Settings,
+    SettingsUpdate, Topic, User,
 };
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::DefaultTerminal;
@@ -19,6 +20,7 @@ use tokio::sync::{mpsc, Notify};
 use tokio::time::MissedTickBehavior;
 
 use super::bookmarks::{BookmarksIntent, BookmarksScreen};
+use super::circ::{CircIntent, CircScreen};
 use super::cmail::{CmailIntent, CmailScreen};
 use super::compose::{launch_editor, ComposeIntent, ComposeKind, ComposeScreen};
 use super::edit_profile::{EditProfileIntent, EditProfileScreen};
@@ -33,6 +35,7 @@ use super::nav::{render_tab_bar, RootKind, TabBarStatus};
 use super::notifications::{NotificationsIntent, NotificationsScreen};
 use super::post_detail::{PostDetailIntent, PostDetailScreen};
 use super::profile::{ProfileIntent, ProfileScreen, ProfileTab};
+use super::search::{SearchIntent, SearchScreen};
 use super::settings_screen::{SettingsIntent, SettingsScreen};
 use super::shuffle::ShufflePool;
 use super::theme::{ColorMode, Theme, ThemeKind};
@@ -101,13 +104,13 @@ pub enum BgEvent {
         initial: bool,
         result: Result<(Vec<CmailMessage>, Option<String>), String>,
     },
-    /// Changes delivered over the live RTDB stream for the open conversation,
+    /// Messages delivered over the live RTDB stream for the open conversation,
     /// tagged with the stream generation that produced them so a superseded
     /// stream's late events are dropped.
     CmailLive {
         conversation_id: String,
         epoch: u64,
-        updates: Vec<CmailLiveUpdate>,
+        messages: Vec<CmailMessage>,
     },
     CmailStarted(Result<CmailConversation, String>),
     CmailSent {
@@ -116,6 +119,25 @@ pub enum BgEvent {
         content: String,
         result: Result<(), String>,
     },
+    CircRooms(Result<Vec<CircRoom>, String>),
+    CircMessages {
+        room_id: String,
+        initial: bool,
+        result: Result<(Vec<CircMessage>, Option<String>), String>,
+    },
+    CircLive {
+        room_id: String,
+        epoch: u64,
+        messages: Vec<CircMessage>,
+    },
+    CircSent {
+        room_id: String,
+        content: String,
+        /// An inline command reply (e.g. `/help`), surfaced as a toast.
+        reply: Option<String>,
+        result: Result<(), String>,
+    },
+    SearchResults(Result<cs_api::SearchPreview, String>),
     /// Result of a background C-Mail unread poll: the total unread count and,
     /// when any conversation is unread, the display name of the most recently
     /// active unread sender (drives the "new mail" toast).
@@ -286,6 +308,7 @@ pub enum Screen {
     Feed(FeedScreen),
     Notifications(NotificationsScreen),
     Cmail(CmailScreen),
+    Circ(CircScreen),
     Bookmarks(BookmarksScreen),
     Topics(TopicsScreen),
     TopicFeed(TopicFeedScreen),
@@ -298,6 +321,7 @@ pub enum Screen {
     Settings(SettingsScreen),
     Guilds(GuildsScreen),
     Guild(GuildScreen),
+    Search(SearchScreen),
 }
 
 impl Screen {
@@ -313,6 +337,8 @@ impl Screen {
                 true
             }
             Screen::Cmail(s) => s.is_text_input(),
+            Screen::Circ(s) => s.is_text_input(),
+            Screen::Search(s) => s.is_editing(),
             // The topics search box captures printable keys while open.
             Screen::Topics(s) => s.is_filtering(),
             // Settings has only toggles, cyclable choices, and read-only fields —
@@ -373,6 +399,30 @@ enum Action {
         contents: Vec<String>,
     },
     CmailBackToConversations,
+    CircRefresh,
+    CircOpen {
+        room_id: String,
+    },
+    CircLoadOlder {
+        room_id: String,
+        before: Option<i64>,
+    },
+    CircCompose {
+        room_id: String,
+        draft: String,
+    },
+    CircSend {
+        room_id: String,
+        content: String,
+    },
+    CircRetry {
+        room_id: String,
+        contents: Vec<String>,
+    },
+    CircBackToRooms,
+    SearchRun {
+        query: String,
+    },
     BookmarksRefresh,
     BookmarksMore {
         cursor: Option<String>,
@@ -586,6 +636,9 @@ pub struct App {
     /// prior conversation's stream aborts and any late events it emits are
     /// discarded instead of leaking into the newly-open thread.
     cmail_stream_epoch: Arc<AtomicU64>,
+    /// Generation counter for the live cIRC room stream (mirrors
+    /// `cmail_stream_epoch`).
+    circ_stream_epoch: Arc<AtomicU64>,
     /// Whether at least one C-Mail unread poll has landed. Gates the "new mail"
     /// toast so pre-existing unread at launch is silent — only a later rise
     /// announces genuinely-new mail.
@@ -717,6 +770,7 @@ impl App {
             feed_poller_started: false,
             cmail_poller_started: false,
             cmail_stream_epoch: Arc::new(AtomicU64::new(0)),
+            circ_stream_epoch: Arc::new(AtomicU64::new(0)),
             cmail_unread_initialized: false,
             input_paused: Arc::new(AtomicBool::new(false)),
             force_clear: false,
@@ -977,6 +1031,8 @@ impl App {
                 Screen::Feed(s) => s.render(frame, screen_area, &self.theme),
                 Screen::Notifications(s) => s.render(frame, screen_area, &self.theme),
                 Screen::Cmail(s) => s.render(frame, screen_area, &self.theme),
+                Screen::Circ(s) => s.render(frame, screen_area, &self.theme),
+                Screen::Search(s) => s.render(frame, screen_area, &self.theme),
                 Screen::Bookmarks(s) => s.render(frame, screen_area, &self.theme),
                 Screen::Topics(s) => s.render(frame, screen_area, &self.theme),
                 Screen::TopicFeed(s) => s.render(frame, screen_area, &self.theme),
@@ -1113,6 +1169,25 @@ impl App {
                 CmailIntent::StartNew | CmailIntent::CancelInput | CmailIntent::None => {
                     Action::None
                 }
+            },
+            Screen::Circ(s) => match s.handle_key(key) {
+                CircIntent::Quit => Action::Quit,
+                CircIntent::RefreshRooms => Action::CircRefresh,
+                CircIntent::OpenRoom { room_id } => Action::CircOpen { room_id },
+                CircIntent::LoadOlder { room_id, before } => {
+                    Action::CircLoadOlder { room_id, before }
+                }
+                CircIntent::BackToRooms => Action::CircBackToRooms,
+                CircIntent::StartCompose { room_id, draft } => {
+                    Action::CircCompose { room_id, draft }
+                }
+                CircIntent::SendMessage { room_id, content } => {
+                    Action::CircSend { room_id, content }
+                }
+                CircIntent::RetryFailed { room_id, contents } => {
+                    Action::CircRetry { room_id, contents }
+                }
+                CircIntent::None => Action::None,
             },
             Screen::Bookmarks(s) => match s.handle_key(key) {
                 BookmarksIntent::Quit => Action::Quit,
@@ -1365,6 +1440,20 @@ impl App {
                 },
                 GuildIntent::None => Action::None,
             },
+            Screen::Search(s) => match s.handle_key(key) {
+                SearchIntent::Quit => Action::Quit,
+                SearchIntent::Back => Action::PopScreen,
+                SearchIntent::Run { query } => Action::SearchRun { query },
+                SearchIntent::OpenPost {
+                    post_id,
+                    highlight_reply_id,
+                } => Action::OpenPostDetailById {
+                    post_id,
+                    highlight_reply_id,
+                },
+                SearchIntent::OpenUser { username } => Action::ProfileOpenUser { username },
+                SearchIntent::None => Action::None,
+            },
         }
     }
 
@@ -1381,6 +1470,8 @@ impl App {
                 Screen::Compose(s) => s.paste_into_focused(&data),
                 Screen::EditProfile(s) => s.paste_into_focused(&data),
                 Screen::Cmail(s) => s.paste_text(&data),
+                Screen::Circ(s) => s.paste_text(&data),
+                Screen::Search(s) => s.paste_text(&data),
                 Screen::Topics(s) if s.is_filtering() => {
                     s.paste_filter(&super::input::collapse_newlines(&data));
                 }
@@ -1448,6 +1539,14 @@ impl App {
                 if let Some(intent) = s.handle_escape() {
                     if matches!(intent, CmailIntent::BackToConversations) {
                         self.spawn_cmail_conversations();
+                    }
+                    return;
+                }
+            }
+            if let Screen::Circ(s) = &mut self.screen {
+                if let Some(intent) = s.handle_escape() {
+                    if matches!(intent, CircIntent::BackToRooms) {
+                        self.spawn_circ_rooms();
                     }
                     return;
                 }
@@ -1536,6 +1635,16 @@ impl App {
         // and an image post renders as a screenful of raw protocol bytes.
         if !self.screen.accepts_text_input() && key.code == KeyCode::Char('i') {
             self.toggle_images();
+            return;
+        }
+
+        // Search (Ctrl+F): global from anywhere (a Ctrl combo never types), opens
+        // the search overlay unless it's already the active screen.
+        if key.code == KeyCode::Char('f')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !matches!(self.screen, Screen::Search(_))
+        {
+            self.push_screen(Screen::Search(SearchScreen::new()));
             return;
         }
 
@@ -1679,6 +1788,42 @@ impl App {
                 }
                 self.spawn_cmail_conversations();
             }
+            Action::CircRefresh => self.spawn_circ_rooms(),
+            Action::CircOpen { room_id } => {
+                if let Screen::Circ(s) = &mut self.screen {
+                    s.open_room(&room_id);
+                }
+                self.spawn_circ_messages(room_id.clone(), None);
+                self.spawn_circ_stream(room_id);
+            }
+            Action::CircLoadOlder { room_id, before } => {
+                self.spawn_circ_messages(room_id, before);
+            }
+            Action::CircCompose { room_id, draft } => {
+                let screen = EditorScreen::new(EditorPurpose::CircMessage { room_id }, &draft);
+                self.push_screen(Screen::Editor(screen));
+            }
+            Action::CircSend { room_id, content } => {
+                if self.block_write_if_offline() {
+                    return;
+                }
+                self.spawn_circ_send(room_id, content);
+            }
+            Action::CircRetry { room_id, contents } => {
+                if self.block_write_if_offline() {
+                    return;
+                }
+                for content in contents {
+                    self.spawn_circ_send(room_id.clone(), content);
+                }
+            }
+            Action::CircBackToRooms => {
+                if let Screen::Circ(s) = &mut self.screen {
+                    s.mode = super::circ::CircMode::Rooms;
+                }
+                self.spawn_circ_rooms();
+            }
+            Action::SearchRun { query } => self.spawn_search(query),
             Action::BookmarksRefresh => self.spawn_bookmarks_initial(),
             Action::BookmarksMore { cursor } => self.spawn_bookmarks_more(cursor),
             Action::BookmarkRemove { bookmark_id } => {
@@ -2113,13 +2258,13 @@ impl App {
             BgEvent::CmailLive {
                 conversation_id,
                 epoch,
-                updates,
+                messages,
             } => {
                 // Drop events from a superseded stream (the user has since opened a
                 // different conversation or left C-Mail).
                 if epoch == self.cmail_stream_epoch.load(Ordering::SeqCst) {
                     if let Screen::Cmail(s) = &mut self.screen {
-                        s.apply_live(&conversation_id, updates);
+                        s.apply_live(&conversation_id, messages);
                     }
                 }
             }
@@ -2146,6 +2291,62 @@ impl App {
                 };
                 if reload {
                     self.spawn_cmail_messages(conversation_id, None);
+                }
+            }
+            BgEvent::CircRooms(result) => {
+                if let Screen::Circ(s) = &mut self.screen {
+                    s.apply_rooms(result);
+                }
+            }
+            BgEvent::CircMessages {
+                room_id,
+                initial,
+                result,
+            } => {
+                let ok = result.is_ok();
+                if let Screen::Circ(s) = &mut self.screen {
+                    s.apply_messages(&room_id, initial, result);
+                }
+                if ok && initial {
+                    self.spawn_circ_mark_read(room_id);
+                }
+            }
+            BgEvent::CircLive {
+                room_id,
+                epoch,
+                messages,
+            } => {
+                if epoch == self.circ_stream_epoch.load(Ordering::SeqCst) {
+                    if let Screen::Circ(s) = &mut self.screen {
+                        s.apply_live(&room_id, messages);
+                    }
+                }
+            }
+            BgEvent::CircSent {
+                room_id,
+                content,
+                reply,
+                result,
+            } => {
+                if let Some(reply) = reply {
+                    // A slash command (e.g. /help) answered inline — show it.
+                    self.toast = Some(Toast::confirmation(first_line(&reply)));
+                }
+                let reload = if let Screen::Circ(s) = &mut self.screen {
+                    s.finish_send(&room_id, &content, result)
+                } else {
+                    false
+                };
+                if reload {
+                    self.spawn_circ_messages(room_id, None);
+                }
+            }
+            BgEvent::SearchResults(result) => {
+                if result.is_ok() {
+                    self.offline = false;
+                }
+                if let Screen::Search(s) = &mut self.screen {
+                    s.apply_results(result);
                 }
             }
             BgEvent::CmailUnread { count, latest_from } => {
@@ -2825,8 +3026,9 @@ impl App {
         // A fresh login re-primes the "new mail" baseline, so pre-existing unread
         // for the next account doesn't toast on its first poll.
         self.cmail_unread_initialized = false;
-        // Tear down any live C-Mail message stream so it can't outlive the session.
+        // Tear down any live message streams so they can't outlive the session.
         self.cmail_stream_epoch.fetch_add(1, Ordering::SeqCst);
+        self.circ_stream_epoch.fetch_add(1, Ordering::SeqCst);
         self.offline = false;
         self.toast = None;
         // Invalidate the topics warm-up: bump the epoch so any in-flight prefetch
@@ -2993,6 +3195,10 @@ impl App {
             RootKind::Cmail => {
                 self.screen = Screen::Cmail(CmailScreen::new());
                 self.spawn_cmail_conversations();
+            }
+            RootKind::Circ => {
+                self.screen = Screen::Circ(CircScreen::new());
+                self.spawn_circ_rooms();
             }
             RootKind::Bookmarks => {
                 self.screen = Screen::Bookmarks(BookmarksScreen::new());
@@ -3198,6 +3404,84 @@ impl App {
             epoch,
             epoch_ref,
         ));
+    }
+
+    fn spawn_circ_rooms(&self) {
+        // Returning to the room list tears down any live room stream (same
+        // chokepoint pattern as C-Mail conversations).
+        self.circ_stream_epoch.fetch_add(1, Ordering::SeqCst);
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .list_circ_rooms()
+                .await
+                .map_err(|e| note_api_err(&tx, e));
+            let _ = tx.send(BgEvent::CircRooms(result));
+        });
+    }
+
+    fn spawn_circ_messages(&self, room_id: String, before: Option<i64>) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        let initial = before.is_none();
+        tokio::spawn(async move {
+            let result = client
+                .read_circ_room(&room_id, before, None)
+                .await
+                .map_err(|e| note_api_err(&tx, e));
+            let _ = tx.send(BgEvent::CircMessages {
+                room_id,
+                initial,
+                result,
+            });
+        });
+    }
+
+    fn spawn_circ_send(&self, room_id: String, content: String) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let (reply, result) = match client.send_circ_message(&room_id, &content).await {
+                Ok(resp) => (resp.reply, Ok(())),
+                Err(e) => (None, Err(note_api_err(&tx, e))),
+            };
+            let _ = tx.send(BgEvent::CircSent {
+                room_id,
+                content,
+                reply,
+                result,
+            });
+        });
+    }
+
+    fn spawn_circ_mark_read(&self, room_id: String) {
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            if let Err(e) = client.mark_circ_read(&room_id).await {
+                tracing::debug!(error = %e, room_id, "mark_circ_read failed");
+            }
+        });
+    }
+
+    fn spawn_circ_stream(&self, room_id: String) {
+        let epoch = self.circ_stream_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        let epoch_ref = self.circ_stream_epoch.clone();
+        tokio::spawn(circ_stream_loop(client, tx, room_id, epoch, epoch_ref));
+    }
+
+    fn spawn_search(&self, query: String) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .search_all(&query)
+                .await
+                .map_err(|e| note_api_err(&tx, e));
+            let _ = tx.send(BgEvent::SearchResults(result));
+        });
     }
 
     fn spawn_cmail_start(&self, username: String) {
@@ -4226,6 +4510,13 @@ impl App {
                     s.set_draft_and_focus(content);
                 }
             }
+            EditorPurpose::CircMessage { room_id } => {
+                let _ = room_id;
+                self.pop_screen();
+                if let Screen::Circ(s) = &mut self.screen {
+                    s.set_draft_and_focus(content);
+                }
+            }
         }
     }
 
@@ -4756,13 +5047,13 @@ async fn cmail_stream_loop(
                 }) => {
                     let path_str = data.get("path").and_then(|p| p.as_str()).unwrap_or("/");
                     let payload = data.get("data").unwrap_or(&serde_json::Value::Null);
-                    let updates = updates_from_rtdb_event(path_str, payload);
-                    if !updates.is_empty()
+                    let messages = messages_from_rtdb_event(path_str, payload);
+                    if !messages.is_empty()
                         && tx
                             .send(BgEvent::CmailLive {
                                 conversation_id: conversation_id.clone(),
                                 epoch,
-                                updates,
+                                messages,
                             })
                             .is_err()
                     {
@@ -4787,6 +5078,102 @@ async fn cmail_stream_loop(
                 }) => {}
                 Err(e) => {
                     tracing::debug!(error = %e, "cmail rtdb stream error; live updates off");
+                    return;
+                }
+            }
+        }
+
+        if !token_expired || superseded(&epoch_ref) {
+            return;
+        }
+        reconnects += 1;
+        if reconnects > MAX_RECONNECTS || client.refresh().await.is_err() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Live RTDB stream for a cIRC room (`chat_messages/<roomId>`). Same lifecycle as
+/// [`cmail_stream_loop`]: epoch-guarded, conservative token-expiry-only reconnect.
+async fn circ_stream_loop(
+    client: Client,
+    tx: mpsc::UnboundedSender<BgEvent>,
+    room_id: String,
+    epoch: u64,
+    epoch_ref: Arc<AtomicU64>,
+) {
+    let params: [(&str, &str); 2] = [("orderBy", "%22timestamp%22"), ("limitToLast", "50")];
+    let path = format!("/chat_messages/{room_id}");
+    let superseded = |epoch_ref: &Arc<AtomicU64>| epoch != epoch_ref.load(Ordering::SeqCst);
+    let mut reconnects: u32 = 0;
+    const MAX_RECONNECTS: u32 = 24;
+
+    loop {
+        if superseded(&epoch_ref) {
+            return;
+        }
+        let tokens = client.tokens().await;
+        if tokens.rtdb_url.is_empty() || tokens.id_token.is_empty() {
+            return;
+        }
+        let rtdb = match RtdbClient::new(tokens.rtdb_url, tokens.id_token) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(error = %e, "circ rtdb client build failed; live updates off");
+                return;
+            }
+        };
+        let mut rx = match rtdb.subscribe(&path, &params).await {
+            Ok(rx) => rx,
+            Err(e) => {
+                tracing::debug!(error = %e, "circ rtdb subscribe failed; live updates off");
+                return;
+            }
+        };
+
+        let mut token_expired = false;
+        while let Some(ev) = rx.recv().await {
+            if superseded(&epoch_ref) {
+                return;
+            }
+            match ev {
+                Ok(SseEvent {
+                    kind: SseEventKind::Put | SseEventKind::Patch,
+                    data,
+                }) => {
+                    let path_str = data.get("path").and_then(|p| p.as_str()).unwrap_or("/");
+                    let payload = data.get("data").unwrap_or(&serde_json::Value::Null);
+                    let messages = circ_messages_from_rtdb_event(path_str, payload);
+                    if !messages.is_empty()
+                        && tx
+                            .send(BgEvent::CircLive {
+                                room_id: room_id.clone(),
+                                epoch,
+                                messages,
+                            })
+                            .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(SseEvent {
+                    kind: SseEventKind::AuthRevoked,
+                    ..
+                }) => {
+                    token_expired = true;
+                    break;
+                }
+                Ok(SseEvent {
+                    kind: SseEventKind::Cancel,
+                    ..
+                }) => return,
+                Ok(SseEvent {
+                    kind: SseEventKind::KeepAlive,
+                    ..
+                }) => {}
+                Err(e) => {
+                    tracing::debug!(error = %e, "circ rtdb stream error; live updates off");
                     return;
                 }
             }

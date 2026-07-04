@@ -1,6 +1,6 @@
 //! Endpoint keys for rate-limiter accounting. One variant per documented endpoint.
 //!
-//! Rate-limit values come from `docs/api-v0.6.0.md`. Where the consolidated table
+//! Rate-limit values come from `docs/api-v0.7.md`. Where the consolidated table
 //! and the per-endpoint section disagree, the lower (more restrictive) value is
 //! used so the client cannot self-trigger 429s.
 use crate::rate_limit::RateLimit;
@@ -79,12 +79,21 @@ pub enum EndpointKey {
     GuildsJoin,
     GuildsLeave,
 
-    // C-Mail (v0.6.0)
+    // C-Mail (v0.7)
     CmailStart,
     CmailList,
     CmailRead,
     CmailSend,
     CmailMarkRead,
+
+    // cIRC (v0.7)
+    CircList,
+    CircRead,
+    CircSend,
+    CircMarkRead,
+
+    // Search (v0.7)
+    Search,
 }
 
 impl EndpointKey {
@@ -93,25 +102,26 @@ impl EndpointKey {
     #[must_use]
     pub fn rate_limit(self) -> RateLimit {
         use EndpointKey::{
-            AuthLogin, AuthRefresh, BookmarksCreate, BookmarksDelete, BookmarksList, CmailList,
-            CmailMarkRead, CmailRead, CmailSend, CmailStart, EntriesCreate, EntriesDelete,
-            EntriesGet, EntriesList, FollowsCreate, FollowsDelete, FollowsList, GuildsGet,
-            GuildsJoin, GuildsLeave, GuildsList, GuildsMembersList, GuildsThreadsCreate,
-            GuildsThreadsList, NotesCreate, NotesDelete, NotesGet, NotesGetRevision, NotesList,
-            NotesListRevisions, NotesUpdate, NotificationsList, NotificationsMarkAllRead,
-            NotificationsMarkRead, NotificationsUnreadCount, RepliesCreate, RepliesDelete,
-            RepliesGet, RepliesList, SettingsGet, SettingsUpdate, TopicsList, TopicsListPosts,
-            UsersGet, UsersGetMe, UsersGetPostBySlug, UsersListPosts, UsersListReplies,
-            UsersUpdateMe, WatchCreate, WatchDelete, WatchStatus, WatchesList,
+            AuthLogin, AuthRefresh, BookmarksCreate, BookmarksDelete, BookmarksList, CircList,
+            CircMarkRead, CircRead, CircSend, CmailList, CmailMarkRead, CmailRead, CmailSend,
+            CmailStart, EntriesCreate, EntriesDelete, EntriesGet, EntriesList, FollowsCreate,
+            FollowsDelete, FollowsList, GuildsGet, GuildsJoin, GuildsLeave, GuildsList,
+            GuildsMembersList, GuildsThreadsCreate, GuildsThreadsList, NotesCreate, NotesDelete,
+            NotesGet, NotesGetRevision, NotesList, NotesListRevisions, NotesUpdate,
+            NotificationsList, NotificationsMarkAllRead, NotificationsMarkRead,
+            NotificationsUnreadCount, RepliesCreate, RepliesDelete, RepliesGet, RepliesList,
+            Search, SettingsGet, SettingsUpdate, TopicsList, TopicsListPosts, UsersGet, UsersGetMe,
+            UsersGetPostBySlug, UsersListPosts, UsersListReplies, UsersUpdateMe, WatchCreate,
+            WatchDelete, WatchStatus, WatchesList,
         };
 
         match self {
             // Auth — login/refresh carry no documented limit.
             AuthLogin | AuthRefresh => RateLimit::none(),
 
-            // Reads — table values from § Anti-Scraping (v0.6.0).
+            // Reads — table values from § Anti-Scraping (v0.7).
             EntriesList | RepliesList | UsersListPosts | UsersListReplies | TopicsListPosts
-            | CmailRead => RateLimit::per_minute(45),
+            | CmailRead | CircRead => RateLimit::per_minute(45),
             TopicsList
             | BookmarksList
             | NotesList
@@ -121,7 +131,9 @@ impl EndpointKey {
             | NotificationsUnreadCount
             | WatchStatus
             | WatchesList
-            | CmailList => RateLimit::per_minute(30),
+            | CmailList
+            | CircList
+            | Search => RateLimit::per_minute(30),
             // Single-post-by-slug isn't in the table; keep a conservative read cap.
             UsersGetPostBySlug => RateLimit::per_minute(30),
 
@@ -129,20 +141,23 @@ impl EndpointKey {
             EntriesGet | RepliesGet | UsersGetMe | NotesGet | NotesGetRevision
             | NotesListRevisions | SettingsGet => RateLimit::none(),
 
-            // Writes — lower of (table, section) values (v0.6.0).
+            // Writes — lower of (table, section) values (v0.7).
             EntriesCreate | UsersUpdateMe | SettingsUpdate => RateLimit::with_day(2, 15),
             RepliesCreate | FollowsCreate | FollowsDelete => RateLimit::with_day(3, 15),
             NotesCreate => RateLimit::with_day(3, 30),
             BookmarksCreate => RateLimit::with_day(5, 75),
             // Thread watching (v0.5.1 § Rate Limits — "Watch thread" 10/min, 100/day).
             WatchCreate => RateLimit::with_day(10, 100),
-            // C-Mail (v0.6.0). Start/send declare all three windows — the hourly
+            // C-Mail (v0.7). Start/send declare all three windows — the hourly
             // cap (30/hr start, 150/hr send) is stricter than per_minute * 60, so
             // it has to be modelled explicitly or the client could self-inflict a
             // 429. Mark-read has only a per-minute cap.
             CmailStart => RateLimit::full(5, 30, 50),
             CmailSend => RateLimit::full(15, 150, 300),
             CmailMarkRead => RateLimit::per_minute(60),
+            // cIRC (v0.7) — same message caps as C-Mail (15/min, 150/hr, 300/day).
+            CircSend => RateLimit::full(15, 150, 300),
+            CircMarkRead => RateLimit::per_minute(60),
 
             // Deletes — not documented; no client-side cap.
             EntriesDelete

@@ -1,6 +1,6 @@
 //! C-Mail screen — private 1:1 conversations.
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use cs_api::{CmailConversation, CmailLiveUpdate, CmailMessage, CmailUser};
+use cs_api::{CmailConversation, CmailMessage, CmailUser};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -15,7 +15,7 @@ const MAX_OUTGOING_ROWS: usize = 4;
 
 /// Collapse a (possibly multi-line) string to a single truncated line for a
 /// compact preview.
-fn one_line_preview(s: &str, max_chars: usize) -> String {
+pub(crate) fn one_line_preview(s: &str, max_chars: usize) -> String {
     let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() > max_chars {
         let head: String = flat.chars().take(max_chars.saturating_sub(1)).collect();
@@ -37,7 +37,7 @@ fn display_name_of(user: &CmailUser) -> &str {
 /// A stable per-user colour for the avatar initial, hashed from the username so
 /// the same person always gets the same colour. Uses the 16-colour ANSI palette
 /// so it adapts to the terminal theme.
-fn avatar_color(username: &str) -> Color {
+pub(crate) fn avatar_color(username: &str) -> Color {
     const PALETTE: [Color; 6] = [
         Color::Cyan,
         Color::Green,
@@ -475,13 +475,11 @@ impl CmailScreen {
         }
     }
 
-    /// Apply changes that arrived over the live RTDB stream to the open
-    /// conversation. New/replaced messages are merged (de-duped by id, kept in
-    /// timestamp order); `Read` updates flip an existing message's read flag
-    /// without touching its content (that's how a read receipt lands live). If
-    /// the view was pinned to the newest message it follows the new tail;
-    /// otherwise the caller's scroll position is preserved.
-    pub fn apply_live(&mut self, conversation_id: &str, updates: Vec<CmailLiveUpdate>) {
+    /// Merge messages that arrived over the live RTDB stream into the open
+    /// conversation, de-duped by id and kept in timestamp order. If the view was
+    /// pinned to the newest message it follows the new tail; otherwise the
+    /// caller's scroll position is preserved.
+    pub fn apply_live(&mut self, conversation_id: &str, incoming: Vec<CmailMessage>) {
         let messages = match &mut self.mode {
             CmailMode::Conversation {
                 conversation,
@@ -489,31 +487,19 @@ impl CmailScreen {
             } if conversation.conversation_id == conversation_id => messages,
             _ => return,
         };
-        if updates.is_empty() {
+        let fresh: Vec<CmailMessage> = incoming.into_iter().filter(|m| !m.id.is_empty()).collect();
+        if fresh.is_empty() {
             return;
         }
         let was_at_bottom =
             messages.items.is_empty() || messages.selected + 1 >= messages.items.len();
         let selected_id = messages.items.get(messages.selected).map(|m| m.id.clone());
-        for update in updates {
-            match update {
-                CmailLiveUpdate::Message(msg) if !msg.id.is_empty() => {
-                    if let Some(existing) = messages.items.iter_mut().find(|m| m.id == msg.id) {
-                        *existing = msg;
-                    } else {
-                        messages.items.push(msg);
-                    }
-                }
-                CmailLiveUpdate::Message(_) => {}
-                CmailLiveUpdate::Read { id, read } => {
-                    if let Some(existing) = messages.items.iter_mut().find(|m| m.id == id) {
-                        existing.read = read;
-                    }
-                }
+        for msg in fresh {
+            if let Some(existing) = messages.items.iter_mut().find(|m| m.id == msg.id) {
+                *existing = msg;
+            } else {
+                messages.items.push(msg);
             }
-        }
-        if messages.items.is_empty() {
-            return;
         }
         messages.items.sort_by_key(|m| m.timestamp);
         messages.loading = false;
@@ -684,14 +670,17 @@ impl CmailScreen {
             .split(inner);
 
         let visible: Vec<usize> = (0..messages.items.len()).collect();
-        let messages_area =
-            bottom_aligned_messages_area(layout[0], rendered_message_rows(&messages.items, other));
+        let unread_from = first_unread_index(&messages.items, other, conversation.unread_count);
+        let messages_area = bottom_aligned_messages_area(
+            layout[0],
+            rendered_message_rows(&messages.items, unread_from),
+        );
         // `render_body` calls the item closure for every message in order each
         // frame, so a couple of `Cell`s let us inject day separators and a single
         // "new" divider without an extra pass or breaking selection indices.
         let now_local = time::OffsetDateTime::now_utc().to_offset(crate::config::get().tz_offset);
         let last_day: std::cell::Cell<Option<(i32, u16)>> = std::cell::Cell::new(None);
-        let divider_placed = std::cell::Cell::new(false);
+        let idx = std::cell::Cell::new(0usize);
         list::render_body(
             frame,
             messages_area,
@@ -708,10 +697,10 @@ impl CmailScreen {
                         lines.push(separator_line(&day_separator_label(t, now_local), theme));
                     }
                 }
-                if !divider_placed.get() && !m.read && message_from_other(m, other) {
-                    divider_placed.set(true);
+                if unread_from == Some(idx.get()) {
                     lines.push(separator_line("new", theme));
                 }
+                idx.set(idx.get() + 1);
                 lines.extend(message_lines(m, other, theme));
                 ListItem::new(lines)
             },
@@ -998,14 +987,37 @@ fn apply_older_messages(
     }
 }
 
+/// The item index at which the "── new ──" divider should be drawn, given the
+/// conversation's `unread_count`. v0.7 has no per-message read flag, so this is
+/// derived: the divider sits before the oldest of the last `unread_count`
+/// messages the other participant sent. `None` when there's nothing unread.
+fn first_unread_index(
+    messages: &[CmailMessage],
+    other: &CmailUser,
+    unread_count: u32,
+) -> Option<usize> {
+    if unread_count == 0 {
+        return None;
+    }
+    let mut remaining = unread_count;
+    for (i, m) in messages.iter().enumerate().rev() {
+        if message_from_other(m, other) {
+            remaining -= 1;
+            if remaining == 0 {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
 /// Total rendered rows for the message list: two per message, plus one for each
-/// injected day separator and the single "new" divider. Lets the bottom-anchor
-/// stay exact even though items are variable-height.
-fn rendered_message_rows(messages: &[CmailMessage], other: &CmailUser) -> usize {
+/// injected day separator and the single "new" divider (at `unread_from`). Lets
+/// the bottom-anchor stay exact even though items are variable-height.
+fn rendered_message_rows(messages: &[CmailMessage], unread_from: Option<usize>) -> usize {
     let mut rows = 0usize;
     let mut last_day: Option<(i32, u16)> = None;
-    let mut divider = false;
-    for m in messages {
+    for (i, m) in messages.iter().enumerate() {
         if let Some(t) = local_datetime(m.timestamp) {
             let key = day_key(t);
             if last_day != Some(key) {
@@ -1013,8 +1025,7 @@ fn rendered_message_rows(messages: &[CmailMessage], other: &CmailUser) -> usize 
                 rows += 1;
             }
         }
-        if !divider && !m.read && message_from_other(m, other) {
-            divider = true;
+        if unread_from == Some(i) {
             rows += 1;
         }
         rows += 2;
@@ -1022,7 +1033,7 @@ fn rendered_message_rows(messages: &[CmailMessage], other: &CmailUser) -> usize 
     rows
 }
 
-fn bottom_aligned_messages_area(area: Rect, content_rows: usize) -> Rect {
+pub(crate) fn bottom_aligned_messages_area(area: Rect, content_rows: usize) -> Rect {
     if content_rows == 0 || area.height == 0 {
         return area;
     }
@@ -1100,20 +1111,11 @@ fn message_lines(m: &CmailMessage, other: &CmailUser, theme: &Theme) -> Vec<Line
     } else {
         ("→ ", "you".to_string(), theme.accent_style())
     };
-    let mut header = vec![
+    let header = vec![
         Span::styled(prefix, theme.muted_style()),
         Span::styled(who, who_style),
         Span::styled(format!(" · {when}"), theme.muted_style()),
     ];
-    // Read receipt on your own outgoing messages: whether the other side has
-    // read it yet.
-    if !from_other {
-        if m.read {
-            header.push(Span::styled(" · ✓ read", theme.accent_style()));
-        } else {
-            header.push(Span::styled(" · sent", theme.muted_style()));
-        }
-    }
     vec![
         Line::from(header),
         // The body is the primary content, so it uses the base style; only the
@@ -1193,7 +1195,7 @@ fn month_abbr(m: time::Month) -> &'static str {
 
 /// Format a ms-epoch timestamp as a compact relative age ("now", "5m", "3h",
 /// "2d"), falling back to an absolute date for anything older than a week.
-fn format_epoch_millis_relative(ms: i64) -> String {
+pub(crate) fn format_epoch_millis_relative(ms: i64) -> String {
     let secs = ms.div_euclid(1000);
     let Ok(t) = time::OffsetDateTime::from_unix_timestamp(secs) else {
         return String::new();
@@ -1249,7 +1251,6 @@ mod tests {
             sender_username: "alice".into(),
             content: content.into(),
             timestamp,
-            read: true,
         }
     }
 
@@ -1500,13 +1501,18 @@ mod tests {
     #[test]
     fn conversation_shows_day_separator_and_unread_divider() {
         let mut s = CmailScreen::new();
-        s.apply_conversations(Ok(vec![convo("c1", "alice")]));
+        // unread_count on the conversation (v0.7 has no per-message read) drives
+        // the "new" divider; the first message also gets a day separator.
+        let mut c = convo("c1", "alice");
+        c.unread_count = 1;
+        s.apply_conversations(Ok(vec![c]));
         s.open_conversation("c1");
-        // Incoming + unread → triggers the "new" divider; the first message also
-        // gets a day separator.
-        let mut unread = message("m1", "hello there", 1_000);
-        unread.read = false;
-        s.apply_messages("c1", true, Ok((vec![unread], None)));
+        // A message from alice (the other participant), so it counts as unread.
+        s.apply_messages(
+            "c1",
+            true,
+            Ok((vec![message("m1", "hello there", 1_000)], None)),
+        );
 
         let theme = Theme::cyber();
         let backend = ratatui::backend::TestBackend::new(60, 12);
@@ -1659,10 +1665,7 @@ mod tests {
         // The live stream's opening window re-delivers m1 and adds a new m2.
         s.apply_live(
             "c1",
-            vec![
-                CmailLiveUpdate::Message(message("m1", "hi", 1_000)),
-                CmailLiveUpdate::Message(message("m2", "reply", 2_000)),
-            ],
+            vec![message("m1", "hi", 1_000), message("m2", "reply", 2_000)],
         );
 
         let CmailMode::Conversation { messages, .. } = &s.mode else {
@@ -1674,32 +1677,5 @@ mod tests {
             messages.selected, 1,
             "the view follows the new tail when it was pinned to the bottom"
         );
-    }
-
-    #[test]
-    fn apply_live_read_update_flips_flag_without_touching_content() {
-        let mut s = CmailScreen::new();
-        s.apply_conversations(Ok(vec![convo("c1", "alice")]));
-        s.open_conversation("c1");
-        // An outgoing message, not yet read by the other side.
-        let mut mine = message("m1", "you there?", 1_000);
-        mine.read = false;
-        s.apply_messages("c1", true, Ok((vec![mine], None)));
-
-        // A read receipt arrives as a bare read-flag flip.
-        s.apply_live(
-            "c1",
-            vec![CmailLiveUpdate::Read {
-                id: "m1".into(),
-                read: true,
-            }],
-        );
-
-        let CmailMode::Conversation { messages, .. } = &s.mode else {
-            panic!("conversation should remain open");
-        };
-        assert_eq!(messages.items.len(), 1, "no phantom message is created");
-        assert_eq!(messages.items[0].content, "you there?", "content preserved");
-        assert!(messages.items[0].read, "read flag flipped by the receipt");
     }
 }

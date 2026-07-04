@@ -1,6 +1,6 @@
 # cs-tui
 
-A terminal client for [cyberspace.online](https://cyberspace.online), targeting the v0.5.1 API.
+A terminal client for [cyberspace.online](https://cyberspace.online), targeting the v0.7 API.
 
 ![cs-tui screenshot](docs/screenshot.png)
 
@@ -8,7 +8,7 @@ A terminal client for [cyberspace.online](https://cyberspace.online), targeting 
 
 ## Status
 
-Early development. Most of the documented v0.5.1 REST surface is implemented; live testing against the API is ongoing. Chat and DMs await the published Firebase RTDB schema.
+Early development. Most of the documented v0.7 REST surface is implemented, including private C-Mail and multi-user cIRC chat (REST + live Firebase RTDB streaming) and full-text search; live testing against the API is ongoing.
 
 ## Features
 
@@ -186,7 +186,7 @@ location is auto-created).
 |---|---|
 | `crates/cs-api/` | HTTP client + types for the Cyberspace REST API |
 | `crates/cs-tui/` | Ratatui application (binary) |
-| `docs/api-v0.5.1.md` | Authoritative API specification (do not modify) |
+| `docs/api-v0.7.md` | Authoritative API specification (do not modify) |
 
 ## License
 

@@ -30,26 +30,30 @@ const SECTIONS: &[Row] = &[
     },
     Row {
         keys: "4",
-        desc: "Bookmarks",
+        desc: "cIRC",
     },
     Row {
         keys: "5",
-        desc: "Topics",
+        desc: "Bookmarks",
     },
     Row {
         keys: "6",
-        desc: "Profile",
+        desc: "Topics",
     },
     Row {
         keys: "7",
-        desc: "Journal",
+        desc: "Profile",
     },
     Row {
         keys: "8",
-        desc: "Guilds",
+        desc: "Journal",
     },
     Row {
         keys: "9",
+        desc: "Guilds",
+    },
+    Row {
+        keys: "0",
         desc: "Settings",
     },
 ];
@@ -64,7 +68,7 @@ const GLOBAL: &[Row] = &[
         desc: "back",
     },
     Row {
-        keys: "1-9 / ← →",
+        keys: "1-0 / ← →",
         desc: "jump to / cycle sections",
     },
     Row {
@@ -78,6 +82,10 @@ const GLOBAL: &[Row] = &[
     Row {
         keys: "i",
         desc: "toggle inline images (turn off to recover if a post renders as garbage)",
+    },
+    Row {
+        keys: "Ctrl+F",
+        desc: "search users, posts, and replies",
     },
     Row {
         keys: "?",

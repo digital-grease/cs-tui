@@ -1,9 +1,9 @@
 //! Firebase Realtime Database transport client.
 //!
 //! Pure plumbing — no cyberspace.online-specific paths or message shapes. API
-//! v0.6.0 documents the C-Mail RTDB paths (`dm_messages/<conversationId>` and
-//! `user_conversations/<uid>`); cIRC/presence typed layers still wait for a
-//! fuller schema.
+//! v0.7 documents the C-Mail + cIRC RTDB paths (`dm_messages/<conversationId>`,
+//! `chat_messages/<roomId>`, and `user_conversations/<uid>`); the typed message
+//! shapes live in the `cmail` / `circ` modules.
 //!
 //! Usage:
 //! ```ignore

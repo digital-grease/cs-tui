@@ -2,7 +2,7 @@ use serde::Deserialize;
 
 pub type Result<T> = std::result::Result<T, ApiError>;
 
-/// API-level error codes per the v0.6.0 spec (`docs/api-v0.6.0.md` § Error Codes).
+/// API-level error codes per the v0.7 spec (`docs/api-v0.7.md` § Error Codes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ErrorCode {
@@ -14,6 +14,8 @@ pub enum ErrorCode {
     Conflict,
     RateLimited,
     InternalError,
+    /// Upstream service (e.g. search) unavailable (502). Added in v0.7.
+    BadGateway,
     #[serde(other)]
     Unknown,
 }
@@ -28,6 +30,7 @@ impl ErrorCode {
             Self::ValidationError => 400,
             Self::Conflict => 409,
             Self::RateLimited => 429,
+            Self::BadGateway => 502,
             Self::InternalError | Self::Unknown => 500,
         }
     }
@@ -129,6 +132,9 @@ impl ApiError {
                 ErrorCode::Unauthorized => "session expired — please sign in again".to_string(),
                 ErrorCode::RateLimited => "rate limited — slow down a moment".to_string(),
                 ErrorCode::InternalError => "the server hit an error — try again".to_string(),
+                ErrorCode::BadGateway => {
+                    "a server-side service is unavailable — try again".to_string()
+                }
                 ErrorCode::Unknown => server_or(message, "something went wrong"),
             },
             Self::RateLimited { retry_after_secs } => {
@@ -163,6 +169,13 @@ mod tests {
     fn http_status_mapping() {
         assert_eq!(ErrorCode::Unauthorized.http_status(), 401);
         assert_eq!(ErrorCode::RateLimited.http_status(), 429);
+        assert_eq!(ErrorCode::BadGateway.http_status(), 502);
+    }
+
+    #[test]
+    fn bad_gateway_deserializes() {
+        let code: ErrorCode = serde_json::from_str("\"BAD_GATEWAY\"").unwrap();
+        assert_eq!(code, ErrorCode::BadGateway);
     }
 
     #[test]

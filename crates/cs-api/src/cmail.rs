@@ -1,4 +1,4 @@
-//! C-Mail REST endpoints (`/v1/cmail`, API v0.6.0).
+//! C-Mail REST endpoints (`/v1/cmail`, API v0.7).
 //!
 //! C-Mail is Cyberspace's private 1:1 messaging. REST covers starting/loading
 //! conversations and sending/marking messages; live updates come from RTDB using
@@ -58,6 +58,9 @@ pub struct CmailUser {
 }
 
 /// A C-Mail message as returned by history/list responses and RTDB events.
+///
+/// Note: v0.7 dropped the per-message `read` flag (unread is tracked per
+/// conversation via `unreadCount`); the field is gone here too.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CmailMessage {
@@ -72,8 +75,6 @@ pub struct CmailMessage {
     /// Milliseconds since Unix epoch.
     #[serde(default)]
     pub timestamp: i64,
-    #[serde(default)]
-    pub read: bool,
 }
 
 /// A C-Mail conversation summary.
@@ -94,11 +95,20 @@ pub struct CmailConversation {
 }
 
 /// Response from `POST /v1/cmail/:conversationId`.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// A normal send returns `{ conversationId, messageId }`; a slash command the
+/// server answers inline (e.g. `/help`, v0.7) returns `{ reply }` and posts
+/// nothing — so all fields are optional and either shape decodes.
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CmailSendResponse {
-    pub conversation_id: String,
-    pub message_id: String,
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+    #[serde(default)]
+    pub message_id: Option<String>,
+    /// Inline command reply (e.g. from `/help`); the message was not posted.
+    #[serde(default)]
+    pub reply: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -225,73 +235,40 @@ fn next_cursor_fallback(messages: &[CmailMessage], limit: u32) -> Option<String>
     messages.first().map(|m| m.timestamp.to_string())
 }
 
-/// A single change delivered over the live RTDB stream for a conversation.
-#[derive(Debug, Clone, PartialEq)]
-pub enum CmailLiveUpdate {
-    /// A whole message arrived or was replaced (a new message, or a full-object
-    /// push of an existing one).
-    Message(CmailMessage),
-    /// A field-level flip of an existing message's `read` flag — e.g. the other
-    /// participant marked the thread read (a read receipt). Carries only the id
-    /// and new value so applying it never clobbers the message's content.
-    Read { id: String, read: bool },
-}
-
-/// Parse the changes carried by an RTDB `put`/`patch` event on a
-/// `dm_messages/<conversationId>` subscription into [`CmailLiveUpdate`]s.
+/// Parse the messages carried by an RTDB `put`/`patch` event on a
+/// `dm_messages/<conversationId>` subscription into [`CmailMessage`]s.
 ///
-/// Firebase keys each message by id, so the id is the map key (root events) or a
-/// path segment (single-message events), not a field in the payload — this
-/// injects it. A whole-message payload (it carries `content`/`timestamp`) yields
-/// [`CmailLiveUpdate::Message`]; a partial `{ "read": true }` patch, or a
-/// `.../read` scalar patch, yields [`CmailLiveUpdate::Read`]. Deletions
-/// (`data: null`) and other field patches yield nothing.
+/// Firebase keys each message by id, so the id is the map key (root events) or
+/// the final path segment (single-message events), not a field in the payload —
+/// this injects it. Deletions (`data: null`) and deeper field patches carry no
+/// whole message and yield nothing.
 #[must_use]
-pub fn updates_from_rtdb_event(path: &str, data: &Value) -> Vec<CmailLiveUpdate> {
+pub fn messages_from_rtdb_event(path: &str, data: &Value) -> Vec<CmailMessage> {
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     match segments.as_slice() {
-        // Root event: `data` is a map of `{ <msgId>: <message-or-patch>, ... }`.
+        // Root event: `data` is a map of `{ <msgId>: <message>, ... }`.
         [] => match data {
             Value::Object(map) => map
                 .iter()
-                .filter_map(|(id, value)| update_from_rtdb_value(id, value))
+                .filter_map(|(id, value)| message_from_rtdb_value(id, value))
                 .collect(),
             _ => Vec::new(),
         },
-        // Single-object event: the id is the (only) path segment.
-        [id] => update_from_rtdb_value(id, data).into_iter().collect(),
-        // A scalar patch on a single field, e.g. `dm_messages/<cid>/<msgId>/read`.
-        [id, "read"] => data
-            .as_bool()
-            .map(|read| CmailLiveUpdate::Read {
-                id: (*id).to_string(),
-                read,
-            })
-            .into_iter()
-            .collect(),
-        // Other deep field patches carry no update we model.
+        // Single-message event: the id is the (only) path segment.
+        [id] => message_from_rtdb_value(id, data).into_iter().collect(),
         _ => Vec::new(),
     }
 }
 
-fn update_from_rtdb_value(id: &str, value: &Value) -> Option<CmailLiveUpdate> {
-    let obj = value.as_object()?;
-    // A whole message always carries content/timestamp; a partial read-receipt
-    // patch carries only `read`.
-    if obj.contains_key("content") || obj.contains_key("timestamp") {
-        let mut message: CmailMessage = serde_json::from_value(value.clone()).ok()?;
-        if message.id.is_empty() {
-            message.id = id.to_string();
-        }
-        Some(CmailLiveUpdate::Message(message))
-    } else {
-        obj.get("read")
-            .and_then(Value::as_bool)
-            .map(|read| CmailLiveUpdate::Read {
-                id: id.to_string(),
-                read,
-            })
+fn message_from_rtdb_value(id: &str, value: &Value) -> Option<CmailMessage> {
+    if !value.is_object() {
+        return None;
     }
+    let mut message: CmailMessage = serde_json::from_value(value.clone()).ok()?;
+    if message.id.is_empty() {
+        message.id = id.to_string();
+    }
+    Some(message)
 }
 
 fn validate_cmail_content(content: &str) -> Result<()> {
@@ -364,20 +341,27 @@ mod tests {
 
     #[test]
     fn message_decodes_timestamp_millis() {
+        // A stray `read` (from a pre-v0.7 server) is simply ignored.
         let msg: CmailMessage = serde_json::from_str(
             r#"{"id":"m1","senderId":"u1","senderUsername":"me","content":"hi","timestamp":1719700000000,"read":false}"#,
         )
         .unwrap();
         assert_eq!(msg.timestamp, 1_719_700_000_000);
-        assert!(!msg.read);
+        assert_eq!(msg.content, "hi");
     }
 
     #[test]
-    fn send_response_decodes() {
+    fn send_response_decodes_posted_and_command_reply() {
         let sent: CmailSendResponse =
             serde_json::from_str(r#"{"conversationId":"c1","messageId":"m1"}"#).unwrap();
-        assert_eq!(sent.conversation_id, "c1");
-        assert_eq!(sent.message_id, "m1");
+        assert_eq!(sent.conversation_id.as_deref(), Some("c1"));
+        assert_eq!(sent.message_id.as_deref(), Some("m1"));
+        assert!(sent.reply.is_none());
+
+        // A `/help` command answered inline (posts nothing).
+        let help: CmailSendResponse = serde_json::from_str(r#"{"reply":"commands: …"}"#).unwrap();
+        assert_eq!(help.reply.as_deref(), Some("commands: …"));
+        assert!(help.message_id.is_none());
     }
 
     #[test]
@@ -451,23 +435,13 @@ mod tests {
         assert_eq!(next_cursor_fallback(&[], 50), None);
     }
 
-    fn only_messages(updates: Vec<CmailLiveUpdate>) -> Vec<CmailMessage> {
-        updates
-            .into_iter()
-            .filter_map(|u| match u {
-                CmailLiveUpdate::Message(m) => Some(m),
-                CmailLiveUpdate::Read { .. } => None,
-            })
-            .collect()
-    }
-
     #[test]
     fn rtdb_root_event_parses_message_map_with_ids_from_keys() {
         let data = serde_json::json!({
-            "m1": {"senderId":"u2","senderUsername":"alice","content":"hi","timestamp":1_000,"read":false},
-            "m2": {"senderId":"u1","senderUsername":"me","content":"yo","timestamp":2_000,"read":true}
+            "m1": {"senderId":"u2","senderUsername":"alice","content":"hi","timestamp":1_000},
+            "m2": {"senderId":"u1","senderUsername":"me","content":"yo","timestamp":2_000}
         });
-        let mut msgs = only_messages(updates_from_rtdb_event("/", &data));
+        let mut msgs = messages_from_rtdb_event("/", &data);
         msgs.sort_by_key(|m| m.timestamp);
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].id, "m1");
@@ -478,47 +452,24 @@ mod tests {
     #[test]
     fn rtdb_single_message_event_takes_id_from_path() {
         let data = serde_json::json!(
-            {"senderId":"u2","senderUsername":"alice","content":"you there?","timestamp":3_000,"read":false}
+            {"senderId":"u2","senderUsername":"alice","content":"you there?","timestamp":3_000}
         );
-        let updates = updates_from_rtdb_event("/m3", &data);
         assert_eq!(
-            updates,
-            vec![CmailLiveUpdate::Message(CmailMessage {
+            messages_from_rtdb_event("/m3", &data),
+            vec![CmailMessage {
                 id: "m3".into(),
                 sender_id: "u2".into(),
                 sender_username: "alice".into(),
                 content: "you there?".into(),
                 timestamp: 3_000,
-                read: false,
-            })]
-        );
-    }
-
-    #[test]
-    fn rtdb_read_receipt_patches_parse_as_read_updates() {
-        // A partial object patch: `{ "read": true }` at the message path.
-        assert_eq!(
-            updates_from_rtdb_event("/m3", &serde_json::json!({"read": true})),
-            vec![CmailLiveUpdate::Read {
-                id: "m3".into(),
-                read: true
-            }]
-        );
-        // A scalar patch straight on the `read` field.
-        assert_eq!(
-            updates_from_rtdb_event("/m3/read", &serde_json::json!(true)),
-            vec![CmailLiveUpdate::Read {
-                id: "m3".into(),
-                read: true
             }]
         );
     }
 
     #[test]
-    fn rtdb_deletions_and_unknown_field_patches_yield_nothing() {
-        // `data: null` (a deletion) and unmodelled field patches yield no update.
-        assert!(updates_from_rtdb_event("/m3", &Value::Null).is_empty());
-        assert!(updates_from_rtdb_event("/m3/content", &serde_json::json!("edited")).is_empty());
+    fn rtdb_deletions_yield_nothing() {
+        // `data: null` (a deletion) carries no whole message.
+        assert!(messages_from_rtdb_event("/m3", &Value::Null).is_empty());
     }
 
     #[test]

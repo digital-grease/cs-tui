@@ -13,6 +13,7 @@ pub enum RootKind {
     Feed,
     Notifications,
     Cmail,
+    Circ,
     Bookmarks,
     Topics,
     Profile,
@@ -28,6 +29,7 @@ impl RootKind {
             Self::Feed,
             Self::Notifications,
             Self::Cmail,
+            Self::Circ,
             Self::Bookmarks,
             Self::Topics,
             Self::Profile,
@@ -43,6 +45,7 @@ impl RootKind {
             Self::Feed => "Feed",
             Self::Notifications => "Notifications",
             Self::Cmail => "C-Mail",
+            Self::Circ => "cIRC",
             Self::Bookmarks => "Bookmarks",
             Self::Topics => "Topics",
             Self::Profile => "Profile",
@@ -74,12 +77,14 @@ impl RootKind {
             Self::Feed => '1',
             Self::Notifications => '2',
             Self::Cmail => '3',
-            Self::Bookmarks => '4',
-            Self::Topics => '5',
-            Self::Profile => '6',
-            Self::Journal => '7',
-            Self::Guilds => '8',
-            Self::Settings => '9',
+            Self::Circ => '4',
+            Self::Bookmarks => '5',
+            Self::Topics => '6',
+            Self::Profile => '7',
+            Self::Journal => '8',
+            Self::Guilds => '9',
+            // Tenth section takes the '0' key.
+            Self::Settings => '0',
         }
     }
 
@@ -89,12 +94,13 @@ impl RootKind {
             '1' => Some(Self::Feed),
             '2' => Some(Self::Notifications),
             '3' => Some(Self::Cmail),
-            '4' => Some(Self::Bookmarks),
-            '5' => Some(Self::Topics),
-            '6' => Some(Self::Profile),
-            '7' => Some(Self::Journal),
-            '8' => Some(Self::Guilds),
-            '9' => Some(Self::Settings),
+            '4' => Some(Self::Circ),
+            '5' => Some(Self::Bookmarks),
+            '6' => Some(Self::Topics),
+            '7' => Some(Self::Profile),
+            '8' => Some(Self::Journal),
+            '9' => Some(Self::Guilds),
+            '0' => Some(Self::Settings),
             _ => None,
         }
     }
@@ -246,7 +252,7 @@ mod tests {
     #[test]
     fn unknown_shortcut_returns_none() {
         assert_eq!(RootKind::from_shortcut('x'), None);
-        assert_eq!(RootKind::from_shortcut('0'), None);
+        assert_eq!(RootKind::from_shortcut('0'), Some(RootKind::Settings));
         assert_eq!(RootKind::from_shortcut('a'), None);
     }
 
