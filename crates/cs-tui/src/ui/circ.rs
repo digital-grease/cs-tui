@@ -448,8 +448,20 @@ impl CircScreen {
             .split(inner);
 
         let visible: Vec<usize> = (0..messages.items.len()).collect();
-        let messages_area =
-            bottom_aligned_messages_area(layout[0], messages.items.len().saturating_mul(2));
+        let content_rows = messages.items.len().saturating_mul(2);
+        let mut messages_area = bottom_aligned_messages_area(layout[0], content_rows);
+        // Every cIRC message is exactly 2 rows. When the history overflows the
+        // pane, ratatui's `List` tiles whole items top-down from the scroll
+        // offset, so an odd pane height leaves a 1-row remainder blank at the
+        // bottom (e.g. the empty gap that appears above the composer while a
+        // send is pending and `out_rows` flips the height to odd). Trim that
+        // remainder off the top so the newest message stays flush above the
+        // composer.
+        if content_rows >= messages_area.height as usize {
+            let remainder = messages_area.height % 2;
+            messages_area.y += remainder;
+            messages_area.height -= remainder;
+        }
         list::render_body(
             frame,
             messages_area,
@@ -642,6 +654,83 @@ mod tests {
         s.open_room(slug);
         s.apply_messages(slug, true, Ok((vec![], None)));
         s
+    }
+
+    /// Renders `s` into a fixed backend and returns the inner (border-stripped)
+    /// text rows, trailing-trimmed.
+    fn render_rows(s: &CircScreen, height: u16) -> Vec<String> {
+        let theme = Theme::cyber();
+        let backend = ratatui::backend::TestBackend::new(50, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| s.render(f, f.area(), &theme)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    // Strip the left/right border cells before trimming.
+                    .trim_matches(|c| c == '│' || c == '┌' || c == '┐' || c == '└' || c == '┘')
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pending_send_keeps_newest_message_flush_above_composer() {
+        // Regression: cIRC messages are 2 rows each, so an odd message-pane
+        // height (as when a pending send's optimistic strip is showing) used to
+        // leave a blank remainder row between the newest message and the
+        // composer. The newest message must stay flush against the outgoing
+        // strip.
+        let mut s = open("general");
+        // Enough history to overflow the pane (the active-chat case).
+        let msgs: Vec<CircMessage> = (0..6)
+            .map(|i| message(&format!("m{i}"), "neo", &format!("line {i}"), 1_000 + i64::from(i)))
+            .collect();
+        s.apply_messages("general", true, Ok((msgs, None)));
+
+        // Send optimistically — the "sending…" strip forces an odd pane height.
+        for c in "hi".chars() {
+            s.handle_key(key(KeyCode::Char(c)));
+        }
+        s.handle_key(key(KeyCode::Enter));
+
+        let rows = render_rows(&s, 14);
+        let strip = rows
+            .iter()
+            .position(|r| r.contains("sending…"))
+            .expect("outgoing strip should be visible");
+        assert!(
+            rows[strip - 1].contains("line 5"),
+            "newest message must sit flush above the composer, not across a blank gap:\n{}",
+            rows.join("\n"),
+        );
+    }
+
+    #[test]
+    fn odd_pane_height_has_no_trailing_blank_row() {
+        // The parity bug also shows at rest on odd-height terminals (no pending
+        // send). The bottom message row must be non-blank right above the footer.
+        let mut s = open("general");
+        let msgs: Vec<CircMessage> = (0..6)
+            .map(|i| message(&format!("m{i}"), "neo", &format!("line {i}"), 1_000 + i64::from(i)))
+            .collect();
+        s.apply_messages("general", true, Ok((msgs, None)));
+
+        // Height 13 → odd inner message pane; the row above the composer input
+        // (`› `) must be the newest message body, not a blank.
+        let rows = render_rows(&s, 13);
+        let input = rows
+            .iter()
+            .position(|r| r.starts_with("› "))
+            .expect("composer input line should be visible");
+        assert!(
+            rows[input - 1].contains("line 5"),
+            "no blank row should sit between the newest message and the composer:\n{}",
+            rows.join("\n"),
+        );
     }
 
     #[test]
