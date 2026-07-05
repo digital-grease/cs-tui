@@ -1,6 +1,6 @@
 //! Notification types and endpoints (`/v1/notifications/*`).
 use reqwest::Method;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use time::OffsetDateTime;
 
 use crate::client::Client;
@@ -148,9 +148,25 @@ pub struct Notification {
     #[serde(default)]
     pub reason: Option<String>,
 
-    /// Type-dependent context; unknown keys are ignored.
-    #[serde(default)]
+    /// Type-dependent context; unknown keys are ignored. `#[serde(default)]`
+    /// covers an absent key, and `deserialize_metadata` maps an explicit
+    /// `"metadata": null` (which the server sends for context-free types) to the
+    /// default rather than failing to decode the whole page.
+    #[serde(default, deserialize_with = "deserialize_metadata")]
     pub metadata: NotificationMetadata,
+}
+
+/// Decode a notification's `metadata`, tolerating an explicit JSON `null`.
+/// Plain `#[serde(default)]` only fills in a *missing* key; a present-but-null
+/// value would otherwise error with "invalid type: null, expected struct
+/// NotificationMetadata" and sink the entire notifications page.
+fn deserialize_metadata<'de, D>(
+    deserializer: D,
+) -> std::result::Result<NotificationMetadata, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<NotificationMetadata>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 impl Notification {
@@ -349,6 +365,32 @@ mod tests {
         let n: Notification = serde_json::from_str(raw).unwrap();
         assert_eq!(n.notification_id, "n1");
         assert_eq!(n.kind, NotificationType::Poke);
+    }
+
+    #[test]
+    fn notification_tolerates_null_metadata() {
+        // The server sends `"metadata": null` for context-free types (e.g.
+        // chat mentions). `#[serde(default)]` alone can't absorb an explicit
+        // null, so this must not fail the whole decode.
+        let raw = r#"{"id":"n1","type":"chat_mention","metadata":null}"#;
+        let n: Notification = serde_json::from_str(raw).unwrap();
+        assert_eq!(n.notification_id, "n1");
+        assert_eq!(n.kind, NotificationType::ChatMention);
+        assert!(n.metadata.post_slug.is_none());
+        assert!(n.reply_id().is_none());
+    }
+
+    #[test]
+    fn notification_page_survives_one_null_metadata() {
+        // A single null-metadata entry mixed with a fully-populated one must
+        // still decode the page (the live-repro shape from cs-tui.log).
+        let raw = r#"[
+            {"id":"a","type":"chat_mention","metadata":{"roomName":"The Sprawl"}},
+            {"id":"b","type":"poke","metadata":null}
+        ]"#;
+        let ns: Vec<Notification> = serde_json::from_str(raw).unwrap();
+        assert_eq!(ns.len(), 2);
+        assert_eq!(ns[1].notification_id, "b");
     }
 
     #[test]
