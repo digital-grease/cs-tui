@@ -73,6 +73,14 @@ impl<T> TabState<T> {
             Ok((items, cursor)) => {
                 self.items = items;
                 self.next_cursor = cursor;
+                // The items are replaced wholesale, so the persisted scroll offset
+                // (an index into the *previous* list) is now meaningless. Reset it
+                // to 0 and let the next render re-derive the viewport from the
+                // selection — otherwise a refresh that returns fewer items than
+                // were on screen (e.g. cIRC's post-send reload after live messages
+                // have accumulated) leaves the offset clamped past the new end,
+                // blanking the pane and stranding the selected row at the top.
+                self.list_offset.set(0);
                 if self.selected >= view_len(self) {
                     self.selected = 0;
                 }
@@ -220,6 +228,20 @@ mod tests {
         s.apply_initial(Ok((vec![1], Some("c".into()))));
         s.apply_more(Err("blip".into()));
         assert!(load_more_error(&s).unwrap().contains("blip"));
+    }
+
+    #[test]
+    fn apply_initial_resets_stale_scroll_offset() {
+        // Regression (cIRC blank-pane-on-post): a persisted scroll offset from a
+        // previously-longer list must not survive a refresh that replaces the
+        // items with a shorter page, or ratatui clamps the offset past the new
+        // end and renders only the selected row at the top of a blank pane.
+        let mut s: TabState<i32> = TabState::default();
+        s.apply_initial(Ok(((0..100).collect(), None)));
+        s.shift_offset(94); // emulate the viewport having scrolled to the tail
+        assert_eq!(s.list_offset.get(), 94);
+        s.apply_initial(Ok(((0..50).collect(), None)));
+        assert_eq!(s.list_offset.get(), 0);
     }
 
     #[test]

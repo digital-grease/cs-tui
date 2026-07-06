@@ -800,6 +800,65 @@ mod tests {
     }
 
     #[test]
+    fn post_send_reload_keeps_newest_flush_not_blank() {
+        // Regression: with a room open long enough that live messages accumulate
+        // past one page, the render settles a large persisted scroll offset. The
+        // post-send reload replaces the history with a shorter page; the stale
+        // offset used to survive, so ratatui clamped it past the new end and drew
+        // only the newest (selected) message at the *top* of an otherwise blank
+        // pane. After the reload the newest message must stay flush at the bottom.
+        let mut s = open("general");
+        // A long backlog (as accumulated over time), rendered so the viewport
+        // scroll offset settles near the tail.
+        let backlog: Vec<CircMessage> = (0..60)
+            .map(|i| {
+                message(
+                    &format!("m{i}"),
+                    "neo",
+                    &format!("line {i}"),
+                    1_000 + i64::from(i),
+                )
+            })
+            .collect();
+        s.apply_messages("general", true, Ok((backlog, None)));
+        let _ = render_rows(&s, 14); // settle the persisted scroll offset
+
+        // The post-send reload returns only the newest page (fewer items than the
+        // backlog on screen), mirroring `read_circ_room`'s default 50-limit.
+        let page: Vec<CircMessage> = (10..60)
+            .map(|i| {
+                message(
+                    &format!("m{i}"),
+                    "neo",
+                    &format!("line {i}"),
+                    1_000 + i64::from(i),
+                )
+            })
+            .collect();
+        s.apply_messages("general", true, Ok((page, None)));
+
+        let rows = render_rows(&s, 14);
+        let input = rows
+            .iter()
+            .position(|r| r.starts_with("› "))
+            .expect("composer input line should be visible");
+        assert!(
+            rows[input - 1].contains("line 59"),
+            "after the post-send reload the newest message must sit flush above \
+             the composer, not stranded at the top of a blank pane:\n{}",
+            rows.join("\n"),
+        );
+        // The pane must not be blank: more than just the single newest message
+        // should be visible above the composer.
+        let visible_bodies = rows.iter().filter(|r| r.contains("line ")).count();
+        assert!(
+            visible_bodies > 1,
+            "the message pane blanked after reload (only one row visible):\n{}",
+            rows.join("\n"),
+        );
+    }
+
+    #[test]
     fn long_message_wraps_onto_multiple_rows() {
         let mut s = open("general");
         let long = "the quick brown fox jumps over the lazy dog and keeps on running well past the edge of the pane";
