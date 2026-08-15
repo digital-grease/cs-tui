@@ -1,7 +1,12 @@
-//! Guilds index screen (root `8`) — a paginated list of guilds, most populated
+//! Guilds index screen (root `9`): a paginated list of guilds, most populated
 //! first. Enter opens the selected guild's detail screen.
+//!
+//! Ordering is by `memberCount` alone (API v0.8.6 § List Guilds), so the
+//! apprentices a guild has never move it up the list. Rows therefore spell out
+//! both counts rather than showing a single number: neither one is the guild's
+//! headcount on its own, and a lone total would make the ordering look broken.
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use cs_api::Guild;
+use cs_api::{Guild, GuildRole};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, ListItem, Paragraph};
@@ -139,13 +144,63 @@ impl Default for GuildsScreen {
     }
 }
 
+/// A guild's headcount, spelled out honestly (API v0.8.6 § List Guilds).
+///
+/// `memberCount` counts founders and members, `apprenticeCount` counts
+/// apprentices, and the guild's headcount is the sum, so neither field on its
+/// own is the number of people in the guild and neither may be printed as if
+/// it were. Guilds that predate apprenticeships omit `apprenticeCount`, which
+/// reads as 0 and prints as the plain member count they have always shown.
+///
+/// Shared with the guild detail screen so both surfaces say the same thing.
+pub fn headcount_label(g: &Guild) -> String {
+    if g.apprentice_count == 0 {
+        return count_label(g.member_count, "member");
+    }
+    format!(
+        "{} · {} · {} total",
+        count_label(g.member_count, "member"),
+        count_label(g.apprentice_count, "apprentice"),
+        g.headcount()
+    )
+}
+
+/// The word for a role somebody holds in a guild (API v0.8.6 § Guilds).
+///
+/// `None` for a role this client doesn't model and for a row that arrived
+/// without one, so neither is printed as a guess. v0.8.6 widened the vocabulary
+/// from founder/member to founder/member/apprentice, and a client that fills an
+/// unrecognized role in with "member" is exactly how an apprentice comes to be
+/// shown wearing a badge they don't have.
+///
+/// Shared by the guild roster and the profile's guilds tab, so one person's
+/// role reads the same wherever it is shown.
+#[must_use]
+pub fn role_label(role: Option<GuildRole>) -> Option<&'static str> {
+    match role {
+        Some(GuildRole::Founder) => Some("founder"),
+        Some(GuildRole::Member) => Some("member"),
+        Some(GuildRole::Apprentice) => Some("apprentice"),
+        Some(GuildRole::Unknown) | None => None,
+    }
+}
+
+/// `n` with its noun, singular when there is exactly one of them.
+fn count_label(n: u32, noun: &str) -> String {
+    if n == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{n} {noun}s")
+    }
+}
+
 fn guild_item(g: &Guild, theme: &Theme) -> ListItem<'static> {
     // The API's `icon` is an icon *identifier* (e.g. "arrows-maximize"), not a
     // glyph, so it's not rendered as text.
     let header = Line::from(vec![
         Span::styled(g.name.clone(), theme.accent_style()),
         Span::styled(
-            format!("  #{} · {} members", g.slug, g.member_count),
+            format!("  #{} · {}", g.slug, headcount_label(g)),
             theme.muted_style(),
         ),
     ]);
@@ -184,6 +239,14 @@ mod tests {
             slug: slug.into(),
             member_count: 3,
             ..Default::default()
+        }
+    }
+
+    fn counted(members: u32, apprentices: u32) -> Guild {
+        Guild {
+            member_count: members,
+            apprentice_count: apprentices,
+            ..guild("owls")
         }
     }
 
@@ -228,6 +291,42 @@ mod tests {
             s.handle_key(key(KeyCode::Char('n'))),
             GuildsIntent::LoadMore
         );
+    }
+
+    #[test]
+    fn headcount_label_reads_a_guild_with_no_apprentices_as_before() {
+        // `apprenticeCount` is missing on guilds that predate apprenticeships,
+        // which decodes to 0, so such a guild reads as it always did.
+        let g = counted(12, 0);
+        assert_eq!(headcount_label(&g), "12 members");
+    }
+
+    #[test]
+    fn headcount_label_names_both_counts_and_the_total() {
+        let g = counted(12, 3);
+        assert_eq!(headcount_label(&g), "12 members · 3 apprentices · 15 total");
+    }
+
+    #[test]
+    fn headcount_label_uses_singular_nouns_for_one() {
+        let g = counted(1, 1);
+        assert_eq!(headcount_label(&g), "1 member · 1 apprentice · 2 total");
+    }
+
+    #[test]
+    fn role_labels_cover_the_v0_8_6_vocabulary() {
+        // v0.8.6 added `apprentice` to a founder/member vocabulary. Guessing at
+        // a role the client doesn't know is how the next addition would show up
+        // wearing the wrong word.
+        assert_eq!(role_label(Some(GuildRole::Founder)), Some("founder"));
+        assert_eq!(role_label(Some(GuildRole::Member)), Some("member"));
+        assert_eq!(role_label(Some(GuildRole::Apprentice)), Some("apprentice"));
+        assert_eq!(
+            role_label(Some(GuildRole::Unknown)),
+            None,
+            "an unmodelled role isn't called a member"
+        );
+        assert_eq!(role_label(None), None);
     }
 
     #[test]

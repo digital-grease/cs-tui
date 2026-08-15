@@ -199,6 +199,37 @@ const PROFILE: &[Row] = &[
         keys: "P",
         desc: "pin / unpin the selected post (your own Posts tab)",
     },
+    Row {
+        keys: "",
+        desc: "the guilds tab lists every guild they are in, the one on their profile badge first, then their apprenticeships; Enter opens one",
+    },
+];
+
+const GUILDS: &[Row] = &[
+    Row {
+        keys: "J then y",
+        desc: "join the guild you are looking at",
+    },
+    Row {
+        keys: "",
+        desc: "the server picks the role: your badge guild if you have none yet, otherwise an apprenticeship, and you can hold five of those",
+    },
+    Row {
+        keys: "P then y",
+        desc: "make this guild the badge on your profile; the guild it replaces becomes an apprenticeship, so you stay in both",
+    },
+    Row {
+        keys: "L then y",
+        desc: "leave (an apprenticeship too); founders cannot leave through the API",
+    },
+    Row {
+        keys: "",
+        desc: "join, promote and leave each ask before sending, and each is a 3/min, 15/day write, so a mistyped key costs nothing; any key but y cancels",
+    },
+    Row {
+        keys: "c",
+        desc: "start a thread; guild forums are open, so membership is not required",
+    },
 ];
 
 const CIRC: &[Row] = &[
@@ -364,6 +395,7 @@ fn help_lines(theme: &Theme, desc_width: usize) -> Vec<Line<'static>> {
     group(&mut lines, "Lists & reading", COMMON);
     group(&mut lines, "Posts & replies", POSTS);
     group(&mut lines, "Profile", PROFILE);
+    group(&mut lines, "Guilds", GUILDS);
     group(&mut lines, "cIRC room", CIRC);
     group(&mut lines, "cIRC message select (Ctrl+B)", CIRC_SELECT);
     group(&mut lines, "C-Mail conversation", CMAIL);
@@ -605,6 +637,22 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn help_covers_the_guild_membership_keys() {
+        let text = body_text(&Theme::cyber());
+        assert!(text.contains("Guilds"), "no guild group");
+        assert!(text.contains("join the guild"));
+        assert!(text.contains("the server picks the role"));
+        assert!(
+            text.contains("make this guild the badge"),
+            "promoting an apprenticeship is undocumented"
+        );
+        assert!(text.contains("leave (an apprenticeship too)"));
+        assert!(text.contains("start a thread"));
+        // The profile's own guilds tab is named alongside the profile keys.
+        assert!(text.contains("the guilds tab lists every guild"));
     }
 
     #[test]

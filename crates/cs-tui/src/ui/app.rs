@@ -14,7 +14,8 @@ use cs_api::{
     CmailMessage, CmailPresenceUpdate, CmailTypingResponse, CmailTypingStatus, EndpointKey, Entry,
     EntryEdit, ErrorCode, FlagResponse, Follow, FollowsDirection, Guild, GuildMembership,
     GuildThread, JoinedGuild, Note, NoteRevision, Notification, NotificationType,
-    NotificationsFilter, PokeResponse, ProfileUpdate, Reply, Settings, SettingsUpdate, Topic, User,
+    NotificationsFilter, PokeResponse, ProfileUpdate, PromotedGuild, Reply, Settings,
+    SettingsUpdate, Topic, UnreadCount, User, UserGuild,
 };
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::DefaultTerminal;
@@ -211,8 +212,10 @@ pub enum BgEvent {
     /// The newest feed page from the background poll — prepended without moving
     /// the user's scroll position. Only emitted while the feed is on screen.
     FeedHead(Vec<Entry>),
-    NotificationsInitial(Result<(Vec<Notification>, Option<String>), String>),
-    NotificationsMore(Result<(Vec<Notification>, Option<String>), String>),
+    /// A fresh notifications page, tagged with the query generation that asked
+    /// for it so a response from a superseded filter can be dropped.
+    NotificationsInitial(u64, Result<(Vec<Notification>, Option<String>), String>),
+    NotificationsMore(u64, Result<(Vec<Notification>, Option<String>), String>),
     CmailConversations(Result<Vec<CmailConversation>, String>),
     CmailMessages {
         conversation_id: String,
@@ -418,7 +421,12 @@ pub enum BgEvent {
         post_id: String,
         result: Result<bool, String>,
     },
-    UnreadCount(u32),
+    /// The unread-notification total from `GET /v1/notifications/unread-count`
+    /// (v0.8.6 § Unread Count). The whole struct travels, not just the number:
+    /// above 100 unread the server counts only the 100 most recent and the
+    /// badge has to read "99+" instead of the figure, which `count` alone
+    /// cannot say.
+    UnreadCount(UnreadCount),
     ProfileUser(Result<User, String>),
     ProfilePosts {
         more: bool,
@@ -436,6 +444,10 @@ pub enum BgEvent {
         more: bool,
         result: Result<(Vec<Follow>, Option<String>), String>,
     },
+    /// Every guild the viewed profile's owner is in (v0.8.6 § List a User's
+    /// Guilds). No `more` flag and no cursor: the endpoint answers with at most
+    /// six rows and never paginates, so each result replaces the tab outright.
+    ProfileGuilds(Result<Vec<UserGuild>, String>),
     ProfileFollowToggled(Result<Option<String>, String>), // Ok(Some(follow_id)) on follow, Ok(None) on unfollow
     ProfileUpdated(Result<User, String>),
     /// Ok carries (post_id, final slug) — the server may suffix the slug on
@@ -517,6 +529,18 @@ pub enum BgEvent {
         slug: String,
         result: Result<String, String>,
     },
+    /// Result of `POST /v1/guilds/:slug/promote` (v0.8.6 § Change Your Guild
+    /// Badge): the badge moves onto an apprenticeship and the guild it replaces
+    /// becomes an apprenticeship in turn, so nothing is left.
+    GuildPromoted {
+        slug: String,
+        result: Result<PromotedGuild, String>,
+    },
+    /// The signed-in account's own guilds (v0.8.6 § List a User's Guilds),
+    /// re-read after every membership write. The guild screen needs them to say
+    /// which guild wears the badge and how many apprenticeships are already
+    /// held, so it can refuse a sixth without spending a join to learn it.
+    OwnGuilds(Result<Vec<UserGuild>, String>),
     GuildThreadCreated {
         slug: String,
         result: Result<String, String>,
@@ -865,6 +889,11 @@ enum Action {
     GuildJoin {
         slug: String,
     },
+    /// Hand the profile badge to this guild (§ Change Your Guild Badge). The
+    /// screen has already run its `y` confirm, so this is not re-prompted.
+    GuildPromote {
+        slug: String,
+    },
     GuildLeave {
         slug: String,
     },
@@ -883,7 +912,11 @@ pub struct App {
     screen: Screen,
     back_stack: Vec<Screen>,
     current_root: Option<RootKind>,
-    unread_count: u32,
+    /// The unread-notification total behind the tab-bar badge (v0.8.6 § Unread
+    /// Count). Kept as the whole struct so the badge can render "99+" for a
+    /// count the server capped, which a bare number cannot distinguish from an
+    /// inbox of exactly 100.
+    unread_count: UnreadCount,
     cmail_unread_count: u32,
     should_quit: bool,
     bg_tx: mpsc::UnboundedSender<BgEvent>,
@@ -972,6 +1005,14 @@ pub struct App {
     /// otherwise skip cells (e.g. the background fill) it believes unchanged,
     /// leaving the editor's blank screen showing through.
     force_clear: bool,
+    /// Session cache of the signed-in account's own guilds (v0.8.6 § List a
+    /// User's Guilds): the badge guild plus any apprenticeships, at most six
+    /// rows. Read once at login and again after every membership write, and
+    /// handed to each guild screen as it opens, so the join/promote/leave
+    /// prompts can name the badge guild and count the apprenticeships without
+    /// spending a read per guild the user browses. `None` until the first read
+    /// lands, which the screens treat as "unknown" rather than "none".
+    own_guilds: Option<Vec<UserGuild>>,
     /// Session cache of the topics list, warmed in the background from login by
     /// a gentle paginated fill (the topics section can run to thousands, so we
     /// trickle them in rather than blocking a search on loading every page). The
@@ -982,6 +1023,17 @@ pub struct App {
     /// Bumped on refresh to invalidate the in-flight warm-up task (its remaining
     /// pages are discarded by epoch check) before a fresh one starts.
     topics_epoch: Arc<AtomicU64>,
+    /// Generation counter for the notifications query (mirrors `topics_epoch`),
+    /// bumped every time a fresh query starts: the initial load, `r`, and the
+    /// `f`/`t` filter keys.
+    ///
+    /// v0.8.6 filters muted and switched-off types server-side, so a page can
+    /// come back short or empty while more results exist, and the shell chases
+    /// the next page automatically. That chase can still be in flight when the
+    /// reader changes the filter, which is exactly when they reach for it. The
+    /// epoch lets a late page from the old query be dropped instead of appended
+    /// under the new filter's heading, taking the old cursor with it.
+    notifications_epoch: Arc<AtomicU64>,
     /// The user's followed / muted topic slugs (from settings), used for the
     /// topics-list markers and the follow/mute toggles. Loaded lazily the first
     /// time the topics section is opened.
@@ -1071,7 +1123,7 @@ impl App {
             screen: Screen::Login(LoginScreen::new(prefill_email)),
             back_stack: Vec::new(),
             current_root: None,
-            unread_count: 0,
+            unread_count: UnreadCount::default(),
             cmail_unread_count: 0,
             should_quit: false,
             bg_tx,
@@ -1099,9 +1151,11 @@ impl App {
             cmail_unread_initialized: false,
             input_paused: Arc::new(AtomicBool::new(false)),
             force_clear: false,
+            own_guilds: None,
             topics_cache: Vec::new(),
             topics_complete: false,
             topics_epoch: Arc::new(AtomicU64::new(0)),
+            notifications_epoch: Arc::new(AtomicU64::new(0)),
             topic_follows: Vec::new(),
             topic_mutes: Vec::new(),
             topic_prefs_loaded: false,
@@ -1171,6 +1225,9 @@ impl App {
         // Learn who we are before any room is opened, so `d` is offered on the
         // user's own cIRC messages and `F` only on everyone else's.
         self.spawn_viewer_identity();
+        // Which guilds this account is in, so the first guild it opens already
+        // knows what a join or a promote there would actually do.
+        self.spawn_own_guilds();
         self.goto_root(crate::config::get().start_section);
         if self.poller_started {
             // A poller from a previous session is still alive (it idled on the
@@ -1502,6 +1559,11 @@ impl App {
                 NotificationsIntent::OpenCmail { username, user_id } => {
                     Action::OpenCmailWith { username, user_id }
                 }
+                // A notification that names somebody but gives nothing to read
+                // (a new follower, a poke, a graffiti mention). The screen
+                // builds this only from `Notification::actor_profile`, so the
+                // literal "system" sender never arrives here.
+                NotificationsIntent::OpenUser { username } => Action::ProfileOpenUser { username },
                 NotificationsIntent::None => Action::None,
             },
             Screen::Cmail(s) => match s.handle_key(key) {
@@ -1790,6 +1852,9 @@ impl App {
                         ProfileTab::Replies => s.replies.next_cursor.clone(),
                         ProfileTab::Followers => s.followers.next_cursor.clone(),
                         ProfileTab::Following => s.following.next_cursor.clone(),
+                        // § List a User's Guilds is not paginated: at most six
+                        // rows and a cursor that is always null.
+                        ProfileTab::Guilds => None,
                     };
                     Action::ProfileLoadMore {
                         tab: s.tab,
@@ -1835,6 +1900,9 @@ impl App {
                     highlight_reply_id: Some(reply_id),
                 },
                 ProfileIntent::OpenUser { username } => Action::ProfileOpenUser { username },
+                // The Guilds tab opens the same detail screen the guilds index
+                // does, which is where joining and the badge move live.
+                ProfileIntent::OpenGuild { slug } => Action::GuildOpen { slug },
                 ProfileIntent::PokeUser { username } => Action::PokeUser { username },
                 ProfileIntent::EditEntry { post_id, content } => {
                     // The intent carries only the body; the rest of the
@@ -1892,6 +1960,9 @@ impl App {
                     highlight_reply_id: None,
                 },
                 GuildIntent::Join => Action::GuildJoin {
+                    slug: s.slug.clone(),
+                },
+                GuildIntent::Promote => Action::GuildPromote {
                     slug: s.slug.clone(),
                 },
                 GuildIntent::Leave => Action::GuildLeave {
@@ -2249,7 +2320,9 @@ impl App {
                 if let Screen::Notifications(s) = &mut self.screen {
                     s.mark_local(&notification_id);
                 }
-                self.unread_count = self.unread_count.saturating_sub(1);
+                // Only the number moves: whether the server's figure was capped
+                // is its answer to give, and clearing one row cannot un-cap it.
+                self.unread_count.count = self.unread_count.count.saturating_sub(1);
                 self.spawn_mark_notification_read(notification_id);
             }
             Action::NotificationsMarkAll => {
@@ -2259,7 +2332,12 @@ impl App {
                 if let Screen::Notifications(s) = &mut self.screen {
                     s.mark_all_local();
                 }
-                self.unread_count = 0;
+                // Reset the whole figure, not just the number: leaving a stale
+                // `exact: false` beside a zeroed count would paint "99+" over an
+                // inbox the user has just cleared. The delayed resync then
+                // reports whatever the 5,000-per-call ceiling left behind
+                // (§ Mark All as Read).
+                self.unread_count = UnreadCount::default();
                 self.spawn_mark_all_notifications_read();
             }
             Action::CmailRefresh => self.spawn_cmail_conversations(),
@@ -2563,6 +2641,12 @@ impl App {
                             s.following.items.clear();
                             s.following.next_cursor = None;
                         }
+                        ProfileTab::Guilds => {
+                            // No cursor to clear: § List a User's Guilds is not
+                            // paginated, so the tab never holds one.
+                            s.guilds.loading = true;
+                            s.guilds.items.clear();
+                        }
                     }
                 }
                 self.spawn_profile_tab_fetch(tab, username, user_id, None);
@@ -2766,15 +2850,35 @@ impl App {
             Action::GuildsRefresh => self.spawn_guilds_initial(),
             Action::GuildsMore { cursor } => self.spawn_guilds_more(cursor),
             Action::GuildOpen { slug } => {
-                self.push_screen(Screen::Guild(GuildScreen::new(slug.clone())));
+                let mut screen = GuildScreen::new(slug.clone());
+                // Hand over the cached membership picture straight away, so the
+                // first `J` or `P` prompt already names the badge guild instead
+                // of falling back to the generic wording.
+                if let Some(own) = &self.own_guilds {
+                    screen.apply_own_guilds(Ok(own.clone()));
+                }
+                self.push_screen(Screen::Guild(screen));
                 self.spawn_guild_open(slug);
+                if self.own_guilds.is_none() {
+                    self.spawn_own_guilds();
+                }
             }
-            Action::GuildRefresh { slug, tab } => self.spawn_guild_tab_initial(&slug, tab),
+            Action::GuildRefresh { slug, tab } => {
+                // Re-read the guild itself, not just the open tab. Join, promote
+                // and leave all write a GUESS at the role and the headcounts
+                // locally, and those helpers say a refresh replaces the guess
+                // with the server's numbers. Refreshing only the tab left the
+                // guess in place for the life of the screen, which in the worst
+                // case leaves the role unknown so the badge key reads as dead.
+                self.spawn_guild_info(&slug);
+                self.spawn_guild_tab_initial(&slug, tab);
+            }
             Action::GuildSelectTab { slug, tab } => self.spawn_guild_tab_initial(&slug, tab),
             Action::GuildLoadMore { slug, tab, cursor } => {
                 self.spawn_guild_tab_more(&slug, tab, cursor)
             }
             Action::GuildJoin { slug } => self.spawn_guild_join(slug),
+            Action::GuildPromote { slug } => self.spawn_guild_promote(slug),
             Action::GuildLeave { slug } => self.spawn_guild_leave(slug),
             Action::GuildComposeThread { slug } => {
                 self.start_compose(ComposeKind::GuildThread { guild_slug: slug }, String::new())
@@ -2854,15 +2958,28 @@ impl App {
                     self.toast = Some(Toast::confirmation("↑ new posts"));
                 }
             }
-            BgEvent::NotificationsInitial(result) => {
-                if let Screen::Notifications(s) = &mut self.screen {
-                    s.apply_initial(result);
+            BgEvent::NotificationsInitial(epoch, result) => {
+                if epoch != self.notifications_epoch.load(Ordering::SeqCst) {
+                    return;
                 }
+                let mut next = None;
+                if let Screen::Notifications(s) = &mut self.screen {
+                    next = s.apply_initial(result);
+                }
+                self.chase_notifications_page(next);
             }
-            BgEvent::NotificationsMore(result) => {
-                if let Screen::Notifications(s) = &mut self.screen {
-                    s.apply_more(result);
+            BgEvent::NotificationsMore(epoch, result) => {
+                // A page from a superseded query would append rows the current
+                // filter excludes and overwrite the live cursor with the old
+                // query's, sending every later page down the wrong query.
+                if epoch != self.notifications_epoch.load(Ordering::SeqCst) {
+                    return;
                 }
+                let mut next = None;
+                if let Screen::Notifications(s) = &mut self.screen {
+                    next = s.apply_more(result);
+                }
+                self.chase_notifications_page(next);
             }
             BgEvent::CmailConversations(result) => {
                 if let Ok(conversations) = &result {
@@ -3132,7 +3249,7 @@ impl App {
                 if let Screen::Notifications(s) = &mut self.screen {
                     s.unmark_local(&notification_id);
                 }
-                self.unread_count = self.unread_count.saturating_add(1);
+                self.unread_count.count = self.unread_count.count.saturating_add(1);
                 self.warn_toast_unless_signalled("couldn't mark as read");
             }
             BgEvent::AllNotificationsMarkFailed => {
@@ -3406,6 +3523,12 @@ impl App {
                 // A successful poll doubles as an online heartbeat.
                 self.offline = false;
                 self.unread_count = n;
+                // The screen keeps its own copy so its status line can say how
+                // much is unread beyond the page on show, which is what a
+                // "mark all as read" that hit the 5,000 ceiling looks like.
+                if let Screen::Notifications(s) = &mut self.screen {
+                    s.set_unread_count(n);
+                }
             }
             BgEvent::ProfileUser(result) => {
                 if let Screen::Profile(s) = &mut self.screen {
@@ -3458,6 +3581,11 @@ impl App {
                     } else {
                         s.following.apply_initial(result);
                     }
+                }
+            }
+            BgEvent::ProfileGuilds(result) => {
+                if let Screen::Profile(s) = &mut self.screen {
+                    s.apply_guilds(result);
                 }
             }
             BgEvent::ProfileFollowToggled(result) => {
@@ -3770,17 +3898,51 @@ impl App {
                 }
             }
             BgEvent::GuildJoined { slug, result } => {
+                let ok = result.is_ok();
                 if let Screen::Guild(s) = &mut self.screen {
                     if s.slug == slug {
                         s.apply_joined(result);
                     }
                 }
+                // The screen patched its own copy so the prompts read right at
+                // once; this is what makes them right, since only the server
+                // knows whether that join spent an apprenticeship slot.
+                if ok {
+                    self.spawn_own_guilds();
+                }
             }
             BgEvent::GuildLeft { slug, result } => {
+                let ok = result.is_ok();
                 if let Screen::Guild(s) = &mut self.screen {
                     if s.slug == slug {
                         s.apply_left(result);
                     }
+                }
+                if ok {
+                    self.spawn_own_guilds();
+                }
+            }
+            BgEvent::GuildPromoted { slug, result } => {
+                let ok = result.is_ok();
+                if let Screen::Guild(s) = &mut self.screen {
+                    if s.slug == slug {
+                        s.apply_promoted(result);
+                    }
+                }
+                if ok {
+                    self.spawn_own_guilds();
+                }
+            }
+            BgEvent::OwnGuilds(result) => {
+                if let Ok(guilds) = &result {
+                    self.own_guilds = Some(guilds.clone());
+                }
+                // Straight on to the open guild screen too: it is the one place
+                // the list changes what the keys offer, and waiting for the next
+                // open would leave a stale prompt in front of the user who just
+                // caused the change.
+                if let Screen::Guild(s) = &mut self.screen {
+                    s.apply_own_guilds(result);
                 }
             }
             BgEvent::GuildThreadCreated { slug, result } => match result {
@@ -3863,8 +4025,12 @@ impl App {
         self.play_history_pos = 0;
         self.back_stack.clear();
         self.current_root = None;
-        self.unread_count = 0;
+        // The whole figure, so the next account's first frame can't inherit a
+        // capped "99+" badge from this one.
+        self.unread_count = UnreadCount::default();
         self.cmail_unread_count = 0;
+        // Guild membership is per-account, so the next session re-reads it.
+        self.own_guilds = None;
         // A fresh login re-primes the "new mail" baseline, so pre-existing unread
         // for the next account doesn't toast on its first poll.
         self.cmail_unread_initialized = false;
@@ -4327,6 +4493,9 @@ impl App {
             RootKind::Notifications => {
                 let mut s = NotificationsScreen::new();
                 s.filter = NotificationsFilter::All;
+                // Seed it with the badge's own figure so the status line is
+                // right from the first frame, not from the next poll.
+                s.set_unread_count(self.unread_count);
                 self.screen = Screen::Notifications(s);
                 self.spawn_notifications_initial(NotificationsFilter::All, Vec::new());
             }
@@ -4428,6 +4597,10 @@ impl App {
         filter: NotificationsFilter,
         types: Vec<NotificationType>,
     ) {
+        // Every fresh query funnels through here, so this is the one place the
+        // generation has to advance. Any page still in flight for the previous
+        // filter is now stale and will be dropped on arrival.
+        let epoch = self.notifications_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
@@ -4435,7 +4608,7 @@ impl App {
                 .list_notifications(None, None, filter, &types)
                 .await
                 .map_err(|e| note_api_err(&tx, e));
-            let _ = tx.send(BgEvent::NotificationsInitial(result));
+            let _ = tx.send(BgEvent::NotificationsInitial(epoch, result));
         });
     }
 
@@ -4445,6 +4618,9 @@ impl App {
         types: Vec<NotificationType>,
         cursor: Option<String>,
     ) {
+        // Continues the CURRENT query, so it rides the existing generation
+        // rather than starting a new one.
+        let epoch = self.notifications_epoch.load(Ordering::SeqCst);
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
@@ -4452,8 +4628,26 @@ impl App {
                 .list_notifications(cursor.as_deref(), None, filter, &types)
                 .await
                 .map_err(|e| note_api_err(&tx, e));
-            let _ = tx.send(BgEvent::NotificationsMore(result));
+            let _ = tx.send(BgEvent::NotificationsMore(epoch, result));
         });
+    }
+
+    /// Fetch the follow-up notifications page the screen asked for, if it did.
+    ///
+    /// v0.8.6 drops muted, blocked and switched-off types out of a page after
+    /// taking it (§ List Notifications), so a page can land empty with plenty
+    /// behind it, and an empty list has no last row for the reader to scroll
+    /// off. The screen hands back the cursor of a page like that and marks
+    /// itself loading; dropping it would strand the screen on "loading…" and
+    /// truncate the reader's notifications at the first muted one. Reports
+    /// whether a page was actually requested.
+    fn chase_notifications_page(&mut self, next: Option<String>) -> bool {
+        let Some(cursor) = next else {
+            return false;
+        };
+        let (filter, types) = self.notification_query();
+        self.spawn_notifications_more(filter, types, Some(cursor));
+        true
     }
 
     fn spawn_mark_notification_read(&self, notification_id: String) {
@@ -5223,21 +5417,26 @@ impl App {
         });
     }
 
-    /// Open a guild: fetch its header/membership and the first page of threads.
-    fn spawn_guild_open(&self, slug: String) {
+    /// Re-read a guild's header and the caller's membership state.
+    ///
+    /// Split out from [`Self::spawn_guild_open`] so a refresh can correct the
+    /// role and headcounts a membership write guessed at locally.
+    fn spawn_guild_info(&self, slug: &str) {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
-        let info_slug = slug.clone();
+        let slug = slug.to_string();
         tokio::spawn(async move {
             let result = client
-                .get_guild(&info_slug)
+                .get_guild(&slug)
                 .await
                 .map_err(|e| note_api_err(&tx, e));
-            let _ = tx.send(BgEvent::GuildInfo {
-                slug: info_slug,
-                result,
-            });
+            let _ = tx.send(BgEvent::GuildInfo { slug, result });
         });
+    }
+
+    /// Open a guild: fetch its header/membership and the first page of threads.
+    fn spawn_guild_open(&self, slug: String) {
+        self.spawn_guild_info(&slug);
         self.spawn_guild_tab_initial(&slug, GuildTab::Threads);
     }
 
@@ -5298,6 +5497,38 @@ impl App {
                 .await
                 .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::GuildJoined { slug, result });
+        });
+    }
+
+    /// Hand the profile badge to `slug` (§ Change Your Guild Badge). The guild
+    /// the user was a member of becomes an apprenticeship rather than being
+    /// left, so this never drops a membership.
+    fn spawn_guild_promote(&self, slug: String) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .promote_guild(&slug)
+                .await
+                .map_err(|e| note_api_err(&tx, e));
+            let _ = tx.send(BgEvent::GuildPromoted { slug, result });
+        });
+    }
+
+    /// Re-read the signed-in account's own guilds (§ List a User's Guilds).
+    ///
+    /// One unpaginated read of at most six rows. A failure is left to the
+    /// screen to swallow: the prompts fall back to wording that names no other
+    /// guild, which is a plainer question, not a broken one.
+    fn spawn_own_guilds(&self) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .list_own_guilds()
+                .await
+                .map_err(|e| note_api_err(&tx, e));
+            let _ = tx.send(BgEvent::OwnGuilds(result));
         });
     }
 
@@ -5712,17 +5943,20 @@ impl App {
         });
     }
 
-    /// Re-read the unread count after a short delay, to converge on truth
-    /// following an optimistic mark-read. The count endpoint is cached
-    /// server-side (~5s); reading it immediately would return the pre-mark
-    /// value and clobber the optimistic update (the badge would flick back to
-    /// its old number until the next poll). Waiting past the cache window reads
-    /// the post-mark truth instead.
+    /// Re-read the unread count to converge on truth following an optimistic
+    /// mark-read.
+    ///
+    /// This used to sleep past the endpoint's 5 second cache, because under
+    /// v0.8.4 an immediate read returned the pre-mark value and clobbered the
+    /// optimistic update. § Unread Count reversed that: "Marking anything read
+    /// clears the cache, so the count drops immediately." So the read can go
+    /// out at once, which also lets the status line report the remainder
+    /// straight after a mark-all that hit the server's 5,000 ceiling instead of
+    /// waiting out a delay that no longer buys anything.
     fn spawn_unread_count_resync(&self) {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(6)).await;
             match client.unread_notification_count().await {
                 Ok(n) => {
                     let _ = tx.send(BgEvent::UnreadCount(n));
@@ -5809,6 +6043,16 @@ impl App {
                         .await
                         .map_err(|e| note_api_err(&tx, e));
                     let _ = tx.send(BgEvent::ProfileFollowing { more, result });
+                }
+                ProfileTab::Guilds => {
+                    // `cursor` and `more` mean nothing here: § List a User's
+                    // Guilds answers with every guild at once, so each result
+                    // replaces the tab rather than extending it.
+                    let result = client
+                        .list_user_guilds(&username)
+                        .await
+                        .map_err(|e| note_api_err(&tx, e));
+                    let _ = tx.send(BgEvent::ProfileGuilds(result));
                 }
             }
         });
@@ -7339,14 +7583,29 @@ mod tests {
         }
     }
 
+    /// An exact unread total, the shape every count below 101 arrives in
+    /// (v0.8.6 § Unread Count).
+    fn unread(count: u32) -> UnreadCount {
+        UnreadCount { count, exact: true }
+    }
+
+    /// A total the server capped: more than 100 unread, so it counted only the
+    /// 100 most recent and the badge must read "99+".
+    fn capped_unread() -> UnreadCount {
+        UnreadCount {
+            count: 100,
+            exact: false,
+        }
+    }
+
     #[test]
     fn mark_failed_rolls_back_read_flag_and_unread_count() {
         let mut app = test_app();
         let mut screen = NotificationsScreen::new();
-        screen.apply_initial(Ok((vec![test_notification("n1")], None)));
+        let _ = screen.apply_initial(Ok((vec![test_notification("n1")], None)));
         screen.mark_local("n1"); // optimistic read
         app.screen = Screen::Notifications(screen);
-        app.unread_count = 2; // pretend 3 → 2 was applied optimistically
+        app.unread_count = unread(2); // pretend 3 → 2 was applied optimistically
 
         app.handle_bg_event(BgEvent::NotificationMarkFailed {
             notification_id: "n1".into(),
@@ -7356,7 +7615,7 @@ mod tests {
             panic!("expected Notifications");
         };
         assert!(!s.list.items[0].read, "read flag should roll back");
-        assert_eq!(app.unread_count, 3, "unread count should be restored");
+        assert_eq!(app.unread_count.count, 3, "unread count should be restored");
         assert!(app.toast.is_some(), "a warning toast should be shown");
     }
 
@@ -7709,10 +7968,10 @@ mod tests {
     async fn offline_blocks_an_optimistic_write_with_a_toast() {
         let mut app = test_app();
         let mut screen = NotificationsScreen::new();
-        screen.apply_initial(Ok((vec![test_notification("n1")], None)));
+        let _ = screen.apply_initial(Ok((vec![test_notification("n1")], None)));
         app.screen = Screen::Notifications(screen);
         app.current_root = Some(RootKind::Notifications);
-        app.unread_count = 3;
+        app.unread_count = unread(3);
         app.offline = true;
 
         // `m` on the unread item would normally mark it read optimistically.
@@ -7726,7 +7985,10 @@ mod tests {
             !s.list.items[0].read,
             "offline write must not optimistically mark"
         );
-        assert_eq!(app.unread_count, 3, "unread count unchanged while offline");
+        assert_eq!(
+            app.unread_count.count, 3,
+            "unread count unchanged while offline"
+        );
         assert!(app.toast.is_some(), "offline write surfaces a toast");
     }
 
@@ -7924,12 +8186,22 @@ mod tests {
     }
 
     #[test]
-    fn unread_count_event_clears_offline() {
+    fn unread_count_event_clears_offline_and_reaches_the_screen() {
         let mut app = test_app();
+        let mut screen = NotificationsScreen::new();
+        let _ = screen.apply_initial(Ok((vec![test_notification("n1")], None)));
+        app.screen = Screen::Notifications(screen);
+        app.current_root = Some(RootKind::Notifications);
         app.offline = true;
-        app.handle_bg_event(BgEvent::UnreadCount(4));
+        app.handle_bg_event(BgEvent::UnreadCount(unread(4)));
         assert!(!app.offline, "a successful poll is an online heartbeat");
-        assert_eq!(app.unread_count, 4);
+        assert_eq!(app.unread_count.count, 4);
+        assert!(app.unread_count.exact);
+        let text = render_to_string(&app);
+        assert!(
+            text.contains("4 unread"),
+            "the screen gets the figure too, for its status line: {text:?}"
+        );
     }
 
     #[test]
@@ -9114,6 +9386,420 @@ mod tests {
             app.cmail_stream_epoch.load(Ordering::SeqCst) > cmail_before,
             "the conversation's poll and streams must be invalidated on the way out",
         );
+    }
+
+    // v0.8.6 unread badge --------------------------------------------------
+
+    /// A notifications screen sitting on `count` unread, as the tab bar sees it.
+    fn notifications_app(count: UnreadCount) -> App {
+        let mut app = test_app();
+        app.screen = Screen::Notifications(NotificationsScreen::new());
+        app.current_root = Some(RootKind::Notifications);
+        app.unread_count = count;
+        app
+    }
+
+    #[test]
+    fn the_unread_badge_shows_the_number_while_the_count_is_exact() {
+        let app = notifications_app(unread(7));
+        let text = render_to_string(&app);
+        assert!(
+            text.contains("(7)"),
+            "badge missing from the tab bar: {text:?}"
+        );
+    }
+
+    #[test]
+    fn the_unread_badge_reads_99_plus_once_the_server_caps_the_count() {
+        // § Unread Count: past 100 unread the server counts only the 100 most
+        // recent, so printing `count` would tell the reader they have exactly
+        // 100 when the truth is "at least that many". The spec asks for "99+".
+        let app = notifications_app(capped_unread());
+        let text = render_to_string(&app);
+        assert!(text.contains("(99+)"), "capped badge missing: {text:?}");
+        assert!(
+            !text.contains("(100)"),
+            "a capped count must never be shown as a number: {text:?}"
+        );
+    }
+
+    #[test]
+    fn nothing_unread_draws_no_badge_at_all() {
+        let app = notifications_app(UnreadCount::default());
+        let text = render_to_string(&app);
+        assert!(
+            !text.contains("(0)"),
+            "an empty inbox needs no badge: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn marking_everything_read_clears_the_cap_along_with_the_count() {
+        // Zeroing the number but leaving `exact: false` behind would paint
+        // "99+" over an inbox the reader has just cleared.
+        let mut app = notifications_app(capped_unread());
+        app.handle_terminal_event(key_event(KeyCode::Char('M')))
+            .await;
+        assert_eq!(app.unread_count.count, 0);
+        assert!(app.unread_count.exact, "the cap must go with the count");
+        let text = render_to_string(&app);
+        assert!(
+            !text.contains("99+"),
+            "stale cap survived mark-all: {text:?}"
+        );
+    }
+
+    // v0.8.6 notification paging -------------------------------------------
+
+    #[tokio::test]
+    async fn an_empty_notifications_page_with_a_cursor_is_chased_by_the_shell() {
+        // § List Notifications filters muted and switched-off types out of a
+        // page after taking it, so a page can land empty with plenty behind it.
+        // An empty list has no last row to scroll off, so if the shell doesn't
+        // fetch the next page nothing ever will and the inbox reads as empty.
+        let mut app = notifications_app(unread(5));
+        app.handle_bg_event(BgEvent::NotificationsInitial(
+            app.notifications_epoch.load(Ordering::SeqCst),
+            Ok((vec![], Some("c1".into()))),
+        ));
+        let Screen::Notifications(s) = &app.screen else {
+            panic!("expected Notifications");
+        };
+        assert!(
+            s.list.loading,
+            "the screen is waiting on the page it asked the shell for"
+        );
+        let text = render_to_string(&app);
+        assert!(
+            !text.contains("no notifications"),
+            "a filtered page is not an empty inbox: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_shell_chases_a_page_the_screen_hands_back_and_nothing_else() {
+        let mut app = notifications_app(unread(5));
+        assert!(
+            app.chase_notifications_page(Some("c1".into())),
+            "a returned cursor must be fetched, not dropped"
+        );
+        assert!(
+            !app.chase_notifications_page(None),
+            "a page that moved the list on needs no follow-up"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_page_from_a_superseded_notifications_query_is_dropped() {
+        // v0.8.6 filters muted types server-side, so a page can land empty and
+        // the shell chases the next one. That chase is still in flight exactly
+        // when the reader reaches for the filter keys. Without a generation
+        // check the late page appends rows the new filter excludes and restores
+        // the OLD query's cursor, sending every later page down the wrong query.
+        let mut app = notifications_app(unread(5));
+        let stale = app.notifications_epoch.load(Ordering::SeqCst);
+
+        // A new query starts, which supersedes anything already in flight.
+        app.spawn_notifications_initial(NotificationsFilter::All, Vec::new());
+        assert_ne!(stale, app.notifications_epoch.load(Ordering::SeqCst));
+
+        app.handle_bg_event(BgEvent::NotificationsMore(
+            stale,
+            Ok((
+                vec![test_notification("from-old-filter")],
+                Some("old-cursor".into()),
+            )),
+        ));
+
+        let Screen::Notifications(s) = &app.screen else {
+            panic!("expected Notifications");
+        };
+        assert!(
+            s.list.items.is_empty(),
+            "a page from the superseded query must not be shown: {:?}",
+            s.list.items.len(),
+        );
+        assert_eq!(
+            s.list.next_cursor, None,
+            "and it must not overwrite the live cursor",
+        );
+    }
+
+    #[test]
+    fn a_notifications_page_that_added_rows_ends_the_chase() {
+        let mut app = notifications_app(unread(5));
+        // Same shape as the empty page above, but this one carried a row, so
+        // the reader can scroll and ask for the next page themselves.
+        app.handle_bg_event(BgEvent::NotificationsInitial(
+            app.notifications_epoch.load(Ordering::SeqCst),
+            Ok((vec![test_notification("n1")], Some("c1".into()))),
+        ));
+        let Screen::Notifications(s) = &app.screen else {
+            panic!("expected Notifications");
+        };
+        assert!(!s.list.loading, "no follow-up fetch was needed");
+        assert_eq!(s.list.items.len(), 1);
+    }
+
+    // v0.8.6 notification actors --------------------------------------------
+
+    /// A notification from a real user, with nothing to read behind it.
+    fn actor_notification(id: &str, kind: NotificationType, actor: &str) -> Notification {
+        let mut n = test_notification(id);
+        n.kind = kind;
+        n.actor_username = Some(actor.to_string());
+        n
+    }
+
+    #[test]
+    fn enter_on_a_notification_with_no_target_opens_the_actors_profile() {
+        let mut screen = NotificationsScreen::new();
+        let _ = screen.apply_initial(Ok((
+            vec![actor_notification(
+                "n1",
+                NotificationType::GraffitiMention,
+                "trinity",
+            )],
+            None,
+        )));
+        let mut screen = Screen::Notifications(screen);
+        assert_eq!(
+            App::route_key(&mut screen, kev(KeyCode::Enter)),
+            Action::ProfileOpenUser {
+                username: "trinity".into()
+            }
+        );
+    }
+
+    #[test]
+    fn enter_on_an_account_notification_opens_nothing() {
+        // § Notification object gives `post_cooldown` the literal "system"
+        // sender and says not to open a profile for it. Routed on the handle
+        // alone, it would push a profile for a user who does not exist.
+        let mut screen = NotificationsScreen::new();
+        let _ = screen.apply_initial(Ok((
+            vec![actor_notification(
+                "n1",
+                NotificationType::PostCooldown,
+                "system",
+            )],
+            None,
+        )));
+        let mut screen = Screen::Notifications(screen);
+        assert_eq!(
+            App::route_key(&mut screen, kev(KeyCode::Enter)),
+            Action::None
+        );
+    }
+
+    // v0.8.6 guild apprenticeships ------------------------------------------
+
+    fn test_guild(slug: &str, role: Option<cs_api::GuildRole>) -> Guild {
+        Guild {
+            id: format!("id-{slug}"),
+            name: format!("Guild {slug}"),
+            slug: slug.into(),
+            member_count: 4,
+            apprentice_count: 2,
+            is_member: role.is_some(),
+            role,
+            ..Default::default()
+        }
+    }
+
+    fn own_guild(slug: &str, role: cs_api::GuildRole) -> UserGuild {
+        UserGuild {
+            guild_id: format!("id-{slug}"),
+            slug: slug.into(),
+            name: format!("Guild {slug}"),
+            role: Some(role),
+            ..Default::default()
+        }
+    }
+
+    /// A guild screen already showing `slug` with the viewer in `role`.
+    fn guild_screen(slug: &str, role: Option<cs_api::GuildRole>) -> GuildScreen {
+        let mut s = GuildScreen::new(slug.into());
+        s.apply_guild(Ok(test_guild(slug, role)));
+        s.apply_threads_initial(Ok((vec![], None)));
+        s
+    }
+
+    #[test]
+    fn p_then_y_on_an_apprenticeship_asks_for_the_badge_to_move() {
+        let mut screen = Screen::Guild(guild_screen("owls", Some(cs_api::GuildRole::Apprentice)));
+        assert_eq!(
+            App::route_key(&mut screen, kev(KeyCode::Char('P'))),
+            Action::None,
+            "P only arms the confirm"
+        );
+        assert_eq!(
+            App::route_key(&mut screen, kev(KeyCode::Char('y'))),
+            Action::GuildPromote {
+                slug: "owls".into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn the_badge_key_reaches_the_guild_screen_while_a_track_is_playing() {
+        // The player owns lowercase `p` on every screen that doesn't bind it,
+        // and the guild screen is one of those, which is why the badge move is
+        // on `P`. This is the check that the two never met.
+        let mut app = test_app();
+        app.screen = Screen::Guild(guild_screen("owls", Some(cs_api::GuildRole::Apprentice)));
+        app.current_root = Some(RootKind::Guilds);
+        app.now_playing = Some(super::super::player::test_handle("https://youtu.be/x", 1));
+
+        app.handle_terminal_event(key_event(KeyCode::Char('P')))
+            .await;
+
+        let Screen::Guild(s) = &app.screen else {
+            panic!("expected the guild screen");
+        };
+        assert_eq!(
+            s.confirming,
+            Some(super::super::guild_detail::GuildAction::Promote),
+            "P must reach the screen, not the player"
+        );
+        assert!(app.now_playing.is_some(), "and the track keeps playing");
+    }
+
+    #[tokio::test]
+    async fn a_badge_move_lands_on_the_open_guild_and_refreshes_the_cache() {
+        let mut app = test_app();
+        app.screen = Screen::Guild(guild_screen("owls", Some(cs_api::GuildRole::Apprentice)));
+        app.current_root = Some(RootKind::Guilds);
+
+        app.handle_bg_event(BgEvent::GuildPromoted {
+            slug: "owls".into(),
+            result: Ok(PromotedGuild {
+                guild_id: "id-owls".into(),
+                role: Some(cs_api::GuildRole::Member),
+            }),
+        });
+
+        let Screen::Guild(s) = &app.screen else {
+            panic!("expected the guild screen");
+        };
+        assert!(!s.action_pending, "the in-flight marker must clear");
+        assert_eq!(
+            s.guild.as_ref().and_then(|g| g.role),
+            Some(cs_api::GuildRole::Member),
+            "the badge moved onto this guild"
+        );
+        let text = render_to_string(&app);
+        assert!(text.contains("profile badge"), "{text:?}");
+    }
+
+    #[tokio::test]
+    async fn opening_a_guild_hands_it_the_cached_own_guilds() {
+        // Without them the join prompt can only state the rule; with them it
+        // can name the badge guild and count the apprenticeships, and refuse a
+        // sixth without spending one of three joins a minute finding out.
+        let mut app = test_app();
+        app.own_guilds = Some(vec![own_guild("night-owls", cs_api::GuildRole::Member)]);
+        let mut index = GuildsScreen::new();
+        index.apply_initial(Ok((vec![test_guild("cats", None)], None)));
+        app.screen = Screen::Guilds(index);
+        app.current_root = Some(RootKind::Guilds);
+
+        app.handle_terminal_event(key_event(KeyCode::Enter)).await;
+
+        let Screen::Guild(s) = &app.screen else {
+            panic!("enter on the index opens the guild");
+        };
+        assert_eq!(
+            s.own_guilds.as_ref().map(Vec::len),
+            Some(1),
+            "the cache must travel with the screen"
+        );
+    }
+
+    #[test]
+    fn own_guilds_are_cached_and_reach_the_open_guild_screen() {
+        let mut app = test_app();
+        app.screen = Screen::Guild(guild_screen("cats", None));
+
+        app.handle_bg_event(BgEvent::OwnGuilds(Ok(vec![
+            own_guild("night-owls", cs_api::GuildRole::Founder),
+            own_guild("deep-divers", cs_api::GuildRole::Apprentice),
+        ])));
+
+        assert_eq!(app.own_guilds.as_ref().map(Vec::len), Some(2));
+        let Screen::Guild(s) = &app.screen else {
+            panic!("expected the guild screen");
+        };
+        assert_eq!(s.own_guilds.as_ref().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn a_failed_own_guilds_read_leaves_the_cache_alone() {
+        // The prompts work without it, so a failure is not worth a toast or a
+        // cleared cache.
+        let mut app = test_app();
+        app.own_guilds = Some(vec![own_guild("night-owls", cs_api::GuildRole::Member)]);
+        app.handle_bg_event(BgEvent::OwnGuilds(Err("offline".into())));
+        assert_eq!(app.own_guilds.as_ref().map(Vec::len), Some(1));
+        assert!(app.toast.is_none(), "an enrichment failure stays quiet");
+    }
+
+    // v0.8.6 profile guilds tab ---------------------------------------------
+
+    #[test]
+    fn the_profile_guilds_tab_is_filled_by_its_own_event() {
+        let mut app = test_app();
+        let mut profile = ProfileScreen::new_for("bob".into());
+        profile.tab = ProfileTab::Guilds;
+        app.screen = Screen::Profile(profile);
+
+        app.handle_bg_event(BgEvent::ProfileGuilds(Ok(vec![
+            own_guild("night-owls", cs_api::GuildRole::Member),
+            own_guild("deep-divers", cs_api::GuildRole::Apprentice),
+        ])));
+
+        let Screen::Profile(s) = &app.screen else {
+            panic!("expected the profile screen");
+        };
+        assert_eq!(s.guilds.items.len(), 2);
+        assert!(
+            s.guilds.next_cursor.is_none(),
+            "§ List a User's Guilds never paginates, so no cursor may appear"
+        );
+        let text = render_to_string(&app);
+        assert!(text.contains("apprentice"), "roles are shown: {text:?}");
+    }
+
+    #[test]
+    fn enter_on_the_profile_guilds_tab_opens_that_guild() {
+        let mut profile = ProfileScreen::new_for("bob".into());
+        profile.tab = ProfileTab::Guilds;
+        profile.apply_guilds(Ok(vec![own_guild("owls", cs_api::GuildRole::Member)]));
+        let mut screen = Screen::Profile(profile);
+        assert_eq!(
+            App::route_key(&mut screen, kev(KeyCode::Enter)),
+            Action::GuildOpen {
+                slug: "owls".into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn refreshing_the_profile_guilds_tab_clears_it_first() {
+        let mut app = test_app();
+        let mut profile = ProfileScreen::new_for("bob".into());
+        profile.tab = ProfileTab::Guilds;
+        profile.apply_guilds(Ok(vec![own_guild("owls", cs_api::GuildRole::Member)]));
+        app.screen = Screen::Profile(profile);
+
+        app.handle_terminal_event(key_event(KeyCode::Char('r')))
+            .await;
+
+        let Screen::Profile(s) = &app.screen else {
+            panic!("expected the profile screen");
+        };
+        assert!(s.guilds.items.is_empty(), "the tab reloads from scratch");
+        assert!(s.guilds.loading);
     }
 
     #[test]

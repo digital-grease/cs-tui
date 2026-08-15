@@ -354,6 +354,10 @@ mod tests {
         User {
             id: "u".into(),
             username: "me".into(),
+            guild_id: None,
+            guild_slug: None,
+            guild_icon: None,
+            guild_name: None,
             display_name: display_name.map(String::from),
             email: None,
             bio: bio.map(String::from),

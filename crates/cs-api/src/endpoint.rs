@@ -1,11 +1,11 @@
 //! Endpoint keys for rate-limiter accounting. One variant per documented endpoint.
 //!
-//! Rate-limit values come from `docs/api-v0.8.4.md` (§ Rate Limits, plus each
+//! Rate-limit values come from `docs/api-v0.8.6.md` (§ Rate Limits, plus each
 //! endpoint's own section). Where the consolidated table and the per-endpoint
 //! section disagree, the lower (more restrictive) value is used so the client
 //! cannot self-trigger 429s.
 //!
-//! Two v0.8.4 limits have a second dimension: cIRC presence is capped per room
+//! Two limits have a second dimension: cIRC presence is capped per room
 //! as well as overall, C-Mail typing per conversation as well as overall. Those
 //! endpoints declare the extra budget in [`EndpointKey::scoped_rate_limit`];
 //! [`EndpointKey::rate_limit`] always means the overall budget.
@@ -58,6 +58,10 @@ pub enum EndpointKey {
     UsersListPosts,
     UsersGetPostBySlug,
     UsersListReplies,
+    /// `GET /v1/users/me/guilds` and `GET /v1/users/:username/guilds` (v0.8.6).
+    /// Both forms of § List a User's Guilds, one budget: they are the same read
+    /// and the caller picks which handle to name.
+    UsersListGuilds,
     UsersUpdateMe,
     /// `POST /v1/users/:username/poke` (v0.8.4). The budget is global across all
     /// users, not per user, so this key is never scoped.
@@ -109,6 +113,10 @@ pub enum EndpointKey {
     GuildsThreadsList,
     GuildsThreadsCreate,
     GuildsJoin,
+    /// `POST /v1/guilds/:slug/promote` (v0.8.6): hand the profile badge to an
+    /// apprenticeship (§ Change Your Guild Badge). Its own key, not shared with
+    /// join or leave, because § Rate Limits gives it its own row.
+    GuildsPromote,
     GuildsLeave,
 
     // C-Mail (v0.7)
@@ -153,14 +161,14 @@ impl EndpointKey {
             CircPresence, CircRead, CircSend, CircUsers, CmailList, CmailMarkRead, CmailRead,
             CmailSend, CmailStart, CmailTyping, CmailTypingRead, EntriesCreate, EntriesDelete,
             EntriesEdit, EntriesGet, EntriesList, Flag, FollowsCreate, FollowsDelete, FollowsList,
-            GuildsGet, GuildsJoin, GuildsLeave, GuildsList, GuildsMembersList, GuildsThreadsCreate,
-            GuildsThreadsList, NotesCreate, NotesDelete, NotesGet, NotesGetRevision, NotesList,
-            NotesListRevisions, NotesUpdate, NotificationsList, NotificationsMarkAllRead,
-            NotificationsMarkRead, NotificationsUnreadCount, RepliesCreate, RepliesDelete,
-            RepliesEdit, RepliesGet, RepliesList, Search, SettingsGet, SettingsUpdate, TopicsList,
-            TopicsListPosts, UsersGet, UsersGetMe, UsersGetPostBySlug, UsersListPosts,
-            UsersListReplies, UsersPoke, UsersUpdateMe, WatchCreate, WatchDelete, WatchStatus,
-            WatchesList,
+            GuildsGet, GuildsJoin, GuildsLeave, GuildsList, GuildsMembersList, GuildsPromote,
+            GuildsThreadsCreate, GuildsThreadsList, NotesCreate, NotesDelete, NotesGet,
+            NotesGetRevision, NotesList, NotesListRevisions, NotesUpdate, NotificationsList,
+            NotificationsMarkAllRead, NotificationsMarkRead, NotificationsUnreadCount,
+            RepliesCreate, RepliesDelete, RepliesEdit, RepliesGet, RepliesList, Search,
+            SettingsGet, SettingsUpdate, TopicsList, TopicsListPosts, UsersGet, UsersGetMe,
+            UsersGetPostBySlug, UsersListGuilds, UsersListPosts, UsersListReplies, UsersPoke,
+            UsersUpdateMe, WatchCreate, WatchDelete, WatchStatus, WatchesList,
         };
 
         match self {
@@ -173,8 +181,8 @@ impl EndpointKey {
             // ever has one of each, so one budget models it.
             AuthCheckUsername => RateLimit::per_minute_with_hour(10, 60),
 
-            // Reads: table values from v0.8.4 § Anti-Scraping, plus
-            // § Get User's Entry by Slug, which states 45/min in its own
+            // Reads: table values from v0.8.6 § Read Actions (Anti-Scraping),
+            // plus § Get User's Entry by Slug, which states 45/min in its own
             // section (the anti-scraping table omits the row).
             EntriesList | RepliesList | UsersListPosts | UsersListReplies | TopicsListPosts
             | CmailRead | CircRead | UsersGetPostBySlug => RateLimit::per_minute(45),
@@ -183,6 +191,7 @@ impl EndpointKey {
             | NotesList
             | FollowsList
             | UsersGet
+            | UsersListGuilds
             | NotificationsList
             | NotificationsUnreadCount
             | WatchStatus
@@ -255,12 +264,20 @@ impl EndpointKey {
             | NotificationsMarkRead
             | NotificationsMarkAllRead => RateLimit::none(),
 
-            // Guilds (v0.8.4): per-endpoint sections plus the § Anti-Scraping table.
+            // Guilds (v0.8.6): per-endpoint sections plus the § Read Actions
+            // (Anti-Scraping) table. Its "List guilds / members / a user's
+            // guilds" row names three endpoints without saying they share one
+            // budget, so each gets 30/min of its own, the same reading applied
+            // to the other grouped read rows. Only the flag endpoints get one
+            // shared key, and only because § Flag an Entry says outright that
+            // they share a budget.
             GuildsList | GuildsMembersList => RateLimit::per_minute(30),
             GuildsThreadsList => RateLimit::per_minute(45),
             GuildsGet => RateLimit::none(),
             GuildsThreadsCreate => RateLimit::with_day(2, 15),
-            GuildsJoin | GuildsLeave => RateLimit::with_day(3, 15),
+            // § Rate Limits, Write Actions: "Guild promote | 3 | 15", matching
+            // join and leave, and § Change Your Guild Badge repeats it.
+            GuildsJoin | GuildsPromote | GuildsLeave => RateLimit::with_day(3, 15),
         }
     }
 
@@ -406,6 +423,39 @@ mod tests {
             typing.scoped_rate_limit().and_then(|rl| rl.per_minute),
             Some(40)
         );
+    }
+
+    #[test]
+    fn the_v086_guild_and_user_guild_routes_carry_their_documented_caps() {
+        // § Rate Limits, Write Actions: "Guild promote | 3 | 15", the same
+        // budget join and leave carry, but counted on its own key.
+        let promote = EndpointKey::GuildsPromote.rate_limit();
+        assert_eq!(promote.per_minute, Some(3));
+        assert_eq!(promote.per_day, Some(15));
+        assert!(
+            EndpointKey::GuildsPromote.scoped_rate_limit().is_none(),
+            "the promote budget is global, there is nothing to scope it by"
+        );
+
+        // § Read Actions: "List guilds / members / a user's guilds | 30".
+        let user_guilds = EndpointKey::UsersListGuilds.rate_limit();
+        assert_eq!(user_guilds.per_minute, Some(30));
+        assert_eq!(user_guilds.per_hour, None);
+        assert_eq!(user_guilds.per_day, None);
+        assert_eq!(
+            user_guilds.per_minute,
+            EndpointKey::GuildsList.rate_limit().per_minute,
+            "the same table row caps both"
+        );
+    }
+
+    #[test]
+    fn promoting_spends_its_own_budget_not_the_one_join_and_leave_share() {
+        // One key per row: were promote folded in with join or leave, a client
+        // that joined a guild and then promoted an apprenticeship would have
+        // spent two of one 3/min budget instead of one of each.
+        assert_ne!(EndpointKey::GuildsPromote, EndpointKey::GuildsJoin);
+        assert_ne!(EndpointKey::GuildsPromote, EndpointKey::GuildsLeave);
     }
 
     #[test]
