@@ -1,6 +1,6 @@
 # cs-tui
 
-A terminal client for [cyberspace.online](https://cyberspace.online), targeting the v0.8.4 API.
+A terminal client for [cyberspace.online](https://cyberspace.online), targeting the v0.8.6 API.
 
 ![cs-tui screenshot](docs/screenshot.png)
 
@@ -8,16 +8,16 @@ A terminal client for [cyberspace.online](https://cyberspace.online), targeting 
 
 ## Status
 
-Early development. Most of the documented v0.8.4 REST surface is implemented, including private C-Mail and multi-user cIRC chat (REST + live Firebase RTDB streaming) and full-text search; live testing against the API is ongoing.
+Early development. Most of the documented v0.8.6 REST surface is implemented, including private C-Mail and multi-user cIRC chat (REST + live Firebase RTDB streaming) and full-text search; live testing against the API is ongoing.
 
 ## Features
 
 - **Feed** with cursor-based infinite scroll and entry titles
 - **Post detail** with threaded replies
-- **Notifications** with read/unread filtering and an unread badge
+- **Notifications** with read/unread filtering and an unread badge that reads `99+` once the count passes 100 (past that the server counts only the 100 most recent), covering the full v0.8.6 type list: graffiti mentions, moderator and API-access changes, ban lifts, post cooldowns and rate-limit warnings alongside the older replies, mentions, follows and pokes. Several of those are about your own account rather than someone else's action, and arrive with no sender at all
 - **Thread watching**: `w` in post detail watches/unwatches a thread for `thread_reply` notifications; replying or being `@mentioned` auto-watches (toggle with `autoWatchOnReply` in Settings)
 - **Bookmarks**, **Topics**, and per-topic feeds
-- **Profiles** (info / posts / replies / followers / following) with follow & unfollow, and `P` to poke someone
+- **Profiles** (info / posts / replies / followers / following / guilds) with follow & unfollow, and `P` to poke someone. The guilds tab lists every guild they belong to with the role held in each, the one on their profile badge first and any apprenticeships after it; `Enter` opens one
 - **Compose** posts and replies in the built-in editor (soft-wrapping, multi-line paste, no external editor required); delete your own entries
 - **Edit** your own entry or reply with `e` (`E` on your profile's Posts tab). The API allows this on supporter accounts for 5 minutes after posting, and says so when it doesn't
 - **Flag** an entry, a reply, or a cIRC message for review with `F`, with an optional reason. Reporting is idempotent and can't be withdrawn
@@ -26,7 +26,7 @@ Early development. Most of the documented v0.8.4 REST surface is implemented, in
 - **Chat attachments** as compact chips: `[image]`, `[gif]` and `[♪ artist - title]`, clickable via OSC 8 when `hyperlinks` is on, with `o` to open the link or play the track in the jukebox
 - **Text styles and ASCII art**: `/art` is decoded and drawn as sent, `/rainbow` colors per character, `/quiet` dims, `/spoiler` stays masked until you press `v`, and `/blink`, `/wave`, `/slow` and `/glitch` get a static stand-in. Nothing animates. `/l33t`, `/flip`, `/comic`, `/cursive` and `/times` rewrite the text rather than style it, so cs-tui shows exactly what the server sent and adds nothing of its own
 - **Muted users**: `/mute` and `/unmute` in a room (or `m` in message-select mode) hide that person's messages for you; it's the same mute list the website uses
-- **Guilds**: browse member groups, view threads/members, join/leave, and post threads
+- **Guilds**: browse member groups, view threads/members, join, leave, move your profile badge between guilds, and post threads. v0.8.6's apprenticeships are modelled throughout: the guild you are a member or founder of is the badge on your profile, joining another while you have one makes you an apprentice there (five at most), and promoting an apprenticeship moves the badge to it while the guild it replaces becomes an apprenticeship, so you stay in both
 - **Journal** (private notes) with revision history
 - **Settings** round-trip that preserves fields the client doesn't model
 - Markdown rendering with `@mention` highlighting
@@ -102,6 +102,9 @@ composes):
 | Feed, topic feed, post detail | `F` | Flag an entry or reply for review, with an optional reason |
 | Someone else's profile | `P` | Poke them |
 | Your own profile, Posts tab | `E` | Edit the selected post (`e` edits your profile, `P` pins a post) |
+| Guild | `J` then `y` | Join (member if you are not in a guild yet, apprentice otherwise) |
+| Guild | `P` then `y` | Make this guild your profile badge |
+| Guild | `L` then `y` | Leave, an apprenticeship included (founders leave on the web) |
 | cIRC room | `Ctrl+U` | Show / hide the room roster |
 | cIRC room | `Ctrl+B` | Enter message-select mode |
 | cIRC message select | `j` / `k` | Pick a message |
@@ -234,7 +237,7 @@ either to `false` in `config.toml` and cs-tui never makes the call at all.
 |---|---|
 | `crates/cs-api/` | HTTP client + types for the Cyberspace REST API |
 | `crates/cs-tui/` | Ratatui application (binary) |
-| `docs/api-v0.8.4.md` | Authoritative API specification (do not modify) |
+| `docs/api-v0.8.6.md` | Authoritative API specification (do not modify) |
 
 ## License
 

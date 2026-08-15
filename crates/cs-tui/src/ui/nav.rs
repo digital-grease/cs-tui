@@ -1,6 +1,7 @@
 //! Top-level navigation: a tab bar and number-key shortcuts for switching between
 //! root screens (Feed / Notifications / Bookmarks / Topics; Profile / Journal /
 //! Settings join when their phases land).
+use cs_api::UnreadCount;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -161,10 +162,24 @@ fn tab_window(
 #[derive(Debug, Clone, Copy)]
 pub struct TabBarStatus {
     pub current: RootKind,
-    pub unread_count: u32,
+    /// Unread notifications (API v0.8.6 § Unread Count). The whole figure, not
+    /// just the number: past 100 the server counts only the 100 most recent and
+    /// the badge has to say "99+", which [`UnreadCount::badge`] decides.
+    pub unread_count: UnreadCount,
     pub cmail_unread_count: u32,
     pub can_go_back: bool,
     pub offline: bool,
+}
+
+/// The parenthesised badge for a tab, or nothing when there is nothing to
+/// report. `text` is already rendered, so a capped notification count arrives
+/// here as "99+" rather than as a number to format.
+fn badge(any: bool, text: &str) -> String {
+    if any {
+        format!(" ({text})")
+    } else {
+        String::new()
+    }
 }
 
 pub fn render_tab_bar(frame: &mut Frame<'_>, area: Rect, status: TabBarStatus, theme: &Theme) {
@@ -172,15 +187,12 @@ pub fn render_tab_bar(frame: &mut Frame<'_>, area: Rect, status: TabBarStatus, t
     let tokens: Vec<String> = kinds
         .iter()
         .map(|k| {
-            let count = match *k {
-                RootKind::Notifications => status.unread_count,
-                RootKind::Cmail => status.cmail_unread_count,
-                _ => 0,
-            };
-            let badge = if count > 0 {
-                format!(" ({count})")
-            } else {
-                String::new()
+            let unread = status.unread_count;
+            let cmail = status.cmail_unread_count;
+            let badge = match *k {
+                RootKind::Notifications => badge(unread.any(), &unread.badge()),
+                RootKind::Cmail => badge(cmail > 0, &cmail.to_string()),
+                _ => String::new(),
             };
             format!("{}·{}{}", k.shortcut(), k.label(), badge)
         })
@@ -254,6 +266,30 @@ mod tests {
         assert_eq!(RootKind::from_shortcut('x'), None);
         assert_eq!(RootKind::from_shortcut('0'), Some(RootKind::Settings));
         assert_eq!(RootKind::from_shortcut('a'), None);
+    }
+
+    #[test]
+    fn a_capped_unread_count_badges_as_99_plus() {
+        // § Unread Count: past 100 unread the server counts only the 100 most
+        // recent, so the number would read as an exact total it is not.
+        let capped = UnreadCount {
+            count: 100,
+            exact: false,
+        };
+        assert_eq!(badge(capped.any(), &capped.badge()), " (99+)");
+
+        let exact = UnreadCount {
+            count: 7,
+            exact: true,
+        };
+        assert_eq!(badge(exact.any(), &exact.badge()), " (7)");
+
+        let none = UnreadCount::default();
+        assert_eq!(
+            badge(none.any(), &none.badge()),
+            "",
+            "an empty inbox gets no badge at all"
+        );
     }
 
     #[test]

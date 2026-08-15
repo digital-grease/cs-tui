@@ -1,6 +1,12 @@
-//! Profile screen — 5 tabs (Info, Posts, Replies, Followers, Following).
+//! Profile screen, 6 tabs (Info, Posts, Replies, Followers, Following,
+//! Guilds).
+//!
+//! The Guilds tab is every guild the viewed user is in (v0.8.6 § List a User's
+//! Guilds): the one guild whose name and icon are their profile badge, held as
+//! founder or member, then up to five apprenticeships. That endpoint returns at
+//! most six rows and never paginates, so the tab has no load-more.
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use cs_api::{Entry, Follow, Reply, User};
+use cs_api::{Entry, Follow, Reply, User, UserGuild};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, ListItem, Paragraph};
@@ -16,15 +22,20 @@ pub enum ProfileTab {
     Replies,
     Followers,
     Following,
+    /// Every guild this user is in, badge guild first (v0.8.6 § List a User's
+    /// Guilds). Added last so the tabs that came before it keep the shifted
+    /// number they have always answered to.
+    Guilds,
 }
 
 impl ProfileTab {
-    pub const ALL: [ProfileTab; 5] = [
+    pub const ALL: [ProfileTab; 6] = [
         Self::Info,
         Self::Posts,
         Self::Replies,
         Self::Followers,
         Self::Following,
+        Self::Guilds,
     ];
 
     pub fn label(self) -> &'static str {
@@ -34,6 +45,7 @@ impl ProfileTab {
             Self::Replies => "replies",
             Self::Followers => "followers",
             Self::Following => "following",
+            Self::Guilds => "guilds",
         }
     }
 
@@ -46,6 +58,7 @@ impl ProfileTab {
             '#' => Some(Self::Replies),
             '$' => Some(Self::Followers),
             '%' => Some(Self::Following),
+            '^' => Some(Self::Guilds),
             _ => None,
         }
     }
@@ -111,6 +124,14 @@ pub enum ProfileIntent {
     OpenUser {
         username: String,
     },
+    /// Open the guild under the cursor (Guilds tab) in the guild detail screen,
+    /// the same one the guilds index opens.
+    ///
+    /// Addressed by slug, which is how every `/v1/guilds/…` route identifies a
+    /// guild. Rows carrying no slug never emit this.
+    OpenGuild {
+        slug: String,
+    },
     None,
 }
 
@@ -134,6 +155,13 @@ pub struct ProfileScreen {
     pub replies: TabState<Reply>,
     pub followers: TabState<Follow>,
     pub following: TabState<Follow>,
+
+    /// Every guild the viewed user is in: the badge guild first, then their
+    /// apprenticeships oldest first (v0.8.6 § List a User's Guilds). Filled by
+    /// [`ProfileScreen::apply_guilds`]. `next_cursor` stays `None` for the life
+    /// of the tab, because that endpoint returns at most six rows and has no
+    /// pagination at all, so the shared list nav never offers a load-more here.
+    pub guilds: TabState<UserGuild>,
 
     pub follow_action_pending: bool,
 
@@ -175,6 +203,7 @@ impl ProfileScreen {
             replies: TabState::default(),
             followers: TabState::default(),
             following: TabState::default(),
+            guilds: TabState::default(),
             follow_action_pending: false,
             poke_pending: false,
             viewer_user_id: None,
@@ -210,6 +239,21 @@ impl ProfileScreen {
             }
             Err(msg) => self.user_error = Some(msg),
         }
+    }
+
+    /// Hand the Guilds tab this user's guilds (v0.8.6 § List a User's Guilds):
+    /// the guild whose badge is on their profile first, then the
+    /// apprenticeships, oldest first. Used for the first load and for `r`
+    /// alike, since both replace the whole list.
+    ///
+    /// Takes a plain `Vec` rather than the `(items, cursor)` pair every other
+    /// tab takes. A user holds at most six guilds, one badge plus five
+    /// apprenticeships, and the spec says outright that the endpoint has no
+    /// pagination and its `cursor` is always null, so there is no page token to
+    /// carry. Leaving `next_cursor` unset is also what keeps the shared list
+    /// nav from offering a load-more the server could never answer.
+    pub fn apply_guilds(&mut self, result: Result<Vec<UserGuild>, String>) {
+        self.guilds.apply_initial(result.map(|items| (items, None)));
     }
 
     /// Replace one entry on the Posts tab with a freshly fetched copy, after an
@@ -355,6 +399,7 @@ impl ProfileScreen {
             ProfileTab::Replies => self.handle_list_key(key, ListTarget::Replies),
             ProfileTab::Followers => self.handle_list_key(key, ListTarget::Followers),
             ProfileTab::Following => self.handle_list_key(key, ListTarget::Following),
+            ProfileTab::Guilds => self.handle_list_key(key, ListTarget::Guilds),
         }
     }
 
@@ -380,6 +425,9 @@ impl ProfileScreen {
                 self.following.loading,
                 self.following.next_cursor.is_some(),
             ),
+            // No third element to read: § List a User's Guilds is not
+            // paginated, so this tab never has another page to pull.
+            ListTarget::Guilds => (self.guilds.items.len(), self.guilds.loading, false),
         };
 
         // Pagination must not fire while a page is already in flight, so the
@@ -408,6 +456,7 @@ impl ProfileScreen {
             ListTarget::Replies => &mut self.replies.selected,
             ListTarget::Followers => &mut self.followers.selected,
             ListTarget::Following => &mut self.following.selected,
+            ListTarget::Guilds => &mut self.guilds.selected,
         }
     }
 
@@ -451,6 +500,17 @@ impl ProfileScreen {
                     username: f.followed_username.clone(),
                 })
                 .unwrap_or(ProfileIntent::None),
+            // Guilds are addressed by slug on every `/v1/guilds/…` route, so a
+            // row that arrived without one has nothing to open.
+            ListTarget::Guilds => self
+                .guilds
+                .items
+                .get(self.guilds.selected)
+                .filter(|g| !g.slug.is_empty())
+                .map(|g| ProfileIntent::OpenGuild {
+                    slug: g.slug.clone(),
+                })
+                .unwrap_or(ProfileIntent::None),
         }
     }
 
@@ -489,6 +549,7 @@ impl ProfileScreen {
             ProfileTab::Replies => self.render_replies(frame, layout[1], theme),
             ProfileTab::Followers => self.render_followers(frame, layout[1], theme),
             ProfileTab::Following => self.render_following(frame, layout[1], theme),
+            ProfileTab::Guilds => self.render_guilds(frame, layout[1], theme),
         }
         self.render_status(frame, layout[2], theme);
     }
@@ -553,6 +614,18 @@ impl ProfileScreen {
             u.following_count.unwrap_or(0),
         );
         lines.push(Line::from(Span::styled(counts, theme.muted_style())));
+        // The guild badge, which § Get User Profile says these fields describe:
+        // the ONE guild held as founder or member. Apprenticeships are not here,
+        // they are on the Guilds tab, so this line is the badge and nothing more.
+        if let Some(name) = u.guild_name.as_deref().filter(|n| !n.trim().is_empty()) {
+            let icon = u.guild_icon.as_deref().unwrap_or("").trim();
+            let badge = if icon.is_empty() {
+                format!("guild: {name}")
+            } else {
+                format!("{icon} {name}")
+            };
+            lines.push(Line::from(Span::styled(badge, theme.muted_style())));
+        }
         if let Some(loc) = &u.location_name {
             lines.push(Line::from(Span::styled(
                 format!("📍 {loc}"),
@@ -680,6 +753,17 @@ impl ProfileScreen {
         );
     }
 
+    fn render_guilds(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
+        render_list_with_state(
+            frame,
+            area,
+            theme,
+            &self.guilds,
+            "guilds",
+            |g: &UserGuild| vec![guild_row(g, theme)],
+        );
+    }
+
     fn render_status(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         let mut parts: Vec<String> = vec![];
         if self.follow_action_pending {
@@ -709,6 +793,10 @@ impl ProfileScreen {
         // List actions only apply on the list tabs.
         if self.tab == ProfileTab::Posts && self.is_self {
             parts.push("enter open · E edit · P pin · scroll for more · r refresh".into());
+        } else if self.tab == ProfileTab::Guilds {
+            // No "scroll for more" here: six rows is the ceiling and there is
+            // no cursor, so the whole tab is always already on screen.
+            parts.push("enter open · r refresh".into());
         } else if self.tab != ProfileTab::Info {
             // Someone else's Posts tab reads like any other list tab: `E` and
             // `P` are yours-only, so neither is advertised here.
@@ -730,6 +818,52 @@ enum ListTarget {
     Replies,
     Followers,
     Following,
+    Guilds,
+}
+
+/// Render one row of the Guilds tab: the guild, the role held in it, and, for
+/// the badge guild, that it is the one on the profile.
+///
+/// Only the badge guild is marked. The list is ordered badge-first, but that is
+/// invisible once it is on screen, and the role alone doesn't say which of
+/// founder/member/apprentice carries the badge, which is the whole distinction
+/// v0.8.6 § Guilds draws.
+///
+/// The guild's `icon` is an icon *identifier* rather than a glyph, the same as
+/// on the guilds index, so it is not rendered as text.
+fn guild_row(g: &UserGuild, theme: &Theme) -> Line<'static> {
+    let name = g.name.trim();
+    let head = if !name.is_empty() {
+        name.to_string()
+    } else if !g.slug.is_empty() {
+        format!("#{}", g.slug)
+    } else {
+        "(unknown guild)".to_string()
+    };
+    let mut spans = vec![Span::styled(head, theme.accent_style())];
+
+    let mut detail: Vec<String> = Vec::new();
+    if !name.is_empty() && !g.slug.is_empty() {
+        detail.push(format!("#{}", g.slug));
+    }
+    // The word for a role is the guilds module's, so a role reads the same here
+    // as it does on the guild's own roster.
+    if let Some(role) = super::guilds::role_label(g.role) {
+        detail.push(role.to_string());
+    }
+    if let Some(joined) = g.joined_at {
+        detail.push(format!("joined {}", format_relative(joined)));
+    }
+    if !detail.is_empty() {
+        spans.push(Span::styled(
+            format!("  {}", detail.join(" · ")),
+            theme.muted_style(),
+        ));
+    }
+    if g.is_badge() {
+        spans.push(Span::styled(" · profile badge", theme.warning_style()));
+    }
+    Line::from(spans)
 }
 
 /// Render one follower/following row. The follows API (v0.8.4) returns only
@@ -788,6 +922,9 @@ fn format_relative(t: OffsetDateTime) -> String {
 mod tests {
     use super::*;
     use crossterm::event::{KeyEventKind, KeyEventState};
+    // Only the fixtures name a role: the rows themselves go through the guilds
+    // module's shared label.
+    use cs_api::GuildRole;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent {
@@ -802,6 +939,10 @@ mod tests {
         User {
             id: "u".into(),
             username: name.into(),
+            guild_id: None,
+            guild_slug: None,
+            guild_icon: None,
+            guild_name: None,
             display_name: None,
             email: None,
             bio: None,
@@ -838,6 +979,16 @@ mod tests {
             created_at: None,
             edited_at: None,
             deleted: false,
+        }
+    }
+
+    fn user_guild(slug: &str, role: GuildRole) -> UserGuild {
+        UserGuild {
+            guild_id: format!("g-{slug}"),
+            slug: slug.into(),
+            name: format!("Guild {slug}"),
+            role: Some(role),
+            ..UserGuild::default()
         }
     }
 
@@ -1404,5 +1555,224 @@ mod tests {
         assert!(!render_to_string(&s, 160, 12).contains("poke pending"));
         s.poke_pending = true;
         assert!(render_to_string(&s, 160, 12).contains("poke pending"));
+    }
+
+    #[test]
+    fn shifted_six_selects_the_guilds_tab() {
+        let mut s = ProfileScreen::new_own();
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('^'))),
+            ProfileIntent::SelectTab(ProfileTab::Guilds)
+        );
+        assert_eq!(s.tab, ProfileTab::Guilds);
+    }
+
+    #[test]
+    fn guilds_is_the_last_tab_in_the_cycle() {
+        let mut s = ProfileScreen::new_own();
+        // h from the first tab wraps backwards onto the last one.
+        s.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(s.tab, ProfileTab::Guilds);
+        s.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(s.tab, ProfileTab::Info);
+    }
+
+    #[test]
+    fn apply_guilds_fills_the_tab_and_leaves_no_cursor() {
+        let mut s = ProfileScreen::new_for("bob".into());
+        s.apply_guilds(Ok(vec![
+            user_guild("owls", GuildRole::Member),
+            user_guild("divers", GuildRole::Apprentice),
+        ]));
+        assert!(s.guilds.loaded);
+        assert!(!s.guilds.loading);
+        assert_eq!(s.guilds.items.len(), 2);
+        assert!(
+            s.guilds.next_cursor.is_none(),
+            "§ List a User's Guilds has no pagination, so nothing may imply a second page"
+        );
+    }
+
+    #[test]
+    fn apply_guilds_surfaces_a_failure() {
+        let mut s = ProfileScreen::new_for("bob".into());
+        s.apply_guilds(Err("api NotFound (404): no such user".into()));
+        assert!(s.guilds.error.is_some());
+        assert!(s.guilds.items.is_empty());
+        assert!(!s.guilds.loading);
+    }
+
+    #[test]
+    fn the_guilds_tab_never_asks_for_another_page() {
+        let mut s = ProfileScreen::new_own();
+        s.tab = ProfileTab::Guilds;
+        s.apply_guilds(Ok(vec![user_guild("owls", GuildRole::Founder)]));
+        // Sitting on the last row is where every other tab pulls the next page.
+        assert_eq!(s.handle_key(key(KeyCode::Char('j'))), ProfileIntent::None);
+        assert_eq!(s.handle_key(key(KeyCode::Char('n'))), ProfileIntent::None);
+        assert_eq!(s.handle_key(key(KeyCode::PageDown)), ProfileIntent::None);
+    }
+
+    #[test]
+    fn r_refreshes_the_guilds_tab() {
+        let mut s = ProfileScreen::new_own();
+        s.tab = ProfileTab::Guilds;
+        s.apply_guilds(Ok(vec![user_guild("owls", GuildRole::Founder)]));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('r'))),
+            ProfileIntent::RefreshCurrentTab
+        );
+    }
+
+    #[test]
+    fn enter_on_the_guilds_tab_opens_the_selected_guild() {
+        let mut s = ProfileScreen::new_for("bob".into());
+        s.apply_user(Ok(user("bob")));
+        s.tab = ProfileTab::Guilds;
+        s.apply_guilds(Ok(vec![
+            user_guild("owls", GuildRole::Member),
+            user_guild("divers", GuildRole::Apprentice),
+        ]));
+        s.guilds.selected = 1;
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            ProfileIntent::OpenGuild {
+                slug: "divers".into()
+            },
+            "an apprenticeship opens the same way the badge guild does"
+        );
+    }
+
+    #[test]
+    fn enter_on_a_guild_row_without_a_slug_is_a_noop() {
+        // Every guild route is addressed by slug, so a row that decoded without
+        // one would request `/v1/guilds/` and fail.
+        let mut s = ProfileScreen::new_for("bob".into());
+        s.tab = ProfileTab::Guilds;
+        s.apply_guilds(Ok(vec![UserGuild::default()]));
+        assert_eq!(s.handle_key(key(KeyCode::Enter)), ProfileIntent::None);
+    }
+
+    #[test]
+    fn the_guilds_tab_shows_every_guild_with_its_role() {
+        let mut s = ProfileScreen::new_for("bob".into());
+        s.apply_user(Ok(user("bob")));
+        s.tab = ProfileTab::Guilds;
+        s.apply_guilds(Ok(vec![
+            user_guild("owls", GuildRole::Member),
+            user_guild("divers", GuildRole::Apprentice),
+        ]));
+        let text = render_to_string(&s, 100, 14);
+        assert!(text.contains("Guild owls"), "{text:?}");
+        assert!(text.contains("#owls"), "{text:?}");
+        assert!(text.contains("member"), "{text:?}");
+        // The apprenticeship is listed too: it is not on the profile badge, but
+        // the user is in the guild.
+        assert!(text.contains("Guild divers"), "{text:?}");
+        assert!(text.contains("apprentice"), "{text:?}");
+        assert_eq!(
+            text.matches("profile badge").count(),
+            1,
+            "exactly one guild carries the badge: {text:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_guilds_tab_says_so() {
+        let mut s = ProfileScreen::new_for("bob".into());
+        s.apply_user(Ok(user("bob")));
+        s.tab = ProfileTab::Guilds;
+        s.apply_guilds(Ok(vec![]));
+        assert!(render_to_string(&s, 100, 14).contains("no guilds"));
+    }
+
+    #[test]
+    fn the_guilds_tab_status_line_promises_no_further_pages() {
+        let mut s = ProfileScreen::new_own();
+        s.apply_user(Ok(user("me")));
+        s.tab = ProfileTab::Guilds;
+        s.apply_guilds(Ok(vec![user_guild("owls", GuildRole::Founder)]));
+        let text = render_to_string(&s, 160, 12);
+        assert!(text.contains("enter open"), "{text:?}");
+        assert!(
+            !text.contains("scroll for more"),
+            "the tab cannot page, so it must not offer to: {text:?}"
+        );
+    }
+
+    #[test]
+    fn an_unmodelled_role_is_never_labelled_as_member() {
+        // v0.8.6 added `apprentice` to a founder/member vocabulary. Guessing at
+        // a role the client doesn't know is how the next addition would show up
+        // wearing the wrong word. The rule lives in the guilds module, which
+        // pins the vocabulary; this holds the row to it.
+        let row = guild_row(
+            &UserGuild {
+                slug: "owls".into(),
+                role: Some(GuildRole::Unknown),
+                ..Default::default()
+            },
+            &Theme::default(),
+        );
+        let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            !text.contains("member"),
+            "an unmodelled role must not be dressed up as one: {text:?}"
+        );
+    }
+
+    #[test]
+    fn guild_row_marks_the_badge_guild_only() {
+        let theme = Theme::default();
+        let row = |g: &UserGuild| -> String {
+            guild_row(g, &theme)
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        assert!(row(&user_guild("owls", GuildRole::Founder)).contains("profile badge"));
+        assert!(row(&user_guild("owls", GuildRole::Member)).contains("profile badge"));
+        assert!(!row(&user_guild("divers", GuildRole::Apprentice)).contains("profile badge"));
+        assert!(!row(&UserGuild::default()).contains("profile badge"));
+    }
+
+    #[test]
+    fn guild_row_names_a_guild_that_arrived_without_a_name() {
+        let theme = Theme::default();
+        let slug_only = UserGuild {
+            slug: "owls".into(),
+            ..UserGuild::default()
+        };
+        assert_eq!(
+            guild_row(&slug_only, &theme).spans[0].content.as_ref(),
+            "#owls"
+        );
+        assert_eq!(
+            guild_row(&UserGuild::default(), &theme).spans[0]
+                .content
+                .as_ref(),
+            "(unknown guild)"
+        );
+    }
+
+    #[test]
+    fn guild_row_dates_the_membership_when_the_server_sent_one() {
+        let theme = Theme::default();
+        let mut g = user_guild("owls", GuildRole::Member);
+        assert!(
+            !guild_row(&g, &theme)
+                .spans
+                .iter()
+                .any(|s| s.content.contains("joined")),
+            "no joinedAt, nothing to date"
+        );
+        g.joined_at = Some(OffsetDateTime::now_utc());
+        let dated: String = guild_row(&g, &theme)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(dated.contains("· joined "), "{dated:?}");
     }
 }

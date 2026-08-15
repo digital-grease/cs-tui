@@ -1,6 +1,6 @@
-//! Async Rust client for the cyberspace.online API (v0.8.4).
+//! Async Rust client for the cyberspace.online API (v0.8.6).
 //!
-//! Authoritative spec: `docs/api-v0.8.4.md` at the repo root.
+//! Authoritative spec: `docs/api-v0.8.6.md` at the repo root.
 #![deny(rust_2018_idioms)]
 
 mod auth;
@@ -47,11 +47,12 @@ pub use endpoint::EndpointKey;
 pub use entries::{CreatedEntry, EntryEdit, TitleEdit};
 pub use error::{ApiError, ErrorCode, Result};
 pub use follows::{Follow, FollowsDirection};
-pub use guilds::{Guild, GuildMembership, GuildRole, GuildThread, JoinedGuild};
+pub use guilds::{Guild, GuildMembership, GuildRole, GuildThread, JoinedGuild, PromotedGuild};
 pub use message::{AudioAttachment, MessageExtras, MessageStyle};
 pub use notes::{Note, NoteRevision};
 pub use notifications::{
-    Notification, NotificationMetadata, NotificationType, NotificationsFilter,
+    Notification, NotificationMetadata, NotificationType, NotificationsFilter, UnreadCount,
+    SYSTEM_ACTOR,
 };
 pub use profile_patch::{Patch, ProfileUpdate};
 pub use rate_limit::RateLimit;
@@ -60,11 +61,11 @@ pub use settings::{NotificationPrefs, Settings, SettingsUpdate};
 pub use tokens::Tokens;
 pub use topics::Topic;
 pub use types::{Attachment, Entry, FlagResponse, Reply};
-pub use users::{PokeResponse, User};
+pub use users::{PokeResponse, User, UserGuild};
 pub use watch::Watch;
 
 /// Spec version this client targets.
-pub const API_VERSION: &str = "v0.8.4";
+pub const API_VERSION: &str = "v0.8.6";
 /// Production API host, used unless [`ClientBuilder`] is given another.
 pub const DEFAULT_BASE_URL: &str = "https://api.cyberspace.online";
 
@@ -74,7 +75,7 @@ mod tests {
 
     #[test]
     fn constants_present() {
-        assert_eq!(API_VERSION, "v0.8.4");
+        assert_eq!(API_VERSION, "v0.8.6");
         assert!(DEFAULT_BASE_URL.starts_with("https://"));
     }
 
@@ -102,6 +103,31 @@ mod tests {
         let sent: CmailSendResponse =
             serde_json::from_str(r#"{"conversationId":"c1","messageId":"m2"}"#).unwrap();
         assert_eq!(sent.message_id.as_deref(), Some("m2"));
+    }
+
+    #[test]
+    fn the_v086_apprenticeship_and_notification_types_are_re_exported() {
+        // Same reasoning as the rtdb re-export test below: a type the TUI has
+        // to name is unusable until it is reachable through the crate root, and
+        // naming it here turns a dropped `pub use` into a failure in this crate
+        // rather than in the consumer.
+        let apprenticeship = UserGuild {
+            role: Some(GuildRole::Apprentice),
+            ..UserGuild::default()
+        };
+        assert!(!apprenticeship.is_badge());
+
+        let promoted: PromotedGuild =
+            serde_json::from_str(r#"{"guildId":"g1","role":"member"}"#).unwrap();
+        assert_eq!(promoted.role, Some(GuildRole::Member));
+
+        let capped = UnreadCount {
+            count: 100,
+            exact: false,
+        };
+        assert_eq!(capped.badge(), "99+");
+        assert_eq!(SYSTEM_ACTOR, "system");
+        assert_eq!(NotificationType::PostCooldown.wire(), "post_cooldown");
     }
 
     #[test]

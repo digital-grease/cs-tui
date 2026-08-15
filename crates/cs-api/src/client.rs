@@ -1065,6 +1065,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn marking_all_read_keeps_calling_until_the_server_says_it_is_done() {
+        // § Mark All as Read marks at most 5,000 per call and reports `hasMore`
+        // while unread notifications remain. One call would leave a big inbox
+        // partly unread under a name that promises otherwise, so the client
+        // calls again until the server clears the flag and returns the total.
+        let pass = |body: &str| response("200 OK", &[], body);
+        let c = client_served_by(vec![
+            pass(r#"{"data":{"updated":5000,"hasMore":true}}"#),
+            pass(r#"{"data":{"updated":5000,"hasMore":true}}"#),
+            pass(r#"{"data":{"updated":12,"hasMore":false}}"#),
+        ])
+        .await;
+
+        let updated = c.mark_all_notifications_read().await.unwrap();
+        assert_eq!(updated, 10_012, "every pass counts towards the total");
+    }
+
+    #[tokio::test]
+    async fn marking_all_read_stops_when_a_pass_makes_no_progress() {
+        // `hasMore` with nothing marked cannot be made to advance by asking
+        // again, so the loop stops instead of hammering the endpoint. The test
+        // server has exactly one response to give: a second request would find
+        // the listener gone and fail as a transport error, which is what proves
+        // the loop stopped rather than merely finished.
+        let c = client_served_by(vec![response(
+            "200 OK",
+            &[],
+            r#"{"data":{"updated":0,"hasMore":true}}"#,
+        )])
+        .await;
+
+        let updated = c.mark_all_notifications_read().await.unwrap();
+        assert_eq!(updated, 0);
+    }
+
+    #[tokio::test]
     async fn presence_and_typing_call_sites_charge_both_of_their_budgets() {
         // § Rate Limits caps presence at 15 per room and 90 overall, and C-Mail
         // typing at 40 per conversation and 120 overall. The call sites have to
