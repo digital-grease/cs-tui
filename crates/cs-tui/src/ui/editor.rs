@@ -419,6 +419,12 @@ pub enum EditorPurpose {
     /// Ctrl+E re-edit of an existing `ComposeScreen` body. On save the app pops
     /// back to that compose screen and overwrites its content.
     ReEditBody,
+    /// Body of something already published, being edited in place (v0.8.4
+    /// § Edit Entry, § Edit Reply). On save the app replaces the editor with a
+    /// `ComposeScreen` of `kind`, exactly like [`EditorPurpose::NewBody`] but
+    /// with no separate topic prefill: an edit kind carries a snapshot of what
+    /// it is editing, and the compose screen fills every field from that.
+    EditBody { kind: ComposeKind },
     /// C-Mail message body. On save the app pops back to the conversation and
     /// sends the content to this conversation id.
     CmailMessage { conversation_id: String },
@@ -481,13 +487,16 @@ impl EditorScreen {
     }
 
     /// The server-side character budget for this editor's content, per the
-    /// v0.6.0 spec § Content Limits: C-Mail messages cap at 2,048 chars; entry,
-    /// reply, and note bodies at 32,768.
+    /// v0.8.4 spec § Content Limits: C-Mail messages cap at 2,048 chars; entry,
+    /// reply, and note bodies at 32,768. An edit keeps the same body cap as the
+    /// thing it edits (§ Edit Entry, § Edit Reply).
     #[must_use]
     fn max_content_chars(&self) -> usize {
         match &self.purpose {
             EditorPurpose::CmailMessage { .. } | EditorPurpose::CircMessage { .. } => 2_048,
-            EditorPurpose::NewBody { .. } | EditorPurpose::ReEditBody => 32_768,
+            EditorPurpose::NewBody { .. }
+            | EditorPurpose::ReEditBody
+            | EditorPurpose::EditBody { .. } => 32_768,
         }
     }
 
@@ -586,7 +595,7 @@ impl EditorScreen {
 
     fn title(&self) -> String {
         match &self.purpose {
-            EditorPurpose::NewBody { kind, .. } => kind.title(),
+            EditorPurpose::NewBody { kind, .. } | EditorPurpose::EditBody { kind } => kind.title(),
             EditorPurpose::ReEditBody => " cs-tui • edit body ".to_string(),
             EditorPurpose::CmailMessage { .. } => " cs-tui • c-mail • compose ".to_string(),
             EditorPurpose::CircMessage { .. } => " cs-tui • cIRC • compose ".to_string(),
@@ -679,6 +688,7 @@ impl EditorScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::compose::EntrySnapshot;
     use crossterm::event::{KeyEventKind, KeyEventState};
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
@@ -1332,5 +1342,76 @@ mod tests {
             "",
         );
         assert_eq!(s.title(), " cs-tui • new post ");
+    }
+
+    #[test]
+    fn edit_body_titles_and_caps_match_the_thing_being_edited() {
+        let entry = EditorScreen::new(
+            EditorPurpose::EditBody {
+                kind: ComposeKind::EditEntry {
+                    post_id: "p1".into(),
+                    original: EntrySnapshot::default(),
+                },
+            },
+            "body",
+        );
+        assert_eq!(entry.title(), " cs-tui • edit post p1 ");
+        assert_eq!(entry.max_content_chars(), 32_768);
+
+        let reply = EditorScreen::new(
+            EditorPurpose::EditBody {
+                kind: ComposeKind::EditReply {
+                    reply_id: "r1".into(),
+                    original_content: "before".into(),
+                },
+            },
+            "before",
+        );
+        assert_eq!(reply.title(), " cs-tui • edit reply r1 ");
+        assert_eq!(reply.max_content_chars(), 32_768);
+    }
+
+    #[test]
+    fn edit_body_prefills_the_buffer_and_saves_the_result() {
+        // The editor opens on the published body, so an edit starts from what is
+        // already there rather than from a blank buffer.
+        let mut s = EditorScreen::new(
+            EditorPurpose::EditBody {
+                kind: ComposeKind::EditReply {
+                    reply_id: "r1".into(),
+                    original_content: "typo".into(),
+                },
+            },
+            "typo",
+        );
+        assert_eq!(s.content(), "typo");
+        s.handle_key(key(KeyCode::Backspace, KeyModifiers::empty()));
+        s.handle_key(key(KeyCode::Char('e'), KeyModifiers::empty()));
+        assert_eq!(s.content(), "type");
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            EditorIntent::Save
+        );
+    }
+
+    #[test]
+    fn a_cleared_edit_body_cannot_be_saved() {
+        // Blanking the body is not an edit: the server requires content on a
+        // reply edit and rejects an empty one on an entry edit.
+        let mut s = EditorScreen::new(
+            EditorPurpose::EditBody {
+                kind: ComposeKind::EditReply {
+                    reply_id: "r1".into(),
+                    original_content: "x".into(),
+                },
+            },
+            "x",
+        );
+        s.handle_key(key(KeyCode::Backspace, KeyModifiers::empty()));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+            EditorIntent::None
+        );
+        assert!(s.error.is_some());
     }
 }

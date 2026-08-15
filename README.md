@@ -1,6 +1,6 @@
 # cs-tui
 
-A terminal client for [cyberspace.online](https://cyberspace.online), targeting the v0.7 API.
+A terminal client for [cyberspace.online](https://cyberspace.online), targeting the v0.8.4 API.
 
 ![cs-tui screenshot](docs/screenshot.png)
 
@@ -8,7 +8,7 @@ A terminal client for [cyberspace.online](https://cyberspace.online), targeting 
 
 ## Status
 
-Early development. Most of the documented v0.7 REST surface is implemented, including private C-Mail and multi-user cIRC chat (REST + live Firebase RTDB streaming) and full-text search; live testing against the API is ongoing.
+Early development. Most of the documented v0.8.4 REST surface is implemented, including private C-Mail and multi-user cIRC chat (REST + live Firebase RTDB streaming) and full-text search; live testing against the API is ongoing.
 
 ## Features
 
@@ -17,8 +17,15 @@ Early development. Most of the documented v0.7 REST surface is implemented, incl
 - **Notifications** with read/unread filtering and an unread badge
 - **Thread watching**: `w` in post detail watches/unwatches a thread for `thread_reply` notifications; replying or being `@mentioned` auto-watches (toggle with `autoWatchOnReply` in Settings)
 - **Bookmarks**, **Topics**, and per-topic feeds
-- **Profiles** (info / posts / replies / followers / following) with follow & unfollow
+- **Profiles** (info / posts / replies / followers / following) with follow & unfollow, and `P` to poke someone
 - **Compose** posts and replies in the built-in editor (soft-wrapping, multi-line paste, no external editor required); delete your own entries
+- **Edit** your own entry or reply with `e` (`E` on your profile's Posts tab). The API allows this on supporter accounts for 5 minutes after posting, and says so when it doesn't
+- **Flag** an entry, a reply, or a cIRC message for review with `F`, with an optional reason. Reporting is idempotent and can't be withdrawn
+- **cIRC** chat rooms with live streaming: a room roster (`Ctrl+U`) showing who's there and who's idle, presence published on your behalf, and a message-select mode (`Ctrl+B`) to delete your own message, flag one, open an attachment, reveal a spoiler, or mute the author
+- **C-Mail** private conversations with live streaming, an unread badge, and a typing indicator in both directions
+- **Chat attachments** as compact chips: `[image]`, `[gif]` and `[♪ artist - title]`, clickable via OSC 8 when `hyperlinks` is on, with `o` to open the link or play the track in the jukebox
+- **Text styles and ASCII art**: `/art` is decoded and drawn as sent, `/rainbow` colors per character, `/quiet` dims, `/spoiler` stays masked until you press `v`, and `/blink`, `/wave`, `/slow` and `/glitch` get a static stand-in. Nothing animates. `/l33t`, `/flip`, `/comic`, `/cursive` and `/times` rewrite the text rather than style it, so cs-tui shows exactly what the server sent and adds nothing of its own
+- **Muted users**: `/mute` and `/unmute` in a room (or `m` in message-select mode) hide that person's messages for you; it's the same mute list the website uses
 - **Guilds**: browse member groups, view threads/members, join/leave, and post threads
 - **Journal** (private notes) with revision history
 - **Settings** round-trip that preserves fields the client doesn't model
@@ -79,7 +86,37 @@ session is saved (see [Files](#files)) and reused on the next launch until you
 log out.
 
 cs-tui is keyboard-driven. Each screen shows its own context keys in the status
-bar, and `?` opens a help overlay anywhere you aren't typing into a field.
+bar, and `?` opens a help overlay anywhere you aren't typing into a field. The
+overlay lists every key grouped by screen and is longer than a terminal, so it
+scrolls with `j`/`k`, the arrows and PgUp/PgDn (`g`/`G` jump to the ends); any
+other key closes it.
+
+### Keys by screen
+
+Beyond the shared list keys (`j`/`k` move, `Enter` opens, `r` refreshes, `c`
+composes):
+
+| Screen | Key | Action |
+|---|---|---|
+| Feed, topic feed, post detail | `e` | Edit your own entry (on post detail, the selected reply) |
+| Feed, topic feed, post detail | `F` | Flag an entry or reply for review, with an optional reason |
+| Someone else's profile | `P` | Poke them |
+| Your own profile, Posts tab | `E` | Edit the selected post (`e` edits your profile, `P` pins a post) |
+| cIRC room | `Ctrl+U` | Show / hide the room roster |
+| cIRC room | `Ctrl+B` | Enter message-select mode |
+| cIRC message select | `j` / `k` | Pick a message |
+| cIRC message select | `d` then `y` | Delete your own message |
+| cIRC message select | `F` | Flag the message |
+| cIRC message select | `o` | Open the attachment, or play the track |
+| cIRC message select | `v` | Reveal a spoiler |
+| cIRC message select | `m` | Mute the author in this room |
+| cIRC message select | `Esc` | Back to the composer |
+| C-Mail conversation | `o` | Open the attachment, or play the track |
+| C-Mail conversation | `v` | Reveal a spoiler |
+
+In a cIRC room the composer always has focus, so every letter you type goes
+into the message. That is why the room's own actions are chords, and why
+deleting or flagging a message goes through the select mode.
 
 ### Themes
 
@@ -159,17 +196,28 @@ location is auto-created).
 
 | Option | Default | Notes |
 |---|---|---|
-| `start_section` | `feed` | Section opened on launch: `feed`, `notifications`, `bookmarks`, `topics`, `profile`, `journal`, `guilds`, `settings`. |
+| `start_section` | `feed` | Section opened on launch: `feed`, `notifications`, `c-mail`, `circ`, `bookmarks`, `topics`, `profile`, `journal`, `guilds`, `settings`. |
 | `nsfw` | `false` | Show NSFW posts by default (otherwise hidden until toggled). |
 | `confirm_deletes` | `true` | Require the two-step `d` then `y` confirmation before deleting a post or note. |
 | `feed_autorefresh` | `true` | Auto-refresh the feed in the background: new entries are prepended at the top without moving your scroll position (only while the feed is on screen). |
-| `feed_refresh_secs` | `60` | Seconds between background feed polls. Minimum 10; lower values use more of the read rate limit. |
+| `feed_refresh_secs` | `30` | Seconds between background feed polls. Minimum 10; lower values use more of the read rate limit. |
 | `notifications_refresh_secs` | `20` | Seconds between background polls of the unread-notification count (the header badge). Minimum 5; lower values surface new notifications sooner but use more of the read rate limit. |
 | `audio_volume` | `50` | Starting jukebox volume for a fresh session (0 to 130; above 100 is soft amplification). Adjust live with `[` / `]`. |
 | `shuffle` | `false` | Start each session with shuffle mode armed (playback still begins by hand). See [Jukebox playback](#jukebox-playback-optional). |
 | `editor` | _(unset, uses the built-in editor)_ | Set to an external editor command (e.g. `nvim`) to compose in it instead of the built-in editor. GUI editors must block until the file is closed, so use a wait flag: `code --wait`, `subl -w`, `gnome-text-editor --standalone`. Leave unset to use the built-in editor. `$VISUAL`/`$EDITOR` are no longer consulted (an environment editor that forks or is missing was silently aborting composes). |
 | `preview_length` | `200` | Characters of post content shown in list previews (clamped 20 to 2000). |
 | `image_height` | `20` | Max rows for the inline image strip in post detail (clamped 1 to 60). |
+
+### What other people can see
+
+Two settings publish your activity to other people. Both are on by default,
+because that is what the website does and what people in a room expect. Set
+either to `false` in `config.toml` and cs-tui never makes the call at all.
+
+| Option | Default | Notes |
+|---|---|---|
+| `circ_presence` | `true` | Announce your presence while a cIRC room is open, so your name appears in that room's user list for everyone in the room, including people reading on the website. cs-tui refreshes it on the cadence the server asks for, and removes you when you leave the room or quit. Set to `false` to stay out of the user list entirely; you can still read the room and post in it. |
+| `cmail_typing` | `true` | Publish a typing indicator while a C-Mail conversation is open, so the other participant sees the same "…is typing" the website shows. It is refreshed while you type and cleared when you stop, close the conversation, or quit. Set to `false` to publish nothing; you still see their indicator either way. |
 
 ### Input and rendering
 
@@ -186,7 +234,7 @@ location is auto-created).
 |---|---|
 | `crates/cs-api/` | HTTP client + types for the Cyberspace REST API |
 | `crates/cs-tui/` | Ratatui application (binary) |
-| `docs/api-v0.7.md` | Authoritative API specification (do not modify) |
+| `docs/api-v0.8.4.md` | Authoritative API specification (do not modify) |
 
 ## License
 

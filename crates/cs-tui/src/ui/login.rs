@@ -229,9 +229,12 @@ fn input_line<'a>(value: &'a str, focused: bool, width: usize, theme: &Theme) ->
 fn humanize_login_error(raw: &str) -> String {
     let lower = raw.to_ascii_lowercase();
     if lower.contains("verif") {
-        // Undocumented prod behavior: login is refused until the email is
-        // verified. Resending isn't possible from a rejected login (that needs
-        // an id_token no failed login issues), so point at the email link.
+        // v0.8.4 § Access moved this: login itself now succeeds for an
+        // unverified address and every *authenticated* call answers
+        // `403 EMAIL_NOT_VERIFIED` instead, which the shell surfaces along with
+        // the resend chord. This branch is the fallback for a deployment that
+        // still refuses the login outright, where there is no id_token to
+        // resend with, so it can only point at the link already in the inbox.
         "Email not verified. Open the verification link in your inbox, then log in again."
             .to_string()
     } else if lower.contains("rate limited") || lower.contains("too many") {

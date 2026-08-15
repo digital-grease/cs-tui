@@ -1,9 +1,21 @@
 //! Firebase Realtime Database transport client.
 //!
-//! Pure plumbing — no cyberspace.online-specific paths or message shapes. API
-//! v0.7 documents the C-Mail + cIRC RTDB paths (`dm_messages/<conversationId>`,
-//! `chat_messages/<roomId>`, and `user_conversations/<uid>`); the typed message
-//! shapes live in the `cmail` / `circ` modules.
+//! Pure plumbing, with no cyberspace.online-specific paths or message shapes.
+//! API v0.8.4 documents five RTDB paths: `dm_messages/<conversationId>`,
+//! `dm_presence/<conversationId>` and `user_conversations/<uid>` for C-Mail,
+//! `chat_messages/<roomId>` and `chat_presence/<roomId>` for cIRC. The typed
+//! shapes and the path builders live in the `cmail` / `circ` modules.
+//!
+//! Read-only in practice: every path above is published through the REST API
+//! (sending, typing indicators, presence heartbeats), so a client subscribes
+//! here and writes there. The `put` / `patch` / `delete` methods below are
+//! transport completeness, not a second way in.
+//!
+//! Decoding an event is not just deserialising its `data`: a `put` replaces the
+//! value at its path while a `patch` merges only the fields it carries, so a
+//! `patch` payload is a fragment rather than a whole object. cIRC deletions
+//! arrive that way (§ Reading a room in real time), which is why
+//! [`crate::circ_message_updates_from_rtdb_event`] takes the event kind.
 //!
 //! Usage:
 //! ```ignore

@@ -2,13 +2,16 @@ use serde::Deserialize;
 
 pub type Result<T> = std::result::Result<T, ApiError>;
 
-/// API-level error codes per the v0.7 spec (`docs/api-v0.7.md` § Error Codes).
+/// API-level error codes per the v0.8.4 spec (`docs/api-v0.8.4.md` § Error Codes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ErrorCode {
     Unauthorized,
     Forbidden,
     Banned,
+    /// The account's email address is not verified (403). Added in v0.8.4; see
+    /// § Access, whose recovery path is `POST /v1/auth/resend-verification`.
+    EmailNotVerified,
     NotFound,
     ValidationError,
     Conflict,
@@ -25,7 +28,7 @@ impl ErrorCode {
     pub fn http_status(self) -> u16 {
         match self {
             Self::Unauthorized => 401,
-            Self::Forbidden | Self::Banned => 403,
+            Self::Forbidden | Self::Banned | Self::EmailNotVerified => 403,
             Self::NotFound => 404,
             Self::ValidationError => 400,
             Self::Conflict => 409,
@@ -129,6 +132,12 @@ impl ApiError {
                 ErrorCode::NotFound => "not found".to_string(),
                 ErrorCode::Forbidden => "you're not allowed to do that".to_string(),
                 ErrorCode::Banned => "your account is banned".to_string(),
+                // § Access: the fix is to click the link in the verification
+                // mail, or to ask for a fresh one via Resend Verification Email.
+                ErrorCode::EmailNotVerified => {
+                    "verify your email address to use the API, check your inbox or resend the verification email"
+                        .to_string()
+                }
                 ErrorCode::Unauthorized => "session expired — please sign in again".to_string(),
                 ErrorCode::RateLimited => "rate limited — slow down a moment".to_string(),
                 ErrorCode::InternalError => "the server hit an error — try again".to_string(),
@@ -176,6 +185,27 @@ mod tests {
     fn bad_gateway_deserializes() {
         let code: ErrorCode = serde_json::from_str("\"BAD_GATEWAY\"").unwrap();
         assert_eq!(code, ErrorCode::BadGateway);
+    }
+
+    #[test]
+    fn email_not_verified_deserializes() {
+        let code: ErrorCode = serde_json::from_str("\"EMAIL_NOT_VERIFIED\"").unwrap();
+        assert_eq!(code, ErrorCode::EmailNotVerified);
+    }
+
+    #[test]
+    fn email_not_verified_is_a_403() {
+        assert_eq!(ErrorCode::EmailNotVerified.http_status(), 403);
+        // And the user-facing copy points at the recovery path rather than
+        // repeating the code.
+        let msg = ApiError::Api {
+            code: ErrorCode::EmailNotVerified,
+            message: "Email not verified".into(),
+            status: 403,
+        }
+        .user_message();
+        assert!(msg.contains("verify your email"), "got {msg:?}");
+        assert!(msg.contains("resend"), "got {msg:?}");
     }
 
     #[test]

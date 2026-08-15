@@ -1,17 +1,20 @@
 //! Top-level App state and event loop.
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use cs_api::rtdb::{RtdbClient, SseEvent, SseEventKind};
 use cs_api::{
-    circ_messages_from_rtdb_event, messages_from_rtdb_event, ApiError, Bookmark, CircMessage,
-    CircRoom, Client, CmailConversation, CmailMessage, EndpointKey, Entry, Follow,
-    FollowsDirection, Guild, GuildMembership, GuildThread, JoinedGuild, Note, NoteRevision,
-    Notification, NotificationType, NotificationsFilter, ProfileUpdate, Reply, Settings,
-    SettingsUpdate, Topic, User,
+    circ_message_updates_from_rtdb_event, circ_messages_path, circ_presence_path,
+    circ_presence_updates_from_rtdb_event, cmail_presence_updates_from_rtdb_event,
+    messages_from_rtdb_event, ApiError, Bookmark, CircMessage, CircMessageUpdate,
+    CircPresenceResponse, CircPresenceUpdate, CircRoom, CircRoomUser, Client, CmailConversation,
+    CmailMessage, CmailPresenceUpdate, CmailTypingResponse, CmailTypingStatus, EndpointKey, Entry,
+    EntryEdit, ErrorCode, FlagResponse, Follow, FollowsDirection, Guild, GuildMembership,
+    GuildThread, JoinedGuild, Note, NoteRevision, Notification, NotificationType,
+    NotificationsFilter, PokeResponse, ProfileUpdate, Reply, Settings, SettingsUpdate, Topic, User,
 };
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::DefaultTerminal;
@@ -28,6 +31,7 @@ use super::editor::{EditorIntent, EditorPurpose, EditorScreen};
 use super::feed::{FeedIntent, FeedScreen, HeadUpdate};
 use super::guild_detail::{GuildIntent, GuildScreen, GuildTab};
 use super::guilds::{GuildsIntent, GuildsScreen};
+use super::help::{HelpIntent, HelpOverlay};
 use super::journal::{JournalIntent, JournalScreen};
 use super::login::{LoginIntent, LoginScreen};
 use super::menu::{MenuIntent, MenuOverlay};
@@ -62,6 +66,115 @@ const SUSPECT_END_LIMIT: u8 = 3;
 /// How many played tracks `<` / `>` can navigate back through.
 const PLAY_HISTORY_CAP: usize = 50;
 
+/// How long the C-Mail composer may sit untouched before the typing flag is
+/// withdrawn, matching the ~2.5s the website uses (v0.8.4 § Typing Indicator).
+/// Waiting for the server's own `staleAfterMs` instead would leave "…is
+/// typing" up on the other screen for seconds after the user stopped.
+const TYPING_IDLE_AFTER: Duration = Duration::from_millis(2_500);
+
+/// The whole budget for the `DELETE`s that withdraw what we publish about the
+/// user when the session ends (§ Leave a Room, § Typing Indicator).
+///
+/// Both are state the server expires on its own, so overrunning this costs at
+/// most one staleness window of stale presence on somebody else's screen. A
+/// client that cannot exit is worse, hence the hard cap.
+const BROADCAST_TEARDOWN_GRACE: Duration = Duration::from_millis(1_500);
+
+/// Floor on the gap between two cIRC presence heartbeats (§ Announce Your
+/// Presence). The spec asks for an extra beat the moment the user wakes up or
+/// goes quiet, and a keystroke is what tells us that; without a floor, a fast
+/// typist would spend the room's whole 15/min budget on wake-up beats.
+const CIRC_PRESENCE_MIN_GAP: Duration = Duration::from_secs(5);
+
+/// How long the presence heartbeat waits after a failed beat before trying
+/// again. Deliberately slower than the server's cadence: a room we cannot
+/// announce in is one we are simply invisible in, which is not worth retrying
+/// hard enough to eat the budget the successful path needs.
+const CIRC_PRESENCE_RETRY: Duration = Duration::from_secs(30);
+
+/// The RTDB node carrying a C-Mail conversation's live typing indicator
+/// (v0.8.4 § Reading in real time). cs-api exposes a path helper for the two
+/// cIRC nodes but not for this one, so the shape lives here.
+fn cmail_presence_path(conversation_id: &str) -> String {
+    format!("/dm_presence/{conversation_id}")
+}
+
+/// Outbound C-Mail typing-flag bookkeeping (v0.8.4 § Typing Indicator).
+///
+/// The screen deliberately has no clock: it reports "the composer holds an
+/// unsent draft" on every keystroke and the shell decides what that costs in
+/// requests. That decision is entirely here: at most one `POST` per the
+/// server's `heartbeatMs`, a `DELETE` once the composer has been quiet for
+/// [`TYPING_IDLE_AFTER`], and nothing at all when the broadcast is switched off
+/// in config.
+#[derive(Debug, Default)]
+struct TypingPublisher {
+    /// The conversation a flag is currently published on, and when it was last
+    /// posted. `None` means we are publishing nothing, so there is nothing to
+    /// withdraw either.
+    published: Option<(String, Instant)>,
+    /// When the user last touched the composer, for the idle timeout.
+    last_typed: Option<Instant>,
+    /// The refresh cadence, read off the last successful `POST` rather than
+    /// assumed. `None` until one has answered.
+    heartbeat: Option<Duration>,
+}
+
+impl TypingPublisher {
+    /// The refresh cadence, falling back to cs-api's documented default until a
+    /// response has named one.
+    fn heartbeat(&self) -> Duration {
+        self.heartbeat
+            .unwrap_or_else(|| CmailTypingResponse::default().heartbeat())
+    }
+
+    /// Whether a fresh `POST` is due for `conversation_id`. A conversation we
+    /// are not currently publishing on is always due, which is what makes the
+    /// first keystroke publish immediately.
+    fn due(&self, conversation_id: &str, now: Instant) -> bool {
+        match &self.published {
+            Some((id, sent_at)) if id == conversation_id => {
+                now.duration_since(*sent_at) >= self.heartbeat()
+            }
+            _ => true,
+        }
+    }
+
+    /// Whether the composer has been quiet long enough to take the flag down.
+    /// An untouched publisher counts as idle, so a flag can never outlive the
+    /// keystrokes that raised it.
+    fn is_idle(&self, now: Instant) -> bool {
+        match self.last_typed {
+            Some(at) => now.duration_since(at) >= TYPING_IDLE_AFTER,
+            None => true,
+        }
+    }
+
+    /// Record a keystroke in the composer.
+    fn touch(&mut self) {
+        self.last_typed = Some(Instant::now());
+    }
+
+    /// Record that the flag has just been posted for `conversation_id`.
+    fn mark_sent(&mut self, conversation_id: &str) {
+        self.published = Some((conversation_id.to_string(), Instant::now()));
+    }
+
+    /// Whether the flag we are publishing is on `conversation_id`.
+    fn published_on(&self, conversation_id: &str) -> bool {
+        self.published
+            .as_ref()
+            .is_some_and(|(id, _)| id == conversation_id)
+    }
+
+    /// Stop tracking the published flag and say which conversation it was on,
+    /// so the caller can decide whether it needs a `DELETE`.
+    fn take_published(&mut self) -> Option<String> {
+        self.last_typed = None;
+        self.published.take().map(|(id, _)| id)
+    }
+}
+
 /// Connectivity / auth signal distilled from a background `ApiError`, delivered
 /// out-of-band via [`BgEvent::ApiSignal`]. This is the typed side-channel that
 /// lets the main loop react to network/session conditions centrally — driving
@@ -76,6 +189,11 @@ pub enum ApiSignal {
     RateLimited { retry_after_secs: u64 },
     /// A 401 outlived the client's refresh-once, so the session is dead.
     SessionExpired,
+    /// The account's email address is not verified, so the server is refusing
+    /// every authenticated call with `403 EMAIL_NOT_VERIFIED` (v0.8.4
+    /// § Access). The session itself is fine, so this must not log anyone out:
+    /// the cure is Resend Verification Email plus a click in the inbox.
+    EmailNotVerified,
     /// The server answered normally (or with a non-transport error) — proof
     /// we're online; clears any offline state.
     Online,
@@ -112,6 +230,30 @@ pub enum BgEvent {
         epoch: u64,
         messages: Vec<CmailMessage>,
     },
+    /// Typing-indicator changes decoded from the conversation's
+    /// `dm_presence/<conversationId>` node (§ Reading in real time). Shares the
+    /// message stream's generation, so leaving the thread drops late events.
+    CmailTypingLive {
+        conversation_id: String,
+        epoch: u64,
+        updates: Vec<CmailPresenceUpdate>,
+    },
+    /// The one-shot `GET /v1/cmail/:conversationId/typing` fired on open, so an
+    /// indicator that was already up shows before the stream's first event
+    /// (§ Typing Indicator). Failures are dropped: the stream is the real
+    /// source and this is only a head start.
+    CmailTypingRead {
+        conversation_id: String,
+        epoch: u64,
+        status: Box<CmailTypingStatus>,
+    },
+    /// Result of publishing our own typing flag. The response carries the
+    /// cadence the shell must refresh at, which the spec is explicit about
+    /// reading off the response rather than hard-coding.
+    CmailTypingSet {
+        conversation_id: String,
+        result: Result<Box<CmailTypingResponse>, String>,
+    },
     CmailStarted(Result<CmailConversation, String>),
     CmailSent {
         conversation_id: String,
@@ -125,10 +267,38 @@ pub enum BgEvent {
         initial: bool,
         result: Result<(Vec<CircMessage>, Option<String>), String>,
     },
+    /// Live changes to the open room's messages (§ Reading a room in real
+    /// time). Carries *updates* rather than messages because a v0.8.4 deletion
+    /// arrives as a patch on an existing message, and a patch decoded as a
+    /// whole message would blank the row it lands on.
     CircLive {
         room_id: String,
         epoch: u64,
-        messages: Vec<CircMessage>,
+        updates: Vec<CircMessageUpdate>,
+    },
+    /// The room's user list from `GET /v1/circ/:roomId/users`
+    /// (§ Who's in a room), fetched on open and whenever the roster pane is
+    /// re-opened.
+    CircRoomUsers {
+        room_id: String,
+        epoch: u64,
+        result: Result<Vec<CircRoomUser>, String>,
+    },
+    /// Live changes to the room's user list, decoded from its
+    /// `chat_presence/<roomId>` node (§ Reading a room in real time).
+    CircPresenceLive {
+        room_id: String,
+        epoch: u64,
+        updates: Vec<CircPresenceUpdate>,
+    },
+    /// A presence heartbeat's answer (§ Announce Your Presence). Its
+    /// `staleAfterMs` / `idleAfterMs` are the thresholds the roster is filtered
+    /// and marked by, so the response is handed to the screen rather than only
+    /// used to time the next beat.
+    CircPresenceBeat {
+        room_id: String,
+        epoch: u64,
+        response: Box<CircPresenceResponse>,
     },
     CircSent {
         room_id: String,
@@ -136,6 +306,29 @@ pub enum BgEvent {
         /// An inline command reply (e.g. `/help`), surfaced as a toast.
         reply: Option<String>,
         result: Result<(), String>,
+    },
+    /// Result of `DELETE /v1/circ/:roomId/messages/:messageId`
+    /// (§ Delete Your Message). The delete is soft and cannot be undone, and
+    /// its three refusals each get their own line, so `Err` already carries the
+    /// text to show.
+    CircMessageDeleted {
+        room_id: String,
+        message_id: String,
+        result: Result<(), String>,
+    },
+    /// Result of a `/mute` or `/unmute` command (§ Commands, "Muting"), which
+    /// posts nothing and answers with a reply line.
+    CircMuted {
+        room_id: String,
+        result: Result<String, String>,
+    },
+    /// The handles muted in `room_id`, read from Settings' `mutedUsersByRoom`
+    /// (§ Commands, "Muting"). Nothing is filtered server-side, so this list is
+    /// what the room view hides. Emitted on room open and after a mute command
+    /// resolves.
+    CircMutedUsers {
+        room_id: String,
+        usernames: Vec<String>,
     },
     SearchResults(Result<cs_api::SearchPreview, String>),
     /// Result of a background C-Mail unread poll: the total unread count and,
@@ -250,6 +443,39 @@ pub enum BgEvent {
     EntryCreated(Result<(String, Option<String>), String>),
     ReplyCreated(Result<String, String>),
     EntryDeleted(Result<String, String>),
+    /// Result of `PATCH /v1/posts/:id` (§ Edit Entry). `Ok` carries only the
+    /// echoed post id, so the patch rides along to be folded into the open
+    /// screen while the authoritative re-read is in flight.
+    EntryEdited {
+        edit: Box<EntryEdit>,
+        result: Result<String, String>,
+    },
+    /// Result of `PATCH /v1/replies/:id` (§ Edit Reply). `Ok` carries the
+    /// echoed reply id; `content` is what was sent, for the same local fold.
+    ReplyEdited {
+        content: String,
+        result: Result<String, String>,
+    },
+    /// A single entry re-read after an edit, since the PATCH answers with an id
+    /// rather than the updated resource. Applied to whichever screen is showing
+    /// that entry, in place.
+    EntryRefreshed {
+        post_id: String,
+        result: Result<Entry, String>,
+    },
+    /// Result of any of the three flag endpoints (§ Flag an Entry, § Flag a
+    /// Reply, § Flag a Message). They share one response shape and one budget,
+    /// so they share one event: a repeat report is a success with
+    /// `alreadyFlagged`, never an error.
+    Flagged(Result<FlagResponse, String>),
+    /// Result of `POST /v1/users/:username/poke` (§ Poke a User).
+    Poked(Result<PokeResponse, String>),
+    /// Result of `POST /v1/auth/resend-verification` (§ Resend Verification
+    /// Email), the documented cure for `403 EMAIL_NOT_VERIFIED`.
+    VerificationResent(Result<bool, String>),
+    /// The signed-in account's user id, read from the RTDB uid inside the id
+    /// token. Tells the cIRC screen which messages are the user's own.
+    ViewerIdentity(String),
     NotesInitial(Result<(Vec<Note>, Option<String>), String>),
     NotesMore(Result<(Vec<Note>, Option<String>), String>),
     NoteRevisions {
@@ -339,6 +565,11 @@ impl Screen {
             Screen::Cmail(s) => s.is_text_input(),
             Screen::Circ(s) => s.is_text_input(),
             Screen::Search(s) => s.is_editing(),
+            // The flag-reason prompts (`F`) are single-line fields, so while one
+            // is open every printable key belongs to it, not to a global.
+            Screen::Feed(s) => s.is_text_input(),
+            Screen::TopicFeed(s) => s.is_text_input(),
+            Screen::PostDetail(s) => s.is_text_input(),
             // The topics search box captures printable keys while open.
             Screen::Topics(s) => s.is_filtering(),
             // Settings has only toggles, cyclable choices, and read-only fields —
@@ -399,6 +630,17 @@ enum Action {
         contents: Vec<String>,
     },
     CmailBackToConversations,
+    /// The composer holds an unsent draft: keep the typing flag alive for this
+    /// conversation (§ Typing Indicator). Emitted per keystroke; the shell
+    /// throttles it to the server's cadence.
+    CmailTypingActive {
+        conversation_id: String,
+    },
+    /// The composer emptied or lost focus: withdraw the typing flag now rather
+    /// than letting it age out on the other screen.
+    CmailTypingIdle {
+        conversation_id: String,
+    },
     CircRefresh,
     CircOpen {
         room_id: String,
@@ -420,6 +662,30 @@ enum Action {
         contents: Vec<String>,
     },
     CircBackToRooms,
+    /// Re-read the open room's user list (§ Who's in a room), emitted when the
+    /// roster pane is opened.
+    CircLoadRoomUsers {
+        room_id: String,
+    },
+    /// Tombstone one of the user's own messages (§ Delete Your Message). The
+    /// screen has already run its two-step confirm, so this is not re-prompted.
+    CircDeleteMessage {
+        room_id: String,
+        message_id: String,
+    },
+    /// Report someone else's message (§ Flag a Message). A `None` reason is a
+    /// legitimate report, not a cancel.
+    CircFlagMessage {
+        room_id: String,
+        message_id: String,
+        reason: Option<String>,
+    },
+    /// Hide a handle in this room. There is no mute endpoint: § Commands makes
+    /// muting a slash command, so this posts `/mute <username>`.
+    CircMuteUser {
+        room_id: String,
+        username: String,
+    },
     SearchRun {
         query: String,
     },
@@ -521,6 +787,39 @@ enum Action {
         prefill: String,
         topics: Vec<String>,
     },
+    /// Open the edit flow for an entry already on screen (§ Edit Entry). The
+    /// fields mirror what `PATCH /v1/posts/:id` accepts; the frozen slug is
+    /// deliberately absent, since sending one is a `400`.
+    EditEntry {
+        post_id: String,
+        content: String,
+        title: Option<String>,
+        topics: Vec<String>,
+        is_public: bool,
+        is_nsfw: bool,
+    },
+    /// Open the edit flow for a reply already on screen (§ Edit Reply), where
+    /// content is the only editable field.
+    EditReply {
+        reply_id: String,
+        content: String,
+    },
+    /// Report an entry (§ Flag an Entry). The reason is already trimmed and
+    /// capped by the screen's prompt, and `None` is a valid report.
+    FlagEntry {
+        post_id: String,
+        reason: Option<String>,
+    },
+    /// Report a reply (§ Flag a Reply).
+    FlagReply {
+        reply_id: String,
+        reason: Option<String>,
+    },
+    /// Nudge another user (§ Poke a User). The budget is 1/hour and 8/day
+    /// across every user, so this is warned about before it is attempted.
+    PokeUser {
+        username: String,
+    },
     ComposeSubmit,
     ComposeReEdit,
     /// Built-in editor: Ctrl+D accepted the body.
@@ -591,8 +890,9 @@ pub struct App {
     bg_rx: mpsc::UnboundedReceiver<BgEvent>,
     /// Open overlay menu, if any (triggered by Esc).
     menu: Option<MenuOverlay>,
-    /// Whether the `?` help overlay is currently shown.
-    help: bool,
+    /// The `?` help overlay, when shown. It owns a scroll position, so it is a
+    /// value rather than a flag.
+    help: Option<HelpOverlay>,
     /// Terminal image protocol picker, if the terminal supports graphics.
     /// `None` disables image rendering (the text placeholder is shown instead).
     picker: Option<Picker>,
@@ -637,8 +937,28 @@ pub struct App {
     /// discarded instead of leaking into the newly-open thread.
     cmail_stream_epoch: Arc<AtomicU64>,
     /// Generation counter for the live cIRC room stream (mirrors
-    /// `cmail_stream_epoch`).
+    /// `cmail_stream_epoch`). It also governs the room's presence stream and
+    /// its heartbeat, so leaving the room stops all four tasks at once.
     circ_stream_epoch: Arc<AtomicU64>,
+    /// Milliseconds since the Unix epoch of the user's last keystroke while a
+    /// cIRC room is in play, published with every presence heartbeat
+    /// (§ Announce Your Presence). Shared with the heartbeat task, which reads
+    /// it at each beat rather than being told about every key.
+    circ_activity_ms: Arc<AtomicI64>,
+    /// Poked whenever `circ_activity_ms` moves, so the heartbeat task can send
+    /// the extra beat the spec asks for the moment the user wakes up.
+    circ_activity_notify: Arc<Notify>,
+    /// The signed-in account's user id, taken from the RTDB uid inside the id
+    /// token. It tells the cIRC screen which messages are the user's own, which
+    /// is what keeps `d` off other people's and `F` off theirs.
+    viewer_user_id: Option<String>,
+    /// Outbound C-Mail typing-flag bookkeeping (§ Typing Indicator).
+    typing: TypingPublisher,
+    /// Set once the server has answered an authenticated call with
+    /// `403 EMAIL_NOT_VERIFIED` (§ Access). It arms the resend chord and is
+    /// cleared by the next call that gets through, which is what a verified
+    /// address looks like from here.
+    email_unverified: bool,
     /// Whether at least one C-Mail unread poll has landed. Gates the "new mail"
     /// toast so pre-existing unread at launch is silent — only a later rise
     /// announces genuinely-new mail.
@@ -757,7 +1077,7 @@ impl App {
             bg_tx,
             bg_rx,
             menu: None,
-            help: false,
+            help: None,
             picker: None,
             images_on: true,
             last_email,
@@ -771,6 +1091,11 @@ impl App {
             cmail_poller_started: false,
             cmail_stream_epoch: Arc::new(AtomicU64::new(0)),
             circ_stream_epoch: Arc::new(AtomicU64::new(0)),
+            circ_activity_ms: Arc::new(AtomicI64::new(0)),
+            circ_activity_notify: Arc::new(Notify::new()),
+            viewer_user_id: None,
+            typing: TypingPublisher::default(),
+            email_unverified: false,
             cmail_unread_initialized: false,
             input_paused: Arc::new(AtomicBool::new(false)),
             force_clear: false,
@@ -843,6 +1168,9 @@ impl App {
         // logout disarms it). Armed only — playback still needs a first track
         // started by hand; chaining takes over from there.
         self.shuffle = crate::config::get().shuffle;
+        // Learn who we are before any room is opened, so `d` is offered on the
+        // user's own cIRC messages and `F` only on everyone else's.
+        self.spawn_viewer_identity();
         self.goto_root(crate::config::get().start_section);
         if self.poller_started {
             // A poller from a previous session is still alive (it idled on the
@@ -952,8 +1280,8 @@ impl App {
                 Some(bg) = self.bg_rx.recv() => {
                     self.handle_bg_event(bg);
                 }
-                _ = ticker.tick(), if self.toast.is_some() => {
-                    self.tick_toast();
+                _ = ticker.tick(), if self.needs_tick() => {
+                    self.on_tick();
                 }
             }
             // A background call may have proven the session dead; logging out
@@ -970,7 +1298,37 @@ impl App {
                 .store(matches!(self.screen, Screen::Feed(_)), Ordering::Relaxed);
             terminal.draw(|f| self.render(f)).context("terminal draw")?;
         }
+        // Quitting withdraws what we publish about the user, bounded so a
+        // wedged connection can never hold the client open.
+        self.broadcast_teardown().await;
         Ok(())
+    }
+
+    /// Whether the 1s heartbeat is worth running. It animates the toast
+    /// countdown, and it is also the clock the C-Mail typing indicator needs:
+    /// a flag going stale produces no event to react to, so the row only comes
+    /// down if something re-renders (§ Typing Indicator).
+    fn needs_tick(&self) -> bool {
+        self.toast.is_some()
+            // A published typing flag has to keep the clock running even when
+            // the conversation is no longer the visible screen. Pushing search
+            // (or a profile) over an open conversation used to stop the tick,
+            // and the tick is the only thing that sends the DELETE, so
+            // "…is typing" sat on the other person's screen until it aged out
+            // (§ Typing Indicator asks for it to clear when the input goes
+            // idle, not for it to be left to expire).
+            || self.typing.published.is_some()
+            || matches!(&self.screen, Screen::Cmail(s) if matches!(
+                s.mode,
+                super::cmail::CmailMode::Conversation { .. }
+            ))
+    }
+
+    /// One heartbeat: expire a finished toast, then keep the outbound typing
+    /// flag honest.
+    fn on_tick(&mut self) {
+        self.tick_toast();
+        self.drive_cmail_typing();
     }
 
     fn render(&self, frame: &mut ratatui::Frame<'_>) {
@@ -1074,8 +1432,8 @@ impl App {
         if let Some(menu) = &self.menu {
             menu.render(frame, full_area, &self.theme);
         }
-        if self.help {
-            super::help::render(frame, full_area, &self.theme);
+        if let Some(help) = &self.help {
+            help.render(frame, full_area, &self.theme);
         }
     }
 
@@ -1105,6 +1463,22 @@ impl App {
                 FeedIntent::Bookmark(post_id) => Action::BookmarkPost { post_id },
                 FeedIntent::PlayJukebox(track) => Action::PlayPressed { track },
                 FeedIntent::OpenJukebox(url) => Action::OpenUrl { url },
+                FeedIntent::EditEntry {
+                    post_id,
+                    content,
+                    title,
+                    topics,
+                    is_public,
+                    is_nsfw,
+                } => Action::EditEntry {
+                    post_id,
+                    content,
+                    title,
+                    topics,
+                    is_public,
+                    is_nsfw,
+                },
+                FeedIntent::FlagEntry { post_id, reason } => Action::FlagEntry { post_id, reason },
                 FeedIntent::None => Action::None,
             },
             Screen::Notifications(s) => match s.handle_key(key) {
@@ -1166,6 +1540,14 @@ impl App {
                     conversation_id,
                     contents,
                 },
+                CmailIntent::TypingActive { conversation_id } => {
+                    Action::CmailTypingActive { conversation_id }
+                }
+                CmailIntent::TypingIdle { conversation_id } => {
+                    Action::CmailTypingIdle { conversation_id }
+                }
+                CmailIntent::OpenUrl(url) => Action::OpenUrl { url },
+                CmailIntent::PlayJukebox(track) => Action::PlayPressed { track: Some(track) },
                 CmailIntent::StartNew | CmailIntent::CancelInput | CmailIntent::None => {
                     Action::None
                 }
@@ -1187,6 +1569,28 @@ impl App {
                 CircIntent::RetryFailed { room_id, contents } => {
                     Action::CircRetry { room_id, contents }
                 }
+                CircIntent::DeleteMessage {
+                    room_id,
+                    message_id,
+                } => Action::CircDeleteMessage {
+                    room_id,
+                    message_id,
+                },
+                CircIntent::FlagMessage {
+                    room_id,
+                    message_id,
+                    reason,
+                } => Action::CircFlagMessage {
+                    room_id,
+                    message_id,
+                    reason,
+                },
+                CircIntent::MuteUser { room_id, username } => {
+                    Action::CircMuteUser { room_id, username }
+                }
+                CircIntent::LoadRoomUsers { room_id } => Action::CircLoadRoomUsers { room_id },
+                CircIntent::OpenUrl(url) => Action::OpenUrl { url },
+                CircIntent::PlayJukebox(track) => Action::PlayPressed { track: Some(track) },
                 CircIntent::None => Action::None,
             },
             Screen::Bookmarks(s) => match s.handle_key(key) {
@@ -1235,6 +1639,24 @@ impl App {
                 TopicFeedIntent::ToggleMute { slug } => Action::ToggleTopicMute { slug },
                 TopicFeedIntent::PlayJukebox(track) => Action::PlayPressed { track },
                 TopicFeedIntent::OpenJukebox(url) => Action::OpenUrl { url },
+                TopicFeedIntent::EditEntry {
+                    post_id,
+                    content,
+                    title,
+                    topics,
+                    is_public,
+                    is_nsfw,
+                } => Action::EditEntry {
+                    post_id,
+                    content,
+                    title,
+                    topics,
+                    is_public,
+                    is_nsfw,
+                },
+                TopicFeedIntent::FlagEntry { post_id, reason } => {
+                    Action::FlagEntry { post_id, reason }
+                }
                 TopicFeedIntent::None => Action::None,
             },
             Screen::PostDetail(s) => match s.handle_key(key) {
@@ -1275,6 +1697,30 @@ impl App {
                 },
                 PostDetailIntent::OpenUrl(url) => Action::OpenUrl { url },
                 PostDetailIntent::PlayJukebox(track) => Action::PlayPressed { track },
+                PostDetailIntent::EditEntry {
+                    post_id,
+                    content,
+                    title,
+                    topics,
+                    is_public,
+                    is_nsfw,
+                } => Action::EditEntry {
+                    post_id,
+                    content,
+                    title,
+                    topics,
+                    is_public,
+                    is_nsfw,
+                },
+                PostDetailIntent::EditReply { reply_id, content } => {
+                    Action::EditReply { reply_id, content }
+                }
+                PostDetailIntent::FlagEntry { post_id, reason } => {
+                    Action::FlagEntry { post_id, reason }
+                }
+                PostDetailIntent::FlagReply { reply_id, reason } => {
+                    Action::FlagReply { reply_id, reason }
+                }
                 PostDetailIntent::None => Action::None,
             },
             Screen::Compose(s) => match s.handle_key(key) {
@@ -1389,6 +1835,22 @@ impl App {
                     highlight_reply_id: Some(reply_id),
                 },
                 ProfileIntent::OpenUser { username } => Action::ProfileOpenUser { username },
+                ProfileIntent::PokeUser { username } => Action::PokeUser { username },
+                ProfileIntent::EditEntry { post_id, content } => {
+                    // The intent carries only the body; the rest of the
+                    // editable field set (§ Edit Entry) comes off the row the
+                    // Posts tab is already holding, so the edit form opens on
+                    // the whole entry without a re-fetch.
+                    let held = s.posts.items.iter().find(|e| e.post_id == post_id);
+                    Action::EditEntry {
+                        title: held.and_then(|e| e.title.clone()),
+                        topics: held.map(|e| e.topics.clone()).unwrap_or_default(),
+                        is_public: held.is_some_and(|e| e.is_public),
+                        is_nsfw: held.is_some_and(|e| e.is_nsfw),
+                        post_id,
+                        content,
+                    }
+                }
                 ProfileIntent::None => Action::None,
             },
             Screen::EditProfile(s) => match s.handle_key(key) {
@@ -1469,9 +1931,26 @@ impl App {
                 Screen::Login(s) => s.paste_into_focused(&data),
                 Screen::Compose(s) => s.paste_into_focused(&data),
                 Screen::EditProfile(s) => s.paste_into_focused(&data),
-                Screen::Cmail(s) => s.paste_text(&data),
+                Screen::Cmail(s) => {
+                    s.paste_text(&data);
+                    // A paste changes the draft without a keystroke reaching
+                    // handle_key, so nothing else would mark the composer as
+                    // active and the flag would never go up for someone who
+                    // pastes a message and pauses before sending. The editor
+                    // hand-back path does the same thing for the same reason.
+                    let drafting = s.typing_conversation().map(str::to_string);
+                    if let Some(conversation_id) = drafting {
+                        self.note_cmail_typing(conversation_id);
+                    }
+                    return;
+                }
                 Screen::Circ(s) => s.paste_text(&data),
                 Screen::Search(s) => s.paste_text(&data),
+                // No-ops unless a flag-reason prompt is open, so they are safe
+                // to route unconditionally.
+                Screen::Feed(s) => s.paste_text(&data),
+                Screen::TopicFeed(s) => s.paste_text(&data),
+                Screen::PostDetail(s) => s.paste_text(&data),
                 Screen::Topics(s) if s.is_filtering() => {
                     s.paste_filter(&super::input::collapse_newlines(&data));
                 }
@@ -1492,12 +1971,13 @@ impl App {
             _ => return,
         };
 
-        // The help overlay swallows the next key to dismiss (Ctrl+C still quits).
-        if self.help {
-            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                self.should_quit = true;
-            } else {
-                self.help = false;
+        // The help overlay owns the keyboard while it is up: scroll keys move
+        // its body, Ctrl+C still quits, anything else dismisses it.
+        if let Some(help) = &mut self.help {
+            match help.handle_key(key) {
+                HelpIntent::None => {}
+                HelpIntent::Close => self.help = None,
+                HelpIntent::Quit => self.should_quit = true,
             }
             return;
         }
@@ -1528,6 +2008,13 @@ impl App {
             return;
         }
 
+        // A keystroke with a room open is what "the user is still here" means
+        // (§ Announce Your Presence): stamp it so the next heartbeat carries an
+        // honest `lastActivity`, and poke the heartbeat task so somebody coming
+        // back from idle stops reading as idle straight away. Done before the
+        // global interceptors, since a key they swallow is activity too.
+        self.note_circ_activity();
+
         // Esc closes the topics search box first, before its "back/menu" role.
         if key.code == KeyCode::Esc {
             if let Screen::Topics(s) = &mut self.screen {
@@ -1535,17 +2022,47 @@ impl App {
                     return;
                 }
             }
+            // An open flag-reason prompt owns Esc, so cancelling a report can't
+            // also pop the screen out from under the reader.
+            if let Screen::Feed(s) = &mut self.screen {
+                if s.cancel_flag_prompt() {
+                    return;
+                }
+            }
+            if let Screen::TopicFeed(s) = &mut self.screen {
+                if s.cancel_flag_prompt() {
+                    return;
+                }
+            }
+            if let Screen::PostDetail(s) = &mut self.screen {
+                if s.cancel_flag_prompt() {
+                    return;
+                }
+            }
             if let Screen::Cmail(s) = &mut self.screen {
                 if let Some(intent) = s.handle_escape() {
-                    if matches!(intent, CmailIntent::BackToConversations) {
-                        self.spawn_cmail_conversations();
+                    match intent {
+                        CmailIntent::BackToConversations => {
+                            self.leave_cmail_conversation();
+                            self.spawn_cmail_conversations();
+                        }
+                        // Unfocusing the composer withdraws the flag now rather
+                        // than leaving it to age out on the other screen.
+                        CmailIntent::TypingIdle { conversation_id } => {
+                            self.clear_cmail_typing_for(&conversation_id);
+                        }
+                        _ => {}
                     }
                     return;
                 }
             }
             if let Screen::Circ(s) = &mut self.screen {
+                // Read the room before `handle_escape` unwinds it, so leaving
+                // still knows which room's presence to withdraw.
+                let open_room = s.open_room_id().map(str::to_string);
                 if let Some(intent) = s.handle_escape() {
                     if matches!(intent, CircIntent::BackToRooms) {
+                        self.leave_circ_presence(open_room);
                         self.spawn_circ_rooms();
                     }
                     return;
@@ -1583,7 +2100,19 @@ impl App {
 
         // `?` opens the help overlay, except where a screen captures text input.
         if key.code == KeyCode::Char('?') && !self.screen.accepts_text_input() {
-            self.help = true;
+            self.help = Some(HelpOverlay::new());
+            return;
+        }
+
+        // Ctrl+G asks for a fresh verification mail, but only once the server
+        // has actually refused us for an unverified address (v0.8.4 § Access,
+        // § Resend Verification Email). Armed that narrowly, it can't shadow a
+        // screen binding for anyone whose account is fine.
+        if self.email_unverified
+            && key.code == KeyCode::Char('g')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.spawn_resend_verification();
             return;
         }
 
@@ -1738,6 +2267,8 @@ impl App {
                 self.open_cmail_with(username, user_id);
             }
             Action::CmailOpen { conversation_id } => {
+                // Switching threads withdraws the flag from the one being left.
+                self.leave_cmail_conversation();
                 if let Screen::Cmail(s) = &mut self.screen {
                     s.open_conversation(&conversation_id);
                 }
@@ -1758,6 +2289,10 @@ impl App {
                 conversation_id,
                 draft,
             } => {
+                // The editor swallows every keystroke, so the screen can no
+                // longer report typing; take the flag down and let the return
+                // trip raise it again.
+                self.clear_cmail_typing_for(&conversation_id);
                 let screen =
                     EditorScreen::new(EditorPurpose::CmailMessage { conversation_id }, &draft);
                 self.push_screen(Screen::Editor(screen));
@@ -1769,6 +2304,9 @@ impl App {
                 if self.block_write_if_offline() {
                     return;
                 }
+                // Sending clears the flag server-side (§ Typing Indicator), so
+                // only our own heartbeat needs stopping, not a `DELETE`.
+                self.typing.take_published();
                 self.spawn_cmail_send(conversation_id, content);
             }
             Action::CmailRetry {
@@ -1783,18 +2321,38 @@ impl App {
                 }
             }
             Action::CmailBackToConversations => {
+                self.leave_cmail_conversation();
                 if let Screen::Cmail(s) = &mut self.screen {
                     s.mode = super::cmail::CmailMode::Conversations;
                 }
                 self.spawn_cmail_conversations();
             }
-            Action::CircRefresh => self.spawn_circ_rooms(),
+            Action::CmailTypingActive { conversation_id } => {
+                self.note_cmail_typing(conversation_id);
+            }
+            Action::CmailTypingIdle { conversation_id } => {
+                self.clear_cmail_typing_for(&conversation_id);
+            }
+            Action::CircRefresh => {
+                let open_room = self.open_circ_room();
+                self.leave_circ_presence(open_room);
+                self.spawn_circ_rooms();
+            }
             Action::CircOpen { room_id } => {
+                let previous = self.open_circ_room();
+                self.leave_circ_presence(previous);
                 if let Screen::Circ(s) = &mut self.screen {
                     s.open_room(&room_id);
+                    if let Some(user_id) = self.viewer_user_id.clone() {
+                        s.set_viewer_user_id(user_id);
+                    }
                 }
+                // Walking into a room is activity, so the first heartbeat
+                // doesn't report an hour-old keystroke and read as idle.
+                self.circ_activity_ms.store(now_millis(), Ordering::Relaxed);
                 self.spawn_circ_messages(room_id.clone(), None);
-                self.spawn_circ_room_watch(room_id);
+                self.spawn_circ_room_watch(room_id.clone());
+                self.spawn_circ_muted_users(room_id);
             }
             Action::CircLoadOlder { room_id, before } => {
                 self.spawn_circ_messages(room_id, before);
@@ -1818,10 +2376,38 @@ impl App {
                 }
             }
             Action::CircBackToRooms => {
+                let open_room = self.open_circ_room();
+                self.leave_circ_presence(open_room);
                 if let Screen::Circ(s) = &mut self.screen {
                     s.mode = super::circ::CircMode::Rooms;
                 }
                 self.spawn_circ_rooms();
+            }
+            Action::CircLoadRoomUsers { room_id } => self.spawn_circ_room_users(room_id),
+            Action::CircDeleteMessage {
+                room_id,
+                message_id,
+            } => {
+                if self.block_write_if_offline() {
+                    return;
+                }
+                self.spawn_circ_delete_message(room_id, message_id);
+            }
+            Action::CircFlagMessage {
+                room_id,
+                message_id,
+                reason,
+            } => {
+                if self.block_write_if_offline() {
+                    return;
+                }
+                self.spawn_circ_flag_message(room_id, message_id, reason);
+            }
+            Action::CircMuteUser { room_id, username } => {
+                if self.block_write_if_offline() {
+                    return;
+                }
+                self.spawn_circ_mute_user(room_id, username);
             }
             Action::SearchRun { query } => self.spawn_search(query),
             Action::BookmarksRefresh => self.spawn_bookmarks_initial(),
@@ -1994,6 +2580,11 @@ impl App {
                 let mut screen = ProfileScreen::new_for(username.clone());
                 screen.is_self = false;
                 screen.is_root = false;
+                // A profile reached by name can be your own (your row in
+                // someone's followers list, your own search hit), and following,
+                // messaging or poking yourself all fail server-side. Hand over
+                // the viewer id so the screen can tell once the profile loads.
+                screen.viewer_user_id = self.viewer_user_id.clone();
                 self.push_screen(Screen::Profile(screen));
                 self.spawn_profile_user(username);
             }
@@ -2083,6 +2674,48 @@ impl App {
                 )
                 .await;
             }
+            Action::EditEntry {
+                post_id,
+                content,
+                title,
+                topics,
+                is_public,
+                is_nsfw,
+            } => {
+                if self.block_write_if_offline() {
+                    return;
+                }
+                let mut entry = self.held_entry(&post_id).unwrap_or_default();
+                entry.post_id = post_id;
+                entry.content = content;
+                entry.title = title;
+                entry.topics = topics;
+                entry.is_public = is_public;
+                entry.is_nsfw = is_nsfw;
+                self.start_entry_edit(&entry).await;
+            }
+            Action::EditReply { reply_id, content } => {
+                if self.block_write_if_offline() {
+                    return;
+                }
+                let mut reply = self.held_reply(&reply_id).unwrap_or_default();
+                reply.reply_id = reply_id;
+                reply.content = content;
+                self.start_reply_edit(&reply).await;
+            }
+            Action::FlagEntry { post_id, reason } => {
+                if self.block_write_if_offline() {
+                    return;
+                }
+                self.spawn_flag_entry(post_id, reason);
+            }
+            Action::FlagReply { reply_id, reason } => {
+                if self.block_write_if_offline() {
+                    return;
+                }
+                self.spawn_flag_reply(reply_id, reason);
+            }
+            Action::PokeUser { username } => self.poke_user(username),
             Action::ComposeSubmit => {
                 self.warn_if_compose_throttled();
                 self.spawn_compose_submit();
@@ -2268,6 +2901,49 @@ impl App {
                     }
                 }
             }
+            BgEvent::CmailTypingLive {
+                conversation_id,
+                epoch,
+                updates,
+            } => {
+                if epoch == self.cmail_stream_epoch.load(Ordering::SeqCst) {
+                    if let Screen::Cmail(s) = &mut self.screen {
+                        s.apply_typing_presence(&conversation_id, updates);
+                    }
+                }
+            }
+            BgEvent::CmailTypingRead {
+                conversation_id,
+                epoch,
+                status,
+            } => {
+                if epoch == self.cmail_stream_epoch.load(Ordering::SeqCst) {
+                    if let Screen::Cmail(s) = &mut self.screen {
+                        s.apply_typing_status(&conversation_id, &status);
+                    }
+                }
+            }
+            BgEvent::CmailTypingSet {
+                conversation_id,
+                result,
+            } => match result {
+                Ok(response) => {
+                    // The spec is explicit that the cadence and the staleness
+                    // window are read off the response, not hard-coded.
+                    self.typing.heartbeat = Some(response.heartbeat());
+                    if let Screen::Cmail(s) = &mut self.screen {
+                        s.set_typing_stale_after(&conversation_id, response.stale_after());
+                    }
+                }
+                Err(msg) => {
+                    // Nobody needs to be told their typing flag didn't publish;
+                    // stop claiming it is live so the next keystroke retries.
+                    tracing::debug!(error = %msg, conversation_id, "cmail typing flag failed");
+                    if self.typing.published_on(&conversation_id) {
+                        self.typing.published = None;
+                    }
+                }
+            },
             BgEvent::CmailStarted(result) => {
                 let opened = if let Screen::Cmail(s) = &mut self.screen {
                     s.apply_started(result)
@@ -2314,12 +2990,74 @@ impl App {
             BgEvent::CircLive {
                 room_id,
                 epoch,
-                messages,
+                updates,
             } => {
                 if epoch == self.circ_stream_epoch.load(Ordering::SeqCst) {
                     if let Screen::Circ(s) = &mut self.screen {
-                        s.apply_live(&room_id, messages);
+                        s.apply_live(&room_id, updates);
                     }
+                }
+            }
+            BgEvent::CircRoomUsers {
+                room_id,
+                epoch,
+                result,
+            } => {
+                if epoch == self.circ_stream_epoch.load(Ordering::SeqCst) {
+                    if let Screen::Circ(s) = &mut self.screen {
+                        s.apply_room_users(&room_id, result);
+                    }
+                }
+            }
+            BgEvent::CircPresenceLive {
+                room_id,
+                epoch,
+                updates,
+            } => {
+                if epoch == self.circ_stream_epoch.load(Ordering::SeqCst) {
+                    if let Screen::Circ(s) = &mut self.screen {
+                        s.apply_presence_updates(&room_id, updates);
+                    }
+                }
+            }
+            BgEvent::CircPresenceBeat {
+                room_id,
+                epoch,
+                response,
+            } => {
+                if epoch == self.circ_stream_epoch.load(Ordering::SeqCst) {
+                    if let Screen::Circ(s) = &mut self.screen {
+                        s.apply_presence_cadence(&room_id, &response);
+                    }
+                }
+            }
+            BgEvent::CircMessageDeleted {
+                room_id,
+                message_id,
+                result,
+            } => match result {
+                Ok(()) => {
+                    if let Screen::Circ(s) = &mut self.screen {
+                        s.apply_deleted(&room_id, &message_id);
+                    }
+                    self.toast = Some(Toast::confirmation("message deleted"));
+                }
+                Err(msg) => self.warn_toast_unless_signalled(&first_line(&msg)),
+            },
+            BgEvent::CircMuted { room_id, result } => match result {
+                Ok(reply) => {
+                    self.toast = Some(Toast::confirmation(first_line(&reply)));
+                    // The command changed the stored list, so re-read it rather
+                    // than guessing what it now holds.
+                    self.spawn_circ_muted_users(room_id);
+                }
+                Err(msg) => {
+                    self.warn_toast_unless_signalled(&format!("mute failed: {}", first_line(&msg)))
+                }
+            },
+            BgEvent::CircMutedUsers { room_id, usernames } => {
+                if let Screen::Circ(s) = &mut self.screen {
+                    s.set_muted_users(&room_id, &usernames);
                 }
             }
             BgEvent::CircSent {
@@ -2337,6 +3075,12 @@ impl App {
                 } else {
                     false
                 };
+                // A mute command typed straight into the composer changes the
+                // stored list just as the `m` key does, and nothing is filtered
+                // server-side, so the view only follows if we re-read it.
+                if is_mute_command(&content) {
+                    self.spawn_circ_muted_users(room_id.clone());
+                }
                 if reload {
                     self.spawn_circ_messages(room_id, None);
                 }
@@ -2818,6 +3562,102 @@ impl App {
                     }
                 }
             },
+            BgEvent::EntryEdited { edit, result } => match result {
+                Ok(post_id) => {
+                    if matches!(self.screen, Screen::Compose(_)) {
+                        self.pop_screen();
+                    }
+                    // The PATCH answers with an id, not the entry, so fold the
+                    // patch in for an instant read and re-read for the truth
+                    // (the same shape as the profile update path).
+                    if let Screen::PostDetail(s) = &mut self.screen {
+                        if s.entry.post_id == post_id {
+                            s.apply_entry_edit(&edit);
+                        }
+                    }
+                    self.spawn_entry_refresh(post_id);
+                    self.toast = Some(Toast::confirmation("saved"));
+                }
+                Err(msg) => {
+                    if let Screen::Compose(s) = &mut self.screen {
+                        s.finish_submit(Err(msg));
+                    } else {
+                        self.warn_toast_unless_signalled(&first_line(&msg));
+                    }
+                }
+            },
+            BgEvent::ReplyEdited { content, result } => match result {
+                Ok(reply_id) => {
+                    if matches!(self.screen, Screen::Compose(_)) {
+                        self.pop_screen();
+                    }
+                    let applied = match &mut self.screen {
+                        Screen::PostDetail(s) => s.apply_reply_edit(&reply_id, content),
+                        _ => false,
+                    };
+                    if !applied {
+                        // The reply isn't on the page we're looking at (or we
+                        // left it), so re-read rather than show stale text.
+                        if let Screen::PostDetail(s) = &self.screen {
+                            let post_id = s.entry.post_id.clone();
+                            self.spawn_detail_replies_initial(&post_id);
+                        }
+                    }
+                    self.toast = Some(Toast::confirmation("saved"));
+                }
+                Err(msg) => {
+                    if let Screen::Compose(s) = &mut self.screen {
+                        s.finish_submit(Err(msg));
+                    } else {
+                        self.warn_toast_unless_signalled(&first_line(&msg));
+                    }
+                }
+            },
+            BgEvent::EntryRefreshed { post_id, result } => match result {
+                Ok(fresh) => self.apply_refreshed_entry(&post_id, fresh),
+                Err(msg) => {
+                    // The edit itself succeeded; only the re-read failed, so the
+                    // locally-folded text stands until the next refresh.
+                    tracing::debug!(error = %msg, post_id, "entry re-read after edit failed");
+                }
+            },
+            BgEvent::Flagged(result) => {
+                self.toast = Some(match result {
+                    // Reporting is idempotent: a repeat is a success, just a
+                    // quieter one to announce (§ Flag an Entry).
+                    Ok(response) if response.is_new() => Toast::confirmation("reported"),
+                    Ok(_) => Toast::confirmation("already reported"),
+                    Err(msg) => Toast::warning(format!("report failed: {}", first_line(&msg))),
+                });
+            }
+            BgEvent::Poked(result) => {
+                // Clear it wherever the profile is, not just when it happens to
+                // be on top. A poke fired and then covered (opening the target's
+                // post, say) would otherwise come back from the back stack still
+                // claiming "poke pending…" for the rest of the session.
+                for screen in std::iter::once(&mut self.screen).chain(self.back_stack.iter_mut()) {
+                    if let Screen::Profile(s) = screen {
+                        s.poke_pending = false;
+                    }
+                }
+                self.toast = Some(match result {
+                    Ok(poke) => Toast::confirmation(format!("poked @{}", poke.username)),
+                    Err(msg) => Toast::warning(format!("poke failed: {}", first_line(&msg))),
+                });
+            }
+            BgEvent::VerificationResent(result) => {
+                self.toast = Some(match result {
+                    Ok(true) => Toast::confirmation("verification email sent · check your inbox"),
+                    Ok(false) => Toast::warning("the server didn't send a verification email"),
+                    Err(msg) => Toast::warning(format!("resend failed: {}", first_line(&msg))),
+                });
+            }
+            BgEvent::ViewerIdentity(user_id) => {
+                if let Screen::Circ(s) = &mut self.screen {
+                    s.set_viewer_user_id(user_id.clone());
+                }
+                self.viewer_user_id = Some(user_id);
+            }
             BgEvent::NotesInitial(result) => {
                 if let Screen::Journal(s) = &mut self.screen {
                     s.apply_initial(result);
@@ -3004,6 +3844,8 @@ impl App {
     /// `Logout` action (also reachable when an API call repeatedly fails and the
     /// user wants to bail).
     async fn logout(&mut self) {
+        // Take our presence and typing flag down while the tokens still work.
+        self.broadcast_teardown().await;
         self.client.clear_tokens().await;
         if let Err(e) = crate::session::Session::clear() {
             tracing::warn!(error = %e, "session clear failed");
@@ -3029,6 +3871,8 @@ impl App {
         // Tear down any live message streams so they can't outlive the session.
         self.cmail_stream_epoch.fetch_add(1, Ordering::SeqCst);
         self.circ_stream_epoch.fetch_add(1, Ordering::SeqCst);
+        self.viewer_user_id = None;
+        self.email_unverified = false;
         self.offline = false;
         self.toast = None;
         // Invalidate the topics warm-up: bump the epoch so any in-flight prefetch
@@ -3039,6 +3883,268 @@ impl App {
         self.topics_complete = false;
         let email = self.last_email.clone();
         self.screen = Screen::Login(LoginScreen::new(email));
+    }
+
+    // Published activity -------------------------------------------------------
+
+    /// The cIRC room the user is in right now, if any. The screen owns that
+    /// fact, so the presence driver asks it rather than keeping a second copy
+    /// that could drift (§ Announce Your Presence).
+    ///
+    /// The back stack counts: pushing search (or a profile) over an open room
+    /// doesn't take the user out of it, and the room's streams keep running, so
+    /// quitting from up there still has presence to withdraw.
+    fn open_circ_room(&self) -> Option<String> {
+        std::iter::once(&self.screen)
+            .chain(self.back_stack.iter().rev())
+            .find_map(|screen| match screen {
+                Screen::Circ(s) => s.open_room_id().map(str::to_string),
+                _ => None,
+            })
+    }
+
+    /// Stamp "the user just did something in the room" and wake the heartbeat,
+    /// which is how somebody coming back from idle stops reading as idle
+    /// without waiting out a whole beat (§ Announce Your Presence).
+    fn note_circ_activity(&self) {
+        if !crate::config::get().circ_presence || self.open_circ_room().is_none() {
+            return;
+        }
+        self.circ_activity_ms.store(now_millis(), Ordering::Relaxed);
+        self.circ_activity_notify.notify_one();
+    }
+
+    /// Withdraw our presence from `room_id` (§ Leave a Room). Optional but
+    /// polite: without it we stay in the room's user list until the server's
+    /// `staleAfterMs` elapses. A no-op when the broadcast is switched off in
+    /// config, since we never announced in the first place.
+    fn leave_circ_presence(&mut self, room_id: Option<String>) {
+        let Some(room_id) = room_id else {
+            return;
+        };
+        if !crate::config::get().circ_presence {
+            return;
+        }
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            if let Err(e) = client.leave_circ_room(&room_id).await {
+                tracing::debug!(error = %e, room_id, "leave_circ_room failed");
+            }
+        });
+    }
+
+    /// Take down the typing flag we are publishing, whichever conversation it
+    /// is on (§ Typing Indicator).
+    fn leave_cmail_conversation(&mut self) {
+        if let Some(conversation_id) = self.typing.take_published() {
+            self.spawn_clear_cmail_typing(conversation_id);
+        }
+    }
+
+    /// Take down the typing flag only if it is the one `conversation_id` names,
+    /// so a stale "the composer went idle" report can't cancel a flag we have
+    /// since raised on another thread.
+    fn clear_cmail_typing_for(&mut self, conversation_id: &str) {
+        if self.typing.published_on(conversation_id) {
+            self.leave_cmail_conversation();
+        }
+    }
+
+    /// The screen reports an unsent draft on every keystroke; this is where
+    /// that becomes at most one `POST` per the server's `heartbeatMs`
+    /// (§ Typing Indicator).
+    fn note_cmail_typing(&mut self, conversation_id: String) {
+        if !crate::config::get().cmail_typing {
+            return;
+        }
+        self.typing.touch();
+        if self.typing.due(&conversation_id, Instant::now()) {
+            self.typing.mark_sent(&conversation_id);
+            self.spawn_set_cmail_typing(conversation_id);
+        }
+    }
+
+    /// Keep the published typing flag in step with the composer once per tick:
+    /// re-post it on the server's cadence while the draft is being worked on,
+    /// and withdraw it once the composer has been quiet for
+    /// [`TYPING_IDLE_AFTER`] or has stopped holding a draft at all.
+    fn drive_cmail_typing(&mut self) {
+        if !crate::config::get().cmail_typing {
+            return;
+        }
+        let now = Instant::now();
+        let drafting = match &self.screen {
+            Screen::Cmail(s) => s.typing_conversation().map(str::to_string),
+            _ => None,
+        };
+        match drafting {
+            Some(conversation_id) if !self.typing.is_idle(now) => {
+                if self.typing.due(&conversation_id, now) {
+                    self.typing.mark_sent(&conversation_id);
+                    self.spawn_set_cmail_typing(conversation_id);
+                }
+            }
+            _ => self.leave_cmail_conversation(),
+        }
+    }
+
+    /// Withdraw everything this session publishes about the user, bounded by
+    /// [`BROADCAST_TEARDOWN_GRACE`] (§ Leave a Room, § Typing Indicator).
+    ///
+    /// Both are state the server expires on its own, so overrunning the budget
+    /// costs at most one staleness window of stale presence on somebody else's
+    /// screen. A client that cannot exit is worse.
+    async fn broadcast_teardown(&mut self) {
+        let room = crate::config::get()
+            .circ_presence
+            .then(|| self.open_circ_room())
+            .flatten();
+        let conversation = self.typing.take_published();
+        if room.is_none() && conversation.is_none() {
+            return;
+        }
+        let client = self.client.clone();
+        let withdraw = async move {
+            if let Some(room_id) = room {
+                if let Err(e) = client.leave_circ_room(&room_id).await {
+                    tracing::debug!(error = %e, room_id, "leave_circ_room on exit failed");
+                }
+            }
+            if let Some(conversation_id) = conversation {
+                if let Err(e) = client.clear_cmail_typing(&conversation_id).await {
+                    tracing::debug!(error = %e, conversation_id, "clear typing on exit failed");
+                }
+            }
+        };
+        if tokio::time::timeout(BROADCAST_TEARDOWN_GRACE, withdraw)
+            .await
+            .is_err()
+        {
+            tracing::debug!("broadcast teardown timed out; the server will expire it");
+        }
+    }
+
+    // Edit, report and poke ----------------------------------------------------
+
+    /// The copy of `post_id` the active screen already holds, if any. Used to
+    /// carry the fields an edit does not touch (the frozen slug, the publish
+    /// time) into the edit flow without spending a fetch.
+    fn held_entry(&self, post_id: &str) -> Option<Entry> {
+        let find = |items: &[Entry]| items.iter().find(|e| e.post_id == post_id).cloned();
+        match &self.screen {
+            Screen::Feed(s) => find(&s.list.items),
+            Screen::TopicFeed(s) => find(&s.list.items),
+            Screen::Profile(s) => find(&s.posts.items),
+            Screen::PostDetail(s) => (s.entry.post_id == post_id).then(|| s.entry.clone()),
+            _ => None,
+        }
+    }
+
+    /// The copy of `reply_id` the active screen already holds, if any.
+    fn held_reply(&self, reply_id: &str) -> Option<Reply> {
+        match &self.screen {
+            Screen::PostDetail(s) => s.replies.iter().find(|r| r.reply_id == reply_id).cloned(),
+            Screen::Profile(s) => s
+                .replies
+                .items
+                .iter()
+                .find(|r| r.reply_id == reply_id)
+                .cloned(),
+            _ => None,
+        }
+    }
+
+    /// Fold a freshly re-read entry into whichever screen is showing it. This
+    /// is the in-place refresh an edit needs: `PATCH /v1/posts/:id` answers
+    /// with an id rather than the updated resource (§ Edit Entry), so without
+    /// it the reader keeps looking at the text they just replaced.
+    fn apply_refreshed_entry(&mut self, post_id: &str, fresh: Entry) {
+        self.shuffle_pool.harvest(std::slice::from_ref(&fresh));
+        match &mut self.screen {
+            Screen::PostDetail(s) if s.entry.post_id == post_id => s.entry = fresh,
+            Screen::Feed(s) => {
+                s.apply_edited_entry(&fresh);
+            }
+            Screen::TopicFeed(s) => {
+                s.apply_edited_entry(&fresh);
+            }
+            Screen::Profile(s) => {
+                s.apply_edited_entry(fresh);
+            }
+            _ => {}
+        }
+    }
+
+    /// Open the edit flow for an already-published entry (§ Edit Entry): the
+    /// body goes to the editor first, exactly like composing, and the compose
+    /// confirm screen then diffs every field against the snapshot the kind
+    /// carries so only what changed is sent.
+    async fn start_entry_edit(&mut self, entry: &Entry) {
+        if Self::external_editor_set() {
+            match self.run_editor(entry.content.clone()).await {
+                Ok(content) if !content.trim().is_empty() => {
+                    self.push_screen(Screen::Compose(ComposeScreen::from_entry(entry, content)));
+                }
+                Ok(_) => self.toast_editor_empty(),
+                Err(msg) => self.toast_editor_failed(&msg),
+            }
+            return;
+        }
+        let screen = EditorScreen::new(
+            EditorPurpose::EditBody {
+                kind: ComposeKind::edit_entry(entry),
+            },
+            &entry.content,
+        );
+        self.push_screen(Screen::Editor(screen));
+    }
+
+    /// Open the edit flow for an already-posted reply (§ Edit Reply), where
+    /// content is the only editable field.
+    async fn start_reply_edit(&mut self, reply: &Reply) {
+        if Self::external_editor_set() {
+            match self.run_editor(reply.content.clone()).await {
+                Ok(content) if !content.trim().is_empty() => {
+                    self.push_screen(Screen::Compose(ComposeScreen::from_reply(reply, content)));
+                }
+                Ok(_) => self.toast_editor_empty(),
+                Err(msg) => self.toast_editor_failed(&msg),
+            }
+            return;
+        }
+        let screen = EditorScreen::new(
+            EditorPurpose::EditBody {
+                kind: ComposeKind::edit_reply(reply),
+            },
+            &reply.content,
+        );
+        self.push_screen(Screen::Editor(screen));
+    }
+
+    /// Nudge another user (§ Poke a User). The budget is 1/hour and 8/day
+    /// *across every user*, so a poke that cannot fire says so with the same
+    /// countdown a throttled compose gets, rather than appearing to do nothing
+    /// while the client-side limiter waits out the hour.
+    fn poke_user(&mut self, username: String) {
+        if self.block_write_if_offline() {
+            return;
+        }
+        let secs = self
+            .client
+            .time_until_writable(EndpointKey::UsersPoke)
+            .as_secs();
+        if secs > 0 {
+            self.toast = Some(if secs <= 90 {
+                Toast::countdown("rate limited · poke in", secs)
+            } else {
+                Toast::warning("poke limit reached · one an hour, eight a day")
+            });
+            return;
+        }
+        if let Screen::Profile(s) = &mut self.screen {
+            s.poke_pending = true;
+        }
+        self.spawn_poke(username);
     }
 
     /// React to a connectivity/auth signal distilled from a background error
@@ -3058,7 +4164,22 @@ impl App {
                     self.offline_notify.notify_one();
                 }
             }
-            ApiSignal::Online => self.offline = false,
+            ApiSignal::Online => {
+                self.offline = false;
+                // A call that got through is what a verified address looks like
+                // from here, so stop advertising the resend chord.
+                self.email_unverified = false;
+            }
+            ApiSignal::EmailNotVerified => {
+                // The server answered, so we're online, and the session is
+                // valid: this must not log anyone out (§ Access). Say plainly
+                // what is wrong and how to fix it.
+                self.offline = false;
+                self.email_unverified = true;
+                self.toast = Some(Toast::warning(
+                    "email not verified · ctrl+g resends the verification link",
+                ));
+            }
             ApiSignal::RateLimited { retry_after_secs } => {
                 // Getting a rate-limit *response* proves we're online.
                 self.offline = false;
@@ -3118,6 +4239,8 @@ impl App {
                 ComposeKind::NewNote => (EndpointKey::NotesCreate, "saving"),
                 ComposeKind::UpdateNote { .. } => (EndpointKey::NotesUpdate, "saving"),
                 ComposeKind::GuildThread { .. } => (EndpointKey::GuildsThreadsCreate, "posting"),
+                ComposeKind::EditEntry { .. } => (EndpointKey::EntriesEdit, "saving"),
+                ComposeKind::EditReply { .. } => (EndpointKey::RepliesEdit, "saving"),
             },
             _ => return,
         };
@@ -3179,6 +4302,21 @@ impl App {
     }
 
     fn goto_root(&mut self, target: RootKind) {
+        // Leaving a section leaves whatever it was publishing about the user
+        // (§ Leave a Room, § Typing Indicator).
+        let open_room = self.open_circ_room();
+        self.leave_circ_presence(open_room);
+        self.leave_cmail_conversation();
+        // Withdrawing is not enough on its own: the room's heartbeat and both
+        // sections' streams are keyed on their generation, not on which screen
+        // is showing. Leaving the section without bumping them lets the next
+        // beat announce the user straight back into the room they just left,
+        // and leaves the conversation's poll and streams running for a
+        // conversation that is closed. Bump unconditionally, so every "left the
+        // section" path tears its tasks down; re-entering spawns a fresh
+        // generation anyway.
+        self.circ_stream_epoch.fetch_add(1, Ordering::SeqCst);
+        self.cmail_stream_epoch.fetch_add(1, Ordering::SeqCst);
         self.back_stack.clear();
         self.current_root = Some(target);
         match target {
@@ -3389,7 +4527,7 @@ impl App {
     }
 
     /// Open the live RTDB stream for `conversation_id` so incoming messages
-    /// appear without a manual refresh (API v0.6.0 § Reading in real time). Bumps
+    /// appear without a manual refresh (API v0.8.4 § Reading in real time). Bumps
     /// the stream generation to supersede any prior conversation's stream; the
     /// task self-terminates once its generation is no longer current.
     /// Watch the open conversation: the live SSE stream *and* a periodic REST
@@ -3408,10 +4546,20 @@ impl App {
         tokio::spawn(cmail_conversation_poll_loop(
             self.client.clone(),
             self.bg_tx.clone(),
-            conversation_id,
+            conversation_id.clone(),
+            epoch,
+            epoch_ref.clone(),
+        ));
+        // The other participant's typing flag: the live node, plus one read so
+        // an indicator that is already up shows before the first event.
+        tokio::spawn(cmail_presence_stream_loop(
+            self.client.clone(),
+            self.bg_tx.clone(),
+            conversation_id.clone(),
             epoch,
             epoch_ref,
         ));
+        self.spawn_read_cmail_typing(conversation_id, epoch);
     }
 
     fn spawn_circ_rooms(&self) {
@@ -3491,10 +4639,273 @@ impl App {
         tokio::spawn(circ_room_poll_loop(
             self.client.clone(),
             self.bg_tx.clone(),
-            room_id,
+            room_id.clone(),
             epoch,
-            epoch_ref,
+            epoch_ref.clone(),
         ));
+        // Who's in the room: one REST snapshot now, then the live node
+        // (§ Who's in a room, § Reading a room in real time).
+        self.spawn_circ_room_users(room_id.clone());
+        tokio::spawn(circ_presence_stream_loop(
+            self.client.clone(),
+            self.bg_tx.clone(),
+            room_id.clone(),
+            epoch,
+            epoch_ref.clone(),
+        ));
+        // Our own presence, if the user lets us publish it.
+        if crate::config::get().circ_presence {
+            tokio::spawn(circ_presence_beat_loop(
+                self.client.clone(),
+                self.bg_tx.clone(),
+                room_id,
+                epoch,
+                epoch_ref,
+                self.circ_activity_ms.clone(),
+                self.circ_activity_notify.clone(),
+            ));
+        }
+    }
+
+    /// Re-read the open room's user list (§ Who's in a room). Tagged with the
+    /// stream generation so a snapshot for a room the user has already left is
+    /// dropped instead of landing on the new one.
+    fn spawn_circ_room_users(&self, room_id: String) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        let epoch = self.circ_stream_epoch.load(Ordering::SeqCst);
+        tokio::spawn(async move {
+            let result = client
+                .list_circ_room_users(&room_id)
+                .await
+                .map_err(|e| note_api_err(&tx, e));
+            let _ = tx.send(BgEvent::CircRoomUsers {
+                room_id,
+                epoch,
+                result,
+            });
+        });
+    }
+
+    /// Read the handles muted in `room_id` out of Settings (§ Commands,
+    /// "Muting"). The wire shape of `mutedUsersByRoom` is not documented, so
+    /// this goes through cs-api's lenient accessor rather than assuming one; a
+    /// failure simply leaves the view unfiltered, which is the safe way to be
+    /// wrong about a display filter.
+    fn spawn_circ_muted_users(&self, room_id: String) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            match client.get_settings().await {
+                Ok(settings) => {
+                    let usernames = settings
+                        .muted_users_in_room(&room_id)
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect();
+                    let _ = tx.send(BgEvent::CircMutedUsers { room_id, usernames });
+                }
+                Err(e) => {
+                    let msg = note_api_err(&tx, e);
+                    tracing::debug!(error = %msg, room_id, "circ mute list load failed");
+                }
+            }
+        });
+    }
+
+    /// Tombstone one of the user's own messages (§ Delete Your Message). The
+    /// delete is soft and cannot be undone, and each of its three refusals says
+    /// something different, so they are translated here rather than shown as
+    /// one generic failure.
+    fn spawn_circ_delete_message(&self, room_id: String, message_id: String) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = match client.delete_circ_message(&room_id, &message_id).await {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    let specific = circ_delete_message_error(&e);
+                    let fallback = note_api_err(&tx, e);
+                    Err(specific.unwrap_or(fallback))
+                }
+            };
+            let _ = tx.send(BgEvent::CircMessageDeleted {
+                room_id,
+                message_id,
+                result,
+            });
+        });
+    }
+
+    /// Report someone else's message (§ Flag a Message).
+    fn spawn_circ_flag_message(&self, room_id: String, message_id: String, reason: Option<String>) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .flag_circ_message(&room_id, &message_id, reason.as_deref())
+                .await
+                .map_err(|e| note_api_err(&tx, e));
+            let _ = tx.send(BgEvent::Flagged(result));
+        });
+    }
+
+    /// Hide a handle in this room. There is no mute endpoint: § Commands makes
+    /// the mute family slash commands that post nothing and answer with a reply
+    /// line, and the list they change lives in Settings.
+    fn spawn_circ_mute_user(&self, room_id: String, username: String) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let command = format!("/mute {username}");
+            let result = client
+                .send_circ_message(&room_id, &command)
+                .await
+                .map(|response| response.reply.unwrap_or(format!("muted @{username}")))
+                .map_err(|e| note_api_err(&tx, e));
+            let _ = tx.send(BgEvent::CircMuted { room_id, result });
+        });
+    }
+
+    /// Publish the typing flag for `conversation_id` (§ Typing Indicator). The
+    /// response names the cadence to refresh at, which is why it comes back to
+    /// the shell rather than being discarded.
+    fn spawn_set_cmail_typing(&self, conversation_id: String) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .set_cmail_typing(&conversation_id)
+                .await
+                .map(Box::new)
+                .map_err(|e| note_api_err(&tx, e));
+            let _ = tx.send(BgEvent::CmailTypingSet {
+                conversation_id,
+                result,
+            });
+        });
+    }
+
+    /// Withdraw the typing flag (§ Typing Indicator). Fire-and-forget: the flag
+    /// ages out on its own, so a failure here costs one staleness window on the
+    /// other person's screen and nothing else.
+    fn spawn_clear_cmail_typing(&self, conversation_id: String) {
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            if let Err(e) = client.clear_cmail_typing(&conversation_id).await {
+                tracing::debug!(error = %e, conversation_id, "clear_cmail_typing failed");
+            }
+        });
+    }
+
+    /// Read who is typing right now, once, on opening a thread, so an indicator
+    /// that was already up shows before the live node's first event.
+    fn spawn_read_cmail_typing(&self, conversation_id: String, epoch: u64) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            match client.read_cmail_typing(&conversation_id).await {
+                Ok(status) => {
+                    let _ = tx.send(BgEvent::CmailTypingRead {
+                        conversation_id,
+                        epoch,
+                        status: Box::new(status),
+                    });
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, conversation_id, "read_cmail_typing failed");
+                }
+            }
+        });
+    }
+
+    /// Report an entry (§ Flag an Entry). Reporting is idempotent and shares
+    /// one budget with the reply and message endpoints, so all three land on
+    /// the same event.
+    fn spawn_flag_entry(&self, post_id: String, reason: Option<String>) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .flag_entry(&post_id, reason.as_deref())
+                .await
+                .map_err(|e| note_api_err(&tx, e));
+            let _ = tx.send(BgEvent::Flagged(result));
+        });
+    }
+
+    /// Report a reply (§ Flag a Reply).
+    fn spawn_flag_reply(&self, reply_id: String, reason: Option<String>) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .flag_reply(&reply_id, reason.as_deref())
+                .await
+                .map_err(|e| note_api_err(&tx, e));
+            let _ = tx.send(BgEvent::Flagged(result));
+        });
+    }
+
+    /// Nudge another user (§ Poke a User).
+    fn spawn_poke(&self, username: String) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .poke_user(&username)
+                .await
+                .map_err(|e| note_api_err(&tx, e));
+            let _ = tx.send(BgEvent::Poked(result));
+        });
+    }
+
+    /// Ask for a fresh verification mail (§ Resend Verification Email), the
+    /// documented cure for the `403 EMAIL_NOT_VERIFIED` § Access describes.
+    fn spawn_resend_verification(&self) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .resend_verification()
+                .await
+                .map_err(|e| note_api_err(&tx, e));
+            let _ = tx.send(BgEvent::VerificationResent(result));
+        });
+    }
+
+    /// Re-read one entry after an edit, since `PATCH /v1/posts/:id` answers
+    /// with the post id rather than the updated resource (§ Edit Entry). Same
+    /// shape as the profile update path, which also re-fetches.
+    fn spawn_entry_refresh(&self, post_id: String) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .get_entry(&post_id)
+                .await
+                .map_err(|e| note_api_err(&tx, e));
+            let _ = tx.send(BgEvent::EntryRefreshed { post_id, result });
+        });
+    }
+
+    /// Read the signed-in account's id out of the id token. It costs no
+    /// request, and the cIRC screen needs it to tell the user's own messages
+    /// from everyone else's.
+    fn spawn_viewer_identity(&self) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let tokens = client.tokens().await;
+            match cs_api::rtdb::uid_from_jwt(&tokens.id_token) {
+                Ok(uid) => {
+                    let _ = tx.send(BgEvent::ViewerIdentity(uid));
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "can't read the account id from the id token");
+                }
+            }
+        });
     }
 
     fn spawn_search(&self, query: String) {
@@ -4517,6 +5928,12 @@ impl App {
                 // holds the originating screen, so Esc from Compose returns there.
                 self.screen = Screen::Compose(screen);
             }
+            EditorPurpose::EditBody { kind } => {
+                // Same replace-the-editor step as a fresh body, minus the topic
+                // prefill: an edit kind carries a snapshot of what it is
+                // editing and the compose screen fills every field from that.
+                self.screen = Screen::Compose(ComposeScreen::new(kind, content));
+            }
             EditorPurpose::ReEditBody => {
                 // The compose screen we re-edited is the top of the back stack.
                 self.pop_screen();
@@ -4533,6 +5950,14 @@ impl App {
                 self.pop_screen();
                 if let Screen::Cmail(s) = &mut self.screen {
                     s.set_draft_and_focus(content);
+                }
+                // `set_draft_and_focus` doesn't go through `handle_key`, so it
+                // can't emit an intent; ask the screen directly whether the
+                // draft it came back with is worth publishing again.
+                if let Screen::Cmail(s) = &self.screen {
+                    if let Some(id) = s.typing_conversation().map(str::to_string) {
+                        self.note_cmail_typing(id);
+                    }
                 }
             }
             EditorPurpose::CircMessage { room_id } => {
@@ -4570,18 +5995,23 @@ impl App {
     }
 
     fn spawn_compose_submit(&self) {
-        let (kind, content, title, slug, topics, is_public, is_nsfw) = match &self.screen {
-            Screen::Compose(s) => (
-                s.kind.clone(),
-                s.content.clone(),
-                s.title_to_send(),
-                s.slug_to_send(),
-                s.parse_topics(),
-                s.is_public,
-                s.is_nsfw,
-            ),
-            _ => return,
-        };
+        let (kind, content, title, slug, topics, is_public, is_nsfw, entry_edit) =
+            match &self.screen {
+                Screen::Compose(s) => (
+                    s.kind.clone(),
+                    s.content.clone(),
+                    s.title_to_send(),
+                    s.slug_to_send(),
+                    s.parse_topics(),
+                    s.is_public,
+                    s.is_nsfw,
+                    // The only correct source for an entry edit: it diffs against
+                    // the snapshot the kind carries, so untouched fields are
+                    // omitted and the server leaves them alone (§ Edit Entry).
+                    s.entry_edit(),
+                ),
+                _ => return,
+            };
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
@@ -4642,6 +6072,30 @@ impl App {
                         slug: guild_slug,
                         result,
                     });
+                }
+                ComposeKind::EditEntry { post_id, .. } => {
+                    // `try_submit` already refused an edit that changed
+                    // nothing, so the patch is non-empty by the time it is here.
+                    let Some(edit) = entry_edit else {
+                        return;
+                    };
+                    let result = client
+                        .edit_entry(&post_id, &edit)
+                        .await
+                        .map(|_| post_id)
+                        .map_err(|e| note_api_err(&tx, e));
+                    let _ = tx.send(BgEvent::EntryEdited {
+                        edit: Box::new(edit),
+                        result,
+                    });
+                }
+                ComposeKind::EditReply { reply_id, .. } => {
+                    let result = client
+                        .edit_reply(&reply_id, &content)
+                        .await
+                        .map(|_| reply_id)
+                        .map_err(|e| note_api_err(&tx, e));
+                    let _ = tx.send(BgEvent::ReplyEdited { content, result });
                 }
             }
         });
@@ -4859,7 +6313,7 @@ impl App {
     }
 
     /// Subscribe to the caller's `user_conversations` RTDB node so unread changes
-    /// surface in real time (API v0.6.0 § Reading in real time). The event is used
+    /// surface in real time (API v0.8.4 § Reading in real time). The event is used
     /// only as a "something changed" poke that triggers an accurate REST count —
     /// so an unknown RTDB payload schema can't corrupt the badge, and if the
     /// subscription fails the periodic poll still keeps it current.
@@ -4999,6 +6453,17 @@ fn note_api_err(tx: &mpsc::UnboundedSender<BgEvent>, e: ApiError) -> String {
         ApiSignal::RateLimited {
             retry_after_secs: e.retry_after_secs().unwrap_or(5),
         }
+    } else if matches!(
+        e,
+        ApiError::Api {
+            code: ErrorCode::EmailNotVerified,
+            ..
+        }
+    ) {
+        // A 403 that any authenticated call can answer with (§ Access). The
+        // session is fine, so this rides its own signal rather than the
+        // session-expiry one.
+        ApiSignal::EmailNotVerified
     } else if e.is_unauthorized() {
         // Any 401 that reaches us has already outlived the client's
         // refresh-once, so the session is genuinely dead.
@@ -5017,7 +6482,7 @@ fn note_api_err(tx: &mpsc::UnboundedSender<BgEvent>, e: ApiError) -> String {
 ///
 /// Reconnection is deliberately conservative: only a token expiry
 /// (`auth_revoked`) triggers a reopen, and only after a successful refresh with a
-/// short pause and a hard cap — never a tight loop (v0.6.0 § "don't reconnect in
+/// short pause and a hard cap, never a tight loop (v0.8.4 § "don't reconnect in
 /// a loop"). Any other stream end simply turns live updates off for this view;
 /// the unread poll and manual `r` still keep it current.
 /// Periodically re-read the open C-Mail conversation over REST and merge the
@@ -5072,7 +6537,7 @@ async fn cmail_stream_loop(
     epoch_ref: Arc<AtomicU64>,
 ) {
     // A JSON-string value for `orderBy`, percent-encoded, plus a bounded window —
-    // both required by the RTDB security rules (v0.6.0 § Reading in real time).
+    // both required by the RTDB security rules (v0.8.4 § Reading in real time).
     let params: [(&str, &str); 2] = [("orderBy", "%22timestamp%22"), ("limitToLast", "50")];
     let path = format!("/dm_messages/{conversation_id}");
     let superseded = |epoch_ref: &Arc<AtomicU64>| epoch != epoch_ref.load(Ordering::SeqCst);
@@ -5188,12 +6653,16 @@ async fn circ_room_poll_loop(
                 if epoch != epoch_ref.load(Ordering::SeqCst) {
                     return;
                 }
-                if !messages.is_empty()
+                // A REST page is always whole messages, so every row is a
+                // `Full` update; only the live stream carries patches.
+                let updates: Vec<CircMessageUpdate> =
+                    messages.into_iter().map(CircMessageUpdate::Full).collect();
+                if !updates.is_empty()
                     && tx
                         .send(BgEvent::CircLive {
                             room_id: room_id.clone(),
                             epoch,
-                            messages,
+                            updates,
                         })
                         .is_err()
                 {
@@ -5215,7 +6684,7 @@ async fn circ_stream_loop(
     epoch_ref: Arc<AtomicU64>,
 ) {
     let params: [(&str, &str); 2] = [("orderBy", "%22timestamp%22"), ("limitToLast", "50")];
-    let path = format!("/chat_messages/{room_id}");
+    let path = circ_messages_path(&room_id);
     let superseded = |epoch_ref: &Arc<AtomicU64>| epoch != epoch_ref.load(Ordering::SeqCst);
     let mut reconnects: u32 = 0;
     const MAX_RECONNECTS: u32 = 24;
@@ -5250,18 +6719,21 @@ async fn circ_stream_loop(
             }
             match ev {
                 Ok(SseEvent {
-                    kind: SseEventKind::Put | SseEventKind::Patch,
+                    kind: kind @ (SseEventKind::Put | SseEventKind::Patch),
                     data,
                 }) => {
                     let path_str = data.get("path").and_then(|p| p.as_str()).unwrap_or("/");
                     let payload = data.get("data").unwrap_or(&serde_json::Value::Null);
-                    let messages = circ_messages_from_rtdb_event(path_str, payload);
-                    if !messages.is_empty()
+                    // The kind has to travel: a v0.8.4 deletion arrives as a
+                    // patch on a message we already hold, and decoding it as a
+                    // whole message would blank the row it lands on.
+                    let updates = circ_message_updates_from_rtdb_event(kind, path_str, payload);
+                    if !updates.is_empty()
                         && tx
                             .send(BgEvent::CircLive {
                                 room_id: room_id.clone(),
                                 epoch,
-                                messages,
+                                updates,
                             })
                             .is_err()
                     {
@@ -5301,10 +6773,269 @@ async fn circ_stream_loop(
     }
 }
 
+/// Live RTDB stream for a cIRC room's user list (`chat_presence/<roomId>`,
+/// § Reading a room in real time). Same lifecycle as [`circ_stream_loop`]:
+/// epoch-guarded, conservative token-expiry-only reconnect.
+///
+/// The node holds one small entry per person in the room, so it is subscribed
+/// without query parameters. It is read-only: our own presence is published
+/// through `POST /v1/circ/:roomId/presence`, never through an RTDB write.
+async fn circ_presence_stream_loop(
+    client: Client,
+    tx: mpsc::UnboundedSender<BgEvent>,
+    room_id: String,
+    epoch: u64,
+    epoch_ref: Arc<AtomicU64>,
+) {
+    let path = circ_presence_path(&room_id);
+    let superseded = |epoch_ref: &Arc<AtomicU64>| epoch != epoch_ref.load(Ordering::SeqCst);
+    let mut reconnects: u32 = 0;
+    const MAX_RECONNECTS: u32 = 24;
+
+    loop {
+        if superseded(&epoch_ref) {
+            return;
+        }
+        let tokens = client.tokens().await;
+        if tokens.rtdb_url.is_empty() || tokens.id_token.is_empty() {
+            return;
+        }
+        let rtdb = match RtdbClient::new(tokens.rtdb_url, tokens.id_token) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(error = %e, "circ presence rtdb client build failed");
+                return;
+            }
+        };
+        let mut rx = match rtdb.subscribe(&path, &[]).await {
+            Ok(rx) => rx,
+            Err(e) => {
+                tracing::debug!(error = %e, "circ presence subscribe failed; roster stays on REST");
+                return;
+            }
+        };
+
+        let mut token_expired = false;
+        while let Some(ev) = rx.recv().await {
+            if superseded(&epoch_ref) {
+                return;
+            }
+            match ev {
+                Ok(SseEvent {
+                    kind: kind @ (SseEventKind::Put | SseEventKind::Patch),
+                    data,
+                }) => {
+                    let path_str = data.get("path").and_then(|p| p.as_str()).unwrap_or("/");
+                    let payload = data.get("data").unwrap_or(&serde_json::Value::Null);
+                    let updates = circ_presence_updates_from_rtdb_event(kind, path_str, payload);
+                    if !updates.is_empty()
+                        && tx
+                            .send(BgEvent::CircPresenceLive {
+                                room_id: room_id.clone(),
+                                epoch,
+                                updates,
+                            })
+                            .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(SseEvent {
+                    kind: SseEventKind::AuthRevoked,
+                    ..
+                }) => {
+                    token_expired = true;
+                    break;
+                }
+                Ok(SseEvent {
+                    kind: SseEventKind::Cancel,
+                    ..
+                }) => return,
+                Ok(SseEvent {
+                    kind: SseEventKind::KeepAlive,
+                    ..
+                }) => {}
+                Err(e) => {
+                    tracing::debug!(error = %e, "circ presence stream error; roster stays on REST");
+                    return;
+                }
+            }
+        }
+
+        if !token_expired || superseded(&epoch_ref) {
+            return;
+        }
+        reconnects += 1;
+        if reconnects > MAX_RECONNECTS || client.refresh().await.is_err() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Announce that the user is in `room_id`, then keep announcing for as long as
+/// the room is open (§ Announce Your Presence).
+///
+/// The cadence is read off each response rather than hard-coded, exactly as the
+/// spec asks, and every beat carries the user's last keystroke so they show as
+/// idle rather than dropping out of the list. A keystroke also wakes the loop
+/// for the extra beat the spec asks for on waking up, throttled by
+/// [`CIRC_PRESENCE_MIN_GAP`] so a fast typist cannot spend the room's budget.
+/// Epoch-guarded like the streams, so leaving the room stops the heartbeat.
+async fn circ_presence_beat_loop(
+    client: Client,
+    tx: mpsc::UnboundedSender<BgEvent>,
+    room_id: String,
+    epoch: u64,
+    epoch_ref: Arc<AtomicU64>,
+    activity_ms: Arc<AtomicI64>,
+    activity_notify: Arc<Notify>,
+) {
+    loop {
+        if epoch != epoch_ref.load(Ordering::SeqCst) {
+            return;
+        }
+        let last_activity = activity_ms.load(Ordering::Relaxed);
+        let last_activity = (last_activity > 0).then_some(last_activity);
+        let sent_at = Instant::now();
+        let wait = match client.announce_circ_presence(&room_id, last_activity).await {
+            Ok(response) => {
+                let interval = response.heartbeat_interval();
+                if epoch != epoch_ref.load(Ordering::SeqCst) {
+                    return;
+                }
+                if tx
+                    .send(BgEvent::CircPresenceBeat {
+                        room_id: room_id.clone(),
+                        epoch,
+                        response: Box::new(response),
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                interval
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, room_id, "circ presence heartbeat failed");
+                CIRC_PRESENCE_RETRY
+            }
+        };
+        tokio::select! {
+            () = tokio::time::sleep(wait) => {}
+            () = activity_notify.notified() => {
+                // Woken by a keystroke: send the extra beat, but never sooner
+                // than the floor, so a burst of typing is still one request.
+                let since = sent_at.elapsed();
+                if since < CIRC_PRESENCE_MIN_GAP {
+                    tokio::time::sleep(CIRC_PRESENCE_MIN_GAP - since).await;
+                }
+            }
+        }
+    }
+}
+
+/// Live RTDB stream for a C-Mail conversation's typing indicator
+/// (`dm_presence/<conversationId>`, § Reading in real time). Same lifecycle as
+/// the message stream it rides alongside, and it shares that stream's
+/// generation so leaving the thread drops late events.
+async fn cmail_presence_stream_loop(
+    client: Client,
+    tx: mpsc::UnboundedSender<BgEvent>,
+    conversation_id: String,
+    epoch: u64,
+    epoch_ref: Arc<AtomicU64>,
+) {
+    let path = cmail_presence_path(&conversation_id);
+    let superseded = |epoch_ref: &Arc<AtomicU64>| epoch != epoch_ref.load(Ordering::SeqCst);
+    let mut reconnects: u32 = 0;
+    const MAX_RECONNECTS: u32 = 24;
+
+    loop {
+        if superseded(&epoch_ref) {
+            return;
+        }
+        let tokens = client.tokens().await;
+        if tokens.rtdb_url.is_empty() || tokens.id_token.is_empty() {
+            return;
+        }
+        let rtdb = match RtdbClient::new(tokens.rtdb_url, tokens.id_token) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(error = %e, "cmail presence rtdb client build failed");
+                return;
+            }
+        };
+        let mut rx = match rtdb.subscribe(&path, &[]).await {
+            Ok(rx) => rx,
+            Err(e) => {
+                tracing::debug!(error = %e, "cmail presence subscribe failed; indicator off");
+                return;
+            }
+        };
+
+        let mut token_expired = false;
+        while let Some(ev) = rx.recv().await {
+            if superseded(&epoch_ref) {
+                return;
+            }
+            match ev {
+                Ok(SseEvent {
+                    kind: kind @ (SseEventKind::Put | SseEventKind::Patch),
+                    data,
+                }) => {
+                    let path_str = data.get("path").and_then(|p| p.as_str()).unwrap_or("/");
+                    let payload = data.get("data").unwrap_or(&serde_json::Value::Null);
+                    let updates = cmail_presence_updates_from_rtdb_event(kind, path_str, payload);
+                    if !updates.is_empty()
+                        && tx
+                            .send(BgEvent::CmailTypingLive {
+                                conversation_id: conversation_id.clone(),
+                                epoch,
+                                updates,
+                            })
+                            .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(SseEvent {
+                    kind: SseEventKind::AuthRevoked,
+                    ..
+                }) => {
+                    token_expired = true;
+                    break;
+                }
+                Ok(SseEvent {
+                    kind: SseEventKind::Cancel,
+                    ..
+                }) => return,
+                Ok(SseEvent {
+                    kind: SseEventKind::KeepAlive,
+                    ..
+                }) => {}
+                Err(e) => {
+                    tracing::debug!(error = %e, "cmail presence stream error; indicator off");
+                    return;
+                }
+            }
+        }
+
+        if !token_expired || superseded(&epoch_ref) {
+            return;
+        }
+        reconnects += 1;
+        if reconnects > MAX_RECONNECTS || client.refresh().await.is_err() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
 /// Long-lived subscription to `user_conversations/<uid>`: each change pokes an
 /// accurate REST unread refresh (so the badge/toast are real-time without parsing
-/// the RTDB payload). Errors terminate the stream — the periodic poll remains the
-/// correctness fallback — and only a token expiry reconnects (bounded, no loop).
+/// the RTDB payload). Errors terminate the stream, leaving the periodic poll as
+/// the correctness fallback, and only a token expiry reconnects (bounded, no loop).
 async fn cmail_conversations_stream_loop(client: Client, tx: mpsc::UnboundedSender<BgEvent>) {
     tokio::time::sleep(Duration::from_secs(3)).await;
     let mut reconnects: u32 = 0;
@@ -5416,6 +7147,42 @@ fn ring_terminal_bell() {
     let _ = out.flush();
 }
 
+/// Now as milliseconds since the Unix epoch, the shape `lastActivity` takes on
+/// the wire (§ Announce Your Presence). A clock before the epoch reports 0,
+/// which the heartbeat reads as "never", so it simply omits the field.
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// Whether `content` is one of the mute-family slash commands (§ Commands,
+/// "Muting"). They post nothing and change the stored `mutedUsersByRoom`, so
+/// the client has to re-read that list to make the change visible. `/muted` is
+/// included because its reply is the list itself, and re-reading keeps the view
+/// and the answer in step.
+fn is_mute_command(content: &str) -> bool {
+    let head = content.split_whitespace().next().unwrap_or_default();
+    matches!(head, "/mute" | "/unmute" | "/muted" | "/unmuteall")
+}
+
+/// The line to show for a refused cIRC delete (§ Delete Your Message), which
+/// answers with three different `403`/`404`/`409` conditions that mean three
+/// different things. `None` for anything else, so the caller falls back to the
+/// generic message.
+fn circ_delete_message_error(e: &ApiError) -> Option<String> {
+    let ApiError::Api { code, .. } = e else {
+        return None;
+    };
+    match code {
+        ErrorCode::Conflict => Some("already deleted".to_string()),
+        ErrorCode::Forbidden => Some("that isn't your message".to_string()),
+        ErrorCode::NotFound => Some("that message is gone".to_string()),
+        _ => None,
+    }
+}
+
 fn first_line(s: &str) -> String {
     let line = s.lines().next().unwrap_or("").trim();
     if line.chars().count() <= 100 {
@@ -5494,6 +7261,7 @@ mod tests {
             is_nsfw: false,
             attachments: vec![],
             created_at: None,
+            edited_at: None,
             deleted: false,
         }
     }
@@ -5508,6 +7276,7 @@ mod tests {
             parent_reply_id: None,
             attachments: vec![],
             created_at: None,
+            edited_at: None,
             deleted: false,
         }
     }
@@ -5730,8 +7499,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cmail_editor_save_returns_text_to_the_inline_composer() {
+    // A tokio runtime is needed: returning the draft to the composer resumes
+    // the typing heartbeat, which spawns.
+    #[tokio::test]
+    async fn cmail_editor_save_returns_text_to_the_inline_composer() {
         let mut app = test_app();
         app.screen = Screen::Cmail(CmailScreen::for_open_conversation(test_conversation()));
         app.push_screen(Screen::Editor(EditorScreen::new(
@@ -5981,10 +7752,16 @@ mod tests {
         app.screen = Screen::Feed(FeedScreen::new()); // not a text-input screen
         app.handle_terminal_event(key_event(KeyCode::Char('?')))
             .await;
-        assert!(app.help, "? should open help on the feed");
+        assert!(app.help.is_some(), "? should open help on the feed");
+        // The overlay scrolls now, so `j` moves its body instead of closing it.
         app.handle_terminal_event(key_event(KeyCode::Char('j')))
             .await;
-        assert!(!app.help, "any key should dismiss help");
+        assert!(
+            app.help.is_some(),
+            "j scrolls the overlay, it doesn't close"
+        );
+        app.handle_terminal_event(key_event(KeyCode::Esc)).await;
+        assert!(app.help.is_none(), "a non-scroll key dismisses help");
     }
 
     #[tokio::test]
@@ -5992,13 +7769,16 @@ mod tests {
         let mut app = test_app(); // starts on Login (text input)
         app.handle_terminal_event(key_event(KeyCode::Char('?')))
             .await;
-        assert!(!app.help, "? must not open help while typing into login");
+        assert!(
+            app.help.is_none(),
+            "? must not open help while typing into login"
+        );
     }
 
     #[test]
     fn help_overlay_renders_over_a_screen() {
         let mut app = test_app();
-        app.help = true;
+        app.help = Some(HelpOverlay::new());
         let text = render_to_string(&app);
         assert!(text.contains("help"), "help title not drawn");
         assert!(text.contains("Sections"), "help body not drawn");
@@ -6700,6 +8480,639 @@ mod tests {
         assert!(
             text.contains("shuffle off"),
             "the self-disarm must be announced, not just the fetch failure: {text:?}"
+        );
+    }
+
+    // v0.8.4 write actions -----------------------------------------------------
+
+    /// A cIRC screen already inside `slug`, holding `messages`.
+    fn circ_room_screen(slug: &str, messages: Vec<CircMessage>) -> CircScreen {
+        let mut s = CircScreen::new();
+        s.apply_rooms(Ok(vec![CircRoom {
+            id: format!("id-{slug}"),
+            slug: slug.into(),
+            name: String::new(),
+            last_message_at: None,
+            sort_order: 0,
+            online_count: 0,
+        }]));
+        s.open_room(slug);
+        s.apply_messages(slug, true, Ok((messages, None)));
+        s
+    }
+
+    fn circ_message(id: &str, user: &str, content: &str) -> CircMessage {
+        CircMessage {
+            id: id.into(),
+            user_id: format!("uid-{user}"),
+            username: user.into(),
+            is_chat_admin: false,
+            content: content.into(),
+            timestamp: 1,
+            extras: cs_api::MessageExtras::default(),
+        }
+    }
+
+    #[test]
+    fn feed_e_and_f_route_to_an_edit_and_a_report() {
+        let mut feed = FeedScreen::new();
+        feed.apply_initial(Ok((vec![test_entry("p1")], None)));
+        let mut screen = Screen::Feed(feed);
+
+        assert_eq!(
+            App::route_key(&mut screen, kev(KeyCode::Char('e'))),
+            Action::EditEntry {
+                post_id: "p1".into(),
+                content: "hi".into(),
+                title: None,
+                topics: vec![],
+                is_public: false,
+                is_nsfw: false,
+            }
+        );
+
+        // `F` only opens the reason prompt; the report goes on Enter.
+        assert_eq!(
+            App::route_key(&mut screen, kev(KeyCode::Char('F'))),
+            Action::None
+        );
+        assert!(
+            screen.accepts_text_input(),
+            "an open reason prompt owns the printable keys"
+        );
+        assert_eq!(
+            App::route_key(&mut screen, kev(KeyCode::Enter)),
+            Action::FlagEntry {
+                post_id: "p1".into(),
+                // Blank is a legitimate report: the reason is optional.
+                reason: None,
+            }
+        );
+        assert!(!screen.accepts_text_input(), "the prompt closed on submit");
+    }
+
+    #[tokio::test]
+    async fn esc_closes_a_flag_prompt_before_it_pops_the_screen() {
+        let mut app = test_app();
+        let mut feed = FeedScreen::new();
+        feed.apply_initial(Ok((vec![test_entry("p1")], None)));
+        app.push_screen(Screen::Feed(feed));
+
+        app.handle_terminal_event(key_event(KeyCode::Char('F')))
+            .await;
+        assert!(app.screen.accepts_text_input(), "prompt open");
+        app.handle_terminal_event(key_event(KeyCode::Esc)).await;
+        assert!(
+            matches!(app.screen, Screen::Feed(_)),
+            "esc cancelled the report, it didn't pop the feed"
+        );
+        assert!(!app.screen.accepts_text_input(), "prompt closed");
+    }
+
+    #[test]
+    fn a_repeat_report_reads_as_a_success_not_a_failure() {
+        let mut app = test_app();
+        app.screen = Screen::Feed(FeedScreen::new());
+        app.current_root = Some(RootKind::Feed);
+
+        app.handle_bg_event(BgEvent::Flagged(Ok(FlagResponse {
+            flagged: true,
+            already_flagged: false,
+            flag_id: Some("f1".into()),
+        })));
+        let text = render_to_string(&app);
+        assert!(text.contains("reported"), "{text:?}");
+        assert!(!text.contains("already"), "a first report isn't a repeat");
+
+        app.toast = None;
+        app.handle_bg_event(BgEvent::Flagged(Ok(FlagResponse {
+            flagged: true,
+            already_flagged: true,
+            flag_id: None,
+        })));
+        let text = render_to_string(&app);
+        assert!(
+            text.contains("already reported"),
+            "a repeat is idempotent, not an error: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_poke_result_clears_the_pending_marker_and_names_the_target() {
+        let mut app = test_app();
+        let mut profile = ProfileScreen::new_for("bob".into());
+        profile.is_self = false;
+        profile.poke_pending = true;
+        app.screen = Screen::Profile(profile);
+
+        app.handle_bg_event(BgEvent::Poked(Ok(PokeResponse {
+            user_id: "u1".into(),
+            username: "bob".into(),
+            poked: true,
+        })));
+
+        let Screen::Profile(s) = &app.screen else {
+            panic!("expected the profile screen");
+        };
+        assert!(!s.poke_pending, "the in-flight marker must clear");
+        let text = render_to_string(&app);
+        assert!(text.contains("poked @bob"), "{text:?}");
+    }
+
+    #[test]
+    fn a_refused_circ_delete_says_which_refusal_it_was() {
+        let api = |code| ApiError::Api {
+            code,
+            message: String::new(),
+            status: ErrorCode::http_status(code),
+        };
+        assert_eq!(
+            circ_delete_message_error(&api(ErrorCode::Conflict)).as_deref(),
+            Some("already deleted")
+        );
+        assert_eq!(
+            circ_delete_message_error(&api(ErrorCode::Forbidden)).as_deref(),
+            Some("that isn't your message")
+        );
+        assert_eq!(
+            circ_delete_message_error(&api(ErrorCode::NotFound)).as_deref(),
+            Some("that message is gone")
+        );
+        assert!(
+            circ_delete_message_error(&ApiError::Unauthorized).is_none(),
+            "anything else falls back to the generic message"
+        );
+    }
+
+    #[test]
+    fn a_confirmed_circ_delete_tombstones_the_message_without_the_stream() {
+        let mut app = test_app();
+        app.screen = Screen::Circ(circ_room_screen(
+            "general",
+            vec![circ_message("m1", "neo", "regrettable")],
+        ));
+        app.current_root = Some(RootKind::Circ);
+
+        app.handle_bg_event(BgEvent::CircMessageDeleted {
+            room_id: "general".into(),
+            message_id: "m1".into(),
+            result: Ok(()),
+        });
+
+        let text = render_to_string(&app);
+        assert!(!text.contains("regrettable"), "the body is gone: {text:?}");
+        assert!(
+            text.contains(super::super::chat::TOMBSTONE),
+            "a tombstone replaces it: {text:?}"
+        );
+    }
+
+    #[test]
+    fn the_stored_mute_list_hides_that_authors_messages() {
+        let mut app = test_app();
+        app.screen = Screen::Circ(circ_room_screen(
+            "general",
+            vec![
+                circ_message("m1", "loud", "advert"),
+                circ_message("m2", "neo", "keepme"),
+            ],
+        ));
+        app.current_root = Some(RootKind::Circ);
+
+        app.handle_bg_event(BgEvent::CircMutedUsers {
+            room_id: "general".into(),
+            usernames: vec!["loud".into()],
+        });
+
+        let text = render_to_string(&app);
+        assert!(!text.contains("advert"), "muted author hidden: {text:?}");
+        assert!(text.contains("keepme"), "everyone else still shows");
+
+        // Nothing was discarded, so an unmute brings the history back.
+        app.handle_bg_event(BgEvent::CircMutedUsers {
+            room_id: "general".into(),
+            usernames: vec![],
+        });
+        assert!(render_to_string(&app).contains("advert"));
+    }
+
+    #[tokio::test]
+    async fn a_mute_command_shows_its_reply_and_re_reads_the_stored_list() {
+        let mut app = test_app();
+        app.screen = Screen::Circ(circ_room_screen("general", vec![]));
+        app.current_root = Some(RootKind::Circ);
+
+        app.handle_bg_event(BgEvent::CircMuted {
+            room_id: "general".into(),
+            result: Ok("muted @loud".into()),
+        });
+
+        let text = render_to_string(&app);
+        assert!(text.contains("muted @loud"), "{text:?}");
+    }
+
+    #[test]
+    fn live_circ_updates_land_only_for_the_current_stream_generation() {
+        let mut app = test_app();
+        app.screen = Screen::Circ(circ_room_screen("general", vec![]));
+        app.current_root = Some(RootKind::Circ);
+        let epoch = app.circ_stream_epoch.load(Ordering::SeqCst);
+
+        app.handle_bg_event(BgEvent::CircLive {
+            room_id: "general".into(),
+            epoch,
+            updates: vec![CircMessageUpdate::Full(circ_message("m1", "neo", "fresh"))],
+        });
+        assert!(render_to_string(&app).contains("fresh"));
+
+        app.handle_bg_event(BgEvent::CircLive {
+            room_id: "general".into(),
+            epoch: epoch.wrapping_add(9),
+            updates: vec![CircMessageUpdate::Full(circ_message("m2", "neo", "stale"))],
+        });
+        assert!(
+            !render_to_string(&app).contains("stale"),
+            "a superseded stream's events must be dropped"
+        );
+    }
+
+    #[test]
+    fn the_account_id_reaches_an_open_room_and_gates_the_select_keys() {
+        let mut app = test_app();
+        app.screen = Screen::Circ(circ_room_screen(
+            "general",
+            vec![circ_message("m1", "neo", "mine")],
+        ));
+        app.handle_bg_event(BgEvent::ViewerIdentity("uid-neo".into()));
+        assert_eq!(app.viewer_user_id.as_deref(), Some("uid-neo"));
+
+        let mut screen = std::mem::replace(&mut app.screen, Screen::Feed(FeedScreen::new()));
+        assert_eq!(
+            App::route_key(&mut screen, kev_ctrl(KeyCode::Char('b'))),
+            Action::None,
+            "Ctrl+B enters message-select mode"
+        );
+        assert_eq!(
+            App::route_key(&mut screen, kev(KeyCode::Char('F'))),
+            Action::None,
+            "you can't report your own message, so F is not offered"
+        );
+        assert_eq!(
+            App::route_key(&mut screen, kev(KeyCode::Char('d'))),
+            Action::None,
+            "d only arms the confirm"
+        );
+        assert_eq!(
+            App::route_key(&mut screen, kev(KeyCode::Char('y'))),
+            Action::CircDeleteMessage {
+                room_id: "general".into(),
+                message_id: "m1".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn m_in_select_mode_asks_the_shell_to_mute_the_author() {
+        let mut screen = Screen::Circ(circ_room_screen(
+            "general",
+            vec![circ_message("m1", "loud", "advert")],
+        ));
+        assert_eq!(
+            App::route_key(&mut screen, kev_ctrl(KeyCode::Char('b'))),
+            Action::None
+        );
+        assert_eq!(
+            App::route_key(&mut screen, kev(KeyCode::Char('m'))),
+            Action::CircMuteUser {
+                room_id: "general".into(),
+                username: "loud".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_edited_entry_is_refreshed_in_place_on_the_open_post_detail() {
+        // The PATCH answers with an id, so without the re-read the reader keeps
+        // looking at the text they just replaced.
+        let mut app = test_app();
+        app.screen = Screen::PostDetail(PostDetailScreen::new(test_entry("p1")));
+
+        let mut fresh = test_entry("p1");
+        fresh.content = "the edited body".into();
+        app.handle_bg_event(BgEvent::EntryRefreshed {
+            post_id: "p1".into(),
+            result: Ok(fresh),
+        });
+
+        let Screen::PostDetail(s) = &app.screen else {
+            panic!("expected the post detail");
+        };
+        assert_eq!(s.entry.content, "the edited body");
+    }
+
+    #[test]
+    fn a_refresh_for_a_different_post_is_ignored() {
+        let mut app = test_app();
+        app.screen = Screen::PostDetail(PostDetailScreen::new(test_entry("p1")));
+        let mut other = test_entry("p2");
+        other.content = "somebody else's edit".into();
+        app.handle_bg_event(BgEvent::EntryRefreshed {
+            post_id: "p2".into(),
+            result: Ok(other),
+        });
+        let Screen::PostDetail(s) = &app.screen else {
+            panic!("expected the post detail");
+        };
+        assert_eq!(s.entry.content, "hi", "the open post must not be clobbered");
+    }
+
+    #[tokio::test]
+    async fn a_successful_entry_edit_folds_the_patch_in_before_the_re_read() {
+        let mut app = test_app();
+        app.screen = Screen::PostDetail(PostDetailScreen::new(test_entry("p1")));
+
+        app.handle_bg_event(BgEvent::EntryEdited {
+            edit: Box::new(EntryEdit {
+                content: Some("patched".into()),
+                ..EntryEdit::default()
+            }),
+            result: Ok("p1".into()),
+        });
+
+        let Screen::PostDetail(s) = &app.screen else {
+            panic!("expected the post detail");
+        };
+        assert_eq!(s.entry.content, "patched");
+        assert!(
+            s.entry.edited_at.is_some(),
+            "the (edited) marker appears without a round trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_reply_edit_lands_on_the_open_thread() {
+        let mut app = test_app();
+        let mut detail = PostDetailScreen::new(test_entry("p1"));
+        detail.apply_replies_initial(Ok((vec![test_reply("r1", "p1")], None)));
+        app.screen = Screen::PostDetail(detail);
+
+        app.handle_bg_event(BgEvent::ReplyEdited {
+            content: "reworded".into(),
+            result: Ok("r1".into()),
+        });
+
+        let Screen::PostDetail(s) = &app.screen else {
+            panic!("expected the post detail");
+        };
+        assert_eq!(s.replies[0].content, "reworded");
+    }
+
+    #[test]
+    fn the_editor_hands_an_edit_body_to_the_compose_confirm_screen() {
+        let mut app = test_app();
+        app.screen = Screen::Feed(FeedScreen::new());
+        let mut entry = test_entry("p1");
+        entry.title = Some("Old title".into());
+        entry.topics = vec!["music".into()];
+
+        let mut ed = EditorScreen::new(
+            EditorPurpose::EditBody {
+                kind: ComposeKind::edit_entry(&entry),
+            },
+            &entry.content,
+        );
+        ed.paste(" + more");
+        app.push_screen(Screen::Editor(ed));
+        app.editor_save();
+
+        let Screen::Compose(c) = &app.screen else {
+            panic!("expected the compose confirm screen");
+        };
+        assert_eq!(c.content, "hi + more");
+        assert_eq!(c.title_input, "Old title", "the snapshot prefills the form");
+        assert_eq!(c.topics_input, "music");
+        assert!(c.kind.is_edit());
+        assert!(
+            matches!(app.back_stack.last(), Some(Screen::Feed(_))),
+            "esc from the confirm screen returns to the feed"
+        );
+    }
+
+    // Published activity -------------------------------------------------------
+
+    #[test]
+    fn the_typing_publisher_posts_once_per_cadence_and_expires_on_silence() {
+        let mut publisher = TypingPublisher::default();
+        assert!(
+            publisher.due("c1", Instant::now()),
+            "the first keystroke publishes at once"
+        );
+        publisher.mark_sent("c1");
+        publisher.touch();
+        assert!(
+            !publisher.due("c1", Instant::now()),
+            "the next keystroke rides the flag already up"
+        );
+        assert!(
+            publisher.due("c2", Instant::now()),
+            "another conversation is always due"
+        );
+        assert!(publisher.published_on("c1"));
+        assert!(!publisher.is_idle(Instant::now()));
+
+        assert_eq!(publisher.take_published().as_deref(), Some("c1"));
+        assert!(!publisher.published_on("c1"));
+        assert!(
+            publisher.is_idle(Instant::now()),
+            "nothing published means nothing to keep alive"
+        );
+    }
+
+    #[tokio::test]
+    async fn typing_into_a_conversation_publishes_the_flag_and_esc_withdraws_it() {
+        let mut app = test_app();
+        app.screen = Screen::Cmail(CmailScreen::for_open_conversation(test_conversation()));
+        app.current_root = Some(RootKind::Cmail);
+
+        app.handle_terminal_event(key_event(KeyCode::Char('c')))
+            .await; // focus the composer
+        app.handle_terminal_event(key_event(KeyCode::Char('h')))
+            .await;
+        assert!(
+            app.typing.published_on("c1"),
+            "a draft publishes the typing flag"
+        );
+
+        // The first Esc unfocuses the composer, which is the input going idle.
+        app.handle_terminal_event(key_event(KeyCode::Esc)).await;
+        assert!(
+            !app.typing.published_on("c1"),
+            "unfocusing withdraws it rather than letting it age out"
+        );
+    }
+
+    #[tokio::test]
+    async fn emptying_the_draft_withdraws_the_typing_flag() {
+        let mut app = test_app();
+        app.screen = Screen::Cmail(CmailScreen::for_open_conversation(test_conversation()));
+        app.current_root = Some(RootKind::Cmail);
+
+        app.handle_terminal_event(key_event(KeyCode::Char('c')))
+            .await;
+        app.handle_terminal_event(key_event(KeyCode::Char('h')))
+            .await;
+        assert!(app.typing.published_on("c1"));
+        app.handle_terminal_event(key_event(KeyCode::Backspace))
+            .await;
+        assert!(
+            !app.typing.published_on("c1"),
+            "an empty draft is not composing"
+        );
+    }
+
+    #[test]
+    fn the_heartbeat_runs_for_a_toast_or_an_open_conversation() {
+        let mut app = test_app();
+        assert!(!app.needs_tick(), "an idle login screen needs no waking");
+        app.toast = Some(Toast::rate_limited(5));
+        assert!(app.needs_tick(), "the countdown animates");
+        app.toast = None;
+        app.screen = Screen::Cmail(CmailScreen::new());
+        assert!(
+            !app.needs_tick(),
+            "the conversation list has no clock to keep"
+        );
+        app.screen = Screen::Cmail(CmailScreen::for_open_conversation(test_conversation()));
+        assert!(
+            app.needs_tick(),
+            "an open thread re-evaluates the typing indicator every second"
+        );
+    }
+
+    #[test]
+    fn the_mute_family_is_recognised_in_a_typed_message() {
+        assert!(is_mute_command("/mute @loud"));
+        assert!(is_mute_command("  /unmute loud"));
+        assert!(is_mute_command("/muted"));
+        assert!(is_mute_command("/unmuteall"));
+        assert!(!is_mute_command("/muteish thing"), "prefixes don't count");
+        assert!(!is_mute_command("mute me"));
+        assert!(!is_mute_command(""));
+    }
+
+    #[test]
+    fn an_open_room_is_still_open_underneath_a_pushed_screen() {
+        // Ctrl+F over a room doesn't take the user out of it, so quitting from
+        // the search screen still has presence to withdraw.
+        let mut app = test_app();
+        app.push_screen(Screen::Circ(circ_room_screen("general", vec![])));
+        assert_eq!(app.open_circ_room().as_deref(), Some("general"));
+        app.push_screen(Screen::Search(SearchScreen::new()));
+        assert_eq!(app.open_circ_room().as_deref(), Some("general"));
+    }
+
+    #[test]
+    fn now_millis_is_a_plausible_epoch_stamp() {
+        // Ms since 2020-01-01, so a seconds/millis mix-up is caught.
+        assert!(now_millis() > 1_577_836_800_000);
+    }
+
+    // Unverified email ---------------------------------------------------------
+
+    #[test]
+    fn note_api_err_signals_an_unverified_email_rather_than_a_dead_session() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let msg = note_api_err(
+            &tx,
+            ApiError::Api {
+                code: ErrorCode::EmailNotVerified,
+                message: String::new(),
+                status: 403,
+            },
+        );
+        assert!(msg.contains("verify"), "guidance preserved: {msg}");
+        assert!(matches!(drain_signal(&mut rx), ApiSignal::EmailNotVerified));
+    }
+
+    #[test]
+    fn an_unverified_email_keeps_the_session_and_offers_a_resend() {
+        let mut app = test_app();
+        app.screen = Screen::Feed(FeedScreen::new());
+        app.current_root = Some(RootKind::Feed);
+        app.offline = true;
+
+        app.handle_api_signal(ApiSignal::EmailNotVerified);
+
+        assert!(
+            app.pending_logout.is_none(),
+            "an unverified address is not an expired session"
+        );
+        assert!(app.email_unverified, "the resend chord is armed");
+        assert!(!app.offline, "the server answered, so we're online");
+        let text = render_to_string(&app);
+        assert!(
+            text.contains("ctrl+g"),
+            "the toast names the way out: {text:?}"
+        );
+
+        // A call that gets through is what a verified address looks like.
+        app.handle_api_signal(ApiSignal::Online);
+        assert!(!app.email_unverified);
+    }
+
+    #[test]
+    fn resending_a_verification_mail_reports_both_outcomes() {
+        let mut app = test_app();
+        app.screen = Screen::Feed(FeedScreen::new());
+        app.current_root = Some(RootKind::Feed);
+
+        app.handle_bg_event(BgEvent::VerificationResent(Ok(true)));
+        assert!(render_to_string(&app).contains("check your inbox"));
+
+        app.toast = None;
+        app.handle_bg_event(BgEvent::VerificationResent(Err("nope".into())));
+        let text = render_to_string(&app);
+        assert!(text.contains("resend failed"), "{text:?}");
+    }
+
+    #[test]
+    fn a_published_typing_flag_keeps_the_clock_running_under_another_screen() {
+        // Regression: the tick was gated on the C-Mail conversation being the
+        // VISIBLE screen, and the tick is the only thing that sends the DELETE.
+        // Pushing search over an open conversation (Ctrl+F is global even inside
+        // a text field) therefore stranded "…is typing" on the other person's
+        // screen until it aged out.
+        let mut app = test_app();
+        app.screen = Screen::Search(SearchScreen::new());
+        assert!(!app.needs_tick(), "nothing to drive yet");
+
+        app.typing.published = Some(("c1".into(), Instant::now()));
+        assert!(
+            app.needs_tick(),
+            "a flag we are publishing must be withdrawable from any screen",
+        );
+    }
+
+    #[tokio::test]
+    async fn leaving_a_section_tears_down_both_sections_live_tasks() {
+        // Regression: goto_root sent the polite leave-DELETE but left the stream
+        // generations alone, so the cIRC presence heartbeat sailed past its
+        // epoch guard and announced the user straight back into the room they
+        // had just left, for the rest of the session. The C-Mail half leaked the
+        // conversation's 4s poll and both of its streams the same way.
+        let mut app = test_app();
+        let circ_before = app.circ_stream_epoch.load(Ordering::SeqCst);
+        let cmail_before = app.cmail_stream_epoch.load(Ordering::SeqCst);
+
+        app.goto_root(RootKind::Feed);
+
+        assert!(
+            app.circ_stream_epoch.load(Ordering::SeqCst) > circ_before,
+            "the room's heartbeat and streams must be invalidated on the way out",
+        );
+        assert!(
+            app.cmail_stream_epoch.load(Ordering::SeqCst) > cmail_before,
+            "the conversation's poll and streams must be invalidated on the way out",
         );
     }
 

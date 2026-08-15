@@ -333,6 +333,7 @@ mod tests {
             is_nsfw: false,
             attachments: vec![],
             created_at: None,
+            edited_at: None,
             deleted: false,
         }
     }
@@ -347,6 +348,7 @@ mod tests {
             parent_reply_id: None,
             attachments: vec![],
             created_at: None,
+            edited_at: None,
             deleted: false,
         }
     }

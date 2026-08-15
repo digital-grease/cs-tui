@@ -1,4 +1,4 @@
-//! Full-text search (`GET /v1/search`, API v0.7).
+//! Full-text search (`GET /v1/search`, API v0.8.4).
 //!
 //! `type=all` returns a grouped preview (up to 8 hits per group, no pagination);
 //! a specific `type` returns a paginated list whose `cursor` is the next page

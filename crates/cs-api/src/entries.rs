@@ -1,11 +1,16 @@
-//! Entry (post) read and write endpoints.
+//! Entry (post) read and write endpoints (`/v1/posts`, API v0.8.4).
+//!
+//! Covers the feed, single-entry reads, slug resolution, create, edit, delete
+//! and reporting. Editing (§ Edit Entry) is limited to supporters, within 5
+//! minutes of publishing, on their own entries. The server owns both rules, so
+//! this module sends the request and lets the `403` surface.
 use reqwest::Method;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 
 use crate::client::Client;
 use crate::endpoint::EndpointKey;
 use crate::error::{ApiError, Result};
-use crate::types::Entry;
+use crate::types::{validate_flag_reason, Attachment, Entry, FlagBody, FlagResponse};
 
 const MAX_CONTENT_LEN: usize = 32_768;
 const MAX_TOPICS: usize = 3;
@@ -89,10 +94,73 @@ impl Client {
         })
     }
 
+    /// `PATCH /v1/posts/:id`, edit an entry you published (v0.8.4 § Edit
+    /// Entry). Only the fields set on `edit` are sent, and only what is sent
+    /// changes.
+    ///
+    /// Returns the echoed `postId`. The server does not return the updated
+    /// entry, so re-fetch with [`get_entry`](Client::get_entry) when the UI
+    /// needs the new `editedAt`. `createdAt` never changes and an edit sends no
+    /// notifications.
+    ///
+    /// Editing is a supporter feature and only works within 5 minutes of
+    /// publishing, on your own entry; outside that the server answers `403`.
+    ///
+    /// An empty `edit` is a `400` server-side, so it is rejected here before it
+    /// costs a rate-limit token.
+    ///
+    /// Rate limit: 5/min, 30/day.
+    pub async fn edit_entry(&self, post_id: &str, edit: &EntryEdit) -> Result<String> {
+        if edit.is_empty() {
+            return Err(ApiError::Config(
+                "entry edit must change at least one field".into(),
+            ));
+        }
+        if let Some(content) = &edit.content {
+            validate_content(content)?;
+        }
+        if let Some(title) = &edit.title {
+            validate_title(title.as_str())?;
+        }
+        if let Some(topics) = &edit.topics {
+            validate_topics(topics)?;
+        }
+        let path = format!("/v1/posts/{post_id}");
+        let r: EditEntryResponse = self
+            .request(
+                EndpointKey::EntriesEdit,
+                Method::PATCH,
+                &path,
+                &[],
+                Some(edit),
+            )
+            .await?;
+        Ok(r.post_id)
+    }
+
     /// `DELETE /v1/posts/:id` — soft-delete an entry. Only the author can.
     pub async fn delete_entry(&self, post_id: &str) -> Result<()> {
         let path = format!("/v1/posts/{post_id}");
         self.request_unit(EndpointKey::EntriesDelete, Method::DELETE, &path, &[])
+            .await
+    }
+
+    /// `POST /v1/posts/:id/flag`, report an entry for review (v0.8.4 § Flag an
+    /// Entry). `reason` is optional, max 500 characters.
+    ///
+    /// Reporting is idempotent: reporting the same entry again files nothing
+    /// new and answers `200` with `alreadyFlagged`, which is a success and not
+    /// an error. Branch on [`FlagResponse::is_new`] rather than on the status
+    /// code, and retry freely. Reports cannot be withdrawn, and reporting your
+    /// own entry is a `403`.
+    ///
+    /// Rate limit: 5/min, 20/hour, 50/day, one budget shared with
+    /// [`flag_reply`](Client::flag_reply) and the cIRC message flag endpoint.
+    pub async fn flag_entry(&self, post_id: &str, reason: Option<&str>) -> Result<FlagResponse> {
+        validate_flag_reason(reason)?;
+        let body = FlagBody { reason };
+        let path = format!("/v1/posts/{post_id}/flag");
+        self.request(EndpointKey::Flag, Method::POST, &path, &[], Some(&body))
             .await
     }
 
@@ -123,7 +191,111 @@ pub struct CreatedEntry {
     pub title: Option<String>,
 }
 
-/// Title length check, shared with guild-thread creation.
+/// What an edit does to an entry's title (v0.8.4 § Edit Entry).
+///
+/// Removing a title and leaving it alone are different operations: omitting
+/// `title` keeps the current one, whereas sending `""` removes it. A plain
+/// `Option<String>` cannot say both, so [`EntryEdit::title`] carries an
+/// `Option<TitleEdit>`: `None` omits the field, `Some(TitleEdit::Remove)` sends
+/// the empty string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TitleEdit {
+    /// Replace the title with this text (max 100 characters).
+    Set(String),
+    /// Drop the entry's title. Serializes as `""`, which is what the server
+    /// reads as a removal, not `null` and not an omitted field.
+    Remove,
+}
+
+impl TitleEdit {
+    /// The exact string this edit puts on the wire: the new title, or `""` for
+    /// [`TitleEdit::Remove`].
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            TitleEdit::Set(title) => title,
+            TitleEdit::Remove => "",
+        }
+    }
+
+    /// Whether this edit removes the title rather than setting one. An empty
+    /// [`TitleEdit::Set`] counts, since it puts the same `""` on the wire.
+    #[must_use]
+    pub fn is_remove(&self) -> bool {
+        self.as_str().is_empty()
+    }
+}
+
+impl Serialize for TitleEdit {
+    fn serialize<S: Serializer>(&self, ser: S) -> std::result::Result<S::Ok, S::Error> {
+        ser.serialize_str(self.as_str())
+    }
+}
+
+/// Partial edit body for [`Client::edit_entry`] (`PATCH /v1/posts/:id`,
+/// v0.8.4 § Edit Entry).
+///
+/// Every field is optional and only what is sent changes, so build one from
+/// [`Default`] and fill in just the fields the user touched. `None` leaves a
+/// field alone; sending nothing at all is a `400`.
+///
+/// Two fields separate "leave it" from "clear it":
+/// - `title`: `None` keeps the current title, `Some(TitleEdit::Remove)` sends
+///   `""` and removes it.
+/// - `attachments`: `None` keeps the current attachments, `Some(Vec::new())`
+///   sends `[]` and removes them. A non-empty list replaces the whole set.
+///
+/// `topics` likewise replaces the existing list wholesale.
+///
+/// There is deliberately no `slug` field. The slug is frozen once an entry is
+/// published so share links keep working, and sending one is a `400`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EntryEdit {
+    /// Replacement content (markdown), max 32,768 characters. Blanking it is
+    /// rejected client-side; an entry needs a body, use `delete_entry` instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+
+    /// Replacement title, or its removal. See [`TitleEdit`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<TitleEdit>,
+
+    /// Replacement topic list, max 3, lowercase.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topics: Option<Vec<String>>,
+
+    /// Whether the entry is visible without login.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_public: Option<bool>,
+
+    /// Content-warning flag. The spec field is literally `isNSFW`, unlike every
+    /// other camelCase field.
+    #[serde(rename = "isNSFW", skip_serializing_if = "Option::is_none")]
+    pub is_nsfw: Option<bool>,
+
+    /// Replacement attachment list. `Some(Vec::new())` removes them all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<Vec<Attachment>>,
+}
+
+impl EntryEdit {
+    /// Whether this edit would send no fields at all. The server answers `400`
+    /// to an empty body, so [`Client::edit_entry`] rejects one up front rather
+    /// than spending a rate-limit token on a certain failure.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.content.is_none()
+            && self.title.is_none()
+            && self.topics.is_none()
+            && self.is_public.is_none()
+            && self.is_nsfw.is_none()
+            && self.attachments.is_none()
+    }
+}
+
+/// Title length check, shared with guild-thread creation. An empty title is
+/// accepted: on an edit it is how a title is removed (v0.8.4 § Edit Entry).
 pub(crate) fn validate_title(title: &str) -> Result<()> {
     if title.chars().count() > MAX_TITLE_LEN {
         return Err(ApiError::Config(format!(
@@ -163,7 +335,9 @@ pub(crate) fn validate_slug(s: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn validate_content_topics(content: &str, topics: &[String]) -> Result<()> {
+/// Content check on its own, so an edit that only changes the content does not
+/// have to invent a topic list to validate against.
+pub(crate) fn validate_content(content: &str) -> Result<()> {
     if content.trim().is_empty() {
         return Err(ApiError::Config("content cannot be empty".into()));
     }
@@ -172,6 +346,12 @@ pub(crate) fn validate_content_topics(content: &str, topics: &[String]) -> Resul
             "content exceeds {MAX_CONTENT_LEN} characters"
         )));
     }
+    Ok(())
+}
+
+/// Topic count and charset check on its own, so an edit that only replaces the
+/// topic list does not have to re-send the content to validate it.
+pub(crate) fn validate_topics(topics: &[String]) -> Result<()> {
     if topics.len() > MAX_TOPICS {
         return Err(ApiError::Config(format!(
             "at most {MAX_TOPICS} topics allowed"
@@ -187,6 +367,13 @@ pub(crate) fn validate_content_topics(content: &str, topics: &[String]) -> Resul
         }
     }
     Ok(())
+}
+
+/// Both checks together, for the create paths that always send content and
+/// topics as a pair.
+pub(crate) fn validate_content_topics(content: &str, topics: &[String]) -> Result<()> {
+    validate_content(content)?;
+    validate_topics(topics)
 }
 
 #[derive(Debug, Serialize)]
@@ -211,6 +398,13 @@ struct CreateEntryResponse {
     slug: Option<String>,
     #[serde(default)]
     title: Option<String>,
+}
+
+/// `PATCH /v1/posts/:id` answers with the id alone, not the updated entry.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EditEntryResponse {
+    post_id: String,
 }
 
 fn clamp_limit(limit: Option<u32>) -> u32 {
@@ -367,5 +561,184 @@ mod tests {
     fn validate_accepts_lowercase_underscore_topic() {
         let topics = vec!["retro_music".into(), "linux".into(), "2026".into()];
         assert!(validate_content_topics("ok", &topics).is_ok());
+    }
+
+    #[test]
+    fn split_validators_check_one_field_each() {
+        // An edit validates only what it is actually sending.
+        assert!(validate_content("ok").is_ok());
+        assert!(matches!(validate_content("   "), Err(ApiError::Config(_))));
+        let big = "x".repeat(MAX_CONTENT_LEN + 1);
+        assert!(matches!(validate_content(&big), Err(ApiError::Config(_))));
+
+        assert!(validate_topics(&[]).is_ok());
+        assert!(validate_topics(&["music".to_string()]).is_ok());
+        let too_many: Vec<String> = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        assert!(matches!(
+            validate_topics(&too_many),
+            Err(ApiError::Config(_))
+        ));
+        let shouty: Vec<String> = vec!["Music".into()];
+        assert!(matches!(validate_topics(&shouty), Err(ApiError::Config(_))));
+    }
+
+    #[test]
+    fn empty_title_validates_because_it_removes_the_title() {
+        assert!(validate_title("").is_ok());
+    }
+
+    #[test]
+    fn title_edit_reports_what_it_puts_on_the_wire() {
+        assert_eq!(TitleEdit::Set("Hello".into()).as_str(), "Hello");
+        assert_eq!(TitleEdit::Remove.as_str(), "");
+        assert!(TitleEdit::Remove.is_remove());
+        assert!(TitleEdit::Set(String::new()).is_remove());
+        assert!(!TitleEdit::Set("Hello".into()).is_remove());
+    }
+
+    #[test]
+    fn entry_edit_default_sends_nothing_and_is_empty() {
+        let edit = EntryEdit::default();
+        assert!(edit.is_empty());
+        assert_eq!(serde_json::to_string(&edit).unwrap(), "{}");
+    }
+
+    #[test]
+    fn entry_edit_sends_only_the_fields_that_are_set() {
+        let edit = EntryEdit {
+            content: Some("corrected".into()),
+            ..Default::default()
+        };
+        assert!(!edit.is_empty());
+        assert_eq!(
+            serde_json::to_string(&edit).unwrap(),
+            r#"{"content":"corrected"}"#
+        );
+    }
+
+    #[test]
+    fn entry_edit_serializes_every_field_with_spec_names() {
+        let edit = EntryEdit {
+            content: Some("body".into()),
+            title: Some(TitleEdit::Set("New Title".into())),
+            topics: Some(vec!["music".into()]),
+            is_public: Some(true),
+            is_nsfw: Some(false),
+            attachments: Some(vec![Attachment::Image {
+                src: "https://x/y.png".into(),
+                width: 640,
+                height: 480,
+            }]),
+        };
+        let v: serde_json::Value = serde_json::to_value(&edit).unwrap();
+        assert_eq!(v["content"], "body");
+        assert_eq!(v["title"], "New Title");
+        assert_eq!(v["topics"][0], "music");
+        assert_eq!(v["isPublic"], true);
+        assert_eq!(v["isNSFW"], false);
+        assert_eq!(v["attachments"][0]["type"], "image");
+        assert_eq!(v["attachments"][0]["src"], "https://x/y.png");
+    }
+
+    #[test]
+    fn entry_edit_distinguishes_removing_a_title_from_leaving_it() {
+        // Removal is the empty string, never null and never an omitted field.
+        let remove = EntryEdit {
+            title: Some(TitleEdit::Remove),
+            ..Default::default()
+        };
+        assert_eq!(serde_json::to_string(&remove).unwrap(), r#"{"title":""}"#);
+        assert!(!remove.is_empty());
+
+        let leave_alone = EntryEdit {
+            content: Some("c".into()),
+            ..Default::default()
+        };
+        let v: serde_json::Value = serde_json::to_value(&leave_alone).unwrap();
+        assert!(!v.as_object().unwrap().contains_key("title"));
+    }
+
+    #[test]
+    fn entry_edit_distinguishes_clearing_attachments_from_leaving_them() {
+        let clear = EntryEdit {
+            attachments: Some(Vec::new()),
+            ..Default::default()
+        };
+        assert!(!clear.is_empty());
+        assert_eq!(
+            serde_json::to_string(&clear).unwrap(),
+            r#"{"attachments":[]}"#
+        );
+
+        let leave_alone = EntryEdit {
+            content: Some("c".into()),
+            ..Default::default()
+        };
+        let v: serde_json::Value = serde_json::to_value(&leave_alone).unwrap();
+        assert!(!v.as_object().unwrap().contains_key("attachments"));
+    }
+
+    #[test]
+    fn entry_edit_never_sends_a_slug() {
+        // The slug is frozen once published and sending one is a 400, so the
+        // body type has no field for it at all.
+        let edit = EntryEdit {
+            content: Some("c".into()),
+            title: Some(TitleEdit::Set("t".into())),
+            topics: Some(vec!["music".into()]),
+            is_public: Some(true),
+            is_nsfw: Some(true),
+            attachments: Some(Vec::new()),
+        };
+        let v: serde_json::Value = serde_json::to_value(&edit).unwrap();
+        assert!(!v.as_object().unwrap().contains_key("slug"));
+    }
+
+    #[test]
+    fn edit_entry_response_decodes() {
+        let r: EditEntryResponse = serde_json::from_str(r#"{"postId":"p1"}"#).unwrap();
+        assert_eq!(r.post_id, "p1");
+    }
+
+    #[test]
+    fn flag_body_omits_an_absent_reason() {
+        let s = serde_json::to_string(&FlagBody { reason: None }).unwrap();
+        assert_eq!(s, "{}");
+    }
+
+    #[test]
+    fn flag_body_sends_a_reason_when_given() {
+        let s = serde_json::to_string(&FlagBody {
+            reason: Some("spam"),
+        })
+        .unwrap();
+        assert_eq!(s, r#"{"reason":"spam"}"#);
+    }
+
+    #[test]
+    fn entry_flag_response_decodes_both_outcomes() {
+        let fresh: FlagResponse =
+            serde_json::from_str(r#"{"postId":"p1","flagId":"f1","flagged":true}"#).unwrap();
+        assert!(fresh.flagged);
+        assert!(fresh.is_new());
+        assert_eq!(fresh.flag_id.as_deref(), Some("f1"));
+
+        // A repeat report is a success, just a quieter one: 200, no flagId.
+        let repeat: FlagResponse =
+            serde_json::from_str(r#"{"postId":"p1","flagged":true,"alreadyFlagged":true}"#)
+                .unwrap();
+        assert!(repeat.flagged);
+        assert!(!repeat.is_new());
+        assert!(repeat.flag_id.is_none());
+    }
+
+    #[test]
+    fn flag_reason_length_is_capped_before_sending() {
+        assert!(validate_flag_reason(None).is_ok());
+        let long = "x".repeat(501);
+        assert!(matches!(
+            validate_flag_reason(Some(&long)),
+            Err(ApiError::Config(_))
+        ));
     }
 }
