@@ -68,6 +68,12 @@ pub struct Config {
     pub cmail_refresh_secs: Option<u64>,
     /// Ring the terminal bell when new C-Mail arrives while you're elsewhere.
     pub cmail_bell: Option<bool>,
+    /// Publish your presence while a cIRC room is open (other people, including
+    /// on the website, see you in that room's user list). Default on.
+    pub circ_presence: Option<bool>,
+    /// Publish a typing indicator while a C-Mail conversation is open (the other
+    /// participant sees "is typing" while you type). Default on.
+    pub cmail_typing: Option<bool>,
     /// Initial jukebox volume for a fresh session (0..=130).
     pub audio_volume: Option<i64>,
     /// Start each session with shuffle mode already armed.
@@ -154,6 +160,24 @@ pub struct Runtime {
     pub cmail_refresh_secs: u64,
     /// Whether to ring the terminal bell on a new C-Mail arrival.
     pub cmail_bell: bool,
+    /// Whether to announce your presence while a cIRC room is open.
+    ///
+    /// This publishes your activity to other people: on (the default) your name
+    /// appears in that room's user list for everyone in the room, including
+    /// people reading on the website, refreshed on the heartbeat the server
+    /// asks for and withdrawn when you leave the room or quit. Off, no presence
+    /// call is ever made and you never appear in the list; reading and posting
+    /// are unaffected, as described in the spec's "Announce Your Presence".
+    pub circ_presence: bool,
+    /// Whether to publish a typing indicator while a C-Mail conversation is
+    /// open.
+    ///
+    /// This publishes your activity to the other participant: on (the default)
+    /// they see the same "is typing" the website shows while you type, kept
+    /// alive on the heartbeat the server asks for and cleared when you go idle,
+    /// close the conversation or quit. Off, nothing is published and they never
+    /// see you typing; you still see theirs, per the spec's "Typing Indicator".
+    pub cmail_typing: bool,
     /// Initial jukebox volume (0..=130) the player opens at each session.
     pub audio_volume: i64,
     /// Whether sessions begin with shuffle mode armed (never auto-playing:
@@ -184,6 +208,10 @@ impl Default for Runtime {
             notifications_refresh_secs: 20,
             cmail_refresh_secs: 20,
             cmail_bell: false,
+            // Both default to on: they are what makes you visible to the people
+            // you're talking to, and the website publishes them too.
+            circ_presence: true,
+            cmail_typing: true,
             // Single-sourced with the player so the two never drift.
             audio_volume: crate::ui::player::DEFAULT_VOLUME,
             shuffle: false,
@@ -336,6 +364,27 @@ const TEMPLATE: &str = r##"# cs-tui configuration. Edit and restart cs-tui.
 # true | false
 #shuffle = false
 
+# ── What other people can see ────────────────────────────────────────────────
+# These two publish your activity to other people. Both are on by default,
+# because that is what the website does and what people in a room expect.
+
+# Announce your presence while a cIRC room is open.
+#   true  (default) your name is in that room's user list for as long as you
+#         have the room open, visible to everyone in it, including people
+#         reading on the website. cs-tui refreshes it on the cadence the server
+#         asks for, and removes you when you leave the room or quit cs-tui.
+#   false no presence is ever published and you never appear in the user list.
+#         You can still read the room and post in it exactly as before.
+#circ_presence = true
+
+# Publish a typing indicator while a C-Mail conversation is open.
+#   true  (default) the other participant sees the same "…is typing" the
+#         website shows while you type. It is refreshed while you keep typing
+#         and cleared when you stop, close the conversation, or quit cs-tui.
+#   false nothing is published and they never see you typing. You still see
+#         their indicator either way; this only controls your own.
+#cmail_typing = true
+
 # ── Input / connection ───────────────────────────────────────────────────────
 
 # Capture the scroll wheel for in-app scrolling. Off keeps native terminal mouse
@@ -452,6 +501,8 @@ impl Config {
                 .unwrap_or(d.cmail_refresh_secs)
                 .clamp(5, 3600),
             cmail_bell: self.cmail_bell.unwrap_or(d.cmail_bell),
+            circ_presence: self.circ_presence.unwrap_or(d.circ_presence),
+            cmail_typing: self.cmail_typing.unwrap_or(d.cmail_typing),
             audio_volume: self.audio_volume.unwrap_or(d.audio_volume).clamp(0, 130),
             shuffle: self.shuffle.unwrap_or(d.shuffle),
             selection: match self.selection.as_deref().map(str::to_ascii_lowercase) {
@@ -699,6 +750,8 @@ mod tests {
             "notifications_refresh_secs",
             "cmail_refresh_secs",
             "cmail_bell",
+            "circ_presence",
+            "cmail_typing",
             "editor",
             "preview_length",
             "image_height",
@@ -761,6 +814,33 @@ mod tests {
         assert!(rt.shuffle);
         // Unset defaults to off (sessions start with shuffle disarmed).
         assert!(!Config::default().to_runtime().shuffle);
+    }
+
+    #[test]
+    fn published_activity_defaults_on_and_can_be_turned_off() {
+        // Unset (and a missing config file) leaves both on, matching the website:
+        // you appear in a cIRC room's user list and the other participant sees
+        // your typing.
+        let d = Config::default().to_runtime();
+        assert!(d.circ_presence);
+        assert!(d.cmail_typing);
+
+        let cfg: Config = toml::from_str(
+            r#"
+            circ_presence = false
+            cmail_typing = false
+            "#,
+        )
+        .unwrap();
+        let rt = cfg.to_runtime();
+        assert!(!rt.circ_presence);
+        assert!(!rt.cmail_typing);
+
+        // The starter template leaves them commented out, so writing it changes
+        // nothing.
+        let template: Config = toml::from_str(TEMPLATE).unwrap();
+        assert!(template.circ_presence.is_none());
+        assert!(template.cmail_typing.is_none());
     }
 
     #[test]

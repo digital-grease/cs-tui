@@ -1,12 +1,31 @@
 //! C-Mail screen — private 1:1 conversations.
+//!
+//! Message bodies are drawn by the shared [`super::chat`] primitives, so a
+//! C-Mail message renders exactly as its cIRC twin does: wrapped text, decoded
+//! art, a text style, the third-person action form and one compact chip per
+//! attachment (§ Message fields). C-Mail has neither delete nor flag in v0.8.4,
+//! so there is no tombstone and no moderation key here.
+//!
+//! The screen also carries both halves of the typing indicator (§ Typing
+//! Indicator): the inbound one is re-derived from the presence entries on every
+//! render, since a flag going stale produces no event, and the outbound one is
+//! reported to the shell as [`CmailIntent::TypingActive`] /
+//! [`CmailIntent::TypingIdle`] so the shell can throttle the network calls.
+use std::collections::HashSet;
+use std::time::Duration;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use cs_api::{CmailConversation, CmailMessage, CmailUser};
+use cs_api::{
+    CmailConversation, CmailMessage, CmailPresence, CmailPresenceUpdate, CmailTypingResponse,
+    CmailTypingStatus, CmailUser,
+};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, ListItem, Paragraph};
 use ratatui::Frame;
 
+use super::chat;
 use super::list::{self, TabState};
 use super::theme::Theme;
 
@@ -99,6 +118,24 @@ pub enum CmailIntent {
         conversation_id: String,
         contents: Vec<String>,
     },
+    /// The user typed into the inline composer and it now holds an unsent
+    /// draft: publish the typing flag (§ Typing Indicator).
+    ///
+    /// Emitted on every keystroke, deliberately: the screen has no clock, so
+    /// the shell owns the throttle and the heartbeat.
+    TypingActive {
+        conversation_id: String,
+    },
+    /// The inline composer went idle (the draft was emptied) or lost focus:
+    /// clear the typing flag rather than waiting for it to age out.
+    TypingIdle {
+        conversation_id: String,
+    },
+    /// Open the selected message's picture in the user's browser (`o`).
+    OpenUrl(String),
+    /// Play the selected message's jukebox track (`o`), which outranks a
+    /// picture on a message carrying both.
+    PlayJukebox(super::audio::JukeboxTrack),
     Quit,
     None,
 }
@@ -128,6 +165,63 @@ pub struct Outgoing {
     pub failed: bool,
 }
 
+/// The inbound typing indicator for the open conversation: whatever the
+/// `dm_presence/<conversationId>` RTDB node currently holds, plus the staleness
+/// window the server asked for (§ Typing Indicator).
+///
+/// Both participants appear on that node (this client publishes its own flag
+/// there too), so the reader is picked out at render time rather than on
+/// arrival, and the flag is re-evaluated against the clock every frame because
+/// one going stale produces no event to react to.
+#[derive(Debug)]
+struct TypingState {
+    /// One entry per participant, keyed by user id. Two at most in a 1:1
+    /// conversation, so a `Vec` beats a map.
+    entries: Vec<CmailPresence>,
+    /// How long a flag survives without a refresh.
+    stale_after: Duration,
+}
+
+impl Default for TypingState {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            // The server states the window on every typing call, so this only
+            // stands in until one has answered. Taken from cs-api's own
+            // fallback rather than written out here, so the figure lives in one
+            // place.
+            stale_after: CmailTypingResponse::default().stale_after(),
+        }
+    }
+}
+
+impl TypingState {
+    /// Merge one decoded RTDB update into the held entries.
+    fn apply(&mut self, update: CmailPresenceUpdate) {
+        match update {
+            CmailPresenceUpdate::Full(entry) => self.upsert(entry),
+            CmailPresenceUpdate::Partial { user_id, patch } => {
+                // A fragment is not an entry: with nothing held to merge into
+                // there is nothing to show, which is the rule cs-api documents.
+                if let Some(entry) = self.entries.iter_mut().find(|e| e.user_id == user_id) {
+                    patch.apply_to(entry);
+                }
+            }
+            CmailPresenceUpdate::Removed { user_id } => {
+                self.entries.retain(|e| e.user_id != user_id);
+            }
+        }
+    }
+
+    /// Replace the entry held for this user id, or add it.
+    fn upsert(&mut self, entry: CmailPresence) {
+        match self.entries.iter_mut().find(|e| e.user_id == entry.user_id) {
+            Some(held) => *held = entry,
+            None => self.entries.push(entry),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct CmailScreen {
     pub conversations: TabState<CmailConversation>,
@@ -140,6 +234,11 @@ pub struct CmailScreen {
     outgoing: Vec<Outgoing>,
     /// Active `/` filter over the conversation list (`Some` while the box is open).
     conv_filter: Option<String>,
+    /// Ids of the messages whose spoiler the reader has revealed with `v`.
+    /// Reader state, not message state, so it lives here and not on the wire.
+    revealed: HashSet<String>,
+    /// The other participant's live typing state.
+    typing: TypingState,
 }
 
 impl CmailScreen {
@@ -151,6 +250,8 @@ impl CmailScreen {
             composing: false,
             outgoing: Vec::new(),
             conv_filter: None,
+            revealed: HashSet::new(),
+            typing: TypingState::default(),
         }
     }
 
@@ -218,6 +319,11 @@ impl CmailScreen {
         self.composing = false;
         self.outgoing.clear();
         self.conv_filter = None;
+        // Both are per-thread reader state: a spoiler revealed in one
+        // conversation stays hidden in the next, and the other participant's
+        // typing flag has nothing to say about the thread being opened.
+        self.revealed.clear();
+        self.typing = TypingState::default();
     }
 
     pub fn is_text_input(&self) -> bool {
@@ -247,6 +353,129 @@ impl CmailScreen {
             }
             _ => false,
         }
+    }
+
+    /// The conversation whose typing flag should be kept alive, i.e. the open
+    /// one when its inline composer is focused and holds an unsent draft
+    /// (§ Typing Indicator).
+    ///
+    /// The shell drives the heartbeat off this rather than off the intents
+    /// alone, because two paths change the draft without a keystroke reaching
+    /// [`Self::handle_key`]: a bracketed paste ([`Self::paste_text`]) and the
+    /// full editor handing its text back ([`Self::set_draft_and_focus`]).
+    pub fn typing_conversation(&self) -> Option<&str> {
+        match &self.mode {
+            CmailMode::Conversation { conversation, .. }
+                if self.composing && !self.draft.trim().is_empty() =>
+            {
+                Some(&conversation.conversation_id)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `conversation_id` is the conversation currently open.
+    fn is_open_conversation(&self, conversation_id: &str) -> bool {
+        matches!(
+            &self.mode,
+            CmailMode::Conversation { conversation, .. }
+                if conversation.conversation_id == conversation_id
+        )
+    }
+
+    /// Merge live typing-indicator changes into the open conversation, as
+    /// decoded from the `dm_presence/<conversationId>` RTDB node by
+    /// [`cs_api::cmail_presence_updates_from_rtdb_event`]
+    /// (§ Reading in real time).
+    ///
+    /// Updates for any other conversation are dropped: only one is open at a
+    /// time, and a late event from the previous one must not raise an indicator
+    /// over this one.
+    pub fn apply_typing_presence(
+        &mut self,
+        conversation_id: &str,
+        updates: Vec<CmailPresenceUpdate>,
+    ) {
+        if !self.is_open_conversation(conversation_id) {
+            return;
+        }
+        for update in updates {
+            self.typing.apply(update);
+        }
+    }
+
+    /// Record the staleness window the server asked for (§ Typing Indicator),
+    /// read off the response to `POST /v1/cmail/:conversationId/typing`.
+    ///
+    /// The spec is explicit that the figure comes off the response rather than
+    /// being assumed, and it is the window this screen ages inbound flags out
+    /// with, so the outbound call is what teaches it.
+    pub fn set_typing_stale_after(&mut self, conversation_id: &str, stale_after: Duration) {
+        if !self.is_open_conversation(conversation_id) {
+            return;
+        }
+        self.typing.stale_after = stale_after;
+    }
+
+    /// Apply a polled `GET /v1/cmail/:conversationId/typing` answer
+    /// (§ Typing Indicator).
+    ///
+    /// The status is the answer as of the moment of the call, so the entry is
+    /// stamped with the time it arrived rather than with `since` (which is when
+    /// they started composing, not when the flag was last refreshed). It then
+    /// ages out from there like any other entry, so a poll that is never
+    /// followed up cannot leave the indicator stuck on.
+    pub fn apply_typing_status(&mut self, conversation_id: &str, status: &CmailTypingStatus) {
+        let CmailMode::Conversation { conversation, .. } = &self.mode else {
+            return;
+        };
+        if conversation.conversation_id != conversation_id {
+            return;
+        }
+        let other = &conversation.other_user;
+        self.typing.stale_after = status.stale_after();
+        if status.typing && !(status.user_id.is_empty() && status.username.is_empty()) {
+            self.typing.upsert(CmailPresence {
+                user_id: status.user_id.clone(),
+                username: status.username.clone(),
+                typing: true,
+                timestamp: now_epoch_millis(),
+            });
+        } else {
+            // Nobody is typing, so drop what is held for them instead of
+            // waiting for it to age out.
+            self.typing
+                .entries
+                .retain(|e| !presence_from_other(e, other));
+        }
+    }
+
+    /// The message the reader has selected in the open conversation.
+    fn selected_message(&self) -> Option<&CmailMessage> {
+        match &self.mode {
+            CmailMode::Conversation { messages, .. } => messages.items.get(messages.selected),
+            _ => None,
+        }
+    }
+
+    /// The "…is typing" line for the open conversation as of `now_ms`, or
+    /// `None` when the other participant is not typing.
+    ///
+    /// Re-derived every render rather than latched, because § Typing Indicator
+    /// makes the flag expire on a clock: it counts only while `typing` is set
+    /// *and* the entry is newer than the staleness window, and a flag going
+    /// stale produces no event, so a latched indicator would never come down.
+    fn typing_label(&self, now_ms: i64) -> Option<String> {
+        let CmailMode::Conversation { conversation, .. } = &self.mode else {
+            return None;
+        };
+        let other = &conversation.other_user;
+        let stale_after = self.typing.stale_after;
+        self.typing
+            .entries
+            .iter()
+            .find(|e| presence_from_other(e, other) && e.is_typing_at(now_ms, stale_after))
+            .map(|_| format!("{} is typing…", display_name_of(other)))
     }
 
     pub fn paste_text(&mut self, text: &str) {
@@ -290,11 +519,14 @@ impl CmailScreen {
                 self.mode = CmailMode::Conversations;
                 Some(CmailIntent::CancelInput)
             }
-            CmailMode::Conversation { .. } if self.composing => {
+            CmailMode::Conversation { conversation, .. } if self.composing => {
                 // First Esc unfocuses the composer (keeping the draft); a second
-                // Esc then leaves the conversation.
+                // Esc then leaves the conversation. Unfocusing is the input
+                // going idle, so the typing flag comes down now rather than
+                // ageing out (§ Typing Indicator).
+                let conversation_id = conversation.conversation_id.clone();
                 self.composing = false;
-                Some(CmailIntent::None)
+                Some(CmailIntent::TypingIdle { conversation_id })
             }
             CmailMode::Conversation { .. } => {
                 self.reset_composer();
@@ -659,22 +891,53 @@ impl CmailScreen {
         frame.render_widget(block, area);
 
         let out_rows = self.outgoing_rows();
+        // The indicator only claims a row while it is live, so an idle thread
+        // renders exactly as it did before there was one.
+        let typing = self.typing_label(now_epoch_millis());
+        let typing_rows = u16::from(typing.is_some());
         let footer_rows = if self.composing { 2 } else { 1 };
         let layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(1),
                 Constraint::Length(out_rows),
+                Constraint::Length(typing_rows),
                 Constraint::Length(footer_rows),
             ])
             .split(inner);
 
         let visible: Vec<usize> = (0..messages.items.len()).collect();
         let unread_from = first_unread_index(&messages.items, other, conversation.unread_count);
-        let messages_area = bottom_aligned_messages_area(
-            layout[0],
-            rendered_message_rows(&messages.items, unread_from),
-        );
+        // Wrap each body to the pane's content width: the list reserves a 2-col
+        // highlight gutter and every body row carries a 2-space indent, so the
+        // text flows within `width - 4`.
+        let body_width = (layout[0].width as usize).saturating_sub(4).max(1);
+        let body_layout = chat::BodyLayout::new(body_width);
+        let heights = message_row_heights(&messages.items, unread_from, body_layout);
+        let content_rows: usize = heights.iter().map(|&h| usize::from(h)).sum();
+        let mut messages_area = bottom_aligned_messages_area(layout[0], content_rows);
+        // When the thread overflows the pane, ratatui's `List` tiles whole items
+        // top-down from the scroll offset and cannot show a partial one at the
+        // top, so it leaves the leftover rows blank at the *bottom*. Trim that
+        // leftover off the top, sizing the pane to the tallest suffix of whole
+        // messages that fits, so the newest message stays flush above the
+        // composer. (The same fix cIRC needed once its messages could wrap.)
+        if content_rows >= messages_area.height as usize {
+            let mut suffix = 0u16;
+            for &h in heights.iter().rev() {
+                if suffix + h > messages_area.height {
+                    break;
+                }
+                suffix += h;
+            }
+            // Only trim when at least one whole message fits; a single message
+            // taller than the pane is left to ratatui (shows its top, clipped).
+            if suffix > 0 {
+                let remainder = messages_area.height - suffix;
+                messages_area.y += remainder;
+                messages_area.height -= remainder;
+            }
+        }
         // `render_body` calls the item closure for every message in order each
         // frame, so a couple of `Cell`s let us inject day separators and a single
         // "new" divider without an extra pass or breaking selection indices.
@@ -701,21 +964,57 @@ impl CmailScreen {
                     lines.push(separator_line("new", theme));
                 }
                 idx.set(idx.get() + 1);
-                lines.extend(message_lines(m, other, theme));
+                // Reveal state is per message and per reader, so it rides on the
+                // layout handed to this one body.
+                let item_layout = body_layout.with_revealed(self.revealed.contains(&m.id));
+                lines.extend(message_lines(m, other, theme, item_layout));
                 ListItem::new(lines)
             },
         );
+        // Attachment chips become clickable links only after the pane is drawn,
+        // and only against the very rect it was drawn into. Gated on the
+        // `hyperlinks` config like every other OSC 8 surface in the client, so
+        // turning it off really does leave the chips as plain text.
+        if crate::config::get().hyperlinks {
+            // Only the rows the list actually drew, which start at the offset it
+            // just settled on. Handing over chips for scrolled-off messages
+            // would slide every link onto the wrong message's attachment.
+            let chips = chat::collect_chips(
+                messages
+                    .items
+                    .iter()
+                    .skip(messages.list_offset())
+                    .map(chat::ChatMessage::from),
+                body_layout,
+            );
+            chat::apply_chip_links(frame.buffer_mut(), messages_area, &chips, theme);
+        }
 
         if out_rows > 0 {
             self.render_outgoing(frame, layout[1], theme);
         }
+        if let Some(label) = typing {
+            self.render_typing(frame, layout[2], theme, &label);
+        }
         let scrolled_up = messages.selected + 1 < messages.items.len();
         self.render_conversation_footer(
             frame,
-            layout[2],
+            layout[3],
             theme,
             messages.next_cursor.is_some(),
             scrolled_up,
+        );
+    }
+
+    /// Draw the live "…is typing" line, between the pending-send strip and the
+    /// composer so it sits where the next message will appear.
+    fn render_typing(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme, label: &str) {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("  {label}"),
+                theme.muted_style().add_modifier(Modifier::ITALIC),
+            ))),
+            area,
         );
     }
 
@@ -792,6 +1091,20 @@ impl CmailScreen {
             if has_older {
                 hint.push_str("scroll up for older · ");
             }
+            // Offer `o` and `v` only where they do something, so the line stays
+            // short and never promises an action the selection can't take.
+            if let Some(m) = self.selected_message() {
+                if !matches!(chat::open_action(&m.extras), chat::OpenAction::None) {
+                    hint.push_str("o open · ");
+                }
+                if chat::has_spoiler(&m.extras) {
+                    hint.push_str(if self.revealed.contains(&m.id) {
+                        "v hide · "
+                    } else {
+                        "v reveal · "
+                    });
+                }
+            }
             hint.push_str("r refresh · esc back");
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(hint, theme.muted_style()))),
@@ -864,7 +1177,7 @@ impl CmailScreen {
             }
             KeyCode::Backspace => {
                 self.draft.pop();
-                CmailIntent::None
+                self.typing_signal(conversation_id)
             }
             // Scroll the thread while keeping the composer focused.
             KeyCode::Up
@@ -875,18 +1188,39 @@ impl CmailScreen {
             | KeyCode::End => self.scroll_messages(key.code, conversation_id),
             KeyCode::Char(c) if !ctrl => {
                 self.draft.push(c);
-                CmailIntent::None
+                self.typing_signal(conversation_id)
             }
             _ => CmailIntent::None,
         }
     }
 
+    /// What the draft's new state says about the typing flag: still composing,
+    /// or gone idle because the draft is now empty (§ Typing Indicator).
+    ///
+    /// Deliberately clock-free. The shell throttles the calls and runs the
+    /// heartbeat, so all this owes it is the fact that a key landed.
+    fn typing_signal(&self, conversation_id: &str) -> CmailIntent {
+        let conversation_id = conversation_id.to_string();
+        if self.draft.trim().is_empty() {
+            CmailIntent::TypingIdle { conversation_id }
+        } else {
+            CmailIntent::TypingActive { conversation_id }
+        }
+    }
+
     fn handle_browse_key(&mut self, key: KeyEvent, conversation_id: &str) -> CmailIntent {
         match key.code {
-            KeyCode::Char('c') | KeyCode::Char('i') | KeyCode::Enter => {
+            // `i` is deliberately not bound here: the shell's global inline-image
+            // toggle claims it on every screen that isn't capturing text, so an
+            // arm for it would never run.
+            KeyCode::Char('c') | KeyCode::Enter => {
                 self.composing = true;
                 CmailIntent::None
             }
+            // `o` plays the selected message's track, or opens its picture.
+            KeyCode::Char('o') => self.open_selected_attachment(),
+            // `v` reveals (or re-hides) the selected message's spoiler.
+            KeyCode::Char('v') => self.toggle_selected_spoiler(),
             KeyCode::Char('r') => {
                 if let CmailMode::Conversation { messages, .. } = &mut self.mode {
                     messages.items.clear();
@@ -902,6 +1236,37 @@ impl CmailScreen {
             }
             code => self.scroll_messages(code, conversation_id),
         }
+    }
+
+    /// `o`: hand the selected message's track to the jukebox, or its picture to
+    /// the desktop opener. Nothing to open is a no-op, not an error toast.
+    fn open_selected_attachment(&self) -> CmailIntent {
+        let Some(m) = self.selected_message() else {
+            return CmailIntent::None;
+        };
+        match chat::open_action(&m.extras) {
+            chat::OpenAction::Play(track) => CmailIntent::PlayJukebox(track),
+            chat::OpenAction::Open(url) => CmailIntent::OpenUrl(url),
+            chat::OpenAction::None => CmailIntent::None,
+        }
+    }
+
+    /// `v`: reveal the selected message's spoiler, or hide it again.
+    ///
+    /// Only messages that actually carry the `spoiler` style respond, so the
+    /// key cannot silently mark an ordinary message as read-through.
+    fn toggle_selected_spoiler(&mut self) -> CmailIntent {
+        let Some(id) = self
+            .selected_message()
+            .filter(|m| chat::has_spoiler(&m.extras))
+            .map(|m| m.id.clone())
+        else {
+            return CmailIntent::None;
+        };
+        if !self.revealed.remove(&id) {
+            self.revealed.insert(id);
+        }
+        CmailIntent::None
     }
 
     /// Move the message selection / trigger an older-page load. Shared by browse
@@ -988,7 +1353,7 @@ fn apply_older_messages(
 }
 
 /// The item index at which the "── new ──" divider should be drawn, given the
-/// conversation's `unread_count`. v0.7 has no per-message read flag, so this is
+/// conversation's `unread_count`. v0.8.4 has no per-message read flag, so this is
 /// derived: the divider sits before the oldest of the last `unread_count`
 /// messages the other participant sent. `None` when there's nothing unread.
 fn first_unread_index(
@@ -1011,26 +1376,39 @@ fn first_unread_index(
     None
 }
 
-/// Total rendered rows for the message list: two per message, plus one for each
-/// injected day separator and the single "new" divider (at `unread_from`). Lets
-/// the bottom-anchor stay exact even though items are variable-height.
-fn rendered_message_rows(messages: &[CmailMessage], unread_from: Option<usize>) -> usize {
-    let mut rows = 0usize;
+/// The rendered height of every message in the thread, in the order the list
+/// draws them: the day separator and the single "new" divider that get folded
+/// into the item, its header row, and its body.
+///
+/// The body is as tall as its wrapped text, decoded art and attachment chips
+/// need, which is why this replaced a flat two rows per message: anything
+/// taller than one line used to be measured short and clipped. Heights come
+/// from [`chat::message_height`], which is derived from the same row list
+/// [`chat::body_lines`] draws, so the measurement and the render cannot
+/// disagree. Revealing a spoiler does not change a height, so the layout passed
+/// here need not carry the reveal state.
+fn message_row_heights(
+    messages: &[CmailMessage],
+    unread_from: Option<usize>,
+    layout: chat::BodyLayout<'_>,
+) -> Vec<u16> {
+    let mut heights = Vec::with_capacity(messages.len());
     let mut last_day: Option<(i32, u16)> = None;
     for (i, m) in messages.iter().enumerate() {
+        let mut extra = 0u16;
         if let Some(t) = local_datetime(m.timestamp) {
             let key = day_key(t);
             if last_day != Some(key) {
                 last_day = Some(key);
-                rows += 1;
+                extra += 1;
             }
         }
         if unread_from == Some(i) {
-            rows += 1;
+            extra += 1;
         }
-        rows += 2;
+        heights.push(extra.saturating_add(chat::message_height(m.into(), layout, 1)));
     }
-    rows
+    heights
 }
 
 pub(crate) fn bottom_aligned_messages_area(area: Rect, content_rows: usize) -> Rect {
@@ -1058,11 +1436,15 @@ fn conversation_item(c: &CmailConversation, theme: &Theme) -> ListItem<'static> 
     } else {
         String::new()
     };
+    // The same content rules the message body applies (§ Message fields): a
+    // caption that merely repeats its attachment URL is skipped, and a message
+    // that is nothing but an attachment previews as its chip rather than as a
+    // blank row.
     let preview = c
         .last_message
         .as_ref()
-        .map(|m| m.content.as_str())
-        .unwrap_or("no messages yet");
+        .map(|m| chat::summary_text(&m.extras, &m.content))
+        .unwrap_or_else(|| "no messages yet".to_string());
     // Header: avatar + display name, with the @handle muted alongside when a
     // separate display name is set.
     let name = display_name_of(&c.other_user);
@@ -1092,7 +1474,30 @@ fn message_from_other(m: &CmailMessage, other: &CmailUser) -> bool {
         || (other.user_id.is_empty() && m.sender_username == other.username)
 }
 
-fn message_lines(m: &CmailMessage, other: &CmailUser, theme: &Theme) -> Vec<Line<'static>> {
+/// Whether a presence entry belongs to the other participant (vs. the local
+/// user, whose own typing flag is published to the same node).
+///
+/// Either identifier is enough, and neither is guaranteed: the entry's user id
+/// is the RTDB key, while a polled status may name only a username.
+fn presence_from_other(entry: &CmailPresence, other: &CmailUser) -> bool {
+    if !other.user_id.is_empty() && entry.user_id == other.user_id {
+        return true;
+    }
+    !other.username.is_empty() && entry.username == other.username
+}
+
+/// One message: a header row naming the sender and its age, then the shared
+/// chat body (§ Message fields).
+///
+/// The header stays even for a `/me` action, whose body row already names the
+/// sender, because it is the only thing carrying the timestamp and the `→ you`
+/// marker that tells the two sides of a 1:1 thread apart.
+fn message_lines(
+    m: &CmailMessage,
+    other: &CmailUser,
+    theme: &Theme,
+    layout: chat::BodyLayout<'_>,
+) -> Vec<Line<'static>> {
     let when = format_epoch_millis_relative(m.timestamp);
     // The other side's messages align left with their name; the local user's own
     // outgoing messages are marked "you", accent-coloured and arrow-prefixed, so
@@ -1116,12 +1521,14 @@ fn message_lines(m: &CmailMessage, other: &CmailUser, theme: &Theme) -> Vec<Line
         Span::styled(who, who_style),
         Span::styled(format!(" · {when}"), theme.muted_style()),
     ];
-    vec![
-        Line::from(header),
-        // The body is the primary content, so it uses the base style; only the
-        // metadata line above is muted.
-        Line::from(Span::styled(format!("  {}", m.content), theme.base())),
-    ]
+    let mut lines = vec![Line::from(header)];
+    // The body is the primary content, so it keeps the base style (only the
+    // metadata line above is muted) and comes pre-wrapped and pre-indented:
+    // never print `content` directly, since an empty caption, a caption that
+    // repeats the attachment URL, base64 art and a text style all have to be
+    // resolved first.
+    lines.extend(chat::body_lines(m.into(), layout, theme));
+    lines
 }
 
 /// A centred-ish separator line like `── Today ──` / `── new ──`, used between
@@ -1131,6 +1538,13 @@ fn separator_line(label: &str, theme: &Theme) -> Line<'static> {
         format!("  ── {label} ──"),
         theme.muted_style(),
     ))
+}
+
+/// Now, in milliseconds since the Unix epoch: the clock a presence entry's
+/// `timestamp` is on, and so the one the staleness rule is applied against.
+fn now_epoch_millis() -> i64 {
+    let millis = time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000;
+    i64::try_from(millis).unwrap_or(i64::MAX)
 }
 
 /// The message timestamp as a local `OffsetDateTime` (config timezone).
@@ -1251,7 +1665,57 @@ mod tests {
             sender_username: "alice".into(),
             content: content.into(),
             timestamp,
+            extras: cs_api::MessageExtras::default(),
         }
+    }
+
+    /// A message from the other participant carrying v0.8.4 extras.
+    fn message_with(
+        id: &str,
+        content: &str,
+        timestamp: i64,
+        extras: cs_api::MessageExtras,
+    ) -> CmailMessage {
+        CmailMessage {
+            extras,
+            ..message(id, content, timestamp)
+        }
+    }
+
+    /// A `dm_presence` entry as the RTDB decoder hands it over.
+    fn presence(user_id: &str, username: &str, typing: bool, timestamp: i64) -> CmailPresence {
+        CmailPresence {
+            user_id: user_id.into(),
+            username: username.into(),
+            typing,
+            timestamp,
+        }
+    }
+
+    /// The named text style, in the single-name wire shape.
+    fn styled(name: &str) -> cs_api::MessageExtras {
+        cs_api::MessageExtras {
+            style: Some(cs_api::MessageStyle::One(name.into())),
+            ..cs_api::MessageExtras::default()
+        }
+    }
+
+    /// Render `s` into a `width` x `height` backend and return every cell
+    /// symbol, row by row, as one string (escape sequences included).
+    fn screen_text(s: &CmailScreen, width: u16, height: u16) -> String {
+        let theme = Theme::cyber();
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| s.render(f, f.area(), &theme)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -1501,7 +1965,7 @@ mod tests {
     #[test]
     fn conversation_shows_day_separator_and_unread_divider() {
         let mut s = CmailScreen::new();
-        // unread_count on the conversation (v0.7 has no per-message read) drives
+        // unread_count on the conversation (v0.8.4 has no per-message read) drives
         // the "new" divider; the first message also gets a day separator.
         let mut c = convo("c1", "alice");
         c.unread_count = 1;
@@ -1677,5 +2141,446 @@ mod tests {
             messages.selected, 1,
             "the view follows the new tail when it was pinned to the bottom"
         );
+    }
+
+    #[test]
+    fn the_typing_indicator_shows_only_while_the_flag_is_fresh() {
+        // § Typing Indicator: typing counts only while the flag is set *and*
+        // the entry is newer than staleAfterMs, and a flag going stale produces
+        // no event, so the answer has to be re-derived against the clock.
+        let mut s = open_with_messages(vec![], None);
+        s.set_typing_stale_after("c1", Duration::from_secs(9));
+        s.apply_typing_presence(
+            "c1",
+            vec![CmailPresenceUpdate::Full(presence(
+                "uid-alice",
+                "alice",
+                true,
+                100_000,
+            ))],
+        );
+        assert_eq!(
+            s.typing_label(101_000).as_deref(),
+            Some("alice is typing…"),
+            "a second-old flag is live"
+        );
+        assert_eq!(
+            s.typing_label(109_000),
+            None,
+            "the same entry is stale nine seconds on, with no event to say so"
+        );
+    }
+
+    #[test]
+    fn the_typing_indicator_ignores_your_own_presence_entry() {
+        // Both participants publish to the same node, so the local user's own
+        // flag must never come back as "…is typing".
+        let mut s = open_with_messages(vec![], None);
+        s.apply_typing_presence(
+            "c1",
+            vec![CmailPresenceUpdate::Full(presence(
+                "uid-me", "me", true, 100_000,
+            ))],
+        );
+        assert_eq!(s.typing_label(100_500), None);
+    }
+
+    #[test]
+    fn a_presence_patch_keeps_the_indicator_up_between_heartbeats() {
+        let mut s = open_with_messages(vec![], None);
+        s.set_typing_stale_after("c1", Duration::from_secs(9));
+        s.apply_typing_presence(
+            "c1",
+            vec![CmailPresenceUpdate::Full(presence(
+                "uid-alice",
+                "alice",
+                true,
+                100_000,
+            ))],
+        );
+        // A heartbeat moves only the timestamp: merged in, it must not blank the
+        // username or clear the flag beside it.
+        s.apply_typing_presence(
+            "c1",
+            vec![CmailPresenceUpdate::Partial {
+                user_id: "uid-alice".into(),
+                patch: cs_api::CmailPresencePatch {
+                    timestamp: Some(108_000),
+                    ..cs_api::CmailPresencePatch::default()
+                },
+            }],
+        );
+        assert_eq!(
+            s.typing_label(109_000).as_deref(),
+            Some("alice is typing…"),
+            "the refreshed entry is live again"
+        );
+
+        // A fragment for someone with no held entry is not an entry.
+        let mut fresh = open_with_messages(vec![], None);
+        fresh.apply_typing_presence(
+            "c1",
+            vec![CmailPresenceUpdate::Partial {
+                user_id: "uid-alice".into(),
+                patch: cs_api::CmailPresencePatch {
+                    typing: Some(true),
+                    timestamp: Some(100_000),
+                    ..cs_api::CmailPresencePatch::default()
+                },
+            }],
+        );
+        assert_eq!(fresh.typing_label(100_500), None);
+    }
+
+    #[test]
+    fn clearing_the_flag_takes_the_indicator_down_at_once() {
+        let mut s = open_with_messages(vec![], None);
+        s.apply_typing_presence(
+            "c1",
+            vec![CmailPresenceUpdate::Full(presence(
+                "uid-alice",
+                "alice",
+                true,
+                100_000,
+            ))],
+        );
+        assert!(s.typing_label(100_500).is_some());
+        // `DELETE .../typing` removes the node rather than letting it age out.
+        s.apply_typing_presence(
+            "c1",
+            vec![CmailPresenceUpdate::Removed {
+                user_id: "uid-alice".into(),
+            }],
+        );
+        assert_eq!(s.typing_label(100_500), None);
+    }
+
+    #[test]
+    fn a_polled_typing_status_raises_and_lowers_the_indicator() {
+        let mut s = open_with_messages(vec![], None);
+        s.apply_typing_status(
+            "c1",
+            &CmailTypingStatus {
+                conversation_id: "c1".into(),
+                user_id: "uid-alice".into(),
+                username: "alice".into(),
+                typing: true,
+                // Started composing long ago: the answer is still "typing now",
+                // so `since` must not be mistaken for a refresh time.
+                since: Some(1_000),
+                stale_after_ms: 9_000,
+            },
+        );
+        assert_eq!(
+            s.typing_label(now_epoch_millis()).as_deref(),
+            Some("alice is typing…")
+        );
+
+        s.apply_typing_status(
+            "c1",
+            &CmailTypingStatus {
+                conversation_id: "c1".into(),
+                ..CmailTypingStatus::default()
+            },
+        );
+        assert_eq!(s.typing_label(now_epoch_millis()), None);
+    }
+
+    #[test]
+    fn typing_updates_for_another_conversation_are_ignored() {
+        let mut s = open_with_messages(vec![], None);
+        s.apply_typing_presence(
+            "c2",
+            vec![CmailPresenceUpdate::Full(presence(
+                "uid-alice",
+                "alice",
+                true,
+                100_000,
+            ))],
+        );
+        assert_eq!(s.typing_label(100_500), None);
+    }
+
+    #[test]
+    fn the_typing_indicator_renders_between_the_thread_and_the_composer() {
+        let mut s = open_with_messages(vec![message("m1", "hello there", 1_000)], None);
+        assert!(
+            !screen_text(&s, 60, 12).contains("is typing"),
+            "an idle thread claims no row for it"
+        );
+        s.apply_typing_presence(
+            "c1",
+            vec![CmailPresenceUpdate::Full(presence(
+                "uid-alice",
+                "alice",
+                true,
+                now_epoch_millis(),
+            ))],
+        );
+        let text = screen_text(&s, 60, 12);
+        assert!(text.contains("alice is typing…"), "{text}");
+    }
+
+    #[test]
+    fn typing_in_the_composer_signals_the_shell_and_going_idle_clears_it() {
+        let mut s = open_with_messages(vec![], None);
+        s.handle_key(key(KeyCode::Char('c'))); // focus the composer
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('y'))),
+            CmailIntent::TypingActive {
+                conversation_id: "c1".into()
+            }
+        );
+        assert_eq!(s.typing_conversation(), Some("c1"));
+        // Backspacing the draft away is the input going idle.
+        assert_eq!(
+            s.handle_key(key(KeyCode::Backspace)),
+            CmailIntent::TypingIdle {
+                conversation_id: "c1".into()
+            }
+        );
+        assert_eq!(s.typing_conversation(), None);
+    }
+
+    #[test]
+    fn unfocusing_the_composer_reports_the_input_idle_and_keeps_the_draft() {
+        let mut s = open_with_messages(vec![], None);
+        s.handle_key(key(KeyCode::Char('c')));
+        s.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Esc)),
+            CmailIntent::TypingIdle {
+                conversation_id: "c1".into()
+            }
+        );
+        assert!(!s.is_text_input(), "the composer lost focus");
+        assert_eq!(s.draft_for_test(), "h", "but the draft survives");
+        assert_eq!(s.typing_conversation(), None);
+    }
+
+    #[test]
+    fn a_pasted_or_edited_draft_still_counts_as_typing() {
+        // Neither path goes through `handle_key`, so the shell asks instead of
+        // waiting for an intent that will never come.
+        let mut s = open_with_messages(vec![], None);
+        s.handle_key(key(KeyCode::Char('c')));
+        s.paste_text("pasted body");
+        assert_eq!(s.typing_conversation(), Some("c1"));
+
+        let mut edited = open_with_messages(vec![], None);
+        edited.set_draft_and_focus("from the editor".into());
+        assert_eq!(edited.typing_conversation(), Some("c1"));
+    }
+
+    #[test]
+    fn opening_another_conversation_drops_the_previous_typing_state() {
+        let mut s = CmailScreen::new();
+        s.apply_conversations(Ok(vec![convo("c1", "alice"), convo("c2", "bob")]));
+        s.open_conversation("c1");
+        s.apply_typing_presence(
+            "c1",
+            vec![CmailPresenceUpdate::Full(presence(
+                "uid-alice",
+                "alice",
+                true,
+                now_epoch_millis(),
+            ))],
+        );
+        assert!(s.typing_label(now_epoch_millis()).is_some());
+        s.open_conversation("c2");
+        assert_eq!(s.typing_label(now_epoch_millis()), None);
+    }
+
+    #[test]
+    fn a_long_message_wraps_instead_of_being_clipped() {
+        // Regression: the thread hard-coded two rows per message and never
+        // wrapped the body, so everything past the pane width was lost.
+        let long = "the quick brown fox jumps over the lazy dog and keeps on running";
+        let s = open_with_messages(vec![message("m1", long, 1_000)], None);
+        let text = screen_text(&s, 40, 12);
+        assert!(text.contains("the quick brown"), "{text}");
+        assert!(
+            text.contains("keeps on running"),
+            "the tail must wrap onto another row: {text}"
+        );
+    }
+
+    #[test]
+    fn message_heights_follow_the_body_that_is_drawn() {
+        let plain = message("m1", "hello", 1_000);
+        let captioned = message_with(
+            "m2",
+            "look at this",
+            2_000,
+            cs_api::MessageExtras {
+                image_url: Some("https://cdn.example/pic.png".into()),
+                ..cs_api::MessageExtras::default()
+            },
+        );
+        let heights = message_row_heights(&[plain, captioned], Some(1), chat::BodyLayout::new(40));
+        assert_eq!(
+            heights,
+            vec![2 + 1, 3 + 1],
+            "day separator + header + body, then the unread divider + header + caption + chip",
+        );
+    }
+
+    #[test]
+    fn an_attachment_renders_as_a_chip_carrying_its_link() {
+        let s = open_with_messages(
+            vec![message_with(
+                "m1",
+                "",
+                1_000,
+                cs_api::MessageExtras {
+                    image_url: Some("https://cdn.example/pic.png".into()),
+                    ..cs_api::MessageExtras::default()
+                },
+            )],
+            None,
+        );
+        let text = screen_text(&s, 60, 12);
+        assert!(text.contains("[image]"), "{text}");
+        assert!(
+            text.contains("]8;;https://cdn.example/pic.png"),
+            "the chip must carry an OSC 8 link: {text}"
+        );
+    }
+
+    #[test]
+    fn an_action_renders_in_the_third_person() {
+        let s = open_with_messages(
+            vec![message_with(
+                "m1",
+                "waves",
+                1_000,
+                cs_api::MessageExtras {
+                    is_action: true,
+                    ..cs_api::MessageExtras::default()
+                },
+            )],
+            None,
+        );
+        let text = screen_text(&s, 60, 12);
+        assert!(text.contains("* alice waves"), "{text}");
+    }
+
+    #[test]
+    fn o_plays_a_track_and_otherwise_opens_the_picture() {
+        let track = cs_api::AudioAttachment {
+            src: "https://youtu.be/dQw4w9WgXcQ".into(),
+            origin: "youtube".into(),
+            artist: "Art of Noise".into(),
+            title: "Paranoimia".into(),
+            genre: None,
+        };
+        let mut s = open_with_messages(
+            vec![message_with(
+                "m1",
+                "listen to this",
+                1_000,
+                cs_api::MessageExtras {
+                    audio_attachment: Some(track),
+                    ..cs_api::MessageExtras::default()
+                },
+            )],
+            None,
+        );
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('o'))),
+            CmailIntent::PlayJukebox(super::super::audio::JukeboxTrack {
+                url: "https://youtu.be/dQw4w9WgXcQ".into(),
+                artist: "Art of Noise".into(),
+                title: "Paranoimia".into(),
+            })
+        );
+
+        let mut gif = open_with_messages(
+            vec![message_with(
+                "m1",
+                "",
+                1_000,
+                cs_api::MessageExtras {
+                    gif_url: Some("https://cdn.example/a.gif".into()),
+                    ..cs_api::MessageExtras::default()
+                },
+            )],
+            None,
+        );
+        assert_eq!(
+            gif.handle_key(key(KeyCode::Char('o'))),
+            CmailIntent::OpenUrl("https://cdn.example/a.gif".into())
+        );
+
+        // Nothing attached: the key is simply inert.
+        let mut plain = open_with_messages(vec![message("m1", "hi", 1_000)], None);
+        assert_eq!(plain.handle_key(key(KeyCode::Char('o'))), CmailIntent::None);
+    }
+
+    #[test]
+    fn v_reveals_a_spoiler_and_hides_it_again() {
+        let mut s = open_with_messages(
+            vec![message_with(
+                "m1",
+                "the butler did it",
+                1_000,
+                styled("spoiler"),
+            )],
+            None,
+        );
+        assert!(
+            !screen_text(&s, 60, 12).contains("butler"),
+            "a spoiler is masked until the reader asks for it"
+        );
+        assert_eq!(s.handle_key(key(KeyCode::Char('v'))), CmailIntent::None);
+        let revealed = screen_text(&s, 60, 12);
+        assert!(revealed.contains("the butler did it"), "{revealed}");
+        // The same key puts it back.
+        s.handle_key(key(KeyCode::Char('v')));
+        assert!(!screen_text(&s, 60, 12).contains("butler"));
+    }
+
+    #[test]
+    fn v_does_nothing_to_a_message_without_a_spoiler() {
+        let mut s = open_with_messages(vec![message("m1", "plain text", 1_000)], None);
+        assert_eq!(s.handle_key(key(KeyCode::Char('v'))), CmailIntent::None);
+        assert!(screen_text(&s, 60, 12).contains("plain text"));
+    }
+
+    #[test]
+    fn the_browse_footer_offers_only_the_keys_the_selection_can_use() {
+        let plain = open_with_messages(vec![message("m1", "hi", 1_000)], None);
+        let text = screen_text(&plain, 70, 12);
+        assert!(!text.contains("o open"), "{text}");
+        assert!(!text.contains("v reveal"), "{text}");
+
+        let spoiler = open_with_messages(
+            vec![message_with("m1", "hidden", 1_000, styled("spoiler"))],
+            None,
+        );
+        assert!(screen_text(&spoiler, 70, 12).contains("v reveal"));
+
+        let gif = open_with_messages(
+            vec![message_with(
+                "m1",
+                "",
+                1_000,
+                cs_api::MessageExtras {
+                    gif_url: Some("https://cdn.example/a.gif".into()),
+                    ..cs_api::MessageExtras::default()
+                },
+            )],
+            None,
+        );
+        assert!(screen_text(&gif, 70, 12).contains("o open"));
+    }
+
+    #[test]
+    fn the_inline_image_toggle_key_is_not_bound_in_browse_mode() {
+        // `i` reaches the shell's global toggle, never this screen, so binding
+        // it here would be a promise the screen cannot keep.
+        let mut s = open_with_messages(vec![message("m1", "hi", 1_000)], None);
+        assert_eq!(s.handle_key(key(KeyCode::Char('i'))), CmailIntent::None);
+        assert!(!s.is_text_input(), "it must not focus the composer");
     }
 }

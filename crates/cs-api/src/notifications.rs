@@ -1,4 +1,5 @@
-//! Notification types and endpoints (`/v1/notifications/*`).
+//! Notification types and endpoints (`/v1/notifications/*`, API v0.8.4
+//! § Notifications).
 use reqwest::Method;
 use serde::{Deserialize, Deserializer};
 use time::OffsetDateTime;
@@ -10,8 +11,8 @@ use crate::error::Result;
 const DEFAULT_PAGE_LIMIT: u32 = 20;
 const MAX_PAGE_LIMIT: u32 = 50;
 
-/// The documented notification types, plus `Unknown` for forward
-/// compatibility with future types.
+/// The documented notification types (API v0.8.4 § List Notifications), plus
+/// `Unknown` for forward compatibility with future types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationType {
@@ -22,6 +23,9 @@ pub enum NotificationType {
     Unfollowed,
     NewPostFollowing,
     NewPostFriend,
+    /// Someone poked you via `POST /v1/users/:username/poke`, which v0.8.4
+    /// opened up to API clients (§ How notifications are generated). The poker
+    /// is `actor_username`; the type carries no `metadata`.
     Poke,
     ChatMention,
     PostMention,
@@ -75,9 +79,13 @@ impl NotificationType {
 }
 
 /// The user who triggered a notification.
-/// Type-dependent context attached to a notification (API v0.7 § Notifications,
-/// "Notification object"). The server treats `metadata` as open-ended, so only
+/// Type-dependent context attached to a notification (API v0.8.4
+/// § Notification object). The server treats `metadata` as open-ended, so only
 /// the commonly-used keys are modelled here; unknown keys are ignored.
+///
+/// Several types carry no context at all and send `null` here, `poke` among
+/// them: the poker's handle arrives as `actor_username`, so there is nothing
+/// type-specific to model for it.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NotificationMetadata {
@@ -110,7 +118,7 @@ pub struct NotificationMetadata {
     pub is_guild_thread: Option<bool>,
 }
 
-/// A notification record. Shape per API v0.7 § Notifications: the actor is
+/// A notification record. Shape per API v0.8.4 § Notification object: the actor is
 /// denormalized onto `actorId` / `actorUsername`, and type-dependent context
 /// (deep-link slug, reply id, guild/thread info) lives under `metadata`.
 #[derive(Debug, Clone, Deserialize)]
@@ -391,6 +399,31 @@ mod tests {
         let ns: Vec<Notification> = serde_json::from_str(raw).unwrap();
         assert_eq!(ns.len(), 2);
         assert_eq!(ns[1].notification_id, "b");
+    }
+
+    #[test]
+    fn poke_notification_carries_only_its_actor() {
+        // v0.8.4 § How notifications are generated added `poke` to the list a
+        // client can trigger (`POST /v1/users/:username/poke`). It has no
+        // type-dependent context: the poker is the actor, there is no target
+        // and no metadata, so nothing extra has to be modelled for it.
+        let raw = r#"{
+            "id": "n9",
+            "type": "poke",
+            "actorId": "u2",
+            "actorUsername": "bob",
+            "read": false,
+            "createdAt": "2026-08-01T09:00:00Z",
+            "metadata": null
+        }"#;
+        let n: Notification = serde_json::from_str(raw).unwrap();
+        assert_eq!(n.kind, NotificationType::Poke);
+        assert_eq!(n.actor_name(), "bob");
+        assert_eq!(n.actor_id.as_deref(), Some("u2"));
+        assert!(n.target_id.is_none());
+        assert!(n.target_type.is_none());
+        assert!(n.reply_id().is_none());
+        assert!(n.created_at.is_some());
     }
 
     #[test]

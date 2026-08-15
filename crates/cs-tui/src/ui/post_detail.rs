@@ -3,7 +3,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use cs_api::{Entry, Reply};
+use cs_api::{Entry, EntryEdit, Reply};
 use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
@@ -12,10 +12,22 @@ use ratatui::Frame;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
 use ratatui_image::{Image, Resize};
+use time::OffsetDateTime;
 
+use super::flag::{FlagPrompt, FlagPromptKey, MAX_FLAG_REASON};
 use super::images::{entry_image_urls, reply_image_urls};
 use super::markdown::{render_markdown_with, ImageUrls};
+use super::text::edited_marker;
 use super::theme::Theme;
+
+/// How long after publishing the server still accepts an edit, in seconds
+/// (v0.8.4 § Edit Entry: "within **5 minutes** of publishing"). Used for a
+/// status-line hint only, never to withhold the key.
+const EDIT_WINDOW_SECS: i64 = 5 * 60;
+
+/// Label in front of the flag-reason field, so the prompt row and the width the
+/// field is windowed into agree on how much room the text has.
+const FLAG_PROMPT_LABEL: &str = "reason (optional): ";
 
 /// An inline image reserved in the post-detail body: its source URL and the
 /// logical line index where its blank-row gap begins. `render` overlays the
@@ -56,7 +68,87 @@ pub enum PostDetailIntent {
     PlayJukebox(Option<super::audio::JukeboxTrack>),
     /// User confirmed deletion of the entry.
     DeleteEntryConfirmed,
+    /// Edit this entry (`e` with the post focused). Carries the current values
+    /// of every field `PATCH /v1/posts/:id` accepts (v0.8.4 § Edit Entry) so the
+    /// app can prefill an edit flow without re-fetching. The slug is absent on
+    /// purpose: it is frozen once published and sending one is a `400`.
+    EditEntry {
+        post_id: String,
+        content: String,
+        title: Option<String>,
+        topics: Vec<String>,
+        is_public: bool,
+        is_nsfw: bool,
+    },
+    /// Edit the selected reply (`e` with a reply selected). `content` is the
+    /// only editable field (v0.8.4 § Edit Reply), so it is all that travels.
+    EditReply {
+        reply_id: String,
+        content: String,
+    },
+    /// Report this entry (`F` with the post focused, after the reason prompt).
+    /// `reason` is `None` when the prompt was submitted empty, which the spec
+    /// allows (v0.8.4 § Flag an Entry).
+    FlagEntry {
+        post_id: String,
+        reason: Option<String>,
+    },
+    /// Report the selected reply (`F` with a reply selected, after the prompt).
+    FlagReply {
+        reply_id: String,
+        reason: Option<String>,
+    },
     None,
+}
+
+/// What an open flag-reason prompt reports. Captured when `F` is pressed, so
+/// the report can never drift onto another target while the reason is typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FlagTarget {
+    /// The entry itself, by post id (no reply was selected).
+    Entry(String),
+    /// One reply, by reply id.
+    Reply(String),
+}
+
+impl FlagTarget {
+    /// How the status line names this target while the prompt is open.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Entry(_) => "this post",
+            Self::Reply(_) => "this reply",
+        }
+    }
+}
+
+/// An open flag-reason prompt on this screen: the shared single-line field
+/// (identical typing, caret keys, paste and cap everywhere `F` is bound) over
+/// this screen's post-or-reply target.
+type DetailFlagPrompt = FlagPrompt<FlagTarget>;
+
+/// The intent that files `prompt`'s report. A blank (or all-whitespace) reason
+/// travels as `None` rather than as `""`: the field is optional, and an empty
+/// string only spends bytes to say nothing.
+fn flag_intent(prompt: DetailFlagPrompt) -> PostDetailIntent {
+    let reason = prompt.reason_to_send();
+    match prompt.target {
+        FlagTarget::Entry(post_id) => PostDetailIntent::FlagEntry { post_id, reason },
+        FlagTarget::Reply(reply_id) => PostDetailIntent::FlagReply { reply_id, reason },
+    }
+}
+
+/// Whether `created_at` could still be inside the server's edit window.
+///
+/// Fails OPEN: `created_at` is optional on both `Entry` and `Reply`, and a
+/// timestamp this client never received answers `true`. A clock we do not have
+/// must never be the reason a user is talked out of trying. This only picks the
+/// wording of a status-line hint; the key itself is never gated, and the server
+/// has the last word (v0.8.4 § Edit Entry answers `403` outside the window).
+fn within_edit_window(created_at: Option<OffsetDateTime>) -> bool {
+    match created_at {
+        Some(t) => (OffsetDateTime::now_utc() - t).whole_seconds() <= EDIT_WINDOW_SECS,
+        None => true,
+    }
 }
 
 pub struct PostDetailScreen {
@@ -86,6 +178,11 @@ pub struct PostDetailScreen {
     reply_anchors: RefCell<Vec<u16>>,
     /// Two-step delete: first `d` arms confirmation; `y` confirms.
     pub confirming_delete: bool,
+    /// The flag-reason prompt opened by `F`, if any. While it is open it owns
+    /// every printable key, so the app must route text-input decisions through
+    /// [`PostDetailScreen::is_text_input`] and Esc through
+    /// [`PostDetailScreen::cancel_flag_prompt`].
+    flag_prompt: Option<DetailFlagPrompt>,
     /// Fixed-size, render-ready image protocols by URL, paired with the
     /// (width, height) cell box they were encoded for so a terminal resize forces
     /// a rebuild. Built lazily from `image_bytes` the first time an image scrolls
@@ -121,6 +218,7 @@ impl PostDetailScreen {
             reply_starts: RefCell::new(Vec::new()),
             reply_anchors: RefCell::new(Vec::new()),
             confirming_delete: false,
+            flag_prompt: None,
             protocols: RefCell::new(HashMap::new()),
             image_bytes: RefCell::new(HashMap::new()),
             requested: RefCell::new(HashSet::new()),
@@ -132,6 +230,80 @@ impl PostDetailScreen {
     /// fetch on open or a watch/unwatch toggle result).
     pub fn set_watching(&mut self, watching: bool) {
         self.watching = Some(watching);
+    }
+
+    /// Whether a field on this screen currently owns the keyboard, i.e. the
+    /// flag-reason prompt is open. The app consults this before its global
+    /// shortcuts so a typed `?`, `i`, `S` or digit lands in the reason instead
+    /// of opening help, toggling images, shuffling or jumping sections.
+    pub fn is_text_input(&self) -> bool {
+        self.flag_prompt.is_some()
+    }
+
+    /// Close the flag-reason prompt without filing anything, answering `true`
+    /// only when there was one to close.
+    ///
+    /// The app intercepts Esc before the screen sees it, so it has to offer the
+    /// prompt the first Esc (the same shape as the topics filter box); a `false`
+    /// answer means Esc keeps its usual "go back" meaning.
+    pub fn cancel_flag_prompt(&mut self) -> bool {
+        self.flag_prompt.take().is_some()
+    }
+
+    /// Fold a successful entry edit into the entry on screen: apply exactly the
+    /// fields `edit` carried and stamp `edited_at`, so the "(edited)" marker
+    /// appears without a round trip.
+    ///
+    /// v0.8.4 § Edit Entry returns only the echoed `postId`, so there is nothing
+    /// to merge from the response, and `created_at` is deliberately left alone
+    /// ("`createdAt` never changes"). The stamp is this machine's clock, an
+    /// approximation of the server's `editedAt` that drives nothing but the
+    /// marker; a later re-fetch replaces it with the real value.
+    pub fn apply_entry_edit(&mut self, edit: &EntryEdit) {
+        if let Some(content) = &edit.content {
+            self.entry.content = content.clone();
+        }
+        if let Some(title) = &edit.title {
+            // Removing a title and setting one are the same field on the wire;
+            // `is_remove` is what tells them apart (v0.8.4 § Edit Entry: "Send
+            // `\"\"` to remove a title").
+            self.entry.title = if title.is_remove() {
+                None
+            } else {
+                Some(title.as_str().to_string())
+            };
+        }
+        if let Some(topics) = &edit.topics {
+            self.entry.topics = topics.clone();
+        }
+        if let Some(is_public) = edit.is_public {
+            self.entry.is_public = is_public;
+        }
+        if let Some(is_nsfw) = edit.is_nsfw {
+            self.entry.is_nsfw = is_nsfw;
+        }
+        if let Some(attachments) = &edit.attachments {
+            self.entry.attachments = attachments.clone();
+        }
+        self.entry.edited_at = Some(OffsetDateTime::now_utc());
+    }
+
+    /// Fold a successful reply edit into the reply with `reply_id`, marking it
+    /// edited the same way [`Self::apply_entry_edit`] marks the entry. Answers
+    /// `false` when that reply is not on this page, which is the caller's cue to
+    /// refresh instead.
+    ///
+    /// `content` is the only editable field (v0.8.4 § Edit Reply), and editing
+    /// does not bump the thread, so no counter is touched here either.
+    pub fn apply_reply_edit(&mut self, reply_id: &str, content: String) -> bool {
+        match self.replies.iter_mut().find(|r| r.reply_id == reply_id) {
+            Some(reply) => {
+                reply.content = content;
+                reply.edited_at = Some(OffsetDateTime::now_utc());
+                true
+            }
+            None => false,
+        }
     }
 
     /// Remember fetched bytes for `url`. Drops any stale decoded protocol so the
@@ -180,6 +352,11 @@ impl PostDetailScreen {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return PostDetailIntent::Quit;
         }
+        // An open reason prompt is a text field, so it swallows every key before
+        // any of the screen's own bindings can read it as a command.
+        if self.flag_prompt.is_some() {
+            return self.handle_flag_prompt_key(key);
+        }
         // While arming delete, only `y` confirms; anything else cancels the arming.
         if self.confirming_delete {
             self.confirming_delete = false;
@@ -218,6 +395,17 @@ impl PostDetailScreen {
                 },
                 None => PostDetailIntent::Bookmark,
             },
+            // `e` edits whatever is focused: the selected reply, else the post.
+            // It is never gated on authorship, supporter status or the 5-minute
+            // window, none of which the client knows for certain, so the
+            // server's 403 surfaces like any other error, exactly as `d` already
+            // behaves here (v0.8.4 § Edit Entry, § Edit Reply).
+            KeyCode::Char('e') => self.edit_intent(),
+            // `F` reports whatever is focused, after an optional reason.
+            KeyCode::Char('F') => {
+                self.flag_prompt = Some(FlagPrompt::new(self.flag_target()));
+                PostDetailIntent::None
+            }
             // `w` watches / unwatches the thread (post-level, ignores reply selection).
             KeyCode::Char('w') => PostDetailIntent::ToggleWatch,
             // `o` opens the jukebox link in the browser — the selected reply's
@@ -282,6 +470,73 @@ impl PostDetailScreen {
                 PostDetailIntent::RefreshReplies
             }
             _ => PostDetailIntent::None,
+        }
+    }
+
+    /// Keys while the flag-reason prompt is open, delegated to the shared field
+    /// so reporting types the same here as it does on the feeds: Enter files the
+    /// report, Esc abandons it, and everything else is text or caret movement.
+    fn handle_flag_prompt_key(&mut self, key: KeyEvent) -> PostDetailIntent {
+        let Some(outcome) = self.flag_prompt.as_mut().map(|p| p.handle_key(key)) else {
+            return PostDetailIntent::None;
+        };
+        match outcome {
+            FlagPromptKey::Consumed => PostDetailIntent::None,
+            // The local mirror of `cancel_flag_prompt`, for whenever Esc does
+            // reach the screen.
+            FlagPromptKey::Cancelled => {
+                self.flag_prompt = None;
+                PostDetailIntent::None
+            }
+            FlagPromptKey::Submitted => match self.flag_prompt.take() {
+                Some(prompt) => flag_intent(prompt),
+                None => PostDetailIntent::None,
+            },
+        }
+    }
+
+    /// Insert bracketed-paste text into the flag-reason prompt. A no-op when no
+    /// prompt is open, since this screen captures no other text.
+    pub fn paste_text(&mut self, text: &str) {
+        if let Some(prompt) = self.flag_prompt.as_mut() {
+            prompt.paste(text);
+        }
+    }
+
+    /// What `e` edits: the selected reply, or the post when none is selected.
+    /// Mirrors how `b` targets the selection before falling back to the post.
+    fn edit_intent(&self) -> PostDetailIntent {
+        match self.selected_reply.and_then(|i| self.replies.get(i)) {
+            Some(reply) => PostDetailIntent::EditReply {
+                reply_id: reply.reply_id.clone(),
+                content: reply.content.clone(),
+            },
+            None => PostDetailIntent::EditEntry {
+                post_id: self.entry.post_id.clone(),
+                content: self.entry.content.clone(),
+                title: self.entry.title.clone(),
+                topics: self.entry.topics.clone(),
+                is_public: self.entry.is_public,
+                is_nsfw: self.entry.is_nsfw,
+            },
+        }
+    }
+
+    /// What `F` reports, resolved once at the keypress with the same selection
+    /// precedence as [`Self::edit_intent`].
+    fn flag_target(&self) -> FlagTarget {
+        match self.selected_reply.and_then(|i| self.replies.get(i)) {
+            Some(reply) => FlagTarget::Reply(reply.reply_id.clone()),
+            None => FlagTarget::Entry(self.entry.post_id.clone()),
+        }
+    }
+
+    /// The publish time of whatever `e` would edit, which is `None` whenever the
+    /// server did not send one. Only [`within_edit_window`] reads it.
+    fn focused_created_at(&self) -> Option<OffsetDateTime> {
+        match self.selected_reply.and_then(|i| self.replies.get(i)) {
+            Some(reply) => reply.created_at,
+            None => self.entry.created_at,
         }
     }
 
@@ -360,12 +615,27 @@ impl PostDetailScreen {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
+        // The flag-reason field takes a row of its own between the body and the
+        // status line, and gives it back the moment the prompt closes.
+        let prompt_open = self.flag_prompt.is_some();
+        let constraints: Vec<Constraint> = if prompt_open {
+            vec![
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ]
+        } else {
+            vec![Constraint::Min(1), Constraint::Length(1)]
+        };
         let layout = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(1)])
+            .constraints(constraints)
             .split(inner);
-        let body_area = layout[0];
-        let status_area = layout[1];
+        let (body_area, prompt_area, status_area) = if prompt_open {
+            (layout[0], Some(layout[1]), layout[2])
+        } else {
+            (layout[0], None, layout[1])
+        };
 
         // Images are drawn inline in the body flow, each into a reserved blank-row
         // gap, on graphics-capable terminals with images enabled and enough room.
@@ -517,6 +787,19 @@ impl PostDetailScreen {
             );
         }
 
+        // The reason field itself, windowed so a long reason keeps its caret in
+        // view rather than running off the row.
+        if let (Some(prompt), Some(prompt_area)) = (self.flag_prompt.as_ref(), prompt_area) {
+            let field_width =
+                (prompt_area.width as usize).saturating_sub(FLAG_PROMPT_LABEL.chars().count());
+            let mut spans = vec![Span::styled(FLAG_PROMPT_LABEL, theme.muted_style())];
+            spans.extend(
+                super::input::windowed_line(&prompt.reason, prompt.cursor, field_width, theme)
+                    .spans,
+            );
+            frame.render_widget(Paragraph::new(Line::from(spans)), prompt_area);
+        }
+
         // Surface the jukebox keys only when there's a track to act on.
         let open_hint = if self.jukebox_url().is_some() {
             " · p play · o open"
@@ -528,7 +811,21 @@ impl PostDetailScreen {
         } else {
             " · w watch"
         };
-        let status_text = if self.confirming_delete {
+        // A soft hint, never a gate: it says when the focused item is certainly
+        // past the server's 5-minute edit window, but the key stays on offer and
+        // a missing `created_at` reads as "still open".
+        let edit_hint = if within_edit_window(self.focused_created_at()) {
+            " · e edit"
+        } else {
+            " · e edit (5m passed)"
+        };
+        let status_text = if let Some(prompt) = &self.flag_prompt {
+            format!(
+                "report {} · enter send · esc cancel · reason optional · {}/{MAX_FLAG_REASON}",
+                prompt.target.label(),
+                prompt.reason.chars().count()
+            )
+        } else if self.confirming_delete {
             "really delete this post? y=yes, any other key=cancel".to_string()
         } else if self.loading_replies && self.replies.is_empty() {
             "loading replies… · esc back".to_string()
@@ -536,12 +833,12 @@ impl PostDetailScreen {
             format!("error: {msg} · esc back · r retry")
         } else if self.next_replies_cursor.is_some() {
             format!(
-                "{} replies · scroll down for more · esc back · J/K select reply · R reply · Q quote · b bookmark{open_hint}{watch_hint} · d delete · r refresh",
+                "{} replies · scroll down for more · esc back · J/K select reply · R reply · Q quote · b bookmark{open_hint}{watch_hint}{edit_hint} · F flag · d delete · r refresh",
                 self.replies.len()
             )
         } else {
             format!(
-                "{} replies · end · esc back · J/K select reply · R reply · Q quote · b bookmark{open_hint}{watch_hint} · d delete · r refresh",
+                "{} replies · end · esc back · J/K select reply · R reply · Q quote · b bookmark{open_hint}{watch_hint}{edit_hint} · F flag · d delete · r refresh",
                 self.replies.len()
             )
         };
@@ -586,12 +883,15 @@ impl PostDetailScreen {
                 )));
             }
         }
+        // v0.8.4: an entry the author has since corrected carries `editedAt`, and
+        // says so next to its timestamp.
+        let edited = edited_marker(self.entry.edited_at);
         lines.push(Line::from(vec![
             Span::styled(
                 format!("@{}", self.entry.author_username),
                 theme.accent_style(),
             ),
-            Span::styled(format!(" · {when}{topics}"), theme.muted_style()),
+            Span::styled(format!(" · {when}{topics}{edited}"), theme.muted_style()),
         ]));
         lines.push(Line::from(Span::styled(
             format!(
@@ -673,6 +973,7 @@ impl PostDetailScreen {
             } else {
                 ""
             };
+            let edited = edited_marker(reply.edited_at);
             // The selected reply's header is marked to match the list style:
             // `fill` tints it with the selection background, `bar` reverse-videos
             // it (the older look).
@@ -688,7 +989,7 @@ impl PostDetailScreen {
             };
             lines.push(Line::from(vec![
                 Span::styled(format!("@{}", reply.author_username), author_style),
-                Span::styled(format!(" · {when}{parent}"), theme.muted_style()),
+                Span::styled(format!(" · {when}{parent}{edited}"), theme.muted_style()),
             ]));
             // Reply body — markdown-rendered. Highlight overrides via the loop below.
             for md_line in render_markdown_with(&reply.content, theme, image_urls) {
@@ -764,6 +1065,7 @@ mod tests {
             is_nsfw: false,
             attachments: vec![],
             created_at: None,
+            edited_at: None,
             deleted: false,
         }
     }
@@ -778,6 +1080,7 @@ mod tests {
             parent_reply_id: None,
             attachments: vec![],
             created_at: None,
+            edited_at: None,
             deleted: false,
         }
     }
@@ -1403,5 +1706,404 @@ mod tests {
             .join(" ");
         assert!(body_text.contains("replies"));
         assert!(body_text.contains("@bob"));
+    }
+
+    /// A screen whose first reply fetch has settled, so the status line shows
+    /// the browse hints instead of "loading replies…".
+    fn settled(e: Entry) -> PostDetailScreen {
+        let mut s = PostDetailScreen::new(e);
+        s.apply_replies_initial(Ok((Vec::new(), None)));
+        s
+    }
+
+    /// The screen as one string per terminal row, for asserting on the reason
+    /// prompt and the status line, neither of which `compose_body` produces.
+    fn rendered_rows(s: &PostDetailScreen, width: u16, height: u16) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|f| s.render(f, f.area(), &Theme::cyber(), false, None))
+            .expect("draw");
+        let buf = terminal.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn e_edits_the_post_when_nothing_is_selected_and_the_reply_when_one_is() {
+        let mut e = entry("p1");
+        e.title = Some("Headline".into());
+        e.is_public = true;
+        let mut s = PostDetailScreen::new(e);
+        s.apply_replies_initial(Ok((vec![reply("r1", "p1")], None)));
+
+        // No selection → the post, carrying every editable field.
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('e'))),
+            PostDetailIntent::EditEntry {
+                post_id: "p1".into(),
+                content: "hello\nworld".into(),
+                title: Some("Headline".into()),
+                topics: vec!["music".into()],
+                is_public: true,
+                is_nsfw: false,
+            }
+        );
+
+        // Selecting a reply retargets `e`, exactly as it retargets `b`.
+        s.handle_key(key(KeyCode::Char('J')));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('e'))),
+            PostDetailIntent::EditReply {
+                reply_id: "r1".into(),
+                content: "reply r1".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn e_is_offered_on_a_post_far_past_the_edit_window() {
+        // The 5-minute window is the server's to enforce; the client offers the
+        // key regardless and lets the 403 speak, the way `d` already does.
+        let mut e = entry("p1");
+        e.created_at = Some(OffsetDateTime::now_utc() - time::Duration::hours(3));
+        let mut s = PostDetailScreen::new(e);
+        assert!(matches!(
+            s.handle_key(key(KeyCode::Char('e'))),
+            PostDetailIntent::EditEntry { .. }
+        ));
+    }
+
+    #[test]
+    fn f_prompts_for_a_reason_and_enter_files_the_report() {
+        let mut s = PostDetailScreen::new(entry("p1"));
+        // `F` files nothing on its own, it opens the prompt.
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('F'))),
+            PostDetailIntent::None
+        );
+        assert!(s.is_text_input(), "the prompt owns the keyboard");
+        for c in "spam".chars() {
+            s.handle_key(key(KeyCode::Char(c)));
+        }
+        s.handle_key(key(KeyCode::Backspace));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            PostDetailIntent::FlagEntry {
+                post_id: "p1".into(),
+                reason: Some("spa".into()),
+            }
+        );
+        assert!(!s.is_text_input(), "submitting closes the prompt");
+    }
+
+    #[test]
+    fn f_reports_the_selected_reply() {
+        let mut s = PostDetailScreen::new(entry("p1"));
+        s.apply_replies_initial(Ok((vec![reply("r1", "p1"), reply("r2", "p1")], None)));
+        s.handle_key(key(KeyCode::Char('J')));
+        s.handle_key(key(KeyCode::Char('J')));
+        assert_eq!(s.selected_reply, Some(1));
+
+        s.handle_key(key(KeyCode::Char('F')));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            PostDetailIntent::FlagReply {
+                reply_id: "r2".into(),
+                reason: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_blank_reason_files_the_report_without_one() {
+        // The reason is optional, so an empty submit is valid and travels as
+        // `None` rather than as an empty string.
+        let mut s = PostDetailScreen::new(entry("p1"));
+        s.handle_key(key(KeyCode::Char('F')));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            PostDetailIntent::FlagEntry {
+                post_id: "p1".into(),
+                reason: None,
+            }
+        );
+
+        // So does a reason that is nothing but spaces.
+        s.handle_key(key(KeyCode::Char('F')));
+        s.handle_key(key(KeyCode::Char(' ')));
+        s.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            PostDetailIntent::FlagEntry {
+                post_id: "p1".into(),
+                reason: None,
+            }
+        );
+    }
+
+    #[test]
+    fn the_reason_stops_at_the_servers_character_cap() {
+        let mut s = PostDetailScreen::new(entry("p1"));
+        s.handle_key(key(KeyCode::Char('F')));
+        for _ in 0..(MAX_FLAG_REASON + 50) {
+            s.handle_key(key(KeyCode::Char('x')));
+        }
+        match s.handle_key(key(KeyCode::Enter)) {
+            PostDetailIntent::FlagEntry {
+                reason: Some(reason),
+                ..
+            } => assert_eq!(
+                reason.chars().count(),
+                MAX_FLAG_REASON,
+                "typing stops at the cap instead of building a body the API rejects"
+            ),
+            other => panic!("expected a reasoned FlagEntry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_reason_can_be_pasted_and_edited_at_the_caret() {
+        // The shared field gives this screen the same editing the feeds have:
+        // bracketed paste (newlines collapsed so it cannot submit) and caret
+        // keys, not just append-and-backspace.
+        let mut s = PostDetailScreen::new(entry("p1"));
+        s.paste_text("dropped"); // no prompt open yet
+        assert!(!s.is_text_input());
+
+        s.handle_key(key(KeyCode::Char('F')));
+        s.paste_text("copy\npasted");
+        s.handle_key(key(KeyCode::Home));
+        for c in "why: ".chars() {
+            s.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            PostDetailIntent::FlagEntry {
+                post_id: "p1".into(),
+                reason: Some("why: copy pasted".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn esc_and_cancel_flag_prompt_both_abandon_the_report() {
+        let mut s = PostDetailScreen::new(entry("p1"));
+
+        // Esc reaching the screen closes the prompt and files nothing.
+        s.handle_key(key(KeyCode::Char('F')));
+        assert_eq!(s.handle_key(key(KeyCode::Esc)), PostDetailIntent::None);
+        assert!(!s.is_text_input());
+
+        // The app's Esc hook does the same, and says whether it acted so a
+        // second Esc can keep its usual "go back" meaning.
+        s.handle_key(key(KeyCode::Char('F')));
+        assert!(s.cancel_flag_prompt(), "closed the open prompt");
+        assert!(!s.cancel_flag_prompt(), "nothing left to close");
+        assert!(!s.is_text_input());
+    }
+
+    #[test]
+    fn keys_typed_into_a_reason_never_reach_the_screens_bindings() {
+        // Every bare letter is text while the prompt is open, so selecting,
+        // deleting and bookmarking all stay out of the way.
+        let mut s = PostDetailScreen::new(entry("p1"));
+        s.apply_replies_initial(Ok((vec![reply("r1", "p1")], None)));
+        s.handle_key(key(KeyCode::Char('F')));
+        for c in "Jdyb".chars() {
+            assert_eq!(s.handle_key(key(KeyCode::Char(c))), PostDetailIntent::None);
+        }
+        assert_eq!(s.selected_reply, None, "J did not move the selection");
+        assert!(!s.confirming_delete, "d did not arm a delete");
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            PostDetailIntent::FlagEntry {
+                post_id: "p1".into(),
+                reason: Some("Jdyb".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn is_text_input_is_false_until_the_prompt_opens() {
+        let mut s = PostDetailScreen::new(entry("p1"));
+        assert!(!s.is_text_input(), "browsing captures no text");
+        s.handle_key(key(KeyCode::Char('F')));
+        assert!(s.is_text_input());
+    }
+
+    #[test]
+    fn the_edited_marker_shows_only_on_edited_items() {
+        let mut e = entry("p1");
+        let mut edited_reply = reply("r1", "p1");
+        edited_reply.edited_at = Some(OffsetDateTime::now_utc());
+
+        // Nothing edited: no marker anywhere.
+        let mut s = PostDetailScreen::new(e.clone());
+        s.apply_replies_initial(Ok((vec![reply("r0", "p1")], None)));
+        assert!(
+            !body_text(&s).iter().any(|l| l.contains("(edited)")),
+            "an untouched post and reply say nothing"
+        );
+
+        // The entry's own `editedAt` marks its author line.
+        e.edited_at = Some(OffsetDateTime::now_utc());
+        let mut s = PostDetailScreen::new(e);
+        s.apply_replies_initial(Ok((vec![reply("r0", "p1"), edited_reply], None)));
+        let body = body_text(&s);
+        assert!(
+            body.iter()
+                .any(|l| l.starts_with("@alice") && l.contains("(edited)")),
+            "the entry header carries the marker: {body:?}"
+        );
+        // Exactly one of the two replies is marked.
+        assert_eq!(
+            body.iter()
+                .filter(|l| l.starts_with("@bob") && l.contains("(edited)"))
+                .count(),
+            1,
+            "only the edited reply is marked: {body:?}"
+        );
+    }
+
+    #[test]
+    fn apply_entry_edit_applies_only_the_fields_it_carries() {
+        let mut e = entry("p1");
+        e.title = Some("Keep Me".into());
+        e.created_at = Some(OffsetDateTime::now_utc());
+        let created = e.created_at;
+        let mut s = PostDetailScreen::new(e);
+
+        s.apply_entry_edit(&EntryEdit {
+            content: Some("corrected".into()),
+            topics: Some(vec!["rust".into()]),
+            is_nsfw: Some(true),
+            ..EntryEdit::default()
+        });
+
+        assert_eq!(s.entry.content, "corrected");
+        assert_eq!(s.entry.topics, vec!["rust".to_string()]);
+        assert!(s.entry.is_nsfw);
+        assert_eq!(
+            s.entry.title.as_deref(),
+            Some("Keep Me"),
+            "an omitted field is left alone"
+        );
+        assert_eq!(s.entry.created_at, created, "createdAt never changes");
+        assert!(s.entry.edited_at.is_some(), "the marker appears at once");
+        assert!(body_text(&s).iter().any(|l| l.contains("(edited)")));
+    }
+
+    #[test]
+    fn apply_entry_edit_removes_a_title_and_sets_a_new_one() {
+        let mut e = entry("p1");
+        e.title = Some("Old".into());
+        let mut s = PostDetailScreen::new(e);
+
+        s.apply_entry_edit(&EntryEdit {
+            title: Some(cs_api::TitleEdit::Set("New".into())),
+            ..EntryEdit::default()
+        });
+        assert_eq!(s.entry.title.as_deref(), Some("New"));
+
+        s.apply_entry_edit(&EntryEdit {
+            title: Some(cs_api::TitleEdit::Remove),
+            ..EntryEdit::default()
+        });
+        assert_eq!(s.entry.title, None, "an empty title is a removal");
+    }
+
+    #[test]
+    fn apply_reply_edit_touches_only_the_matching_reply() {
+        let mut s = PostDetailScreen::new(entry("p1"));
+        s.apply_replies_initial(Ok((vec![reply("r1", "p1"), reply("r2", "p1")], None)));
+
+        assert!(s.apply_reply_edit("r2", "corrected".into()));
+        assert_eq!(s.replies[1].content, "corrected");
+        assert!(s.replies[1].edited_at.is_some());
+        assert_eq!(
+            s.replies[0].content, "reply r1",
+            "the neighbour is untouched"
+        );
+        assert!(s.replies[0].edited_at.is_none());
+
+        assert!(
+            !s.apply_reply_edit("nope", "x".into()),
+            "a reply that isn't on this page reports back as a miss"
+        );
+    }
+
+    #[test]
+    fn the_reason_prompt_renders_its_label_the_typed_text_and_its_keys() {
+        let mut s = PostDetailScreen::new(entry("p1"));
+        s.handle_key(key(KeyCode::Char('F')));
+        for c in "bot".chars() {
+            s.handle_key(key(KeyCode::Char(c)));
+        }
+        let rows = rendered_rows(&s, 80, 12);
+        assert!(
+            rows.iter().any(|r| r.contains("reason (optional): bot")),
+            "the field shows the label and what was typed: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("report this post") && r.contains("enter send")),
+            "the status line names the target and the keys: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("3/500")),
+            "and how much of the reason budget is spent: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn the_status_line_notes_a_closed_edit_window_but_still_offers_the_key() {
+        // Fresh post: the plain hint.
+        let mut e = entry("p1");
+        e.created_at = Some(OffsetDateTime::now_utc());
+        let rows = rendered_rows(&settled(e), 200, 10);
+        let status = rows.join("\n");
+        assert!(status.contains("e edit"), "the key is offered: {status:?}");
+        assert!(!status.contains("5m passed"), "no note yet: {status:?}");
+        assert!(status.contains("F flag"), "so is flagging: {status:?}");
+
+        // Old post: the hint says the window has passed, and still offers `e`.
+        let mut e = entry("p1");
+        e.created_at = Some(OffsetDateTime::now_utc() - time::Duration::hours(1));
+        let rows = rendered_rows(&settled(e), 200, 10);
+        let status = rows.join("\n");
+        assert!(
+            status.contains("e edit (5m passed)"),
+            "a soft hint, not a removal: {status:?}"
+        );
+
+        // Unknown publish time: fail open, no discouraging note.
+        let rows = rendered_rows(&settled(entry("p1")), 200, 10);
+        let status = rows.join("\n");
+        assert!(status.contains("e edit"));
+        assert!(
+            !status.contains("5m passed"),
+            "a timestamp we never received can't close the window: {status:?}"
+        );
+    }
+
+    #[test]
+    fn within_edit_window_fails_open_and_expires_on_a_known_timestamp() {
+        assert!(
+            within_edit_window(None),
+            "no timestamp means the server decides"
+        );
+        assert!(within_edit_window(Some(OffsetDateTime::now_utc())));
+        assert!(within_edit_window(Some(
+            OffsetDateTime::now_utc() - time::Duration::seconds(299)
+        )));
+        assert!(!within_edit_window(Some(
+            OffsetDateTime::now_utc() - time::Duration::seconds(301)
+        )));
     }
 }

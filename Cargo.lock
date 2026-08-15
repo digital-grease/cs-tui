@@ -455,6 +455,7 @@ name = "cs-tui"
 version = "0.4.3"
 dependencies = [
  "anyhow",
+ "base64",
  "clap",
  "crossterm",
  "cs-api",

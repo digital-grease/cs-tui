@@ -102,6 +102,18 @@ impl<T> TabState<T> {
         self.list_offset.set(self.list_offset.get() + delta);
     }
 
+    /// The scroll offset the last [`render_body`] settled on: an index into the
+    /// `visible` slice naming the first row actually drawn.
+    ///
+    /// Only meaningful after a render. A caller that has to reason about which
+    /// items are on screen (overlaying links onto them, say) needs this, since
+    /// the list widget owns the scroll and the screen otherwise cannot tell a
+    /// scrolled-up pane from one sitting at the bottom.
+    #[must_use]
+    pub fn list_offset(&self) -> usize {
+        self.list_offset.get()
+    }
+
     /// Append a load-more page (selection is unaffected).
     pub fn apply_more(&mut self, result: Result<(Vec<T>, Option<String>), String>) {
         self.loading = false;

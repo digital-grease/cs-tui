@@ -42,22 +42,39 @@ pub enum RtdbError {
 }
 
 /// Kind of SSE event delivered by Firebase RTDB.
+///
+/// `Put` and `Patch` carry the same payload shape but mean different things, so
+/// consumers have to keep them apart: a `put` replaces the value at its path,
+/// while a `patch` merges only the keys it carries into what's already there.
+/// Decoding a `patch` as if it were a whole object invents empty fields, which
+/// is how a cIRC deletion turns into a nameless message (API v0.8.4,
+/// § Reading a room in real time).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SseEventKind {
-    /// `put` — a path's value was set (replaced). Payload: `{"path": "...", "data": <value>}`.
+    /// `put`: a path's value was set (replaced). Payload:
+    /// `{"path": "...", "data": <value>}`. A `data` of `null` means the path was
+    /// removed, which on a `limitToLast` subscription also happens when a child
+    /// simply drops out of the window.
     Put,
-    /// `patch` — fields under a path were merged. Payload: `{"path": "...", "data": {...}}`.
+    /// `patch`: fields under a path were merged, and the payload holds only
+    /// those fields. Payload: `{"path": "...", "data": {...}}`. Merge it into
+    /// what you hold; never treat it as a replacement.
     Patch,
-    /// `cancel` — the server cancelled the listener (e.g. rules denied the path).
+    /// `cancel`: the server cancelled the listener (e.g. rules denied the path).
     Cancel,
-    /// `auth_revoked` — the auth token was revoked or expired mid-stream.
+    /// `auth_revoked`: the auth token was revoked or expired mid-stream.
     AuthRevoked,
-    /// `keep-alive` — periodic heartbeat. No useful payload; consumers can ignore.
+    /// `keep-alive`: periodic heartbeat. No useful payload; consumers can ignore.
     KeepAlive,
 }
 
+/// One event off an RTDB subscription: what happened, and the raw payload it
+/// happened with. The typed decoders (e.g.
+/// [`crate::circ_message_updates_from_rtdb_event`]) take both, since the same
+/// payload means different things per [`SseEventKind`].
 #[derive(Debug, Clone)]
 pub struct SseEvent {
+    /// Which kind of event this is, and so how `data` must be applied.
     pub kind: SseEventKind,
     /// Raw JSON payload (`null` for keep-alive).
     pub data: serde_json::Value,

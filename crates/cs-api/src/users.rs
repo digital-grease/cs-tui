@@ -1,16 +1,16 @@
-//! User profile types and endpoints (`/v1/users/*`).
+//! User profile types and endpoints (`/v1/users/*`, API v0.8.4 § Users).
 //!
 //! `User` models the `/v1/users/me` and `/v1/users/:username` response shapes.
-//! Because the v0.3.6 spec only enumerates fields under PATCH input, several
-//! optional response fields (followers/following/posts counts, supporter flags)
-//! are inferred and decoded leniently.
+//! Because the spec still only enumerates fields under PATCH input (§ Update
+//! Own Profile), several optional response fields (followers/following/posts
+//! counts, supporter flags) are inferred and decoded leniently.
 use reqwest::Method;
 use serde::Deserialize;
 use time::OffsetDateTime;
 
 use crate::client::Client;
 use crate::endpoint::EndpointKey;
-use crate::error::Result;
+use crate::error::{ApiError, Result};
 use crate::types::{Entry, Reply};
 
 const DEFAULT_PAGE_LIMIT: u32 = 20;
@@ -70,6 +70,27 @@ pub struct User {
     pub created_at: Option<OffsetDateTime>,
 }
 
+/// Result of `POST /v1/users/:username/poke` (API v0.8.4 § Poke a User).
+///
+/// The server echoes the poked user back, so a client that pokes by handle
+/// learns the id without a second lookup.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PokeResponse {
+    /// Id of the poked user.
+    #[serde(default)]
+    pub user_id: String,
+
+    /// Handle of the poked user, echoed back by the server.
+    #[serde(default)]
+    pub username: String,
+
+    /// True once the nudge was delivered. A refused poke comes back as an
+    /// error, not as `poked: false`, so this is true on every success.
+    #[serde(default)]
+    pub poked: bool,
+}
+
 impl Client {
     /// `GET /v1/users/me` — the authenticated user's profile.
     pub async fn get_own_profile(&self) -> Result<User> {
@@ -122,6 +143,45 @@ impl Client {
         let path = format!("/v1/users/{username}/replies");
         self.request_page(EndpointKey::UsersListReplies, Method::GET, &path, &query)
             .await
+    }
+
+    /// `POST /v1/users/:username/poke`, a nudge, the same notification the web
+    /// client's `[P] Poke` button sends (API v0.8.4 § Poke a User). No body.
+    ///
+    /// The target gets a `poke` notification; there is nothing to un-poke.
+    /// Errors follow the spec: `400` for poking yourself, `403` when either side
+    /// has blocked the other, `404` for an unknown handle.
+    ///
+    /// The budget (1/hour, 8/day) is global across all users rather than per
+    /// user, so one poke spends the whole allowance for the hour. Use
+    /// [`time_until_writable`](Client::time_until_writable) with
+    /// [`EndpointKey::UsersPoke`] to show the wait instead of blocking on it.
+    pub async fn poke_user(&self, username: &str) -> Result<PokeResponse> {
+        let path = format!("/v1/users/{username}/poke");
+        match self
+            .request::<PokeResponse, ()>(EndpointKey::UsersPoke, Method::POST, &path, &[], None)
+            .await
+        {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                // The spec says a rejected poke (400 self-poke, 403 blocked, 404
+                // unknown user) "doesn't count against it", but our limiter
+                // spends its token before the request is sent. Without a refund
+                // one mistyped handle would lock poking out locally for a full
+                // hour while the server would still have allowed it, so hand the
+                // token back on exactly those three statuses.
+                //
+                // Nothing else is refunded. A 429 means the token really was
+                // spent, and a transport error may well have reached the server
+                // and been counted there, so both keep the deduction rather than
+                // risk letting the client spend more than the server allows.
+                if matches!(&e, ApiError::Api { status, .. } if matches!(*status, 400 | 403 | 404))
+                {
+                    self.refund_rate_limit(EndpointKey::UsersPoke, None);
+                }
+                Err(e)
+            }
+        }
     }
 }
 
@@ -176,5 +236,22 @@ mod tests {
         let raw = r#"{"userId":"u1","username":"alice"}"#;
         let u: User = serde_json::from_str(raw).unwrap();
         assert_eq!(u.id, "u1");
+    }
+
+    #[test]
+    fn poke_response_decodes_documented_shape() {
+        let raw = r#"{"userId":"u2","username":"bob","poked":true}"#;
+        let p: PokeResponse = serde_json::from_str(raw).unwrap();
+        assert_eq!(p.user_id, "u2");
+        assert_eq!(p.username, "bob");
+        assert!(p.poked);
+    }
+
+    #[test]
+    fn poke_response_tolerates_missing_fields() {
+        let p: PokeResponse = serde_json::from_str("{}").unwrap();
+        assert!(p.user_id.is_empty());
+        assert!(p.username.is_empty());
+        assert!(!p.poked);
     }
 }

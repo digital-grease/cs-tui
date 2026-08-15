@@ -1,4 +1,5 @@
-//! Thread-watching types and endpoints (`/v1/posts/:id/watch`, `/v1/watches`, v0.5.1).
+//! Thread-watching types and endpoints (`/v1/posts/:id/watch`, `/v1/watches`,
+//! API v0.8.4 § Thread Watching).
 //!
 //! Watching a thread subscribes you to `thread_reply` notifications when anyone
 //! replies to it. You're auto-watched when you reply to a thread (unless
