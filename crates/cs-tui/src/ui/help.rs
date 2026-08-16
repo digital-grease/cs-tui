@@ -259,7 +259,15 @@ const CIRC: &[Row] = &[
     },
     Row {
         keys: "↑ / ↓",
-        desc: "scroll the room history (PgUp/PgDn and Home/End too)",
+        desc: "scroll the room history (PgUp/PgDn too)",
+    },
+    Row {
+        keys: "← / →",
+        desc: "move the caret through the draft; it wraps onto more rows as the message grows",
+    },
+    Row {
+        keys: "Home / End",
+        desc: "jump the caret to the start / end of the draft",
     },
     Row {
         keys: "",
@@ -271,6 +279,10 @@ const CIRC_SELECT: &[Row] = &[
     Row {
         keys: "j / k",
         desc: "pick a message",
+    },
+    Row {
+        keys: "Home / End",
+        desc: "jump to the oldest / newest message held",
     },
     Row {
         keys: "d then y",

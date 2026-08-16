@@ -36,11 +36,28 @@ use super::cmail::{
     avatar_color, bottom_aligned_messages_area, format_epoch_millis_relative, one_line_preview,
     Outgoing,
 };
+use super::editor::Segment;
 use super::flag::FlagPromptKey;
 use super::list::{self, TabState};
 use super::theme::Theme;
 
 const MAX_OUTGOING_ROWS: usize = 4;
+
+/// Most rows the composer may grow to as a long draft soft-wraps. Past this it
+/// scrolls to keep the caret in view instead: the conversation above it is the
+/// point of the screen, and `Ctrl+E` opens a whole editor for a long message.
+const MAX_COMPOSER_ROWS: u16 = 4;
+
+/// Rows of conversation the composer may never take, however long the draft is.
+const MIN_CHAT_ROWS: u16 = 3;
+
+/// The composer's prompt, and the gutter every wrapped continuation row indents
+/// by so the draft stays in one column. Both are two cells wide.
+const COMPOSER_PROMPT: &str = "› ";
+const COMPOSER_GUTTER: &str = "  ";
+/// Marker for the top row when the draft has grown past [`MAX_COMPOSER_ROWS`]
+/// and rows have scrolled off above it.
+const COMPOSER_MORE: &str = "… ";
 
 /// Columns the roster pane takes when it is open (`Ctrl+U`). Wide enough for a
 /// handle plus the admin star and the idle mark.
@@ -221,6 +238,199 @@ impl Default for Roster {
     }
 }
 
+/// The always-on inline composer: the draft, and a caret inside it.
+///
+/// Every other text field in the client is a short value that scrolls sideways
+/// under [`super::input::windowed_line`]. A chat composer is neither: a message
+/// is long enough to wrap, and it is the field you live in while a room is open,
+/// so it gets the caret keys (`←`/`→`, Home/End, Delete) and soft-wraps
+/// downwards instead of running off the right edge.
+#[derive(Debug, Default)]
+struct Composer {
+    /// The draft so far. It may hold newlines — the `Ctrl+E` editor is the only
+    /// way to put them there, since Enter sends, and `/art` needs them.
+    text: String,
+    /// Caret as a char index into `text` (`0..=` its char count).
+    cursor: usize,
+}
+
+impl Composer {
+    /// Characters typed so far (the caret is a char index, never a byte offset).
+    fn len(&self) -> usize {
+        self.text.chars().count()
+    }
+
+    fn clear(&mut self) {
+        self.text.clear();
+        self.cursor = 0;
+    }
+
+    /// Replace the whole draft, leaving the caret at the end: a prefill (the
+    /// editor handing its content back) is something you keep typing after.
+    fn set(&mut self, text: String) {
+        self.text = text;
+        self.cursor = self.len();
+    }
+
+    fn insert(&mut self, c: char) {
+        let at = super::input::byte_index(&self.text, self.cursor);
+        self.text.insert(at, c);
+        self.cursor += 1;
+    }
+
+    /// Insert text at the caret, which lands just after it. Newlines survive:
+    /// unlike the single-line fields, this one can hold them.
+    fn insert_str(&mut self, text: &str) {
+        for c in text.chars() {
+            self.insert(c);
+        }
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let at = super::input::byte_index(&self.text, self.cursor - 1);
+        self.text.remove(at);
+        self.cursor -= 1;
+    }
+
+    fn delete(&mut self) {
+        if self.cursor < self.len() {
+            let at = super::input::byte_index(&self.text, self.cursor);
+            self.text.remove(at);
+        }
+    }
+
+    fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.len());
+    }
+
+    fn move_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn move_end(&mut self) {
+        self.cursor = self.len();
+    }
+}
+
+/// A draft laid out for the composer strip: the wrapped rows, which of them are
+/// on screen, and where the caret landed.
+///
+/// Derived from `(draft, width, cap)` every frame and never stored, so a resize
+/// is correct by construction — the same rule [`super::editor`] follows.
+struct ComposerView {
+    /// The draft as display characters (see [`composer_display`]).
+    chars: Vec<char>,
+    /// Every soft-wrapped row, as a range into `chars`.
+    segs: Vec<Segment>,
+    /// The caret's index among `chars`, and the row holding it.
+    caret: usize,
+    caret_row: usize,
+    /// First visible row, and how many rows are visible (`1..=cap`).
+    first: usize,
+    rows: usize,
+}
+
+/// The draft as the characters the composer actually draws, plus where the caret
+/// sits among them.
+///
+/// A newline only reaches the draft through the `Ctrl+E` editor, and the
+/// composer is a strip under the conversation rather than an editor of its own,
+/// so a newline stays the inline `⏎` marker it has always been. Only the width
+/// starts a new row.
+fn composer_display(draft: &Composer) -> (Vec<char>, usize) {
+    let mut chars: Vec<char> = Vec::with_capacity(draft.text.len());
+    let mut caret = 0;
+    for (i, c) in draft.text.chars().enumerate() {
+        if i == draft.cursor {
+            caret = chars.len();
+        }
+        if c == '\n' {
+            chars.extend([' ', '⏎', ' ']);
+        } else {
+            chars.push(c);
+        }
+    }
+    if draft.cursor >= draft.len() {
+        caret = chars.len();
+    }
+    (chars, caret)
+}
+
+/// Wrap `draft` to `width` content columns, showing at most `cap` rows.
+///
+/// A draft that outgrows `cap` scrolls rather than growing further, and the
+/// window always holds the caret: it rides the bottom row while you type, and
+/// Home takes both it and the window back to the start.
+fn layout_composer(draft: &Composer, width: usize, cap: usize) -> ComposerView {
+    let cap = cap.max(1);
+    let (chars, caret) = composer_display(draft);
+    // `wrap_line` always yields at least one segment, so `segs` is never empty.
+    let segs = super::editor::wrap_line(&chars, width.max(1));
+    let (caret_row, _) = super::editor::caret_in_line(&chars, &segs, caret);
+    let rows = segs.len().min(cap);
+    let first = caret_row
+        .saturating_sub(rows - 1)
+        .min(segs.len().saturating_sub(rows));
+    ComposerView {
+        chars,
+        segs,
+        caret,
+        caret_row,
+        first,
+        rows,
+    }
+}
+
+/// Content columns the draft has, once the prompt gutter is paid for.
+fn composer_width(area_width: u16) -> usize {
+    (area_width as usize)
+        .saturating_sub(COMPOSER_PROMPT.chars().count())
+        .max(1)
+}
+
+/// Draw a laid-out draft: the prompt on its first row, an aligned gutter on the
+/// wrapped continuations, and a reverse-video caret, the same block the shared
+/// single-line fields use.
+fn composer_lines(view: &ComposerView, theme: &Theme) -> Vec<Line<'static>> {
+    let caret_style = theme.base().add_modifier(Modifier::REVERSED);
+    let run = |range: std::ops::Range<usize>| view.chars[range].iter().collect::<String>();
+    (view.first..view.first + view.rows)
+        .map(|r| {
+            let seg = view.segs[r];
+            let gutter = if r == 0 {
+                Span::styled(COMPOSER_PROMPT, theme.accent_style())
+            } else if r == view.first {
+                // The draft scrolled: say so, rather than silently cutting it.
+                Span::styled(COMPOSER_MORE, theme.muted_style())
+            } else {
+                Span::styled(COMPOSER_GUTTER, theme.base())
+            };
+            let mut spans = vec![gutter];
+            if r != view.caret_row {
+                spans.push(Span::styled(run(seg.start..seg.end), theme.base()));
+                return Line::from(spans);
+            }
+            let at = view.caret.clamp(seg.start, seg.end);
+            spans.push(Span::styled(run(seg.start..at), theme.base()));
+            if at < seg.end {
+                spans.push(Span::styled(view.chars[at].to_string(), caret_style));
+                spans.push(Span::styled(run(at + 1..seg.end), theme.base()));
+            } else {
+                // Caret past the last character of the row.
+                spans.push(Span::styled(" ", caret_style));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
 /// The cIRC screen: a room list, and one open room at a time.
 #[derive(Debug)]
 pub struct CircScreen {
@@ -228,9 +438,9 @@ pub struct CircScreen {
     pub rooms: TabState<CircRoom>,
     /// Room list, or one open room.
     pub mode: CircMode,
-    /// Always-on inline composer buffer for the open room (it's a chat channel,
-    /// so the input is focused the whole time you're in a room).
-    draft: String,
+    /// Always-on inline composer for the open room (it's a chat channel, so the
+    /// input is focused the whole time you're in a room).
+    draft: Composer,
     /// Optimistic outgoing messages awaiting their server echo.
     outgoing: Vec<Outgoing>,
     /// Whether the roster pane is open. Kept on the screen rather than on the
@@ -252,7 +462,7 @@ impl CircScreen {
         Self {
             rooms: TabState::loading(),
             mode: CircMode::Rooms,
-            draft: String::new(),
+            draft: Composer::default(),
             outgoing: Vec::new(),
             roster_open: false,
             muted: HashMap::new(),
@@ -295,7 +505,7 @@ impl CircScreen {
         if select.active {
             return;
         }
-        self.draft.push_str(text);
+        self.draft.insert_str(text);
     }
 
     /// Set the composer text (used when the full editor hands its content back).
@@ -309,7 +519,7 @@ impl CircScreen {
         select.active = false;
         select.confirming_delete = false;
         select.flag = None;
-        self.draft = content;
+        self.draft.set(content);
     }
 
     /// The room currently open, for the shell's presence heartbeat and for the
@@ -780,15 +990,19 @@ impl CircScreen {
             return self.handle_select_key(key, &room_id);
         }
 
-        // The composer is focused in a room: typed keys go to the draft,
-        // Enter sends, Ctrl+E expands to the editor, and arrows scroll history.
+        // The composer is focused in a room: typed keys go to the draft, Enter
+        // sends, Ctrl+E expands to the editor, and the vertical keys scroll the
+        // history. The horizontal keys — ←/→, Home and End — belong to the
+        // composer's caret, the way they do in every other field in the client;
+        // jumping the history to its ends is select mode's Home/End (Ctrl+B),
+        // which has no text to move a caret through.
         match key.code {
             KeyCode::Char('e') if ctrl => CircIntent::StartCompose {
                 room_id,
-                draft: self.draft.clone(),
+                draft: self.draft.text.clone(),
             },
             KeyCode::Enter => {
-                let content = send_content(&self.draft);
+                let content = send_content(&self.draft.text);
                 if content.trim().is_empty() {
                     return CircIntent::None;
                 }
@@ -800,17 +1014,34 @@ impl CircScreen {
                 CircIntent::SendMessage { room_id, content }
             }
             KeyCode::Backspace => {
-                self.draft.pop();
+                self.draft.backspace();
                 CircIntent::None
             }
-            KeyCode::Up
-            | KeyCode::Down
-            | KeyCode::PageUp
-            | KeyCode::PageDown
-            | KeyCode::Home
-            | KeyCode::End => self.scroll_messages(key.code, &room_id),
+            KeyCode::Delete => {
+                self.draft.delete();
+                CircIntent::None
+            }
+            KeyCode::Left => {
+                self.draft.move_left();
+                CircIntent::None
+            }
+            KeyCode::Right => {
+                self.draft.move_right();
+                CircIntent::None
+            }
+            KeyCode::Home => {
+                self.draft.move_home();
+                CircIntent::None
+            }
+            KeyCode::End => {
+                self.draft.move_end();
+                CircIntent::None
+            }
+            KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => {
+                self.scroll_messages(key.code, &room_id)
+            }
             KeyCode::Char(c) if !ctrl => {
-                self.draft.push(c);
+                self.draft.insert(c);
                 CircIntent::None
             }
             _ => CircIntent::None,
@@ -1100,13 +1331,23 @@ impl CircScreen {
         };
 
         let out_rows = self.outgoing_rows();
-        // The composer input is always present (2 rows: input + hint).
+        // The composer input is always present: its rows, then one row of hints.
+        // It grows as the draft wraps, but never past the point where the
+        // conversation it belongs to would be squeezed out.
+        let cap = MAX_COMPOSER_ROWS
+            .min(
+                chat_area
+                    .height
+                    .saturating_sub(out_rows + MIN_CHAT_ROWS + 1),
+            )
+            .max(1);
+        let composer_rows = self.composer_rows(chat_area.width, cap);
         let layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(1),
                 Constraint::Length(out_rows),
-                Constraint::Length(2),
+                Constraint::Length(composer_rows + 1),
             ])
             .split(chat_area);
 
@@ -1242,6 +1483,23 @@ impl CircScreen {
         frame.render_widget(Paragraph::new(lines), area);
     }
 
+    /// Rows the footer's top half takes: one for the flag prompt, the delete
+    /// confirmation or the select status line, and however many the wrapped
+    /// draft needs (up to `cap`) when the composer is the one showing.
+    ///
+    /// [`render_room`](Self::render_room) sizes the layout with this and
+    /// [`render_footer`](Self::render_footer) fills it, both from the same
+    /// `(draft, width, cap)`, so the two can't disagree about the height.
+    fn composer_rows(&self, width: u16, cap: u16) -> u16 {
+        let CircMode::Room { select, .. } = &self.mode else {
+            return 1;
+        };
+        if select.flag.is_some() || select.confirming_delete || select.active {
+            return 1;
+        }
+        layout_composer(&self.draft, composer_width(width), usize::from(cap)).rows as u16
+    }
+
     fn render_footer(
         &self,
         frame: &mut Frame<'_>,
@@ -1251,9 +1509,11 @@ impl CircScreen {
         select: &SelectState,
         selected: Option<&CircMessage>,
     ) {
+        // `render_room` sized this area as the composer's rows plus the hint, so
+        // everything above the last row belongs to the composer.
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Length(1)])
+            .constraints([Constraint::Min(1), Constraint::Length(1)])
             .split(area);
 
         let (top, hint) = if let Some(prompt) = &select.flag {
@@ -1266,15 +1526,15 @@ impl CircScreen {
                 super::input::windowed_line(&prompt.reason, prompt.cursor, width, theme).spans,
             );
             (
-                line,
+                vec![line],
                 "enter report · esc cancel · reason optional, max 500".to_string(),
             )
         } else if select.confirming_delete {
             (
-                Line::from(Span::styled(
+                vec![Line::from(Span::styled(
                     "delete this message? y confirms · any other key cancels",
                     theme.warning_style(),
-                )),
+                ))],
                 "y confirm · esc cancel".to_string(),
             )
         } else if select.active {
@@ -1283,18 +1543,19 @@ impl CircScreen {
                 Some(!m.user_id.is_empty() && m.user_id == viewer)
             });
             (
-                select_status_line(selected, select, theme),
+                vec![select_status_line(selected, select, theme)],
                 select_hint(selected, mine),
             )
         } else {
-            // Always-on input line.
-            let shown = self.draft.replace('\n', " ⏎ ");
+            // Always-on input line, soft-wrapped over the rows `render_room`
+            // reserved for it.
+            let view = layout_composer(
+                &self.draft,
+                composer_width(rows[0].width),
+                usize::from(rows[0].height),
+            );
             (
-                Line::from(vec![
-                    Span::styled("› ", theme.accent_style()),
-                    Span::styled(shown, theme.base()),
-                    Span::styled("▏", theme.accent_style()),
-                ]),
+                composer_lines(&view, theme),
                 if has_older {
                     "enter send · ↑ older · ctrl+b select · ctrl+u users · ctrl+e editor · esc back"
                         .to_string()
@@ -1780,7 +2041,9 @@ mod tests {
         let rows = render_rows(&s, 14);
         let input = rows
             .iter()
-            .position(|r| r.starts_with("› "))
+            // The caret is a reverse-video cell, so the empty composer's row is
+            // the prompt plus a blank the row trim takes off.
+            .position(|r| r.starts_with('›'))
             .expect("composer input line should be visible");
         assert!(
             rows[input - 1].contains("line 59"),
@@ -1852,7 +2115,9 @@ mod tests {
         let rows = render_rows(&s, 13);
         let input = rows
             .iter()
-            .position(|r| r.starts_with("› "))
+            // The caret is a reverse-video cell, so the empty composer's row is
+            // the prompt plus a blank the row trim takes off.
+            .position(|r| r.starts_with('›'))
             .expect("composer input line should be visible");
         assert!(
             rows[input - 1].contains("line 5"),
@@ -1890,6 +2155,257 @@ mod tests {
         );
         assert_eq!(s.outgoing.len(), 1);
         assert_eq!(s.outgoing[0].content, "hey");
+    }
+
+    /// Type `text` into whatever field currently has the keyboard.
+    fn typed(s: &mut CircScreen, text: &str) {
+        for c in text.chars() {
+            s.handle_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    /// The composer's rendered rows with the prompt gutter stripped, joined back
+    /// into the draft text they show. The caret is a reverse-video cell, so it
+    /// contributes the character underneath it (or a blank at end of text).
+    fn composer_text(s: &CircScreen, width: u16, height: u16) -> String {
+        let rows = render_rows_wide(s, width, height);
+        let first = rows
+            .iter()
+            .position(|r| r.starts_with('›') || r.starts_with('…'))
+            .expect("composer should be visible");
+        let hint = rows
+            .iter()
+            .position(|r| r.contains("enter send"))
+            .expect("composer hint row should be visible");
+        rows[first..hint]
+            .iter()
+            .map(|r| r.chars().skip(COMPOSER_PROMPT.chars().count()).collect())
+            .collect::<Vec<String>>()
+            .join("")
+    }
+
+    #[test]
+    fn home_and_end_move_the_composer_caret_instead_of_jumping_the_history() {
+        // Regression: Home/End used to scroll the room's scrollback, which left
+        // the composer with no way to reach the start of a line at all.
+        let mut s = open("general");
+        s.apply_messages(
+            "general",
+            true,
+            Ok((
+                (0..5)
+                    .map(|i| message(&format!("m{i}"), "neo", "hi", 1_000 + i64::from(i)))
+                    .collect(),
+                None,
+            )),
+        );
+        let CircMode::Room { messages, .. } = &s.mode else {
+            panic!("room should be open");
+        };
+        let selected = messages.selected;
+
+        typed(&mut s, "hey");
+        s.handle_key(key(KeyCode::Home));
+        assert_eq!(s.draft.cursor, 0);
+        typed(&mut s, ">");
+        assert_eq!(s.draft.text, ">hey");
+        s.handle_key(key(KeyCode::End));
+        typed(&mut s, "!");
+        assert_eq!(s.draft.text, ">hey!");
+
+        let CircMode::Room { messages, .. } = &s.mode else {
+            panic!("room should be open");
+        };
+        assert_eq!(
+            messages.selected, selected,
+            "the caret keys must leave the scrollback where it was"
+        );
+    }
+
+    #[test]
+    fn the_caret_keys_edit_in_the_middle_of_the_draft() {
+        let mut s = open("general");
+        typed(&mut s, "helo");
+        s.handle_key(key(KeyCode::Left));
+        typed(&mut s, "l");
+        assert_eq!(s.draft.text, "hello");
+        s.handle_key(key(KeyCode::Backspace));
+        assert_eq!(
+            s.draft.text, "helo",
+            "backspace takes the char before the caret"
+        );
+        s.handle_key(key(KeyCode::Delete));
+        assert_eq!(s.draft.text, "hel", "delete takes the char under the caret");
+        s.handle_key(key(KeyCode::Right));
+        typed(&mut s, "p");
+        assert_eq!(s.draft.text, "help");
+    }
+
+    #[test]
+    fn a_paste_lands_at_the_caret() {
+        let mut s = open("general");
+        typed(&mut s, "ab");
+        s.handle_key(key(KeyCode::Left));
+        s.paste_text("xy");
+        assert_eq!(s.draft.text, "axyb");
+        assert_eq!(s.draft.cursor, 3, "the caret follows the pasted text");
+    }
+
+    #[test]
+    fn multibyte_text_is_edited_by_character_not_by_byte() {
+        let mut s = open("general");
+        typed(&mut s, "héllo");
+        s.handle_key(key(KeyCode::Home));
+        s.handle_key(key(KeyCode::Right));
+        s.handle_key(key(KeyCode::Delete));
+        assert_eq!(s.draft.text, "hllo");
+    }
+
+    #[test]
+    fn sending_and_leaving_both_reset_the_caret() {
+        let mut s = open("general");
+        typed(&mut s, "hey");
+        s.handle_key(key(KeyCode::Enter));
+        assert_eq!(s.draft.cursor, 0, "a sent draft leaves an empty composer");
+        typed(&mut s, "more");
+        s.handle_escape();
+        assert_eq!(s.draft.text, "");
+        assert_eq!(s.draft.cursor, 0);
+    }
+
+    #[test]
+    fn a_prefill_from_the_editor_leaves_the_caret_at_the_end() {
+        let mut s = open("general");
+        s.set_draft_and_focus("from the editor".to_string());
+        assert_eq!(s.draft.cursor, s.draft.len());
+        typed(&mut s, "!");
+        assert_eq!(s.draft.text, "from the editor!");
+    }
+
+    #[test]
+    fn a_long_draft_wraps_onto_more_composer_rows() {
+        // Regression: the composer drew one row and let anything past the right
+        // edge fall off the screen, so a long message became invisible as it was
+        // typed.
+        let mut s = open("general");
+        let draft: String = (0..120)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        typed(&mut s, &draft);
+
+        let rows = render_rows(&s, 16);
+        let first = rows
+            .iter()
+            .position(|r| r.starts_with('›'))
+            .expect("composer should be visible");
+        let hint = rows
+            .iter()
+            .position(|r| r.contains("enter send"))
+            .expect("composer hint row should be visible");
+        assert!(
+            hint - first > 1,
+            "a draft wider than the pane must wrap onto further rows:\n{}",
+            rows.join("\n"),
+        );
+        assert_eq!(
+            composer_text(&s, 50, 16),
+            draft,
+            "every character typed stays on screen"
+        );
+    }
+
+    #[test]
+    fn an_overlong_draft_scrolls_the_composer_and_keeps_the_caret_in_view() {
+        let mut s = open("general");
+        let draft: String = (0..400)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        typed(&mut s, &draft);
+
+        let rows = render_rows(&s, 20);
+        let first = rows
+            .iter()
+            .position(|r| r.starts_with('…'))
+            .expect("a scrolled composer marks the rows above it");
+        let hint = rows
+            .iter()
+            .position(|r| r.contains("enter send"))
+            .expect("composer hint row should be visible");
+        assert_eq!(
+            (hint - first) as u16,
+            MAX_COMPOSER_ROWS,
+            "the composer stops growing and scrolls instead:\n{}",
+            rows.join("\n"),
+        );
+        let shown = composer_text(&s, 50, 20);
+        assert!(
+            draft.ends_with(shown.trim_end()),
+            "typing shows the tail of the draft, where the caret is:\n{shown}"
+        );
+
+        // Home takes the window back to the start along with the caret.
+        s.handle_key(key(KeyCode::Home));
+        let shown = composer_text(&s, 50, 20);
+        assert!(
+            draft.starts_with(&shown[..shown.len() - 1]),
+            "Home scrolls the composer back to the head of the draft:\n{shown}"
+        );
+    }
+
+    #[test]
+    fn the_composer_never_crowds_the_conversation_out() {
+        let mut s = open("general");
+        s.apply_messages(
+            "general",
+            true,
+            Ok((vec![message("m1", "neo", "hi", 1_000)], None)),
+        );
+        let draft: String = (0..400)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        typed(&mut s, &draft);
+
+        // A short terminal: the draft would happily take every row it can get.
+        let rows = render_rows(&s, 10);
+        let first = rows
+            .iter()
+            .position(|r| r.starts_with('›') || r.starts_with('…'))
+            .expect("composer should be visible");
+        assert!(
+            first >= usize::from(MIN_CHAT_ROWS),
+            "the conversation keeps its rows however long the draft is:\n{}",
+            rows.join("\n"),
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("hi")),
+            "the message pane is still drawn:\n{}",
+            rows.join("\n"),
+        );
+    }
+
+    #[test]
+    fn select_mode_still_jumps_the_history_with_home_and_end() {
+        let msgs: Vec<CircMessage> = (0..5)
+            .map(|i| {
+                message(
+                    &format!("m{i}"),
+                    "neo",
+                    &format!("line {i}"),
+                    1_000 + i64::from(i),
+                )
+            })
+            .collect();
+        let mut s = selecting(msgs);
+        s.handle_key(key(KeyCode::Home));
+        let CircMode::Room { messages, .. } = &s.mode else {
+            panic!("room should be open");
+        };
+        assert_eq!(messages.selected, 0, "Home reaches the oldest message");
+        s.handle_key(key(KeyCode::End));
+        let CircMode::Room { messages, .. } = &s.mode else {
+            panic!("room should be open");
+        };
+        assert_eq!(messages.selected, 4, "End reaches the newest");
     }
 
     #[test]
@@ -2109,7 +2625,10 @@ mod tests {
         );
         // A bare letter now acts on the message instead of typing into the draft.
         s.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(s.draft, "", "select mode must not type into the composer");
+        assert_eq!(
+            s.draft.text, "",
+            "select mode must not type into the composer"
+        );
 
         // Esc unwinds select mode before it unwinds the room.
         assert_eq!(s.handle_escape(), Some(CircIntent::None));
@@ -2590,14 +3109,17 @@ mod tests {
                 reason: Some("spam harassment".into()),
             }
         );
-        assert_eq!(s.draft, "", "the paste must not leak into the composer");
+        assert_eq!(
+            s.draft.text, "",
+            "the paste must not leak into the composer"
+        );
     }
 
     #[test]
     fn paste_is_dropped_in_select_mode() {
         let mut s = selecting(vec![message("m1", "neo", "hi", 1_000)]);
         s.paste_text("nope");
-        assert_eq!(s.draft, "");
+        assert_eq!(s.draft.text, "");
     }
 
     #[test]
