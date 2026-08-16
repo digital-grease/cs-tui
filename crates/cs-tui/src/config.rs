@@ -74,6 +74,8 @@ pub struct Config {
     /// Publish a typing indicator while a C-Mail conversation is open (the other
     /// participant sees "is typing" while you type). Default on.
     pub cmail_typing: Option<bool>,
+    /// Check GitHub once a day for a newer cs-tui release. Default on.
+    pub update_check: Option<bool>,
     /// Initial jukebox volume for a fresh session (0..=130).
     pub audio_volume: Option<i64>,
     /// Start each session with shuffle mode already armed.
@@ -178,6 +180,14 @@ pub struct Runtime {
     /// close the conversation or quit. Off, nothing is published and they never
     /// see you typing; you still see theirs, per the spec's "Typing Indicator".
     pub cmail_typing: bool,
+    /// Whether to check GitHub for a newer release of cs-tui.
+    ///
+    /// On (the default) the client asks the project's release list at most once
+    /// a day, in the background, and mentions a newer version once. That request
+    /// tells GitHub your address and that you run cs-tui; it goes nowhere near
+    /// the Cyberspace API, carries no session token, and never installs
+    /// anything. Off, no such request is ever made.
+    pub update_check: bool,
     /// Initial jukebox volume (0..=130) the player opens at each session.
     pub audio_volume: i64,
     /// Whether sessions begin with shuffle mode armed (never auto-playing:
@@ -212,6 +222,9 @@ impl Default for Runtime {
             // you're talking to, and the website publishes them too.
             circ_presence: true,
             cmail_typing: true,
+            // On by default so a fixed build is noticed. It is one request a
+            // day to GitHub, never to the Cyberspace API.
+            update_check: true,
             // Single-sourced with the player so the two never drift.
             audio_volume: crate::ui::player::DEFAULT_VOLUME,
             shuffle: false,
@@ -365,8 +378,10 @@ const TEMPLATE: &str = r##"# cs-tui configuration. Edit and restart cs-tui.
 #shuffle = false
 
 # ── What other people can see ────────────────────────────────────────────────
-# These two publish your activity to other people. Both are on by default,
-# because that is what the website does and what people in a room expect.
+# These two publish your activity to other people on Cyberspace. Both are on by
+# default, because that is what the website does and what people in a room
+# expect. `update_check` below is different: it talks to GitHub, not Cyberspace,
+# and publishes nothing to anyone you talk to.
 
 # Announce your presence while a cIRC room is open.
 #   true  (default) your name is in that room's user list for as long as you
@@ -384,6 +399,16 @@ const TEMPLATE: &str = r##"# cs-tui configuration. Edit and restart cs-tui.
 #   false nothing is published and they never see you typing. You still see
 #         their indicator either way; this only controls your own.
 #cmail_typing = true
+
+# Check GitHub for a newer release of cs-tui.
+#   true  (default) at most once a day, in the background, cs-tui asks the
+#         project's release list whether a newer version exists and mentions it
+#         once. The request tells GitHub your address and that you run cs-tui.
+#         It never touches the Cyberspace API, carries no session token, and
+#         nothing is ever downloaded or installed: you are told a version and a
+#         link, and updating stays your decision.
+#   false no such request is ever made.
+#update_check = true
 
 # ── Input / connection ───────────────────────────────────────────────────────
 
@@ -503,6 +528,7 @@ impl Config {
             cmail_bell: self.cmail_bell.unwrap_or(d.cmail_bell),
             circ_presence: self.circ_presence.unwrap_or(d.circ_presence),
             cmail_typing: self.cmail_typing.unwrap_or(d.cmail_typing),
+            update_check: self.update_check.unwrap_or(d.update_check),
             audio_volume: self.audio_volume.unwrap_or(d.audio_volume).clamp(0, 130),
             shuffle: self.shuffle.unwrap_or(d.shuffle),
             selection: match self.selection.as_deref().map(str::to_ascii_lowercase) {
@@ -752,6 +778,7 @@ mod tests {
             "cmail_bell",
             "circ_presence",
             "cmail_typing",
+            "update_check",
             "editor",
             "preview_length",
             "image_height",

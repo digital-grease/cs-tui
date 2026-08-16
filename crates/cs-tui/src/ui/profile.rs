@@ -11,7 +11,6 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, ListItem, Paragraph};
 use ratatui::Frame;
-use time::OffsetDateTime;
 
 use super::theme::Theme;
 
@@ -618,13 +617,14 @@ impl ProfileScreen {
         // the ONE guild held as founder or member. Apprenticeships are not here,
         // they are on the Guilds tab, so this line is the badge and nothing more.
         if let Some(name) = u.guild_name.as_deref().filter(|n| !n.trim().is_empty()) {
-            let icon = u.guild_icon.as_deref().unwrap_or("").trim();
-            let badge = if icon.is_empty() {
-                format!("guild: {name}")
-            } else {
-                format!("{icon} {name}")
-            };
-            lines.push(Line::from(Span::styled(badge, theme.muted_style())));
+            // `guild_icon` is deliberately not drawn: the API's icon is an icon
+            // IDENTIFIER (e.g. "arrows-maximize"), not a glyph, the same reading
+            // the guilds index, the guild detail header and the Guilds tab all
+            // take. Rendering it here would print that identifier as text.
+            lines.push(Line::from(Span::styled(
+                format!("guild: {name}"),
+                theme.muted_style(),
+            )));
         }
         if let Some(loc) = &u.location_name {
             lines.push(Line::from(Span::styled(
@@ -645,7 +645,10 @@ impl ProfileScreen {
                 theme.muted_style(),
             )));
         }
-        if !self.is_self {
+        // `is_viewing_self`, not `is_self`: the key handlers and the status line
+        // already gate on it, and a profile reached by NAME can be your own, in
+        // which case every key promised below would be refused server-side.
+        if !self.is_viewing_self() {
             lines.push(Line::from(""));
             let txt = match u.is_following {
                 Some(true) => "F to unfollow",
@@ -685,7 +688,10 @@ impl ProfileScreen {
             &self.posts,
             "posts",
             move |e: &Entry| {
-                let when = e.created_at.map(format_relative).unwrap_or_default();
+                let when = e
+                    .created_at
+                    .map(crate::config::format_list_timestamp)
+                    .unwrap_or_default();
                 let mut header = vec![
                     Span::styled(format!("@{}", e.author_username), theme.accent_style()),
                     Span::styled(format!(" · {when}"), theme.muted_style()),
@@ -711,7 +717,10 @@ impl ProfileScreen {
 
     fn render_replies(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         render_list_with_state(frame, area, theme, &self.replies, "replies", |r: &Reply| {
-            let when = r.created_at.map(format_relative).unwrap_or_default();
+            let when = r
+                .created_at
+                .map(crate::config::format_list_timestamp)
+                .unwrap_or_default();
             let mut header = vec![
                 Span::styled(format!("@{}", r.author_username), theme.accent_style()),
                 Span::styled(format!(" · {when} · on {}", r.post_id), theme.muted_style()),
@@ -852,7 +861,10 @@ fn guild_row(g: &UserGuild, theme: &Theme) -> Line<'static> {
         detail.push(role.to_string());
     }
     if let Some(joined) = g.joined_at {
-        detail.push(format!("joined {}", format_relative(joined)));
+        detail.push(format!(
+            "joined {}",
+            crate::config::format_list_timestamp(joined)
+        ));
     }
     if !detail.is_empty() {
         spans.push(Span::styled(
@@ -901,27 +913,11 @@ fn render_list_with_state<T, F>(
     });
 }
 
-fn format_relative(t: OffsetDateTime) -> String {
-    let now = OffsetDateTime::now_utc();
-    let secs = (now - t).whole_seconds();
-    if secs < 60 {
-        format!("{secs}s ago")
-    } else if secs < 3_600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h ago", secs / 3_600)
-    } else if secs < 30 * 86_400 {
-        format!("{}d ago", secs / 86_400)
-    } else {
-        let d = t.date();
-        format!("{}-{:02}-{:02}", d.year(), u8::from(d.month()), d.day())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::{KeyEventKind, KeyEventState};
+    use time::OffsetDateTime;
     // Only the fixtures name a role: the rows themselves go through the guilds
     // module's shared label.
     use cs_api::GuildRole;

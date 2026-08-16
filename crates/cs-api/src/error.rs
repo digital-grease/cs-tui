@@ -2,7 +2,7 @@ use serde::Deserialize;
 
 pub type Result<T> = std::result::Result<T, ApiError>;
 
-/// API-level error codes per the v0.8.4 spec (`docs/api-v0.8.4.md` § Error Codes).
+/// API-level error codes, per § Error Codes of the v0.8.6 spec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ErrorCode {

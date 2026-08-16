@@ -34,11 +34,30 @@ pub enum RtdbError {
     #[error("rtdb sse parse: {0}")]
     Sse(String),
 
+    /// A transport failure, with the URL's query string already removed.
+    ///
+    /// Build these with [`scrub`] rather than with `?` or `From`: every RTDB URL
+    /// carries `?auth=<idToken>`, the live session token, and reqwest's error
+    /// `Display` appends the whole URL it failed on. A bare `?` here would put
+    /// that token in cleartext into the log file, which is written with default
+    /// permissions while the session file is deliberately 0600.
     #[error("transport: {0}")]
-    Transport(#[from] reqwest::Error),
+    Transport(reqwest::Error),
 
     #[error("decode: {0}")]
     Decode(#[from] serde_json::Error),
+}
+
+/// Wrap a reqwest error, dropping the query string it would otherwise print.
+///
+/// Every RTDB URL carries the session token as `?auth=…`, so this is the one
+/// thing standing between a routine transport error (a sleeping laptop, a wifi
+/// roam) and a credential in the log.
+fn scrub(mut e: reqwest::Error) -> RtdbError {
+    if let Some(url) = e.url_mut() {
+        url.set_query(None);
+    }
+    RtdbError::Transport(e)
 }
 
 /// Kind of SSE event delivered by Firebase RTDB.
@@ -98,7 +117,8 @@ impl Client {
         let http = reqwest::Client::builder()
             .user_agent(DEFAULT_USER_AGENT)
             .timeout(Duration::from_secs(30))
-            .build()?;
+            .build()
+            .map_err(scrub)?;
         let base = base.into();
         let base = base.trim_end_matches('/').to_string();
         Ok(Self {
@@ -133,12 +153,12 @@ impl Client {
         params: &[(&str, &str)],
     ) -> Result<serde_json::Value, RtdbError> {
         let url = self.build_url(path, params);
-        let resp = self.http.get(url).send().await?;
+        let resp = self.http.get(url).send().await.map_err(scrub)?;
         let status = resp.status();
         if !status.is_success() {
             return Err(http_err(status, resp.text().await.unwrap_or_default()));
         }
-        let bytes = resp.bytes().await?;
+        let bytes = resp.bytes().await.map_err(scrub)?;
         if bytes.is_empty() {
             return Ok(serde_json::Value::Null);
         }
@@ -158,7 +178,7 @@ impl Client {
     /// `DELETE <path>.json` — remove the value at `path`.
     pub async fn delete(&self, path: &str) -> Result<(), RtdbError> {
         let url = self.build_url(path, &[]);
-        let resp = self.http.delete(url).send().await?;
+        let resp = self.http.delete(url).send().await.map_err(scrub)?;
         let status = resp.status();
         if !status.is_success() {
             return Err(http_err(status, resp.text().await.unwrap_or_default()));
@@ -179,7 +199,8 @@ impl Client {
             .header("Content-Type", "application/json")
             .json(val)
             .send()
-            .await?;
+            .await
+            .map_err(scrub)?;
         let status = resp.status();
         if !status.is_success() {
             return Err(http_err(status, resp.text().await.unwrap_or_default()));
@@ -202,15 +223,18 @@ impl Client {
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .header(reqwest::header::CACHE_CONTROL, "no-cache")
             .send()
-            .await?;
+            .await
+            .map_err(scrub)?;
         let status = resp.status();
         if !status.is_success() {
             return Err(http_err(status, resp.text().await.unwrap_or_default()));
         }
 
+        // Through `scrub` before stringifying: a mid-stream transport error
+        // formats the URL it failed on, and this one carries `?auth=<idToken>`.
         let stream = resp
             .bytes_stream()
-            .map(|r| r.map_err(|e| std::io::Error::other(e.to_string())));
+            .map(|r| r.map_err(|e| std::io::Error::other(scrub(e).to_string())));
         let reader = BufReader::new(StreamReader::new(stream));
 
         let (tx, rx) = mpsc::channel(64);
@@ -407,6 +431,37 @@ mod tests {
         let ev = rx.recv().await.unwrap().unwrap();
         assert_eq!(ev.kind, SseEventKind::Put);
         assert_eq!(ev.data["a"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_transport_error_never_prints_the_auth_token() {
+        // Every RTDB URL carries `?auth=<idToken>`, and reqwest's error Display
+        // appends the URL it failed on. These errors are logged at debug into a
+        // file written with default permissions, so the query has to be gone
+        // before the error can ever be formatted.
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(1))
+            .build()
+            .unwrap();
+        // Unroutable by definition (RFC 5737 TEST-NET-1), so this fails in
+        // connect or timeout without depending on the network.
+        let err = client
+            .get("http://192.0.2.1/x.json?auth=SUPER_SECRET_TOKEN&orderBy=%22timestamp%22")
+            .send()
+            .await
+            .expect_err("must not succeed");
+
+        let leaked = format!("{err}");
+        assert!(
+            leaked.contains("SUPER_SECRET_TOKEN"),
+            "precondition: reqwest really does print the query: {leaked}",
+        );
+
+        let scrubbed = format!("{}", scrub(err));
+        assert!(
+            !scrubbed.contains("SUPER_SECRET_TOKEN") && !scrubbed.contains("auth="),
+            "the token must not survive into a formatted error: {scrubbed}",
+        );
     }
 
     #[tokio::test]

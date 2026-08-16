@@ -62,6 +62,19 @@ impl Toast {
         }
     }
 
+    /// A neutral notice the user did not ask for, held a little longer than a
+    /// confirmation because nothing on screen prompted them to look.
+    ///
+    /// Styled as a success rather than a warning: it is news, not a problem.
+    pub fn info(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            expires_at: Instant::now() + Duration::from_secs(6),
+            countdown: false,
+            kind: ToastKind::Success,
+        }
+    }
+
     /// A brief warning/failure notice that isn't a rate-limit countdown.
     pub fn warning(text: impl Into<String>) -> Self {
         Self {

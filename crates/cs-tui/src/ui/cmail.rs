@@ -912,7 +912,12 @@ impl CmailScreen {
         // highlight gutter and every body row carries a 2-space indent, so the
         // text flows within `width - 4`.
         let body_width = (layout[0].width as usize).saturating_sub(4).max(1);
-        let body_layout = chat::BodyLayout::new(body_width);
+        // No single message may exceed the pane. ratatui's `List` renders an
+        // over-tall item as NOTHING, blanking the whole conversation, so a long
+        // enough DM would hide the entire thread. One row is left for the
+        // message's own header.
+        let body_cap = (layout[0].height as usize).saturating_sub(1).max(1);
+        let body_layout = chat::BodyLayout::new(body_width).with_max_rows(body_cap);
         let heights = message_row_heights(&messages.items, unread_from, body_layout);
         let content_rows: usize = heights.iter().map(|&h| usize::from(h)).sum();
         let mut messages_area = bottom_aligned_messages_area(layout[0], content_rows);

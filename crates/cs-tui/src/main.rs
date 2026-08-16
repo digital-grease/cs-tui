@@ -8,6 +8,7 @@ mod config;
 mod prefs;
 mod session;
 mod ui;
+mod update;
 
 use config::Config;
 use prefs::Prefs;
@@ -43,8 +44,24 @@ struct Cli {
     config: Option<PathBuf>,
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<()> {
+/// Owns the runtime explicitly so shutdown can be bounded.
+///
+/// Dropping a runtime waits for its blocking pool, and DNS resolution runs
+/// there and cannot be cancelled. Since the terminal is restored before this
+/// returns, an unbounded wait would leave an invisible process holding the
+/// shell for as long as a slow or blackholed resolver takes. Whatever is still
+/// in flight by then is best-effort anyway: a presence withdrawal, a typing
+/// clear, an update check.
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run());
+    runtime.shutdown_timeout(std::time::Duration::from_millis(250));
+    result
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     init_tracing(cli.debug);
