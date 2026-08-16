@@ -2926,9 +2926,13 @@ impl App {
                 }
                 self.push_screen(Screen::Guild(screen));
                 self.spawn_guild_open(slug);
-                if self.own_guilds.is_none() {
-                    self.spawn_own_guilds();
-                }
+                // Always re-read, not just when the cache is empty. It is only
+                // ever refreshed by THIS client's own join/leave/promote, so a
+                // membership changed on the website (or in another session)
+                // leaves it wrong for the life of the process, and `arm_join`
+                // refuses a legal join on the strength of it. The cached copy
+                // above still fills the screen immediately; this corrects it.
+                self.spawn_own_guilds();
             }
             Action::GuildRefresh { slug, tab } => {
                 // Re-read the guild itself, not just the open tab. Join, promote
@@ -5546,11 +5550,15 @@ impl App {
             // Mention a given version once, however many times cs-tui is
             // started while it is the newest. The menu entry carries it from
             // then on, so nothing is lost by staying quiet.
-            let announce = seen.as_deref() != Some(release.version.as_str());
-            if announce {
+            // Announce only if the "already told them" marker actually lands.
+            // If prefs cannot be written, a toast every launch is worse than no
+            // toast: the menu entry still carries the release, so nothing is
+            // lost, and the user is not nagged forever by a fault they cannot
+            // see.
+            let announce = seen.as_deref() != Some(release.version.as_str()) && {
                 let version = release.version.clone();
-                crate::prefs::Prefs::edit(|p| p.last_seen_version = Some(version));
-            }
+                crate::prefs::Prefs::edit(|p| p.last_seen_version = Some(version))
+            };
             let _ = tx.send(BgEvent::UpdateAvailable { release, announce });
         });
     }
@@ -9994,6 +10002,29 @@ mod tests {
             s.own_guilds.as_ref().map(Vec::len),
             Some(1),
             "the cache must travel with the screen"
+        );
+
+        // ...and a re-read is issued even though the cache was already warm.
+        // It is only ever refreshed by this client's own join/leave/promote, so
+        // a membership changed on the website would otherwise stay wrong for the
+        // life of the process, with arm_join refusing a legal join on it.
+        let fresh = vec![
+            own_guild("night-owls", cs_api::GuildRole::Member),
+            own_guild("deep-divers", cs_api::GuildRole::Apprentice),
+        ];
+        app.handle_bg_event(BgEvent::OwnGuilds(Ok(fresh)));
+        assert_eq!(
+            app.own_guilds.as_ref().map(Vec::len),
+            Some(2),
+            "the corrected list replaces the cache",
+        );
+        let Screen::Guild(s) = &app.screen else {
+            panic!("still on the guild");
+        };
+        assert_eq!(
+            s.own_guilds.as_ref().map(Vec::len),
+            Some(2),
+            "and reaches the screen already showing a prompt built from the old one",
         );
     }
 

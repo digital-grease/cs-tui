@@ -42,26 +42,43 @@ impl Prefs {
     /// everyone else's (cycling the theme would erase the update-check stamp).
     /// Read-modify-write keeps the writers independent.
     ///
-    /// A failed save is logged and otherwise ignored: prefs are a convenience
-    /// and must never be load-bearing.
-    pub fn edit(edit: impl FnOnce(&mut Self)) {
+    /// Returns whether the change reached disk. Callers that persist a
+    /// "we already did this" marker need to know, because a marker that never
+    /// lands means the thing gets done again on every launch.
+    pub fn edit(edit: impl FnOnce(&mut Self)) -> bool {
         let Ok(path) = Self::default_path() else {
-            return;
+            return false;
         };
         // Deliberately NOT `load()`, which flattens a damaged file into
-        // defaults. Writing those defaults back would silently destroy whatever
-        // the file still held (the saved theme, most visibly). A missing file
-        // still reads as defaults, which is the case we do want to write.
+        // defaults: writing those back would destroy whatever the file still
+        // held (the saved theme, most visibly). A missing file still reads as
+        // defaults, which is the case we do want to write.
         let mut prefs = match Self::load_from(&path) {
             Ok(prefs) => prefs,
             Err(e) => {
-                tracing::warn!(error = %e, "prefs unreadable; leaving the file untouched");
-                return;
+                // Move it aside rather than refusing forever. Bailing preserved
+                // the damaged file but left every marker unwritable, so a
+                // once-a-day update check became once-per-launch for good. This
+                // heals on the next write and keeps the old file for inspection.
+                let aside = path.with_extension("json.corrupt");
+                tracing::warn!(
+                    error = %e,
+                    moved_to = %aside.display(),
+                    "prefs unreadable; starting fresh",
+                );
+                if fs::rename(&path, &aside).is_err() {
+                    return false;
+                }
+                Self::default()
             }
         };
         edit(&mut prefs);
-        if let Err(e) = prefs.save_to(&path) {
-            tracing::warn!(error = %e, "prefs save failed");
+        match prefs.save_to(&path) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "prefs save failed");
+                false
+            }
         }
     }
 
@@ -216,6 +233,50 @@ mod tests {
         assert_eq!(again.last_update_check, Some(42));
         assert_eq!(again.last_seen_version.as_deref(), Some("9.9.9"));
         let _ = fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_damaged_prefs_file_is_moved_aside_and_replaced() {
+        // Refusing to write over a damaged file preserved it, but left every
+        // marker unwritable: a once-a-day update check then ran, and announced
+        // itself, on every launch forever. Heal instead, keeping the old file.
+        let dir = tmp_path("damaged");
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("prefs.json");
+        fs::write(&p, b"{ this is not json").unwrap();
+
+        let mut loaded = Prefs::load_from(&p);
+        assert!(loaded.is_err(), "precondition: the file is unreadable");
+
+        // What `edit` does on the damaged path, exercised directly since `edit`
+        // itself resolves the XDG location rather than taking one.
+        let aside = p.with_extension("json.corrupt");
+        fs::rename(&p, &aside).unwrap();
+        Prefs {
+            last_update_check: Some(99),
+            ..Prefs::default()
+        }
+        .save_to(&p)
+        .unwrap();
+
+        loaded = Prefs::load_from(&p);
+        assert_eq!(loaded.unwrap().last_update_check, Some(99), "marker landed");
+        assert!(aside.exists(), "the damaged file is kept for inspection");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_save_leaves_no_temp_file_behind() {
+        let dir = tmp_path("atomic");
+        fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("prefs.json");
+        Prefs::default().save_to(&p).unwrap();
+        assert!(p.exists());
+        assert!(
+            !p.with_extension("json.tmp").exists(),
+            "the temp file must be renamed, not left alongside",
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
