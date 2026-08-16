@@ -236,15 +236,15 @@ fn cell_width(ch: char) -> usize {
 }
 
 /// Total display width of a char slice.
-fn display_width(chars: &[char]) -> usize {
+pub(super) fn display_width(chars: &[char]) -> usize {
     chars.iter().map(|&c| cell_width(c)).sum()
 }
 
 /// One visual row of a logical line, as a half-open char range `chars[start..end]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Segment {
-    start: usize,
-    end: usize,
+pub(super) struct Segment {
+    pub start: usize,
+    pub end: usize,
 }
 
 /// Hard-wrap one logical line to content width `w`.
@@ -254,7 +254,7 @@ struct Segment {
 /// the right edge. Guarantees forward progress (every segment advances the char
 /// index by >= 1), so degenerate widths (`w == 0`, or `w == 1` facing a 2-wide
 /// glyph) terminate.
-fn wrap_line(line: &[char], w: usize) -> Vec<Segment> {
+pub(super) fn wrap_line(line: &[char], w: usize) -> Vec<Segment> {
     let w = w.max(1);
     let mut segs = Vec::new();
     let mut seg_start = 0;
@@ -322,21 +322,28 @@ fn logical_row_of(m: &WrapMap, vrow: usize) -> usize {
 /// (where the next glyph will land), except at true end-of-line, which has no
 /// next segment and renders at the right edge of the last segment.
 fn cursor_to_visual(m: &WrapMap, lines: &[Vec<char>], row: usize, col: usize) -> (usize, usize) {
-    let segs = &m.segs[row];
-    let base = m.vrow_base[row];
-    let line = &lines[row];
+    let (k, vcol) = caret_in_line(&lines[row], &m.segs[row], col);
+    (m.vrow_base[row] + k, vcol)
+}
+
+/// Where caret `col` sits inside one already-wrapped logical line: its segment
+/// index, and its display column within that segment.
+///
+/// Shared with the cIRC composer, which wraps a single line of its own and needs
+/// the caret placed by exactly the same rule as the editor: at a wrap boundary
+/// the caret belongs at the START of the next segment (where the next glyph will
+/// land), except at true end-of-line, which has no next segment and sits at the
+/// right edge of the last one.
+pub(super) fn caret_in_line(line: &[char], segs: &[Segment], col: usize) -> (usize, usize) {
     for (k, seg) in segs.iter().enumerate() {
         let is_last = k + 1 == segs.len();
         if col < seg.end || (is_last && col == seg.end) {
-            return (base + k, display_width(&line[seg.start..col]));
+            return (k, display_width(&line[seg.start..col]));
         }
     }
     let last = segs.len() - 1;
     let seg = segs[last];
-    (
-        base + last,
-        display_width(&line[seg.start..col.min(line.len())]),
-    )
+    (last, display_width(&line[seg.start..col.min(line.len())]))
 }
 
 /// Map a visual `(vrow, target_vcol)` back to the nearest logical `(row, col)`,

@@ -22,6 +22,17 @@ pub fn collapse_newlines(text: &str) -> String {
         .collect()
 }
 
+/// Byte offset of char index `at` in `s`, or `s.len()` when `at` is past the
+/// end (so it can address the position just after the last character).
+///
+/// Every caret in the client is a char index, and every edit has to become a
+/// byte offset before `String` will take it, so the conversion lives here rather
+/// than once per field.
+#[must_use]
+pub fn byte_index(s: &str, at: usize) -> usize {
+    s.char_indices().nth(at).map_or(s.len(), |(i, _)| i)
+}
+
 /// Render a focused input value into a `Line`, windowed to `width` cells so the
 /// caret at char index `cursor` (`0..=len`) stays in view, with a reverse-video
 /// block caret.

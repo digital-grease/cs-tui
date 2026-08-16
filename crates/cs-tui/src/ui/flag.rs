@@ -106,12 +106,12 @@ impl<T> FlagPrompt<T> {
             KeyCode::Enter => return FlagPromptKey::Submitted,
             KeyCode::Esc => return FlagPromptKey::Cancelled,
             KeyCode::Backspace if self.cursor > 0 => {
-                let at = byte_index(&self.reason, self.cursor - 1);
+                let at = super::input::byte_index(&self.reason, self.cursor - 1);
                 self.reason.remove(at);
                 self.cursor -= 1;
             }
             KeyCode::Delete if self.cursor < self.len() => {
-                let at = byte_index(&self.reason, self.cursor);
+                let at = super::input::byte_index(&self.reason, self.cursor);
                 self.reason.remove(at);
             }
             KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
@@ -137,16 +137,10 @@ impl<T> FlagPrompt<T> {
         if self.len() >= MAX_FLAG_REASON {
             return;
         }
-        let at = byte_index(&self.reason, self.cursor);
+        let at = super::input::byte_index(&self.reason, self.cursor);
         self.reason.insert(at, c);
         self.cursor += 1;
     }
-}
-
-/// Byte offset of char index `at` in `s`, or `s.len()` when `at` is past the
-/// end (so it can address the position just after the last character).
-fn byte_index(s: &str, at: usize) -> usize {
-    s.char_indices().nth(at).map_or(s.len(), |(i, _)| i)
 }
 
 /// Draw an open flag-reason prompt into `area`: a hint row carrying a live
