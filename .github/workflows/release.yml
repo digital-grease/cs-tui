@@ -14,9 +14,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The tag and the crate version must agree. The version is compiled into the
+  # binary and the in-app update check compares GitHub's latest tag against it,
+  # so tagging v0.4.4 without bumping Cargo.toml ships a binary that calls
+  # itself 0.4.3 and then tells every user of that release to update to the
+  # version they are already running. Fail here instead.
+  verify-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Tag matches Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          echo "tag=$tag crate=$crate"
+          if [ "$tag" != "$crate" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $crate; bump the version before tagging"
+            exit 1
+          fi
+
   # upload-rust-binary-action uploads into an existing Release but does not
   # create one, so make the Release once here; the matrix below fills it.
   create-release:
+    needs: verify-version
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6

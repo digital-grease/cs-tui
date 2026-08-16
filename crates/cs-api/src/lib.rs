@@ -1,6 +1,7 @@
 //! Async Rust client for the cyberspace.online API (v0.8.6).
 //!
-//! Authoritative spec: `docs/api-v0.8.6.md` at the repo root.
+//! Targets Cyberspace API v0.8.6. Comments cite that spec by section name;
+//! the spec itself is not redistributed with this repository.
 #![deny(rust_2018_idioms)]
 
 mod auth;

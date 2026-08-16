@@ -119,6 +119,16 @@ struct TypingPublisher {
     /// The refresh cadence, read off the last successful `POST` rather than
     /// assumed. `None` until one has answered.
     heartbeat: Option<Duration>,
+    /// The conversation a `POST` was last ATTEMPTED on, and when, successful or
+    /// not.
+    ///
+    /// A failure clears `published`, since the flag is not actually live. That
+    /// alone would make [`Self::due`] true again immediately and retry on every
+    /// 1 s tick, hammering a server that just refused (or a network that is
+    /// down). Holding the attempt separately keeps the retry on the server's own
+    /// cadence, while staying keyed to the conversation so switching to a
+    /// different one still publishes at once.
+    last_attempt: Option<(String, Instant)>,
 }
 
 impl TypingPublisher {
@@ -137,7 +147,15 @@ impl TypingPublisher {
             Some((id, sent_at)) if id == conversation_id => {
                 now.duration_since(*sent_at) >= self.heartbeat()
             }
-            _ => true,
+            // Not publishing: due, unless an attempt on THIS conversation that
+            // failed is still inside the cadence, which would otherwise retry on
+            // every tick. A different conversation is always due.
+            _ => match &self.last_attempt {
+                Some((id, at)) if id == conversation_id => {
+                    now.duration_since(*at) >= self.heartbeat()
+                }
+                _ => true,
+            },
         }
     }
 
@@ -158,7 +176,9 @@ impl TypingPublisher {
 
     /// Record that the flag has just been posted for `conversation_id`.
     fn mark_sent(&mut self, conversation_id: &str) {
-        self.published = Some((conversation_id.to_string(), Instant::now()));
+        let now = Instant::now();
+        self.published = Some((conversation_id.to_string(), now));
+        self.last_attempt = Some((conversation_id.to_string(), now));
     }
 
     /// Whether the flag we are publishing is on `conversation_id`.
@@ -212,6 +232,16 @@ pub enum BgEvent {
     /// The newest feed page from the background poll — prepended without moving
     /// the user's scroll position. Only emitted while the feed is on screen.
     FeedHead(Vec<Entry>),
+    /// A newer cs-tui release exists. Only ever sent when one was found, so
+    /// there is no "up to date" case to handle.
+    ///
+    /// `announce` is false once this version has already been mentioned, which
+    /// the background check decides so that the handler needs no disk access and
+    /// stays testable.
+    UpdateAvailable {
+        release: crate::update::Release,
+        announce: bool,
+    },
     /// A fresh notifications page, tagged with the query generation that asked
     /// for it so a response from a superseded filter can be dropped.
     NotificationsInitial(u64, Result<(Vec<Notification>, Option<String>), String>),
@@ -426,7 +456,7 @@ pub enum BgEvent {
     /// above 100 unread the server counts only the 100 most recent and the
     /// badge has to read "99+" instead of the figure, which `count` alone
     /// cannot say.
-    UnreadCount(UnreadCount),
+    UnreadCount(u64, UnreadCount),
     ProfileUser(Result<User, String>),
     ProfilePosts {
         more: bool,
@@ -1023,6 +1053,10 @@ pub struct App {
     /// Bumped on refresh to invalidate the in-flight warm-up task (its remaining
     /// pages are discarded by epoch check) before a fresh one starts.
     topics_epoch: Arc<AtomicU64>,
+    /// A published release newer than this binary, once the daily check has
+    /// found one. Purely informational: nothing is ever downloaded, the user is
+    /// shown a version and a link and decides for themselves.
+    update_available: Option<crate::update::Release>,
     /// Generation counter for the notifications query (mirrors `topics_epoch`),
     /// bumped every time a fresh query starts: the initial load, `r`, and the
     /// `f`/`t` filter keys.
@@ -1034,6 +1068,14 @@ pub struct App {
     /// epoch lets a late page from the old query be dropped instead of appended
     /// under the new filter's heading, taking the old cursor with it.
     notifications_epoch: Arc<AtomicU64>,
+    /// Generation counter for the unread-notification count.
+    ///
+    /// Bumped whenever the count is changed locally (an optimistic
+    /// mark-read). A poll issued BEFORE that change can otherwise land
+    /// after the corrective re-read and restore the stale badge until the
+    /// next poll interval, which is exactly the flicker the old delayed
+    /// resync existed to avoid.
+    unread_epoch: Arc<AtomicU64>,
     /// The user's followed / muted topic slugs (from settings), used for the
     /// topics-list markers and the follow/mute toggles. Loaded lazily the first
     /// time the topics section is opened.
@@ -1156,6 +1198,8 @@ impl App {
             topics_complete: false,
             topics_epoch: Arc::new(AtomicU64::new(0)),
             notifications_epoch: Arc::new(AtomicU64::new(0)),
+            unread_epoch: Arc::new(AtomicU64::new(0)),
+            update_available: None,
             topic_follows: Vec::new(),
             topic_mutes: Vec::new(),
             topic_prefs_loaded: false,
@@ -1262,6 +1306,10 @@ impl App {
     }
 
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> Result<()> {
+        // Kicked off before the first draw but never awaited, so a slow or dead
+        // network cannot delay startup by a single frame.
+        self.spawn_update_check();
+
         // 1s heartbeat that only fires while a toast is up (see the guarded
         // select arm); it animates the countdown without waking an idle TUI.
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
@@ -2074,6 +2122,24 @@ impl App {
                         menu.refresh_theme_label(self.theme_kind.name());
                     }
                 }
+                MenuIntent::OpenUpdate => {
+                    self.menu = None;
+                    // Opens the release page and stops there. cs-tui never
+                    // downloads or installs anything: rewriting its own binary
+                    // would be a trust problem and would fight whatever package
+                    // manager put it there.
+                    if let Some(url) = self.update_available.as_ref().map(|r| r.url.clone()) {
+                        match super::open::open_url(&url) {
+                            Ok(()) => {
+                                self.toast = Some(Toast::confirmation("opening in browser…"));
+                            }
+                            Err(e) => {
+                                tracing::debug!(error = %e, %url, "failed to open release page");
+                                self.toast = Some(Toast::warning("couldn't open your browser"));
+                            }
+                        }
+                    }
+                }
                 MenuIntent::Quit => self.should_quit = true,
             }
             return;
@@ -2150,6 +2216,7 @@ impl App {
                     authenticated,
                     false,
                     self.theme_kind.name(),
+                    self.update_available.is_some(),
                 ));
             } else {
                 self.pop_screen();
@@ -2958,6 +3025,15 @@ impl App {
                     self.toast = Some(Toast::confirmation("↑ new posts"));
                 }
             }
+            BgEvent::UpdateAvailable { release, announce } => {
+                if announce {
+                    self.toast = Some(Toast::info(format!(
+                        "cs-tui {} is available (esc menu for the link)",
+                        release.version
+                    )));
+                }
+                self.update_available = Some(release);
+            }
             BgEvent::NotificationsInitial(epoch, result) => {
                 if epoch != self.notifications_epoch.load(Ordering::SeqCst) {
                     return;
@@ -3237,11 +3313,11 @@ impl App {
                 }
             }
             BgEvent::NotificationMarkedRead | BgEvent::AllNotificationsMarked => {
-                // Server confirmed the mark; local UI already updated optimistically.
-                // Converge on truth with a *delayed* re-read: the count endpoint
-                // is cached server-side (~5s), so an immediate poll would return
-                // the pre-mark value and flick the just-cleared badge back to its
-                // old number. The resync waits past that cache window.
+                // Server confirmed the mark; local UI already updated
+                // optimistically. Converge on truth with a re-read. It goes out
+                // immediately: § Unread Count says marking anything read clears
+                // the server's cache, so the poll sees the post-mark figure
+                // rather than the stale one it used to have to wait out.
                 self.spawn_unread_count_resync();
             }
             BgEvent::NotificationMarkFailed { notification_id } => {
@@ -3519,7 +3595,10 @@ impl App {
                     self.warn_toast_unless_signalled("couldn't open that post");
                 }
             },
-            BgEvent::UnreadCount(n) => {
+            BgEvent::UnreadCount(epoch, n) => {
+                if epoch != self.unread_epoch.load(Ordering::SeqCst) {
+                    return;
+                }
                 // A successful poll doubles as an online heartbeat.
                 self.offline = false;
                 self.unread_count = n;
@@ -4161,6 +4240,12 @@ impl App {
     /// costs at most one staleness window of stale presence on somebody else's
     /// screen. A client that cannot exit is worse.
     async fn broadcast_teardown(&mut self) {
+        // Invalidate the generation FIRST, the same ordering goto_root uses.
+        // The heartbeat loop is otherwise still live while the withdrawal is in
+        // flight, and a beat landing after the DELETE re-announces the user into
+        // the room they just left, where they then linger for staleAfterMs.
+        self.circ_stream_epoch.fetch_add(1, Ordering::SeqCst);
+        self.cmail_stream_epoch.fetch_add(1, Ordering::SeqCst);
         let room = crate::config::get()
             .circ_presence
             .then(|| self.open_circ_room())
@@ -4459,12 +4544,8 @@ impl App {
             .unwrap_or(0);
         self.theme_kind = kinds[(idx + 1) % kinds.len()];
         self.theme = self.resolve_theme(self.theme_kind);
-        let prefs = crate::prefs::Prefs {
-            theme: Some(self.theme_kind.name().to_string()),
-        };
-        if let Err(e) = prefs.save() {
-            tracing::warn!(error = %e, "theme prefs save failed");
-        }
+        let name = self.theme_kind.name().to_string();
+        crate::prefs::Prefs::edit(|p| p.theme = Some(name));
     }
 
     fn goto_root(&mut self, target: RootKind) {
@@ -4838,9 +4919,17 @@ impl App {
             epoch_ref.clone(),
         ));
         // Who's in the room: one REST snapshot now, then the live node
-        // (§ Who's in a room, § Reading a room in real time).
+        // (§ Who's in a room, § Reading a room in real time), plus a slow REST
+        // re-read so the roster survives the stream dying or never starting.
         self.spawn_circ_room_users(room_id.clone());
         tokio::spawn(circ_presence_stream_loop(
+            self.client.clone(),
+            self.bg_tx.clone(),
+            room_id.clone(),
+            epoch,
+            epoch_ref.clone(),
+        ));
+        tokio::spawn(circ_room_users_poll_loop(
             self.client.clone(),
             self.bg_tx.clone(),
             room_id.clone(),
@@ -5417,6 +5506,55 @@ impl App {
         });
     }
 
+    /// Ask GitHub whether a newer cs-tui exists, at most once a day.
+    ///
+    /// Fire and forget: nothing awaits this, no screen waits on it, and every
+    /// failure is silent. The stamp is written BEFORE the request so an offline
+    /// or rate-limited run waits out the interval like any other, instead of
+    /// retrying on every launch.
+    ///
+    /// Every prefs read and write for the update check lives here, so the event
+    /// handler stays a pure function of the message it receives.
+    fn spawn_update_check(&self) {
+        if !crate::config::get().update_check {
+            return;
+        }
+        let now = now_millis() / 1_000;
+        let prefs = crate::prefs::Prefs::load();
+        let seen = prefs.last_seen_version.clone();
+        if !prefs.update_check_due(now) {
+            // Not due, but a release found on an earlier run may still be newer
+            // than this binary, and the menu entry is where the user goes for
+            // the link. Offer it without announcing it again.
+            if let Some(release) =
+                crate::update::remembered(seen.as_deref(), crate::update::current_version())
+            {
+                let _ = self.bg_tx.send(BgEvent::UpdateAvailable {
+                    release,
+                    announce: false,
+                });
+            }
+            return;
+        }
+        crate::prefs::Prefs::edit(|p| p.last_update_check = Some(now));
+
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let Some(release) = crate::update::check(crate::update::current_version()).await else {
+                return;
+            };
+            // Mention a given version once, however many times cs-tui is
+            // started while it is the newest. The menu entry carries it from
+            // then on, so nothing is lost by staying quiet.
+            let announce = seen.as_deref() != Some(release.version.as_str());
+            if announce {
+                let version = release.version.clone();
+                crate::prefs::Prefs::edit(|p| p.last_seen_version = Some(version));
+            }
+            let _ = tx.send(BgEvent::UpdateAvailable { release, announce });
+        });
+    }
+
     /// Re-read a guild's header and the caller's membership state.
     ///
     /// Split out from [`Self::spawn_guild_open`] so a refresh can correct the
@@ -5930,10 +6068,11 @@ impl App {
     fn spawn_unread_count_once(&self) {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
+        let epoch = self.unread_epoch.load(Ordering::SeqCst);
         tokio::spawn(async move {
             match client.unread_notification_count().await {
                 Ok(n) => {
-                    let _ = tx.send(BgEvent::UnreadCount(n));
+                    let _ = tx.send(BgEvent::UnreadCount(epoch, n));
                 }
                 Err(e) => {
                     let msg = note_api_err(&tx, e);
@@ -5954,12 +6093,15 @@ impl App {
     /// straight after a mark-all that hit the server's 5,000 ceiling instead of
     /// waiting out a delay that no longer buys anything.
     fn spawn_unread_count_resync(&self) {
+        // This read is the authority on the count after a local change, so it
+        // invalidates every poll issued before it.
+        let epoch = self.unread_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
             match client.unread_notification_count().await {
                 Ok(n) => {
-                    let _ = tx.send(BgEvent::UnreadCount(n));
+                    let _ = tx.send(BgEvent::UnreadCount(epoch, n));
                 }
                 Err(e) => {
                     let msg = note_api_err(&tx, e);
@@ -6517,6 +6659,7 @@ impl App {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         let wake = self.offline_notify.clone();
+        let unread_epoch = self.unread_epoch.clone();
         let online_delay = crate::config::get().notifications_refresh_secs;
         tokio::spawn(async move {
             // Brief settle delay so the initial render lands before the first poll.
@@ -6530,9 +6673,13 @@ impl App {
             // `wake` notification cuts the sleep short so the marker clears
             // promptly on reconnect.
             loop {
+                // Read the generation BEFORE the request: if a mark-read
+                // happens while it is in flight, this answer is stale and the
+                // handler drops it rather than restoring the old badge.
+                let epoch = unread_epoch.load(Ordering::SeqCst);
                 let next_delay = match client.unread_notification_count().await {
                     Ok(n) => {
-                        if tx.send(BgEvent::UnreadCount(n)).is_err() {
+                        if tx.send(BgEvent::UnreadCount(epoch, n)).is_err() {
                             return; // app gone
                         }
                         online_delay
@@ -6920,6 +7067,57 @@ async fn circ_room_poll_loop(
     }
 }
 
+/// Periodic REST re-read of the room's user list.
+///
+/// The roster's live source is the presence SSE node, but that stream ends
+/// permanently on any transport error and cannot be established at all on some
+/// networks. Without this, entries simply age past `staleAfterMs` and the pane
+/// then states, with confidence, that an occupied room is empty, for the rest of
+/// the session. The message pane has had exactly this fallback all along; the
+/// roster shipped without it.
+///
+/// Keeps looping on error, like the message poll, since a failed read is
+/// precisely when the next one matters.
+async fn circ_room_users_poll_loop(
+    client: Client,
+    tx: mpsc::UnboundedSender<BgEvent>,
+    room_id: String,
+    epoch: u64,
+    epoch_ref: Arc<AtomicU64>,
+) {
+    // Comfortably inside the server's default 180s staleness window, and 2/min
+    // against a 60/min read budget (§ Who's in a room).
+    const POLL_SECS: u64 = 30;
+    loop {
+        tokio::time::sleep(Duration::from_secs(POLL_SECS)).await;
+        if epoch != epoch_ref.load(Ordering::SeqCst) {
+            return;
+        }
+        match client.list_circ_room_users(&room_id).await {
+            Ok(users) => {
+                if epoch != epoch_ref.load(Ordering::SeqCst) {
+                    return;
+                }
+                if tx
+                    .send(BgEvent::CircRoomUsers {
+                        room_id: room_id.clone(),
+                        epoch,
+                        result: Ok(users),
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(e) => {
+                // Deliberately not surfaced: the roster is a nicety, and the
+                // snapshot already on screen is better than an error banner.
+                tracing::debug!(error = %e, room_id, "circ room users poll failed");
+            }
+        }
+    }
+}
+
 async fn circ_stream_loop(
     client: Client,
     tx: mpsc::UnboundedSender<BgEvent>,
@@ -7054,7 +7252,7 @@ async fn circ_presence_stream_loop(
         let mut rx = match rtdb.subscribe(&path, &[]).await {
             Ok(rx) => rx,
             Err(e) => {
-                tracing::debug!(error = %e, "circ presence subscribe failed; roster stays on REST");
+                tracing::debug!(error = %e, "circ presence subscribe failed; roster falls back to the REST poll");
                 return;
             }
         };
@@ -7100,7 +7298,7 @@ async fn circ_presence_stream_loop(
                     ..
                 }) => {}
                 Err(e) => {
-                    tracing::debug!(error = %e, "circ presence stream error; roster stays on REST");
+                    tracing::debug!(error = %e, "circ presence stream error; roster falls back to the REST poll");
                     return;
                 }
             }
@@ -7465,7 +7663,7 @@ mod tests {
         // invisible menu and the UI appeared frozen.
         let mut app = test_app();
         assert!(app.screen.is_login());
-        app.menu = Some(MenuOverlay::build(false, false, "cyber"));
+        app.menu = Some(MenuOverlay::build(false, false, "cyber", false));
         let text = render_to_string(&app);
         assert!(text.contains("menu"), "menu title not drawn: {text:?}");
         assert!(text.contains("Quit"), "Quit item not drawn");
@@ -8193,7 +8391,10 @@ mod tests {
         app.screen = Screen::Notifications(screen);
         app.current_root = Some(RootKind::Notifications);
         app.offline = true;
-        app.handle_bg_event(BgEvent::UnreadCount(unread(4)));
+        app.handle_bg_event(BgEvent::UnreadCount(
+            app.unread_epoch.load(Ordering::SeqCst),
+            unread(4),
+        ));
         assert!(!app.offline, "a successful poll is an online heartbeat");
         assert_eq!(app.unread_count.count, 4);
         assert!(app.unread_count.exact);
@@ -9201,6 +9402,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_count_issued_before_a_mark_read_cannot_restore_the_stale_badge() {
+        // The resync goes out immediately now, so a poll already in flight can
+        // answer after it with the pre-mark figure and flick the badge back for
+        // a whole poll interval.
+        let mut app = test_app();
+        let stale = app.unread_epoch.load(Ordering::SeqCst);
+
+        // The user clears their notifications: the badge drops locally, and the
+        // corrective re-read supersedes anything already asked for.
+        app.handle_bg_event(BgEvent::UnreadCount(stale, unread(0)));
+        app.spawn_unread_count_resync();
+        let fresh = app.unread_epoch.load(Ordering::SeqCst);
+        assert_ne!(stale, fresh, "the re-read starts a new generation");
+
+        // The poll issued before the mark now answers with the OLD figure.
+        app.handle_bg_event(BgEvent::UnreadCount(stale, unread(9)));
+        assert_eq!(
+            app.unread_count.count, 0,
+            "a superseded answer must be dropped, not painted over the cleared badge",
+        );
+
+        // The current generation still applies normally.
+        app.handle_bg_event(BgEvent::UnreadCount(fresh, unread(3)));
+        assert_eq!(app.unread_count.count, 3);
+    }
+
+    #[test]
+    fn a_failed_typing_post_retries_on_cadence_not_on_every_tick() {
+        // A failure clears `published`, because the flag is not live. Without a
+        // record of the attempt that alone made `due` true again immediately,
+        // so the 1s tick retried once a second against a server that had just
+        // refused, or a network that was down.
+        let mut publisher = TypingPublisher::default();
+        publisher.mark_sent("c1");
+        // What the failure handler does.
+        publisher.published = None;
+
+        assert!(
+            !publisher.due("c1", Instant::now()),
+            "a just-failed conversation must wait out the cadence",
+        );
+        assert!(
+            publisher.due("c1", Instant::now() + publisher.heartbeat()),
+            "and become due again once it has",
+        );
+        assert!(
+            publisher.due("c2", Instant::now()),
+            "a different conversation is still due at once",
+        );
+    }
+
+    #[tokio::test]
     async fn typing_into_a_conversation_publishes_the_flag_and_esc_withdraws_it() {
         let mut app = test_app();
         app.screen = Screen::Cmail(CmailScreen::for_open_conversation(test_conversation()));
@@ -9345,6 +9598,34 @@ mod tests {
         app.handle_bg_event(BgEvent::VerificationResent(Err("nope".into())));
         let text = render_to_string(&app);
         assert!(text.contains("resend failed"), "{text:?}");
+    }
+
+    #[test]
+    fn a_found_update_reaches_the_menu_and_toasts() {
+        let mut app = test_app();
+        assert!(app.update_available.is_none());
+
+        let release = crate::update::Release {
+            version: "9.9.9".into(),
+            url: "https://example.invalid/releases/tag/v9.9.9".into(),
+        };
+        app.handle_bg_event(BgEvent::UpdateAvailable {
+            release: release.clone(),
+            announce: true,
+        });
+
+        assert!(app.update_available.is_some(), "held for the menu entry");
+        let text = render_to_string(&app);
+        assert!(text.contains("9.9.9"), "version announced: {text:?}");
+
+        // A version already mentioned goes to the menu without toasting again.
+        let mut quiet = test_app();
+        quiet.handle_bg_event(BgEvent::UpdateAvailable {
+            release,
+            announce: false,
+        });
+        assert!(quiet.update_available.is_some());
+        assert!(quiet.toast.is_none(), "no repeat announcement");
     }
 
     #[test]

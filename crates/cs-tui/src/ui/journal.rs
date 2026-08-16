@@ -416,7 +416,10 @@ impl Default for JournalScreen {
 }
 
 fn note_item<'a>(n: &'a Note, theme: &Theme) -> ListItem<'a> {
-    let when = n.created_at.map(format_relative).unwrap_or_default();
+    let when = n
+        .created_at
+        .map(crate::config::format_list_timestamp)
+        .unwrap_or_default();
     let preview = first_line_truncated(&n.content, 60);
     let topics = if n.topics.is_empty() {
         String::new()
@@ -438,23 +441,6 @@ fn first_line_truncated(s: &str, max: usize) -> String {
     } else {
         let truncated: String = first.chars().take(max - 1).collect();
         format!("{truncated}…")
-    }
-}
-
-fn format_relative(t: OffsetDateTime) -> String {
-    let now = OffsetDateTime::now_utc();
-    let secs = (now - t).whole_seconds();
-    if secs < 60 {
-        format!("{secs}s ago")
-    } else if secs < 3_600 {
-        format!("{}m ago", secs / 60)
-    } else if secs < 86_400 {
-        format!("{}h ago", secs / 3_600)
-    } else if secs < 30 * 86_400 {
-        format!("{}d ago", secs / 86_400)
-    } else {
-        let d = t.date();
-        format!("{}-{:02}-{:02}", d.year(), u8::from(d.month()), d.day())
     }
 }
 

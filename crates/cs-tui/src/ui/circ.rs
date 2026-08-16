@@ -1119,8 +1119,15 @@ impl CircScreen {
         // highlight gutter and the body carries a 2-space indent, so the text
         // wraps within `width - 4`.
         let body_width = (layout[0].width as usize).saturating_sub(4).max(1);
+        // No single message may exceed the pane. ratatui's `List` renders an
+        // over-tall item as NOTHING, blanking the whole conversation, and a
+        // decoded `/art` picture reaches that height routinely. One row is left
+        // for the message's own header.
+        let body_cap = (layout[0].height as usize).saturating_sub(1).max(1);
         let layout_of = |m: &CircMessage| {
-            BodyLayout::new(body_width).with_revealed(select.revealed.contains(&m.id))
+            BodyLayout::new(body_width)
+                .with_revealed(select.revealed.contains(&m.id))
+                .with_max_rows(body_cap)
         };
         let heights: Vec<u16> = visible
             .iter()
@@ -1176,7 +1183,9 @@ impl CircScreen {
                     .iter()
                     .skip(messages.list_offset())
                     .map(|&i| ChatMessage::from(&messages.items[i])),
-                BodyLayout::new(body_width),
+                // Same cap the bodies were drawn with, or a chip cut by the cap
+                // would still be listed and shift the links.
+                BodyLayout::new(body_width).with_max_rows(body_cap),
             );
             chat::apply_chip_links(frame.buffer_mut(), messages_area, &chips, theme);
         }

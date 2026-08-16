@@ -124,6 +124,20 @@ pub struct BodyLayout<'a> {
     /// Whether the reader has revealed this message's spoiler. Owned by the
     /// screen, since it is per-message reader state and not part of the message.
     pub revealed: bool,
+    /// Hard cap on body rows, when the screen has one.
+    ///
+    /// ratatui's `List` cannot render an item taller than its viewport: it
+    /// paints NOTHING at all, not a clipped top, and settles its offset onto the
+    /// offending item so the pane stays blank on later frames too. One
+    /// over-tall message therefore hides the entire conversation, not just
+    /// itself. A decoded `/art` picture reaches 25 lines on an 80 column canvas
+    /// (§ Commands), which wraps to about 50 rows in a standard terminal, so
+    /// this is routine rather than exotic.
+    ///
+    /// Capping here rather than at the render site is what keeps
+    /// [`body_height`] and [`body_lines`] agreeing, since both derive from
+    /// [`body_rows`].
+    pub max_rows: Option<usize>,
 }
 
 impl<'a> BodyLayout<'a> {
@@ -139,7 +153,22 @@ impl<'a> BodyLayout<'a> {
             indent: INDENT,
             width,
             revealed: false,
+            max_rows: None,
         }
+    }
+
+    /// Cap the body at `rows` rows, replacing the overflow with a marker.
+    ///
+    /// A screen drawing into a `List` must set this to the pane's height, or a
+    /// single tall message blanks the whole pane. See [`BodyLayout::max_rows`].
+    ///
+    /// ```ignore
+    /// let layout = chat::BodyLayout::new(width).with_max_rows(pane_rows);
+    /// ```
+    #[must_use]
+    pub fn with_max_rows(mut self, rows: usize) -> Self {
+        self.max_rows = Some(rows);
+        self
     }
 
     /// Mark this message's spoiler as revealed.
@@ -199,6 +228,9 @@ enum BodyRow {
     Chip(ChipLink),
     /// The deletion tombstone.
     Tombstone,
+    /// Stands in for the rows a [`BodyLayout::max_rows`] cap removed, carrying
+    /// how many they were, so a clipped message says so instead of just ending.
+    Truncated(usize),
 }
 
 /// Render a message body into styled lines, indent included.
@@ -241,6 +273,10 @@ pub fn body_lines(
                 BodyRow::Chip(chip) => spans.push(Span::styled(chip.label, chip_style(theme))),
                 BodyRow::Tombstone => spans.push(Span::styled(
                     TOMBSTONE.to_string(),
+                    theme.muted_style().add_modifier(Modifier::ITALIC),
+                )),
+                BodyRow::Truncated(n) => spans.push(Span::styled(
+                    format!("… {n} more lines, too tall for this pane"),
                     theme.muted_style().add_modifier(Modifier::ITALIC),
                 )),
             }
@@ -287,10 +323,18 @@ pub fn message_height(msg: ChatMessage<'_>, layout: BodyLayout<'_>, header_rows:
 /// ```
 #[must_use]
 pub fn message_chips(msg: ChatMessage<'_>, layout: BodyLayout<'_>) -> Vec<ChipLink> {
-    if msg.extras.deleted {
-        return Vec::new();
-    }
-    chips_of(msg.extras, layout.width.max(1))
+    // Derived from the same rows the renderer draws, so the two cannot disagree
+    // about which chips exist. That matters because [`apply_chip_links`] pairs
+    // the chips it is given against the chip runs it finds on screen: a chip
+    // listed here but cut by a `max_rows` cap, or suppressed by a tombstone,
+    // would shift every later chip onto another message's URL.
+    body_rows(msg, layout)
+        .into_iter()
+        .filter_map(|row| match row {
+            BodyRow::Chip(chip) => Some(chip),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The chips of a run of messages, in the order they are drawn.
@@ -634,6 +678,16 @@ fn body_rows(msg: ChatMessage<'_>, layout: BodyLayout<'_>) -> Vec<BodyRow> {
         );
     }
     rows.extend(chips_of(msg.extras, width).into_iter().map(BodyRow::Chip));
+
+    // Last, so the cap counts every row the message actually produced.
+    if let Some(max) = layout.max_rows {
+        let max = max.max(1);
+        if rows.len() > max {
+            let hidden = rows.len() - max + 1;
+            rows.truncate(max - 1);
+            rows.push(BodyRow::Truncated(hidden));
+        }
+    }
     rows
 }
 
@@ -1440,6 +1494,67 @@ mod tests {
             let cell = buf.cell((2, y)).unwrap().symbol().to_string();
             assert!(cell.contains(url), "row {y} should link {url}: {cell:?}");
         }
+    }
+
+    #[test]
+    fn a_body_is_capped_so_it_can_never_blank_its_pane() {
+        // ratatui's List paints NOTHING for an item taller than the viewport,
+        // so one tall message would hide the entire conversation. A decoded
+        // /art picture (80x25 canvas, § Commands) reaches that height on a
+        // normal terminal, which is what makes this routine.
+        let extras = MessageExtras::default();
+        let long = (0..60)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let msg = ChatMessage::new("neo", &long, &extras);
+
+        let capped = BodyLayout::new(40).with_max_rows(10);
+        let height = body_height(msg, capped);
+        assert!(height <= 10, "body must fit the cap, got {height}");
+        assert_eq!(
+            body_lines(msg, capped, &Theme::cyber()).len(),
+            usize::from(height),
+            "measured and drawn heights must agree",
+        );
+
+        let rendered: String = body_lines(msg, capped, &Theme::cyber())
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(
+            rendered.contains("more lines"),
+            "a clipped message must say so: {rendered:?}",
+        );
+
+        // Uncapped is still uncapped, so screens that do not draw into a List
+        // are unaffected.
+        assert!(body_height(msg, BodyLayout::new(40)) > 10);
+    }
+
+    #[test]
+    fn a_chip_cut_by_the_cap_is_not_offered_for_linking() {
+        // apply_chip_links pairs the chips it is given against the runs it finds
+        // on screen. A chip listed but not drawn would shift every later chip
+        // onto another message's URL.
+        let extras = MessageExtras {
+            image_url: Some("https://cdn.example/pic.png".into()),
+            ..MessageExtras::default()
+        };
+        let long = (0..60)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let msg = ChatMessage::new("neo", &long, &extras);
+
+        assert!(
+            message_chips(msg, BodyLayout::new(40)).len() == 1,
+            "uncapped, the chip is there",
+        );
+        assert!(
+            message_chips(msg, BodyLayout::new(40).with_max_rows(5)).is_empty(),
+            "capped away, it must not be offered",
+        );
     }
 
     #[test]

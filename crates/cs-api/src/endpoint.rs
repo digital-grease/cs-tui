@@ -1,6 +1,6 @@
 //! Endpoint keys for rate-limiter accounting. One variant per documented endpoint.
 //!
-//! Rate-limit values come from `docs/api-v0.8.6.md` (§ Rate Limits, plus each
+//! Rate-limit values come from the v0.8.6 spec (§ Rate Limits, plus each
 //! endpoint's own section). Where the consolidated table and the per-endpoint
 //! section disagree, the lower (more restrictive) value is used so the client
 //! cannot self-trigger 429s.
