@@ -2216,7 +2216,7 @@ impl App {
                     authenticated,
                     false,
                     self.theme_kind.name(),
-                    self.update_available.is_some(),
+                    self.update_available.as_ref().map(|r| r.version.as_str()),
                 ));
             } else {
                 self.pop_screen();
@@ -7671,7 +7671,7 @@ mod tests {
         // invisible menu and the UI appeared frozen.
         let mut app = test_app();
         assert!(app.screen.is_login());
-        app.menu = Some(MenuOverlay::build(false, false, "cyber", false));
+        app.menu = Some(MenuOverlay::build(false, false, "cyber", None));
         let text = render_to_string(&app);
         assert!(text.contains("menu"), "menu title not drawn: {text:?}");
         assert!(text.contains("Quit"), "Quit item not drawn");

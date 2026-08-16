@@ -11,29 +11,30 @@ use ratatui::Frame;
 
 use super::theme::Theme;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuItem {
     Back,
     Logout,
     /// Cycle the color palette. Carries the current theme name for its label.
     Theme(&'static str),
-    /// A newer release exists. Opens its page; nothing is downloaded here or
-    /// anywhere else, updating stays the user's decision.
+    /// A newer release exists, named so the menu can say what you would be
+    /// moving to (the title says what you are on). Opens its page; nothing is
+    /// downloaded here or anywhere else, updating stays the user's decision.
     ///
     /// Present only when the daily check found one, which is what keeps the
     /// menu at its usual length the rest of the time.
-    Update,
+    Update(String),
     Quit,
     Cancel,
 }
 
 impl MenuItem {
-    fn label(self) -> String {
+    fn label(&self) -> String {
         match self {
             Self::Back => "Back  (close this screen)".to_string(),
             Self::Logout => "Logout  (clear session, return to login)".to_string(),
             Self::Theme(name) => format!("Theme: {name}  (cycle palette)"),
-            Self::Update => "Update available  (open the release page)".to_string(),
+            Self::Update(version) => format!("Update to {version}  (open the release page)"),
             Self::Quit => "Quit  (exit cs-tui)".to_string(),
             Self::Cancel => "Cancel  (close menu, stay here)".to_string(),
         }
@@ -64,13 +65,13 @@ impl MenuOverlay {
     /// - `has_back` is true when there's a child screen above a root (so "Back"
     ///   is a meaningful action).
     /// - `authenticated` is true after a successful login (so "Logout" is real).
-    /// - `update_available` is true once the daily check has found a newer
-    ///   release, which adds the entry that opens its page.
+    /// - `update` carries the version the daily check found, when it found one,
+    ///   which adds the entry that opens its release page.
     pub fn build(
         authenticated: bool,
         has_back: bool,
         theme_name: &'static str,
-        update_available: bool,
+        update: Option<&str>,
     ) -> Self {
         let mut items = Vec::new();
         if has_back {
@@ -80,8 +81,8 @@ impl MenuOverlay {
             items.push(MenuItem::Logout);
         }
         items.push(MenuItem::Theme(theme_name));
-        if update_available {
-            items.push(MenuItem::Update);
+        if let Some(version) = update {
+            items.push(MenuItem::Update(version.to_string()));
         }
         items.push(MenuItem::Quit);
         items.push(MenuItem::Cancel);
@@ -90,12 +91,12 @@ impl MenuOverlay {
 
     /// What choosing `item` means. Shared by Enter and the number shortcuts, so
     /// the two can never drift.
-    fn intent_for(item: MenuItem) -> MenuIntent {
+    fn intent_for(item: &MenuItem) -> MenuIntent {
         match item {
             MenuItem::Back => MenuIntent::Back,
             MenuItem::Logout => MenuIntent::Logout,
             MenuItem::Theme(_) => MenuIntent::CycleTheme,
-            MenuItem::Update => MenuIntent::OpenUpdate,
+            MenuItem::Update(_) => MenuIntent::OpenUpdate,
             MenuItem::Quit => MenuIntent::Quit,
             MenuItem::Cancel => MenuIntent::Cancel,
         }
@@ -134,7 +135,7 @@ impl MenuOverlay {
             }
             KeyCode::Enter => {
                 if let Some(item) = self.items.get(self.selected) {
-                    return Self::intent_for(*item);
+                    return Self::intent_for(item);
                 }
             }
             // Number shortcuts for direct selection.
@@ -143,7 +144,7 @@ impl MenuOverlay {
                     if idx < self.items.len() {
                         self.selected = idx;
                         if let Some(item) = self.items.get(idx) {
-                            return Self::intent_for(*item);
+                            return Self::intent_for(item);
                         }
                     }
                 }
@@ -172,7 +173,10 @@ impl MenuOverlay {
             .borders(Borders::ALL)
             .style(theme.base())
             .border_style(theme.accent_style())
-            .title(Span::styled(" menu ", theme.heading_style()));
+            .title(Span::styled(
+                format!(" menu · cs-tui {} ", crate::update::current_version()),
+                theme.heading_style(),
+            ));
         let inner = block.inner(card);
         frame.render_widget(block, card);
 
@@ -239,7 +243,7 @@ mod tests {
 
     #[test]
     fn unauthenticated_root_menu_has_theme_quit_cancel() {
-        let m = MenuOverlay::build(false, false, "cyber", false);
+        let m = MenuOverlay::build(false, false, "cyber", None);
         assert_eq!(
             m.items,
             vec![MenuItem::Theme("cyber"), MenuItem::Quit, MenuItem::Cancel]
@@ -248,7 +252,7 @@ mod tests {
 
     #[test]
     fn authenticated_root_menu_has_logout_theme_quit_cancel() {
-        let m = MenuOverlay::build(true, false, "cyber", false);
+        let m = MenuOverlay::build(true, false, "cyber", None);
         assert_eq!(
             m.items,
             vec![
@@ -262,7 +266,7 @@ mod tests {
 
     #[test]
     fn child_screen_menu_offers_back_first() {
-        let m = MenuOverlay::build(true, true, "cyber", false);
+        let m = MenuOverlay::build(true, true, "cyber", None);
         assert_eq!(
             m.items,
             vec![
@@ -277,13 +281,13 @@ mod tests {
 
     #[test]
     fn esc_dismisses_menu() {
-        let mut m = MenuOverlay::build(true, true, "cyber", false);
+        let mut m = MenuOverlay::build(true, true, "cyber", None);
         assert_eq!(m.handle_key(key(KeyCode::Esc)), MenuIntent::Cancel);
     }
 
     #[test]
     fn ctrl_c_quits() {
-        let mut m = MenuOverlay::build(true, false, "cyber", false);
+        let mut m = MenuOverlay::build(true, false, "cyber", None);
         let k = KeyEvent {
             code: KeyCode::Char('c'),
             modifiers: KeyModifiers::CONTROL,
@@ -295,14 +299,14 @@ mod tests {
 
     #[test]
     fn enter_on_back_emits_back() {
-        let mut m = MenuOverlay::build(true, true, "cyber", false);
+        let mut m = MenuOverlay::build(true, true, "cyber", None);
         // Back is item 0.
         assert_eq!(m.handle_key(key(KeyCode::Enter)), MenuIntent::Back);
     }
 
     #[test]
     fn enter_on_logout_emits_logout() {
-        let mut m = MenuOverlay::build(true, false, "cyber", false);
+        let mut m = MenuOverlay::build(true, false, "cyber", None);
         // Logout is item 0 when not pushed.
         assert_eq!(m.handle_key(key(KeyCode::Enter)), MenuIntent::Logout);
     }
@@ -310,13 +314,13 @@ mod tests {
     #[test]
     fn enter_on_theme_emits_cycle_theme() {
         // Unauthenticated root: [Theme, Quit, Cancel] — Theme is item 0.
-        let mut m = MenuOverlay::build(false, false, "cyber", false);
+        let mut m = MenuOverlay::build(false, false, "cyber", None);
         assert_eq!(m.handle_key(key(KeyCode::Enter)), MenuIntent::CycleTheme);
     }
 
     #[test]
     fn j_advances_then_enter_picks() {
-        let mut m = MenuOverlay::build(true, true, "cyber", false);
+        let mut m = MenuOverlay::build(true, true, "cyber", None);
         m.handle_key(key(KeyCode::Char('j'))); // Logout
         assert_eq!(m.handle_key(key(KeyCode::Enter)), MenuIntent::Logout);
     }
@@ -324,7 +328,7 @@ mod tests {
     #[test]
     fn digit_picks_directly() {
         // [Back(1), Logout(2), Theme(3), Quit(4), Cancel(5)]
-        let mut m = MenuOverlay::build(true, true, "cyber", false);
+        let mut m = MenuOverlay::build(true, true, "cyber", None);
         assert_eq!(
             m.handle_key(key(KeyCode::Char('3'))),
             MenuIntent::CycleTheme
@@ -334,14 +338,14 @@ mod tests {
 
     #[test]
     fn out_of_range_digit_is_no_op() {
-        let mut m = MenuOverlay::build(false, false, "cyber", false);
+        let mut m = MenuOverlay::build(false, false, "cyber", None);
         // Only 3 items; pressing 9 does nothing.
         assert_eq!(m.handle_key(key(KeyCode::Char('9'))), MenuIntent::None);
     }
 
     #[test]
     fn refresh_theme_label_swaps_name_and_keeps_selection() {
-        let mut m = MenuOverlay::build(false, false, "cyber", false);
+        let mut m = MenuOverlay::build(false, false, "cyber", None);
         assert_eq!(m.items[0], MenuItem::Theme("cyber"));
         let before = m.selected;
         m.refresh_theme_label("c64");
@@ -372,7 +376,7 @@ mod tests {
     fn short_terminal_shows_all_items_and_drops_hint() {
         // 5 items; a 7-row terminal leaves inner height == item count, so the
         // hint is dropped and every item (incl. the last) still renders.
-        let m = MenuOverlay::build(true, true, "cyber", false);
+        let m = MenuOverlay::build(true, true, "cyber", None);
         let text = render_to_string(&m, 60, 7);
         assert!(text.contains("Back"), "first item missing");
         assert!(
@@ -386,17 +390,31 @@ mod tests {
     }
 
     #[test]
-    fn the_update_entry_appears_only_when_there_is_one() {
-        let plain = MenuOverlay::build(true, false, "cyber", false);
-        assert!(!render_to_string(&plain, 60, 24).contains("Update available"));
+    fn the_title_names_the_running_version() {
+        // The only place a user can see which cs-tui they are on without
+        // quitting and running --version. It reads next to the update entry, so
+        // "you are on X, Y is available" is one glance.
+        let m = MenuOverlay::build(true, false, "cyber", Some("9.9.9"));
+        let text = render_to_string(&m, 60, 24);
+        assert!(
+            text.contains(&format!("cs-tui {}", crate::update::current_version())),
+            "the running version belongs in the title: {text:?}",
+        );
+        assert!(text.contains("Update to 9.9.9"), "{text:?}");
+    }
 
-        let with_update = MenuOverlay::build(true, false, "cyber", true);
-        assert!(render_to_string(&with_update, 60, 24).contains("Update available"));
+    #[test]
+    fn the_update_entry_appears_only_when_there_is_one() {
+        let plain = MenuOverlay::build(true, false, "cyber", None);
+        assert!(!render_to_string(&plain, 60, 24).contains("Update to"));
+
+        let with_update = MenuOverlay::build(true, false, "cyber", Some("9.9.9"));
+        assert!(render_to_string(&with_update, 60, 24).contains("Update to 9.9.9"));
     }
 
     #[test]
     fn choosing_the_update_entry_asks_to_open_it() {
-        let mut m = MenuOverlay::build(false, false, "cyber", true);
+        let mut m = MenuOverlay::build(false, false, "cyber", Some("9.9.9"));
         // Theme, Update, Quit, Cancel: the number shortcut and Enter must agree,
         // which is why they share one mapping.
         assert_eq!(
@@ -409,7 +427,7 @@ mod tests {
 
     #[test]
     fn tall_terminal_shows_hint() {
-        let m = MenuOverlay::build(true, true, "cyber", false);
+        let m = MenuOverlay::build(true, true, "cyber", None);
         let text = render_to_string(&m, 60, 24);
         assert!(text.contains("enter select"), "hint should show with room");
     }
