@@ -138,6 +138,13 @@ pub struct BodyLayout<'a> {
     /// [`body_height`] and [`body_lines`] agreeing, since both derive from
     /// [`body_rows`].
     pub max_rows: Option<usize>,
+    /// The reader's own handle, when the screen knows it, so `@them` stands out
+    /// in the text. `None` leaves every row styled exactly as before.
+    ///
+    /// Only affects colour, never layout, so it is deliberately not part of
+    /// [`body_rows`] and cannot make [`body_height`] and [`body_lines`]
+    /// disagree.
+    pub mention: Option<&'a str>,
 }
 
 impl<'a> BodyLayout<'a> {
@@ -154,6 +161,7 @@ impl<'a> BodyLayout<'a> {
             width,
             revealed: false,
             max_rows: None,
+            mention: None,
         }
     }
 
@@ -179,6 +187,17 @@ impl<'a> BodyLayout<'a> {
     #[must_use]
     pub fn with_revealed(mut self, revealed: bool) -> Self {
         self.revealed = revealed;
+        self
+    }
+
+    /// Mark `@handle` in the text as the reader's own.
+    ///
+    /// ```ignore
+    /// let layout = chat::BodyLayout::new(width).with_mention("neo");
+    /// ```
+    #[must_use]
+    pub fn with_mention(mut self, handle: &'a str) -> Self {
+        self.mention = Some(handle);
         self
     }
 }
@@ -255,20 +274,21 @@ pub fn body_lines(
         .map(|row| {
             let mut spans = vec![Span::styled(layout.indent.to_string(), base)];
             match row {
-                BodyRow::Text(text) | BodyRow::Art(text) => spans.extend(styles::styled_spans(
+                BodyRow::Text(text) => {
+                    spans.extend(text_spans(&text, text_styles, layout, base, theme));
+                }
+                // Art is a picture, not prose: `@` runs in it are pixels, and
+                // the mention scan would colour part of the drawing.
+                BodyRow::Art(text) => spans.extend(styles::styled_spans(
                     &text,
                     text_styles,
                     layout.revealed,
                     base,
                     theme,
                 )),
-                BodyRow::Action(text) => spans.extend(styles::styled_spans(
-                    &text,
-                    text_styles,
-                    layout.revealed,
-                    action,
-                    theme,
-                )),
+                BodyRow::Action(text) => {
+                    spans.extend(text_spans(&text, text_styles, layout, action, theme));
+                }
                 BodyRow::Highlight(text) => spans.push(Span::styled(text, theme.accent_style())),
                 BodyRow::Chip(chip) => spans.push(Span::styled(chip.label, chip_style(theme))),
                 BodyRow::Tombstone => spans.push(Span::styled(
@@ -471,6 +491,32 @@ pub fn has_spoiler(extras: &MessageExtras) -> bool {
     TextStyles::from_message(extras.style.as_ref()).spoiler
 }
 
+/// Whether the message says `@handle`, i.e. whether it is addressed at the
+/// reader.
+///
+/// Mentions are `@username`, matched case-insensitively (§ Notifications), and
+/// only on a whole handle: `@neo` is not a mention of `neon`, and the address in
+/// `you@example.com` is not a mention of anyone. A message the reader has hidden
+/// behind a spoiler still counts, since knowing you were named gives away none of
+/// the hidden text, and the server has already told you so with a `chat_mention`
+/// notification.
+///
+/// ```ignore
+/// let for_me = chat::mentions(m.into(), handle);
+/// ```
+#[must_use]
+pub fn mentions(msg: ChatMessage<'_>, handle: &str) -> bool {
+    if msg.extras.deleted {
+        return false;
+    }
+    if TextStyles::from_message(msg.extras.style.as_ref()).art {
+        return false;
+    }
+    msg.extras
+        .display_content(msg.content)
+        .is_some_and(|text| !mention_ranges(text, handle).is_empty())
+}
+
 /// The message's text as a one-line preview would want it: the same text the
 /// body renders, with `/art` decoded first.
 ///
@@ -640,6 +686,134 @@ pub fn hard_wrap(content: &str, width: usize) -> Vec<String> {
 #[must_use]
 pub fn truncate_to_width(s: &str, width: usize) -> String {
     super::text::truncate_to_width(s, width)
+}
+
+/// One row of message prose, styled, with any mention of the reader picked out.
+///
+/// `base` is the style the row would have had without a mention (the body or
+/// the action style), so this only ever decorates what [`styles::styled_spans`]
+/// already produced.
+fn text_spans(
+    text: &str,
+    text_styles: TextStyles,
+    layout: BodyLayout<'_>,
+    base: Style,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let spans = styles::styled_spans(text, text_styles, layout.revealed, base, theme);
+    // An unrevealed spoiler is drawn as a mask, so there is no `@you` on screen
+    // to pick out, and colouring the mask cells would leak whereabouts in the
+    // hidden text the mention sits. The row-level marker still fires: see
+    // [`mentions`].
+    if text_styles.spoiler && !layout.revealed {
+        return spans;
+    }
+    let Some(handle) = layout.mention else {
+        return spans;
+    };
+    let ranges = mention_ranges(text, handle);
+    if ranges.is_empty() {
+        return spans;
+    }
+    highlight_runs(spans, &ranges, theme)
+}
+
+/// Re-style the bytes covered by `ranges`, splitting spans where a range starts
+/// or ends inside one.
+///
+/// Works off the spans rather than the text so it composes with whatever
+/// [`styles::styled_spans`] did: one span for an ordinary row, one per character
+/// for `rainbow`. Safe because every path that reaches here emits spans whose
+/// contents concatenate back to exactly the row text, which is what lets byte
+/// offsets be tracked across them.
+fn highlight_runs(
+    spans: Vec<Span<'static>>,
+    ranges: &[std::ops::Range<usize>],
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let mut out = Vec::with_capacity(spans.len());
+    let mut start = 0usize;
+    for span in spans {
+        let style = span.style;
+        let text = span.content.into_owned();
+        let mut at = 0usize;
+        while at < text.len() {
+            let abs = start + at;
+            // Cut at the next range edge past here, so each piece is wholly
+            // inside a mention or wholly outside one.
+            let next = ranges
+                .iter()
+                .flat_map(|r| [r.start, r.end])
+                .filter(|&edge| edge > abs)
+                .min()
+                .map_or(text.len(), |edge| (edge - start).min(text.len()));
+            let piece_style = if ranges.iter().any(|r| r.contains(&abs)) {
+                style.fg(theme.accent).add_modifier(Modifier::BOLD)
+            } else {
+                style
+            };
+            out.push(Span::styled(text[at..next].to_string(), piece_style));
+            at = next;
+        }
+        start += text.len();
+    }
+    out
+}
+
+/// Byte ranges of every `@handle` in `text`, the `@` included.
+///
+/// A mention has to be a whole handle on both sides: `@` may not follow a
+/// handle character (so `you@example.com` is an address, not a mention of
+/// `example`), and the handle may not run on into one (so `@neo` does not match
+/// `@neon`). Matching is case-insensitive, which is what § Notifications
+/// specifies for `@username`.
+fn mention_ranges(text: &str, handle: &str) -> Vec<std::ops::Range<usize>> {
+    let handle = handle.trim().trim_start_matches('@');
+    if handle.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (at, _) in text.match_indices('@') {
+        if text[..at].chars().next_back().is_some_and(is_handle_char) {
+            continue;
+        }
+        let rest = &text[at + 1..];
+        let Some(len) = handle_prefix_len(rest, handle) else {
+            continue;
+        };
+        if rest[len..].chars().next().is_some_and(is_handle_char) {
+            continue;
+        }
+        out.push(at..at + 1 + len);
+    }
+    out
+}
+
+/// How many bytes of `rest` `handle` matches, ignoring case, or `None` if it
+/// does not match at all.
+fn handle_prefix_len(rest: &str, handle: &str) -> Option<usize> {
+    let mut used = 0usize;
+    let mut wanted = handle.chars();
+    let mut got = rest.chars();
+    loop {
+        let Some(want) = wanted.next() else {
+            return Some(used);
+        };
+        let have = got.next()?;
+        // `to_lowercase` rather than `eq_ignore_ascii_case`: handles are not
+        // promised to be ASCII, and folding the wrong way would either miss a
+        // mention or claim one that isn't there.
+        if have != want && !have.to_lowercase().eq(want.to_lowercase()) {
+            return None;
+        }
+        used += have.len_utf8();
+    }
+}
+
+/// Whether `c` can be part of a handle, i.e. whether a mention can run through
+/// it rather than ending before it.
+fn is_handle_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '-'
 }
 
 /// Lay a message out into rows, applying the § Message fields rules for empty,
@@ -1313,6 +1487,138 @@ mod tests {
         let colours: Vec<Option<Color>> = lines[0].spans[1..].iter().map(|s| s.style.fg).collect();
         assert_eq!(colours.len(), 3);
         assert!(colours[0] != colours[1] && colours[1] != colours[2]);
+    }
+
+    /// The text of every span drawn in the mention style, in order.
+    fn mention_runs(msg: ChatMessage<'_>, width: usize, handle: &str) -> Vec<String> {
+        let theme = Theme::cyber();
+        body_lines(msg, layout(width).with_mention(handle), &theme)
+            .iter()
+            .flat_map(|l| l.spans.clone())
+            .filter(|s| {
+                s.style.fg == Some(theme.accent) && s.style.add_modifier.contains(Modifier::BOLD)
+            })
+            .map(|s| s.content.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_mention_of_the_reader_is_picked_out_of_the_text() {
+        let e = extras();
+        let msg = ChatMessage::new("trinity", "hey @neo, you around?", &e);
+        assert_eq!(mention_runs(msg, 40, "neo"), vec!["@neo"]);
+        // Only the colour changed: the row still reads exactly as before.
+        assert_eq!(rows(msg, 40), vec!["  hey @neo, you around?"]);
+        assert!(mentions(msg, "neo"));
+    }
+
+    #[test]
+    fn a_mention_is_case_insensitive_but_has_to_be_the_whole_handle() {
+        let e = extras();
+        let hit = ChatMessage::new("trinity", "@NEO wake up", &e);
+        assert_eq!(mention_runs(hit, 40, "neo"), vec!["@NEO"]);
+
+        // A longer handle that merely starts the same is someone else.
+        let neon = ChatMessage::new("trinity", "@neon is not you", &e);
+        assert!(mention_runs(neon, 40, "neo").is_empty());
+        assert!(!mentions(neon, "neo"));
+
+        // Nor is a handle that runs on through a hyphen.
+        let hyphen = ChatMessage::new("trinity", "ask @neo-two", &e);
+        assert!(mention_runs(hyphen, 40, "neo").is_empty());
+
+        // An address is not a mention: the `@` has to start a word.
+        let email = ChatMessage::new("trinity", "write to you@neo.example", &e);
+        assert!(mention_runs(email, 40, "neo").is_empty());
+        assert!(!mentions(email, "neo"));
+
+        // The handle is taken as a handle whether or not it arrives with its `@`.
+        assert_eq!(mention_runs(hit, 40, "@neo"), vec!["@NEO"]);
+    }
+
+    #[test]
+    fn a_mention_is_marked_in_the_action_form_too() {
+        let e = MessageExtras {
+            is_action: true,
+            ..MessageExtras::default()
+        };
+        let msg = ChatMessage::new("trinity", "waves at @neo", &e);
+        assert_eq!(rows(msg, 40), vec!["  * trinity waves at @neo"]);
+        assert_eq!(mention_runs(msg, 40, "neo"), vec!["@neo"]);
+    }
+
+    #[test]
+    fn a_hidden_spoiler_is_never_marked_up_inside() {
+        let e = styled("spoiler");
+        let msg = ChatMessage::new("trinity", "psst @neo the butler did it", &e);
+        // Nothing to mark while it is masked, and marking the mask cells would
+        // give away where in the hidden text the mention sits.
+        assert!(mention_runs(msg, 40, "neo").is_empty());
+        let hidden: String = rows(msg, 40).concat();
+        assert!(!hidden.contains("@neo"), "{hidden:?}");
+
+        let theme = Theme::cyber();
+        let revealed: Vec<String> = body_lines(
+            msg,
+            layout(40).with_mention("neo").with_revealed(true),
+            &theme,
+        )
+        .iter()
+        .flat_map(|l| l.spans.clone())
+        .filter(|s| {
+            s.style.fg == Some(theme.accent) && s.style.add_modifier.contains(Modifier::BOLD)
+        })
+        .map(|s| s.content.to_string())
+        .collect();
+        assert_eq!(revealed, vec!["@neo"]);
+    }
+
+    #[test]
+    fn a_mention_inside_a_rainbow_message_keeps_every_other_character_coloured() {
+        let theme = Theme::cyber();
+        let e = styled("rainbow");
+        let msg = ChatMessage::new("trinity", "hi @neo", &e);
+        // Rainbow draws one span per character; the mention is picked out of
+        // those rather than replacing them wholesale.
+        assert_eq!(mention_runs(msg, 40, "neo").concat(), "@neo");
+        let lines = body_lines(msg, layout(40).with_mention("neo"), &theme);
+        let plain: Vec<Option<Color>> = lines[0].spans[1..4].iter().map(|s| s.style.fg).collect();
+        assert!(plain[0] != plain[1], "the rainbow still cycles: {plain:?}");
+        assert_eq!(rows(msg, 40), vec!["  hi @neo"]);
+    }
+
+    #[test]
+    fn art_is_never_marked_up() {
+        // A picture's `@` cells are pixels, and the wire content is base64, so
+        // neither the row nor the message counts as a mention.
+        let e = styled("art");
+        let picture = STANDARD.encode("@neo  o\n     /|\\");
+        let msg = ChatMessage::new("trinity", &picture, &e);
+        assert!(mention_runs(msg, 40, "neo").is_empty());
+        assert!(!mentions(msg, "neo"));
+    }
+
+    #[test]
+    fn a_deleted_message_mentions_nobody() {
+        let e = MessageExtras {
+            deleted: true,
+            ..MessageExtras::default()
+        };
+        // The wire content of a deleted message is `[DELETED]`, but even a
+        // stale body must not keep marking the reader after it is gone.
+        let msg = ChatMessage::new("trinity", "@neo said something", &e);
+        assert!(!mentions(msg, "neo"));
+        assert_eq!(rows(msg, 40), vec![format!("  {TOMBSTONE}")]);
+    }
+
+    #[test]
+    fn marking_a_mention_does_not_change_the_height() {
+        let e = extras();
+        let msg = ChatMessage::new("trinity", "hey @neo, are you around anywhere?", &e);
+        assert_eq!(
+            body_height(msg, layout(12)),
+            body_height(msg, layout(12).with_mention("neo")),
+        );
     }
 
     #[test]

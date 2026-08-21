@@ -71,6 +71,16 @@ const MIN_MESSAGES_WIDTH: u16 = 24;
 /// What the website puts next to an idle person's name (§ Who's in a room).
 const IDLE_MARK: &str = "\u{1f4a4}";
 
+/// Fills the header gutter of a message that `@`-mentions the reader. Two cells
+/// wide, exactly like the blank gutter it replaces, so marking a message never
+/// moves the text beside it.
+///
+/// Deliberately not the `▌` bar a marked row would otherwise want: the list
+/// widget already draws `▌ ` in its own gutter for the selected message
+/// ([`super::list::render_body`]), one column to the left of this one, so a bar
+/// here would read as a second cursor. An `@` says what the mark means anyway.
+const MENTION_MARK: &str = "@ ";
+
 /// The wire `content` of a deleted message (§ Delete Your Message). Never
 /// rendered: [`super::chat::body_lines`] draws a tombstone instead.
 const DELETED_CONTENT: &str = "[DELETED]";
@@ -235,6 +245,24 @@ impl Default for Roster {
             loading: true,
             error: None,
         }
+    }
+}
+
+impl Roster {
+    /// The handle presence reports for `user_id`, if the roster has heard of
+    /// them.
+    ///
+    /// Staleness is deliberately not applied: a stale entry is someone who has
+    /// stopped heartbeating, not someone whose name has changed, and this is
+    /// how the screen learns the *reader's own* handle (see
+    /// [`CircScreen::viewer_handle`]), which it must keep even while their own
+    /// heartbeat is between beats.
+    fn handle_of(&self, user_id: &str) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|e| e.user_id == user_id)
+            .map(|e| e.username.trim())
+            .filter(|name| !name.is_empty())
     }
 }
 
@@ -1071,6 +1099,46 @@ impl CircScreen {
         view.get(messages.selected).map(|&i| &messages.items[i])
     }
 
+    /// The reader's own handle, so a message that says `@them` can be marked.
+    ///
+    /// The client is told *who* it is signed in as (the account id, read off the
+    /// id token) but never *what it is called*: login takes an email, and no
+    /// response hands an account its own handle back. The room's presence list
+    /// closes that gap for free: it is keyed by user id and carries the
+    /// username (§ Who's in a room), and we publish our own presence on entering
+    /// a room, so our entry is in there alongside everyone else's.
+    ///
+    /// Failing that, our own messages name us: every message carries both the
+    /// author's id and their handle, so anything we have said in this room
+    /// answers the same question. That is the path for a reader running with
+    /// `circ_presence = false`, who is deliberately absent from the roster and
+    /// would otherwise never see a mention marked.
+    ///
+    /// `None` until one of the two knows, which is the case for the first
+    /// moments of a room and for an invisible reader who has never spoken in it.
+    fn viewer_handle(&self) -> Option<&str> {
+        let viewer = self.viewer_user_id.as_deref()?;
+        let CircMode::Room {
+            roster, messages, ..
+        } = &self.mode
+        else {
+            return None;
+        };
+        if let Some(handle) = roster.handle_of(viewer) {
+            return Some(handle);
+        }
+        // Newest first: whatever we said last carries the handle we hold now.
+        // A linear scan on every frame, but only for a reader the roster does
+        // not name, and only over messages already in memory.
+        messages
+            .items
+            .iter()
+            .rev()
+            .find(|m| m.user_id == viewer)
+            .map(|m| m.username.trim())
+            .filter(|name| !name.is_empty())
+    }
+
     /// Whether the selected message is one of ours, as far as we can tell.
     /// `None` when the shell has not told us who is signed in.
     fn selected_is_mine(&self, room_id: &str) -> Option<bool> {
@@ -1365,10 +1433,18 @@ impl CircScreen {
         // decoded `/art` picture reaches that height routinely. One row is left
         // for the message's own header.
         let body_cap = (layout[0].height as usize).saturating_sub(1).max(1);
+        // Who we are, so a message that names us can say so. `None` (the room
+        // has only just opened, or we never published presence) simply leaves
+        // every message rendered the way it was before.
+        let mention = self.viewer_handle();
         let layout_of = |m: &CircMessage| {
-            BodyLayout::new(body_width)
+            let layout = BodyLayout::new(body_width)
                 .with_revealed(select.revealed.contains(&m.id))
-                .with_max_rows(body_cap)
+                .with_max_rows(body_cap);
+            match mention {
+                Some(handle) => layout.with_mention(handle),
+                None => layout,
+            }
         };
         let heights: Vec<u16> = visible
             .iter()
@@ -1825,27 +1901,40 @@ fn circ_message_lines(
     theme: &Theme,
     layout: BodyLayout<'_>,
 ) -> Vec<Line<'static>> {
-    let mut lines = vec![circ_message_header(m, theme)];
+    let for_me = layout
+        .mention
+        .is_some_and(|handle| chat::mentions(ChatMessage::from(m), handle));
+    let mut lines = vec![circ_message_header(m, theme, for_me)];
     lines.extend(chat::body_lines(ChatMessage::from(m), layout, theme));
     lines
 }
 
 /// The speaker row: name, a `★` for a chat admin, and the relative timestamp.
 ///
+/// `for_me` fills the row's two-column gutter with [`MENTION_MARK`], so a
+/// message that names the reader is findable while scrolling past rather than
+/// only once they stop and read it. The gutter is the same width either way, so
+/// marking one never shifts the pane.
+///
 /// Kept even for an action (`/me`), whose body already reads `* username …`,
 /// and even for a deleted message: § Delete Your Message keeps the author's name
 /// and the original timestamp, and the header is the only place either appears.
-fn circ_message_header(m: &CircMessage, theme: &Theme) -> Line<'static> {
+fn circ_message_header(m: &CircMessage, theme: &Theme, for_me: bool) -> Line<'static> {
     let when = format_epoch_millis_relative(m.timestamp);
     let name = if m.username.is_empty() {
         "?".to_string()
     } else {
         m.username.clone()
     };
+    let gutter = if for_me {
+        Span::styled(MENTION_MARK, theme.accent_style())
+    } else {
+        Span::styled("  ", theme.muted_style())
+    };
     // Each speaker's name gets their stable per-user colour so a busy room is
     // easy to scan; a ★ marks chat admins.
     let mut header = vec![
-        Span::styled("  ", theme.muted_style()),
+        gutter,
         Span::styled(
             name,
             Style::default()
@@ -2945,6 +3034,89 @@ mod tests {
             rows.iter()
                 .any(|r| r.contains("dozer") && r.contains(IDLE_MARK)),
             "someone past idleAfterMs carries the idle mark:\n{joined}",
+        );
+    }
+
+    /// A room where presence has told us our own handle is `neo`.
+    fn room_knowing_us(msgs: Vec<CircMessage>) -> CircScreen {
+        let mut s = open("general");
+        s.set_viewer_user_id("uid-neo".into());
+        let now = now_ms();
+        s.apply_room_users(
+            "general",
+            Ok(vec![CircRoomUser {
+                user_id: "uid-neo".into(),
+                username: "neo".into(),
+                is_chat_admin: false,
+                last_seen: now,
+                last_activity: Some(now),
+            }]),
+        );
+        s.apply_messages("general", true, Ok((msgs, None)));
+        s
+    }
+
+    #[test]
+    fn a_message_that_names_you_is_marked_in_the_gutter() {
+        let s = room_knowing_us(vec![
+            message("m1", "trinity", "hey @neo, you around?", 1),
+            message("m2", "dozer", "nothing to see here", 2),
+        ]);
+        let rows = render_rows(&s, 14);
+        let joined = rows.join("\n");
+        assert!(
+            joined.contains(&format!("{MENTION_MARK}trinity")),
+            "the message naming us carries the marker:\n{joined}",
+        );
+        assert!(
+            !joined.contains(&format!("{MENTION_MARK}dozer")),
+            "a message that names nobody is left alone:\n{joined}",
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("hey @neo, you around?")),
+            "the text itself is untouched:\n{joined}",
+        );
+    }
+
+    #[test]
+    fn nothing_is_marked_until_presence_tells_us_our_own_handle() {
+        // The id token gives the account id, never the handle, so until the
+        // roster names us there is nothing to match messages against.
+        let mut s = open("general");
+        s.set_viewer_user_id("uid-neo".into());
+        s.apply_messages(
+            "general",
+            true,
+            Ok((vec![message("m1", "trinity", "hey @neo", 1)], None)),
+        );
+        let joined = render_rows(&s, 10).join("\n");
+        assert!(
+            !joined.contains(&format!("{MENTION_MARK}trinity")),
+            "no handle, no marker:\n{joined}",
+        );
+    }
+
+    #[test]
+    fn an_invisible_reader_learns_their_handle_from_their_own_messages() {
+        // With circ_presence off we are in nobody's user list, so the roster
+        // can't name us. Anything we have said in the room can.
+        let mut s = open("general");
+        s.set_viewer_user_id("uid-neo".into());
+        s.apply_messages(
+            "general",
+            true,
+            Ok((
+                vec![
+                    message("m1", "neo", "anyone about?", 1),
+                    message("m2", "trinity", "hey @neo", 2),
+                ],
+                None,
+            )),
+        );
+        let joined = render_rows(&s, 12).join("\n");
+        assert!(
+            joined.contains(&format!("{MENTION_MARK}trinity")),
+            "our own message named us:\n{joined}",
         );
     }
 

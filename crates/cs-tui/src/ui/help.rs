@@ -273,6 +273,10 @@ const CIRC: &[Row] = &[
         keys: "",
         desc: "your presence is published while a room is open, so everyone sees you in its user list; set circ_presence = false in config.toml to stay invisible",
     },
+    Row {
+        keys: "",
+        desc: "a message that @-mentions you is marked with an @ beside the speaker's name, and your handle is picked out in the text",
+    },
 ];
 
 const CIRC_SELECT: &[Row] = &[
