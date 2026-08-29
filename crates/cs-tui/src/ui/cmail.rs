@@ -6,6 +6,11 @@
 //! attachment (§ Message fields). C-Mail has neither delete nor flag in v0.8.4,
 //! so there is no tombstone and no moderation key here.
 //!
+//! The inline composer is the shared [`super::composer`] strip, so a long draft
+//! soft-wraps and scrolls here exactly as it does in a cIRC room. It has no
+//! caret keys, though: Home/End and the arrows scroll the thread while the
+//! composer stays focused, so the caret lives at the end of the draft.
+//!
 //! The screen also carries both halves of the typing indicator (§ Typing
 //! Indicator): the inbound one is re-derived from the presence entries on every
 //! render, since a flag going stale produces no event, and the outbound one is
@@ -31,6 +36,7 @@ use ratatui_image::protocol::Protocol;
 use ratatui_image::{Image, Resize};
 
 use super::chat;
+use super::composer;
 use super::list::{self, TabState};
 use super::theme::Theme;
 
@@ -1016,7 +1022,21 @@ impl CmailScreen {
         // renders exactly as it did before there was one.
         let typing = self.typing_label(now_epoch_millis());
         let typing_rows = u16::from(typing.is_some());
-        let footer_rows = if self.composing { 2 } else { 1 };
+        // The composer grows as the draft soft-wraps, but never past the point
+        // where the conversation it belongs to would be squeezed out. One row
+        // of hints sits under it either way.
+        let cap = composer::MAX_ROWS
+            .min(
+                inner
+                    .height
+                    .saturating_sub(out_rows + typing_rows + composer::MIN_CHAT_ROWS + 1),
+            )
+            .max(1);
+        let footer_rows = if self.composing {
+            self.composer_rows(inner.width, cap) + 1
+        } else {
+            1
+        };
         let layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -1256,6 +1276,28 @@ impl CmailScreen {
         (n.min(MAX_OUTGOING_ROWS) + usize::from(n > MAX_OUTGOING_ROWS)) as u16
     }
 
+    /// Rows the wrapped draft needs (up to `cap`), i.e. the footer's top half
+    /// while the composer is focused.
+    ///
+    /// [`render_conversation`](Self::render_conversation) sizes the layout with
+    /// this and [`render_conversation_footer`](Self::render_conversation_footer)
+    /// fills it, both from the same `(draft, width, cap)`, so the two can't
+    /// disagree about the height.
+    ///
+    /// The caret sits at the end of the draft: unlike cIRC's composer this one
+    /// has no caret keys, because Home/End and the arrows scroll the thread
+    /// while it stays focused.
+    fn composer_rows(&self, width: u16, cap: u16) -> u16 {
+        composer::layout(
+            &self.draft,
+            self.draft.chars().count(),
+            composer::width(width),
+            usize::from(cap),
+            "",
+        )
+        .rows as u16
+    }
+
     fn render_outgoing(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
         let mut lines: Vec<Line<'static>> = Vec::new();
         for o in self.outgoing.iter().take(MAX_OUTGOING_ROWS) {
@@ -1289,21 +1331,25 @@ impl CmailScreen {
         scrolled_up: bool,
     ) {
         if self.composing {
+            // `render_conversation` sized this area as the composer's rows plus
+            // the hint, so everything above the last row belongs to the draft.
             let rows = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(1), Constraint::Length(1)])
+                .constraints([Constraint::Min(1), Constraint::Length(1)])
                 .split(area);
-            // Single-line composer view: newlines (from a paste or the expanded
-            // editor) collapse to a marker; the full text is still sent.
-            let shown = self.draft.replace('\n', " ⏎ ");
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled("› ", theme.accent_style()),
-                    Span::styled(shown, theme.base()),
-                    Span::styled("▏", theme.accent_style()),
-                ])),
-                rows[0],
+            // Soft-wrapped over the rows reserved for it, exactly as cIRC's
+            // composer is: a draft wider than the pane flows onto further rows
+            // instead of running off the right edge. Newlines (from a paste or
+            // the expanded editor) stay the inline marker they have always
+            // been; the full text is still sent.
+            let view = composer::layout(
+                &self.draft,
+                self.draft.chars().count(),
+                composer::width(rows[0].width),
+                usize::from(rows[0].height),
+                "",
             );
+            frame.render_widget(Paragraph::new(composer::lines(&view, theme)), rows[0]);
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     "enter send · ctrl+e editor · esc unfocus",
@@ -2715,6 +2761,144 @@ mod tests {
         assert!(s.typing_label(now_epoch_millis()).is_some());
         s.open_conversation("c2");
         assert_eq!(s.typing_label(now_epoch_millis()), None);
+    }
+
+    /// Renders `s` into a fixed backend and returns the inner (border-stripped)
+    /// text rows, trailing-trimmed.
+    fn render_rows(s: &CmailScreen, width: u16, height: u16) -> Vec<String> {
+        let theme = Theme::cyber();
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| s.render(f, f.area(), &theme, None))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    // Strip the left/right border cells before trimming.
+                    .trim_matches(|c| c == '│' || c == '┌' || c == '┐' || c == '└' || c == '┘')
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Focus the composer and type `text` into it.
+    fn composed(s: &mut CmailScreen, text: &str) {
+        s.handle_key(key(KeyCode::Char('c')));
+        for c in text.chars() {
+            s.handle_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    /// The composer's rendered rows with the prompt gutter stripped, joined back
+    /// into the draft text they show. The caret is a reverse-video cell, so it
+    /// contributes the character underneath it (or a blank at end of text).
+    fn composer_text(s: &CmailScreen, width: u16, height: u16) -> String {
+        let rows = render_rows(s, width, height);
+        let first = rows
+            .iter()
+            .position(|r| r.starts_with('›') || r.starts_with('…'))
+            .expect("composer should be visible");
+        let hint = rows
+            .iter()
+            .position(|r| r.contains("enter send"))
+            .expect("composer hint row should be visible");
+        rows[first..hint]
+            .iter()
+            .map(|r| r.chars().skip(composer::PROMPT.chars().count()).collect())
+            .collect::<Vec<String>>()
+            .join("")
+    }
+
+    /// A draft of `n` letters, with no spaces to wrap on, so every character has
+    /// to be accounted for in the rows that come back.
+    fn long_draft(n: usize) -> String {
+        (0..n).map(|i| char::from(b'a' + (i % 26) as u8)).collect()
+    }
+
+    #[test]
+    fn a_long_draft_wraps_onto_more_composer_rows() {
+        // Regression: the composer drew a single line, so everything past the
+        // right edge of the pane simply fell off the screen as it was typed.
+        // cIRC's composer soft-wraps; this is the same field, so it must too.
+        let mut s = open_with_messages(vec![], None);
+        let draft = long_draft(120);
+        composed(&mut s, &draft);
+
+        let rows = render_rows(&s, 50, 16);
+        let first = rows
+            .iter()
+            .position(|r| r.starts_with('›'))
+            .expect("composer should be visible");
+        let hint = rows
+            .iter()
+            .position(|r| r.contains("enter send"))
+            .expect("composer hint row should be visible");
+        assert!(
+            hint - first > 1,
+            "a draft wider than the pane must wrap onto further rows:\n{}",
+            rows.join("\n"),
+        );
+        assert_eq!(
+            composer_text(&s, 50, 16),
+            draft,
+            "every character typed stays on screen"
+        );
+    }
+
+    #[test]
+    fn an_overlong_draft_scrolls_the_composer_and_keeps_the_tail_in_view() {
+        let mut s = open_with_messages(vec![], None);
+        let draft = long_draft(400);
+        composed(&mut s, &draft);
+
+        let rows = render_rows(&s, 50, 20);
+        let first = rows
+            .iter()
+            .position(|r| r.starts_with('…'))
+            .expect("a scrolled composer marks the rows above it");
+        let hint = rows
+            .iter()
+            .position(|r| r.contains("enter send"))
+            .expect("composer hint row should be visible");
+        assert_eq!(
+            (hint - first) as u16,
+            composer::MAX_ROWS,
+            "the composer stops growing and scrolls instead:\n{}",
+            rows.join("\n"),
+        );
+        let shown = composer_text(&s, 50, 20);
+        assert!(
+            draft.ends_with(shown.trim_end()),
+            "typing shows the tail of the draft, where the caret is:\n{shown}"
+        );
+    }
+
+    #[test]
+    fn the_composer_never_crowds_the_conversation_out() {
+        let mut s = open_with_messages(vec![message("m1", "hi", 1_000)], None);
+        composed(&mut s, &long_draft(400));
+
+        // A short terminal: the draft would happily take every row it can get.
+        let rows = render_rows(&s, 50, 10);
+        let first = rows
+            .iter()
+            .position(|r| r.starts_with('›') || r.starts_with('…'))
+            .expect("composer should be visible");
+        assert!(
+            first >= usize::from(composer::MIN_CHAT_ROWS),
+            "the conversation keeps its rows however long the draft is:\n{}",
+            rows.join("\n"),
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("hi")),
+            "the message pane is still drawn:\n{}",
+            rows.join("\n"),
+        );
     }
 
     #[test]

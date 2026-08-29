@@ -43,29 +43,13 @@ use super::cmail::{
     avatar_color, bottom_aligned_messages_area, format_epoch_millis_relative, one_line_preview,
     Outgoing,
 };
-use super::editor::Segment;
+use super::composer::{self, Composer};
 use super::flag::FlagPromptKey;
 use super::list::{self, TabState};
 use super::mention;
 use super::theme::Theme;
 
 const MAX_OUTGOING_ROWS: usize = 4;
-
-/// Most rows the composer may grow to as a long draft soft-wraps. Past this it
-/// scrolls to keep the caret in view instead: the conversation above it is the
-/// point of the screen, and `Ctrl+E` opens a whole editor for a long message.
-const MAX_COMPOSER_ROWS: u16 = 4;
-
-/// Rows of conversation the composer may never take, however long the draft is.
-const MIN_CHAT_ROWS: u16 = 3;
-
-/// The composer's prompt, and the gutter every wrapped continuation row indents
-/// by so the draft stays in one column. Both are two cells wide.
-const COMPOSER_PROMPT: &str = "› ";
-const COMPOSER_GUTTER: &str = "  ";
-/// Marker for the top row when the draft has grown past [`MAX_COMPOSER_ROWS`]
-/// and rows have scrolled off above it.
-const COMPOSER_MORE: &str = "… ";
 
 /// Columns the roster pane takes, border included.
 ///
@@ -369,249 +353,6 @@ impl Roster {
             .map(|e| e.username.trim())
             .filter(|name| !name.is_empty())
     }
-}
-
-/// The always-on inline composer: the draft, and a caret inside it.
-///
-/// Every other text field in the client is a short value that scrolls sideways
-/// under [`super::input::windowed_line`]. A chat composer is neither: a message
-/// is long enough to wrap, and it is the field you live in while a room is open,
-/// so it gets the caret keys (`←`/`→`, Home/End, Delete) and soft-wraps
-/// downwards instead of running off the right edge.
-#[derive(Debug, Default)]
-struct Composer {
-    /// The draft so far. It may hold newlines — the `Ctrl+E` editor is the only
-    /// way to put them there, since Enter sends, and `/art` needs them.
-    text: String,
-    /// Caret as a char index into `text` (`0..=` its char count).
-    cursor: usize,
-}
-
-impl Composer {
-    /// Characters typed so far (the caret is a char index, never a byte offset).
-    fn len(&self) -> usize {
-        self.text.chars().count()
-    }
-
-    fn clear(&mut self) {
-        self.text.clear();
-        self.cursor = 0;
-    }
-
-    /// Replace the whole draft, leaving the caret at the end: a prefill (the
-    /// editor handing its content back) is something you keep typing after.
-    fn set(&mut self, text: String) {
-        self.text = text;
-        self.cursor = self.len();
-    }
-
-    fn insert(&mut self, c: char) {
-        let at = super::input::byte_index(&self.text, self.cursor);
-        self.text.insert(at, c);
-        self.cursor += 1;
-    }
-
-    /// Insert text at the caret, which lands just after it. Newlines survive:
-    /// unlike the single-line fields, this one can hold them.
-    fn insert_str(&mut self, text: &str) {
-        for c in text.chars() {
-            self.insert(c);
-        }
-    }
-
-    fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let at = super::input::byte_index(&self.text, self.cursor - 1);
-        self.text.remove(at);
-        self.cursor -= 1;
-    }
-
-    fn delete(&mut self) {
-        if self.cursor < self.len() {
-            let at = super::input::byte_index(&self.text, self.cursor);
-            self.text.remove(at);
-        }
-    }
-
-    fn move_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
-    }
-
-    fn move_right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.len());
-    }
-
-    fn move_home(&mut self) {
-        self.cursor = 0;
-    }
-
-    fn move_end(&mut self) {
-        self.cursor = self.len();
-    }
-}
-
-/// A draft laid out for the composer strip: the wrapped rows, which of them are
-/// on screen, and where the caret landed.
-///
-/// Derived from `(draft, width, cap)` every frame and never stored, so a resize
-/// is correct by construction — the same rule [`super::editor`] follows.
-struct ComposerView {
-    /// The draft as display characters (see [`composer_display`]).
-    chars: Vec<char>,
-    /// Every soft-wrapped row, as a range into `chars`.
-    segs: Vec<Segment>,
-    /// The caret's index among `chars`, and the row holding it.
-    caret: usize,
-    caret_row: usize,
-    /// First visible row, and how many rows are visible (`1..=cap`).
-    first: usize,
-    rows: usize,
-    /// Index in `chars` where the mention ghost begins, when one is showing.
-    ///
-    /// Everything from here on is a preview, not text: it is styled as such,
-    /// and it is not in the draft. Building it into `chars` rather than
-    /// appending it after the fact is what lets the ghost take part in wrapping
-    /// and scrolling like anything else, instead of needing its own width math.
-    ghost_from: Option<usize>,
-}
-
-/// The draft as the characters the composer actually draws, plus where the caret
-/// sits among them.
-///
-/// A newline only reaches the draft through the `Ctrl+E` editor, and the
-/// composer is a strip under the conversation rather than an editor of its own,
-/// so a newline stays the inline `⏎` marker it has always been. Only the width
-/// starts a new row.
-fn composer_display(draft: &Composer, ghost: &str) -> (Vec<char>, usize, Option<usize>) {
-    let mut chars: Vec<char> = Vec::with_capacity(draft.text.len());
-    let mut caret = 0;
-    for (i, c) in draft.text.chars().enumerate() {
-        if i == draft.cursor {
-            caret = chars.len();
-        }
-        if c == '\n' {
-            chars.extend([' ', '⏎', ' ']);
-        } else {
-            chars.push(c);
-        }
-    }
-    if draft.cursor >= draft.len() {
-        caret = chars.len();
-    }
-    // The ghost sits exactly at the caret, so the caret cell lands on its first
-    // character. Deliberate: the preview then reads as a continuation of what
-    // you are typing rather than something parked after a gap.
-    let ghost_from = (!ghost.is_empty()).then(|| {
-        let at = caret;
-        let tail: Vec<char> = chars.split_off(at);
-        chars.extend(ghost.chars());
-        chars.extend(tail);
-        at
-    });
-    (chars, caret, ghost_from)
-}
-
-/// Wrap `draft` to `width` content columns, showing at most `cap` rows.
-///
-/// A draft that outgrows `cap` scrolls rather than growing further, and the
-/// window always holds the caret: it rides the bottom row while you type, and
-/// Home takes both it and the window back to the start.
-fn layout_composer(draft: &Composer, width: usize, cap: usize, ghost: &str) -> ComposerView {
-    let cap = cap.max(1);
-    let (chars, caret, ghost_from) = composer_display(draft, ghost);
-    // `wrap_line` always yields at least one segment, so `segs` is never empty.
-    let segs = super::editor::wrap_line(&chars, width.max(1));
-    let (caret_row, _) = super::editor::caret_in_line(&chars, &segs, caret);
-    let rows = segs.len().min(cap);
-    let first = caret_row
-        .saturating_sub(rows - 1)
-        .min(segs.len().saturating_sub(rows));
-    ComposerView {
-        chars,
-        segs,
-        caret,
-        caret_row,
-        first,
-        rows,
-        ghost_from,
-    }
-}
-
-/// Content columns the draft has, once the prompt gutter is paid for.
-fn composer_width(area_width: u16) -> usize {
-    (area_width as usize)
-        .saturating_sub(COMPOSER_PROMPT.chars().count())
-        .max(1)
-}
-
-/// Draw a laid-out draft: the prompt on its first row, an aligned gutter on the
-/// wrapped continuations, and a reverse-video caret, the same block the shared
-/// single-line fields use.
-fn composer_lines(view: &ComposerView, theme: &Theme) -> Vec<Line<'static>> {
-    let ghost_style = theme.muted_style();
-    // The caret sits on the ghost's first character, so it has to carry the
-    // ghost's colour too. Reversed in the draft's own colour there would read
-    // as a character you had actually typed.
-    let caret_style = if view.ghost_from == Some(view.caret) {
-        ghost_style.add_modifier(Modifier::REVERSED)
-    } else {
-        theme.base().add_modifier(Modifier::REVERSED)
-    };
-    let style_at = |i: usize| match view.ghost_from {
-        Some(from) if i >= from => ghost_style,
-        _ => theme.base(),
-    };
-    // A run may straddle the ghost boundary, so it is emitted per style rather
-    // than as one span.
-    let run_spans = |range: std::ops::Range<usize>| -> Vec<Span<'static>> {
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        let mut buf = String::new();
-        let mut current: Option<Style> = None;
-        for i in range {
-            let st = style_at(i);
-            if current != Some(st) {
-                if let Some(prev) = current.take() {
-                    spans.push(Span::styled(std::mem::take(&mut buf), prev));
-                }
-                current = Some(st);
-            }
-            buf.push(view.chars[i]);
-        }
-        if let Some(st) = current {
-            spans.push(Span::styled(buf, st));
-        }
-        spans
-    };
-    (view.first..view.first + view.rows)
-        .map(|r| {
-            let seg = view.segs[r];
-            let gutter = if r == 0 {
-                Span::styled(COMPOSER_PROMPT, theme.accent_style())
-            } else if r == view.first {
-                // The draft scrolled: say so, rather than silently cutting it.
-                Span::styled(COMPOSER_MORE, theme.muted_style())
-            } else {
-                Span::styled(COMPOSER_GUTTER, theme.base())
-            };
-            let mut spans = vec![gutter];
-            if r != view.caret_row {
-                spans.extend(run_spans(seg.start..seg.end));
-                return Line::from(spans);
-            }
-            let at = view.caret.clamp(seg.start, seg.end);
-            spans.extend(run_spans(seg.start..at));
-            if at < seg.end {
-                spans.push(Span::styled(view.chars[at].to_string(), caret_style));
-                spans.extend(run_spans(at + 1..seg.end));
-            } else {
-                // Caret past the last character of the row.
-                spans.push(Span::styled(" ", caret_style));
-            }
-            Line::from(spans)
-        })
-        .collect()
 }
 
 /// The cIRC screen: a room list, and one open room at a time.
@@ -2107,11 +1848,11 @@ impl CircScreen {
         // The composer input is always present: its rows, then one row of hints.
         // It grows as the draft wraps, but never past the point where the
         // conversation it belongs to would be squeezed out.
-        let cap = MAX_COMPOSER_ROWS
+        let cap = composer::MAX_ROWS
             .min(
                 chat_area
                     .height
-                    .saturating_sub(out_rows + MIN_CHAT_ROWS + 1),
+                    .saturating_sub(out_rows + composer::MIN_CHAT_ROWS + 1),
             )
             .max(1);
         let composer_rows = self.composer_rows(chat_area.width, cap);
@@ -2419,9 +2160,10 @@ impl CircScreen {
         if select.flag.is_some() || select.confirming_delete || select.menu_open {
             return 1;
         }
-        layout_composer(
-            &self.draft,
-            composer_width(width),
+        composer::layout(
+            &self.draft.text,
+            self.draft.cursor,
+            composer::width(width),
             usize::from(cap),
             // The ghost occupies columns, so a preview that pushes the draft
             // onto another row has to be counted here too, or the pane and the
@@ -2480,14 +2222,15 @@ impl CircScreen {
         } else {
             // Always-on input line, soft-wrapped over the rows `render_room`
             // reserved for it.
-            let view = layout_composer(
-                &self.draft,
-                composer_width(rows[0].width),
+            let view = composer::layout(
+                &self.draft.text,
+                self.draft.cursor,
+                composer::width(rows[0].width),
                 usize::from(rows[0].height),
                 &self.mention_offer().map_or_else(String::new, |(_, _, g)| g),
             );
             (
-                composer_lines(&view, theme),
+                composer::lines(&view, theme),
                 // Only the keys that change with state are spelled out; the
                 // hint has to fit on one row and `?` covers the rest.
                 if has_older {
@@ -3347,7 +3090,7 @@ mod tests {
             .expect("composer hint row should be visible");
         rows[first..hint]
             .iter()
-            .map(|r| r.chars().skip(COMPOSER_PROMPT.chars().count()).collect())
+            .map(|r| r.chars().skip(composer::PROMPT.chars().count()).collect())
             .collect::<Vec<String>>()
             .join("")
     }
@@ -3501,7 +3244,7 @@ mod tests {
             .expect("composer hint row should be visible");
         assert_eq!(
             (hint - first) as u16,
-            MAX_COMPOSER_ROWS,
+            composer::MAX_ROWS,
             "the composer stops growing and scrolls instead:\n{}",
             rows.join("\n"),
         );
@@ -3540,7 +3283,7 @@ mod tests {
             .position(|r| r.starts_with('›') || r.starts_with('…'))
             .expect("composer should be visible");
         assert!(
-            first >= usize::from(MIN_CHAT_ROWS),
+            first >= usize::from(composer::MIN_CHAT_ROWS),
             "the conversation keeps its rows however long the draft is:\n{}",
             rows.join("\n"),
         );

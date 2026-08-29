@@ -8,6 +8,7 @@ pub mod clipboard;
 pub mod cmail;
 pub mod commands;
 pub mod compose;
+pub mod composer;
 pub mod edit_profile;
 pub mod editor;
 pub mod feed;
