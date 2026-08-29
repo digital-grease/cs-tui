@@ -36,7 +36,61 @@ Early development. Most of the documented v0.8.6 REST surface is implemented, in
 
 ## Install
 
-Download the archive for your platform from the [latest release](https://github.com/digital-grease/cs-tui/releases/latest), extract it, and run the binary. No Rust toolchain required.
+cs-tui is one ready-to-run program file. There is nothing to install, and no Rust toolchain or other software to set up first.
+
+It runs *inside* a terminal window, so double-clicking it won't get you far. You will need a terminal open: **Terminal** on macOS (Applications → Utilities), **Windows Terminal** or **PowerShell** on Windows (search the Start menu), or whichever terminal app your Linux desktop ships with.
+
+Every download below is on the [latest release page](https://github.com/digital-grease/cs-tui/releases/latest).
+
+### macOS
+
+1. Download the file ending in **`aarch64-apple-darwin.tar.gz`** for an Apple Silicon Mac (M1 and newer), or **`x86_64-apple-darwin.tar.gz`** for an older Intel one. Not sure which you have? Apple menu → About This Mac.
+2. Double-click the downloaded file in Finder. It unpacks into a program called `cs-tui`.
+3. Open Terminal and run these one line at a time:
+
+```sh
+cd ~/Downloads
+xattr -d com.apple.quarantine cs-tui
+./cs-tui
+```
+
+The `xattr` line tells macOS you trust the program. Without it, macOS refuses to open it, because these builds aren't signed with a paid Apple developer certificate.
+
+### Windows
+
+1. Download the file ending in **`x86_64-pc-windows-msvc.zip`**. Windows 10 or newer; nothing else needs installing.
+2. Right-click it in File Explorer, choose **Extract All**, then **Extract**. That gives you a folder containing `cs-tui.exe`.
+3. Open that folder, right-click an empty spot inside it, and choose **Open in Terminal** (on Windows 10: hold Shift while right-clicking, then **Open PowerShell window here**). Then run:
+
+```powershell
+.\cs-tui.exe
+```
+
+If Windows shows a blue "Windows protected your PC" box, choose **More info**, then **Run anyway**. That appears because the program isn't signed with a paid certificate, not because anything is wrong with it.
+
+### Linux
+
+1. Download the file ending in **`x86_64-unknown-linux-musl.tar.gz`**. That build works on any distribution.
+2. In a terminal:
+
+```sh
+cd ~/Downloads
+tar xzf cs-tui-*-x86_64-unknown-linux-musl.tar.gz
+./cs-tui
+```
+
+### Running it from anywhere
+
+The steps above run cs-tui out of your Downloads folder. To launch it by just typing `cs-tui` from any folder, move it somewhere your shell looks for programs. On macOS and Linux:
+
+```sh
+install -m 755 cs-tui ~/.local/bin/
+```
+
+If typing `cs-tui` still doesn't find it, `~/.local/bin` isn't on your `PATH` yet. On Windows, put `cs-tui.exe` wherever you like and run it from that folder, or add that folder to your `PATH` in the Start menu's "Edit environment variables for your account".
+
+<details>
+<summary>Full list of downloads</summary>
 
 | Platform | Asset | Notes |
 |---|---|---|
@@ -46,23 +100,13 @@ Download the archive for your platform from the [latest release](https://github.
 | macOS (Intel) | `cs-tui-<ver>-x86_64-apple-darwin.tar.gz` | |
 | Windows | `cs-tui-<ver>-x86_64-pc-windows-msvc.zip` | Windows 10 or newer. |
 
-```sh
-# Linux / macOS
-tar xzf cs-tui-*-x86_64-unknown-linux-musl.tar.gz
-./cs-tui
-# optionally put it on your PATH
-install -m 755 cs-tui ~/.local/bin/
-```
+Every archive has a matching `.sha256` file next to it if you want to verify the download.
 
-On macOS the binaries are not notarized, so the first launch is blocked by Gatekeeper. Right-click the binary and choose Open, or clear the quarantine flag:
+</details>
 
-```sh
-xattr -d com.apple.quarantine cs-tui
-```
+### Build from source
 
-On Windows, SmartScreen may warn on the unsigned `.exe` (choose More info, then Run anyway). No extra runtime is needed on Windows 10 or newer.
-
-## Build from source
+Only needed if you want changes that aren't in a release yet.
 
 ```sh
 cargo build --release
