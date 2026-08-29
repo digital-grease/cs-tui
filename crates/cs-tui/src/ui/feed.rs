@@ -1,10 +1,17 @@
 //! Feed screen — paginated list of entries with cursor-driven scroll.
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use cs_api::Entry;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, ListItem, Paragraph};
 use ratatui::Frame;
+
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::Protocol;
+use ratatui_image::{Image, Resize};
 
 use super::flag::{render_flag_prompt, FlagPrompt, FlagPromptKey};
 use super::list::{self, TabState};
@@ -59,13 +66,23 @@ pub enum FeedIntent {
     None,
 }
 
-#[derive(Debug)]
 pub struct FeedScreen {
     pub list: TabState<Entry>,
     pub include_nsfw: bool,
     /// The open flag-reason prompt (`F`), or `None` when nothing is being
     /// reported. While it's open it owns every key the screen sees.
     pub flag_prompt: Option<EntryFlagPrompt>,
+    /// Raw bytes of images already fetched, keyed by URL. Same lazy model as
+    /// the chat screens: decoding waits until the picture is on screen.
+    image_bytes: RefCell<HashMap<String, Vec<u8>>>,
+    /// URLs already asked for, so a failed fetch is not retried in a loop.
+    image_requested: RefCell<HashSet<String>>,
+    /// URLs whose fetch failed; they fall back to a chip instead of a band.
+    image_failed: RefCell<HashSet<String>>,
+    /// Pixel dimensions per URL, so a band can shrink to what the picture needs.
+    image_dims: RefCell<HashMap<String, (u32, u32)>>,
+    /// Encoded protocols with the size they were built for.
+    image_protocols: RefCell<HashMap<String, (Protocol, Size)>>,
 }
 
 /// Outcome of folding a background head-poll into the feed.
@@ -81,12 +98,28 @@ pub enum HeadUpdate {
     Gap,
 }
 
+impl std::fmt::Debug for FeedScreen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `Protocol` has no `Debug`, and a dump of encoded pixels helps nobody.
+        f.debug_struct("FeedScreen")
+            .field("list", &self.list)
+            .field("include_nsfw", &self.include_nsfw)
+            .field("images_cached", &self.image_bytes.borrow().len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl FeedScreen {
     pub fn new() -> Self {
         Self {
             list: TabState::loading(),
             include_nsfw: crate::config::get().nsfw,
             flag_prompt: None,
+            image_bytes: RefCell::new(HashMap::new()),
+            image_requested: RefCell::new(HashSet::new()),
+            image_failed: RefCell::new(HashSet::new()),
+            image_dims: RefCell::new(HashMap::new()),
+            image_protocols: RefCell::new(HashMap::new()),
         }
     }
 
@@ -160,11 +193,13 @@ impl FeedScreen {
             return FeedIntent::None;
         }
         let visible = self.visible_indices();
-        match super::list_nav::navigate(
+        let page = self.list.page_items();
+        match super::list_nav::navigate_paged(
             key.code,
             &mut self.list.selected,
             visible.len(),
             self.list.next_cursor.is_some(),
+            page,
         ) {
             super::list_nav::ListNav::LoadMore => {
                 self.list.loading = true;
@@ -380,7 +415,142 @@ impl FeedScreen {
         true
     }
 
-    pub fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
+    /// Record that `url` could not be fetched, so no band is held open for it.
+    ///
+    /// Without this the layout reserves rows for a picture that will never
+    /// arrive *and* suppresses the `[image]` chip, because as far as the layout
+    /// knows one is being drawn. The reader gets a blank hole with nothing to
+    /// explain it. Marking the URL failed puts the chip back.
+    pub fn note_image_failed(&self, url: &str) {
+        self.image_failed.borrow_mut().insert(url.to_string());
+    }
+
+    /// The bytes already fetched for `url`, for the fullscreen modal.
+    #[must_use]
+    pub fn held_image_bytes(&self, url: &str) -> Option<Vec<u8>> {
+        self.image_bytes.borrow().get(url).cloned()
+    }
+
+    /// Hand the screen the bytes of an image it asked for.
+    pub fn cache_image_bytes(&self, url: String, bytes: Vec<u8>) {
+        if let Some(dims) = super::images::probe_dimensions(&bytes) {
+            self.image_dims.borrow_mut().insert(url.clone(), dims);
+        }
+        self.image_bytes.borrow_mut().insert(url, bytes);
+    }
+
+    /// The first image URL of each loaded entry that has not been asked for yet.
+    ///
+    /// Only the first per entry: a card shows one picture, and fetching the
+    /// rest would spend the reader's bandwidth on images no screen will draw.
+    pub fn image_urls_to_fetch(&self, limit: usize) -> Vec<String> {
+        let mut requested = self.image_requested.borrow_mut();
+        let bytes = self.image_bytes.borrow();
+        self.list
+            .items
+            .iter()
+            .filter_map(|e| super::images::entry_image_urls(e).into_iter().next())
+            // Three steps, and the order of all three matters. Skip what is
+            // already held or already asked for, *then* cap the batch, and only
+            // then mark. Capping before the skip would re-take the same URLs
+            // every call and hand back nothing; marking before the cap would
+            // spend URLs that were never fetched, and a spent URL is never
+            // offered again.
+            .filter(|url| !bytes.contains_key(url) && !requested.contains(url))
+            .take(limit)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .inspect(|url| {
+                requested.insert(url.clone());
+            })
+            .collect()
+    }
+
+    /// Paint each card's reserved band, after the list has settled its offset.
+    ///
+    /// Positions are summed from `entry_height` using the same `rows_for` the
+    /// cards were built with, so the two cannot disagree. The list tiles
+    /// top-down from `list_offset`, unlike the chat panes which are anchored to
+    /// the bottom, so `y` simply accumulates from the top of the pane.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_images(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        visible: &[usize],
+        cols: u16,
+        font: (u16, u16),
+        rows_for: &dyn Fn(&Entry) -> u16,
+        picker: Option<&Picker>,
+    ) {
+        let Some(picker) = picker else { return };
+        let _ = font;
+        let mut protocols = self.image_protocols.borrow_mut();
+        let bytes = self.image_bytes.borrow();
+        let bottom = area.y.saturating_add(area.height);
+        let mut y = area.y;
+        for &i in visible.iter().skip(self.list.list_offset()) {
+            let Some(entry) = self.list.items.get(i) else {
+                break;
+            };
+            if y >= bottom {
+                break;
+            }
+            let rows = rows_for(entry);
+            let height = entry_height(entry, rows);
+            if rows > 0 {
+                if let Some(url) = super::images::entry_image_urls(entry).into_iter().next() {
+                    // The band sits below the header, title and snippet, which
+                    // is what `entry_height` counts before it.
+                    let above = entry_height(entry, 0).saturating_sub(
+                        u16::from(!crate::config::get().compact), // the rule
+                    );
+                    let top = y.saturating_add(above);
+                    let visible_rows = rows.min(bottom.saturating_sub(top));
+                    if top < bottom && visible_rows > 0 {
+                        let target = Size::new(cols, rows);
+                        let stale = protocols
+                            .get(&url)
+                            .map_or(true, |(_, built)| *built != target);
+                        if stale {
+                            if let Some(raw) = bytes.get(&url) {
+                                match super::images::decode_bounded(raw).and_then(|img| {
+                                    picker
+                                        .new_protocol(
+                                            img,
+                                            target,
+                                            Resize::Fit(super::images::filter()),
+                                        )
+                                        .map_err(|e| e.to_string())
+                                }) {
+                                    Ok(proto) => {
+                                        protocols.insert(url.clone(), (proto, target));
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!(error = %e, url = %url, "feed image encode failed");
+                                    }
+                                }
+                            }
+                        }
+                        if let Some((proto, _)) = protocols.get(&url) {
+                            let img_area =
+                                Rect::new(area.x.saturating_add(2), top, cols, visible_rows);
+                            frame.render_widget(Image::new(proto).allow_clipping(true), img_area);
+                        }
+                    }
+                }
+            }
+            y = y.saturating_add(height);
+        }
+    }
+
+    pub fn render(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        theme: &Theme,
+        picker: Option<&Picker>,
+    ) {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(theme.border_style())
@@ -400,6 +570,43 @@ impl FeedScreen {
 
         let visible = self.visible_indices();
         let width = list_area.width;
+
+        // A feed is an index you scan, not a page you read, so a picture here
+        // is held to a *third* of the pane rather than the half a conversation
+        // allows. Without that, a run of image posts turns the feed into one
+        // post per screen and stops being a feed at all. The configured
+        // `image_height` still caps it, and `fitted_image_rows` usually lands
+        // well under both.
+        let band_cap: Option<u16> = picker.filter(|_| list_area.height > 8).map(|_| {
+            crate::config::get()
+                .image_height
+                .min(list_area.height / 3)
+                .max(1)
+        });
+        let font = picker.map_or((8, 16), |p| {
+            let fs = p.font_size();
+            (fs.width, fs.height)
+        });
+        // The text column: the list reserves a two-column highlight gutter.
+        let cols = width.saturating_sub(2).max(1);
+        let rows_for = |e: &Entry| -> u16 {
+            let Some(cap) = band_cap else { return 0 };
+            let Some(url) = super::images::entry_image_urls(e).into_iter().next() else {
+                return 0;
+            };
+            // A failed fetch reserves nothing, so a card does not carry a blank
+            // band for a picture that will never arrive.
+            if self.image_failed.borrow().contains(&url) {
+                return 0;
+            }
+            match self.image_dims.borrow().get(&url) {
+                Some(&dims) => super::chat::fitted_image_rows(dims, cols, font, cap),
+                // Not fetched yet: reserve the cap so the picture is never
+                // clipped, and let the band shrink when the header is known.
+                None => cap,
+            }
+        };
+
         list::render_body(
             frame,
             list_area,
@@ -407,8 +614,9 @@ impl FeedScreen {
             &self.list,
             &visible,
             "no entries to show",
-            |e| entry_item(e, width, theme),
+            |e| entry_item(e, width, theme, rows_for(e)),
         );
+        self.paint_images(frame, list_area, &visible, cols, font, &rows_for, picker);
 
         if let Some(prompt) = &self.flag_prompt {
             render_flag_prompt(frame, status_area, theme, prompt);
@@ -425,7 +633,29 @@ impl Default for FeedScreen {
     }
 }
 
-fn entry_item(entry: &Entry, width: u16, theme: &Theme) -> ListItem<'static> {
+/// Rows an entry card occupies, including any reserved image band.
+///
+/// **Must agree with [`entry_item`] exactly.** The overlay places pictures by
+/// summing these, so a disagreement puts every image below the first one in the
+/// wrong place. `entry_height_matches_entry_item` pins it.
+fn entry_height(entry: &Entry, image_rows: u16) -> u16 {
+    let mut rows = 1u16; // header
+    if entry.title.as_deref().is_some_and(|t| !t.trim().is_empty()) {
+        rows += 1;
+    }
+    if !super::markdown::content_preview(&entry.content, crate::config::get().preview_length)
+        .is_empty()
+    {
+        rows += 1;
+    }
+    rows += image_rows;
+    if !crate::config::get().compact {
+        rows += 1; // rule
+    }
+    rows
+}
+
+fn entry_item(entry: &Entry, width: u16, theme: &Theme, image_rows: u16) -> ListItem<'static> {
     let when = entry
         .created_at
         .map(crate::config::format_list_timestamp)
@@ -479,6 +709,13 @@ fn entry_item(entry: &Entry, width: u16, theme: &Theme) -> ListItem<'static> {
         super::markdown::content_preview(&entry.content, crate::config::get().preview_length);
     if !snippet.is_empty() {
         lines.push(Line::from(Span::styled(snippet, theme.base())));
+    }
+
+    // Blank rows the screen paints the picture onto after the list is drawn.
+    // Below the snippet so the text stays the thing you scan; a card still
+    // reads as a card with the image as its illustration.
+    for _ in 0..image_rows {
+        lines.push(Line::from(String::new()));
     }
 
     // Rule between posts so it's clear where one ends and the next begins
@@ -555,7 +792,7 @@ mod tests {
     fn render_entry_item(entry: &Entry) -> String {
         use ratatui::widgets::List;
         let theme = Theme::cyber();
-        let item = entry_item(entry, 80, &theme);
+        let item = entry_item(entry, 80, &theme, 0);
         let backend = ratatui::backend::TestBackend::new(80, 10);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal
@@ -571,6 +808,76 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect()
+    }
+
+    #[test]
+    fn pgdn_and_pgup_move_the_feed_by_a_screenful() {
+        let entries: Vec<Entry> = (0..40)
+            .map(|i| entry(&format!("e{i}"), "text", false))
+            .collect();
+        let mut s = FeedScreen::new();
+        s.apply_initial(Ok((entries, None)));
+        assert_eq!(s.list.selected, 0);
+
+        // Render once so the screen knows how many cards fit; before that
+        // `page_items` is 1 and paging would behave like a single step.
+        let _ = render_feed_to_string(&s);
+        let page = s.list.page_items();
+        assert!(page > 1, "a rendered feed fits more than one card: {page}");
+
+        s.handle_key(key(KeyCode::PageDown));
+        assert_eq!(s.list.selected, page, "PgDn moves exactly one page");
+
+        s.handle_key(key(KeyCode::PageUp));
+        assert_eq!(s.list.selected, 0, "and PgUp comes back");
+    }
+
+    #[test]
+    fn paging_up_from_the_top_of_the_feed_stays_put() {
+        let entries: Vec<Entry> = (0..10)
+            .map(|i| entry(&format!("e{i}"), "text", false))
+            .collect();
+        let mut s = FeedScreen::new();
+        s.apply_initial(Ok((entries, None)));
+        let _ = render_feed_to_string(&s);
+        s.handle_key(key(KeyCode::PageUp));
+        assert_eq!(s.list.selected, 0);
+    }
+
+    #[test]
+    fn entry_height_matches_entry_item() {
+        // The invariant the image overlay rests on: it sums `entry_height` to
+        // find where each card starts, so any disagreement puts every picture
+        // below the first one in the wrong place. This is the same class of bug
+        // that `body_height` had for image gaps.
+        let theme = Theme::cyber();
+        let mut plain = entry("e1", "just text", false);
+        plain.title = None;
+        let mut titled = entry("e2", "with a title", false);
+        titled.title = Some("A Title".into());
+        let empty = entry("e3", "", false);
+
+        for e in [&plain, &titled, &empty] {
+            for rows in [0u16, 1, 7] {
+                let item = entry_item(e, 80, &theme, rows);
+                assert_eq!(
+                    u16::try_from(item.height()).unwrap_or(u16::MAX),
+                    entry_height(e, rows),
+                    "height disagreed for {:?} at {rows} image rows",
+                    e.post_id,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_card_reserves_no_rows_when_there_is_no_picture() {
+        let theme = Theme::cyber();
+        let e = entry("e1", "no image here", false);
+        assert_eq!(
+            entry_item(&e, 80, &theme, 0).height(),
+            entry_height(&e, 0) as usize,
+        );
     }
 
     #[test]
@@ -1044,7 +1351,9 @@ mod tests {
         let theme = Theme::cyber();
         let backend = ratatui::backend::TestBackend::new(80, 12);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| s.render(f, f.area(), &theme)).unwrap();
+        terminal
+            .draw(|f| s.render(f, f.area(), &theme, None))
+            .unwrap();
         terminal
             .backend()
             .buffer()

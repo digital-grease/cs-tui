@@ -42,6 +42,7 @@ use unicode_width::UnicodeWidthChar;
 use super::art;
 use super::audio::JukeboxTrack;
 use super::hyperlink::osc8;
+use super::markdown::InlineMark;
 use super::styles::{self, TextStyles};
 use super::theme::Theme;
 
@@ -138,6 +139,20 @@ pub struct BodyLayout<'a> {
     /// [`body_height`] and [`body_lines`] agreeing, since both derive from
     /// [`body_rows`].
     pub max_rows: Option<usize>,
+    /// The animation frame, when `animate_styles` is on and the screen is
+    /// driving a clock. `None` renders the static approximation.
+    pub anim_frame: Option<usize>,
+    /// Rows to reserve for an inline picture, when the screen can draw one.
+    ///
+    /// `None` (the default) keeps the `[image]` chip, which is what a terminal
+    /// without graphics, or a pane too short to spare the rows, should show.
+    /// `Some(n)` replaces that chip with `n` blank rows for the screen to paint
+    /// the decoded image onto after the pane has been rendered.
+    ///
+    /// Deliberately part of [`body_rows`], unlike [`Self::mention`]: it changes
+    /// how tall a message is, so [`body_height`] and [`body_lines`] must both
+    /// see it or they would disagree about where every later message starts.
+    pub image_rows: Option<u16>,
     /// The reader's own handle, when the screen knows it, so `@them` stands out
     /// in the text. `None` leaves every row styled exactly as before.
     ///
@@ -161,8 +176,35 @@ impl<'a> BodyLayout<'a> {
             width,
             revealed: false,
             max_rows: None,
+            anim_frame: None,
+            image_rows: None,
             mention: None,
         }
+    }
+
+    /// Reserve `rows` blank rows for an inline picture instead of an
+    /// `[image]` chip.
+    ///
+    /// Only affects a message that actually carries a still image: a GIF or a
+    /// song keeps its chip, since neither is something this can paint.
+    ///
+    /// ```ignore
+    /// let layout = chat::BodyLayout::new(width).with_image_rows(rows);
+    /// ```
+    /// Render at animation frame `frame`.
+    ///
+    /// Only affects colour and case, never how many rows a message occupies, so
+    /// it is safe to vary between frames without the pane reflowing.
+    #[must_use]
+    pub fn with_anim_frame(mut self, frame: usize) -> Self {
+        self.anim_frame = Some(frame);
+        self
+    }
+
+    #[must_use]
+    pub fn with_image_rows(mut self, rows: u16) -> Self {
+        self.image_rows = Some(rows.max(1));
+        self
     }
 
     /// Cap the body at `rows` rows, replacing the overflow with a marker.
@@ -235,16 +277,21 @@ pub enum OpenAction {
 /// never be measured at one height and drawn at another.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BodyRow {
-    /// A wrapped row of message text.
-    Text(String),
+    /// A wrapped row of message text, with what inline markdown marked it as.
+    Text(String, Vec<InlineMark>),
     /// A hard-wrapped row of decoded `/art`.
     Art(String),
-    /// A wrapped row of the `* username action` form.
-    Action(String),
+    /// A wrapped row of the `* username action` form, with its marks.
+    Action(String, Vec<InlineMark>),
     /// An 8-ball answer or a fortune, surfaced on its own row.
     Highlight(String),
     /// An attachment chip.
     Chip(ChipLink),
+    /// Blank rows held open for an inline picture the screen paints itself.
+    ///
+    /// Carries the URL so the screen knows which image belongs to this gap
+    /// without re-deriving it from the message.
+    ImageGap { url: String, rows: u16 },
     /// The deletion tombstone.
     Tombstone,
     /// Stands in for the rows a [`BodyLayout::max_rows`] cap removed, carrying
@@ -271,23 +318,40 @@ pub fn body_lines(
     let action = action_style(msg.extras, theme);
     body_rows(msg, layout)
         .into_iter()
-        .map(|row| {
+        .flat_map(|row| {
             let mut spans = vec![Span::styled(layout.indent.to_string(), base)];
             match row {
-                BodyRow::Text(text) => {
-                    spans.extend(text_spans(&text, text_styles, layout, base, theme));
+                // Blank rows, because the screen paints the picture over them
+                // after the pane is drawn. They still have to exist as lines so
+                // everything below the image sits where the height math said it
+                // would.
+                BodyRow::ImageGap { rows, .. } => {
+                    return vec![Line::from(String::new()); rows as usize];
                 }
-                // Art is a picture, not prose: `@` runs in it are pixels, and
-                // the mention scan would colour part of the drawing.
-                BodyRow::Art(text) => spans.extend(styles::styled_spans(
+                BodyRow::Text(text, marks) => {
+                    spans.extend(text_spans(&text, &marks, text_styles, layout, base, theme));
+                }
+                // Art is a picture, not prose. `@` runs in it are pixels, so
+                // the mention scan would colour part of the drawing, and a
+                // glitch's combining marks would settle on the drawing rather
+                // than corrupt it. Both live in `text_spans`, which this skips.
+                BodyRow::Art(text) => spans.extend(styles::styled_spans_at(
                     &text,
                     text_styles,
                     layout.revealed,
                     base,
                     theme,
+                    layout.anim_frame,
                 )),
-                BodyRow::Action(text) => {
-                    spans.extend(text_spans(&text, text_styles, layout, action, theme));
+                BodyRow::Action(text, marks) => {
+                    spans.extend(text_spans(
+                        &text,
+                        &marks,
+                        text_styles,
+                        layout,
+                        action,
+                        theme,
+                    ));
                 }
                 BodyRow::Highlight(text) => spans.push(Span::styled(text, theme.accent_style())),
                 BodyRow::Chip(chip) => spans.push(Span::styled(chip.label, chip_style(theme))),
@@ -300,7 +364,7 @@ pub fn body_lines(
                     theme.muted_style().add_modifier(Modifier::ITALIC),
                 )),
             }
-            Line::from(spans)
+            vec![Line::from(spans)]
         })
         .collect()
 }
@@ -315,7 +379,18 @@ pub fn body_lines(
 /// ```
 #[must_use]
 pub fn body_height(msg: ChatMessage<'_>, layout: BodyLayout<'_>) -> u16 {
-    u16::try_from(body_rows(msg, layout).len()).unwrap_or(u16::MAX)
+    // Not `.len()`: an image gap is one row in the list but many rows on
+    // screen. Counting it as one would put every message below an image that
+    // many rows off, which for a pane laid out by summed heights means the
+    // whole conversation drifts.
+    let rows: usize = body_rows(msg, layout)
+        .iter()
+        .map(|row| match row {
+            BodyRow::ImageGap { rows, .. } => *rows as usize,
+            _ => 1,
+        })
+        .sum();
+    u16::try_from(rows).unwrap_or(u16::MAX)
 }
 
 /// Rendered height of a whole message: the caller's `header_rows` plus its body.
@@ -433,14 +508,48 @@ pub fn apply_chip_links(buf: &mut Buffer, area: Rect, chips: &[ChipLink], theme:
 /// }
 /// ```
 #[must_use]
-pub fn open_action(extras: &MessageExtras) -> OpenAction {
+pub fn open_action(extras: &MessageExtras, content: &str) -> OpenAction {
     if let Some(track) = jukebox_track(extras) {
         return OpenAction::Play(track);
     }
-    match attachment_url(extras) {
+    // An attachment first, since it is what the message is *for*. A URL someone
+    // typed is the fallback, and until now was reachable by no path at all:
+    // `open_action` read attachments only, and OSC 8 linkifying is applied to
+    // attachment chips rather than to body text, so a link in a chat message
+    // could be neither opened nor clicked.
+    match attachment_url(extras).or_else(|| message_urls(extras, content).into_iter().next()) {
         Some(url) => OpenAction::Open(url),
         None => OpenAction::None,
     }
+}
+
+/// Every URL a message offers: its attachments, then any typed in its text.
+///
+/// Order is deliberate: an attachment is the message's point, a link in the
+/// prose is an aside. Deduplicated, so a caption repeating its own attachment
+/// URL is listed once.
+#[must_use]
+pub fn message_urls(extras: &MessageExtras, content: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |u: String| {
+        if !u.is_empty() && !out.iter().any(|e| e == &u) {
+            out.push(u);
+        }
+    };
+    for u in [
+        extras.image_url.as_deref(),
+        extras.gif_url.as_deref(),
+        extras.audio_attachment.as_ref().map(|a| a.src.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        push(u.trim().to_string());
+    }
+    for u in super::hyperlink::urls_in_text(content) {
+        push(u);
+    }
+    out
 }
 
 /// The picture a message links to: its image, else its GIF.
@@ -565,7 +674,7 @@ pub fn summary_text(extras: &MessageExtras, content: &str) -> String {
             return text;
         }
     }
-    chips_of(extras, usize::MAX)
+    chips_of(extras, usize::MAX, None)
         .first()
         .map(|c| c.label.clone())
         .unwrap_or_default()
@@ -650,6 +759,87 @@ pub fn word_wrap(content: &str, width: usize) -> Vec<String> {
 /// let rows = chat::hard_wrap(&art::decode_art(&m.content), body_width);
 /// ```
 #[must_use]
+/// Word-wrap text that carries a per-character mark, keeping the two aligned.
+///
+/// The same algorithm as [`word_wrap`], but carrying [`InlineMark`] alongside
+/// each character so a wrapped row arrives with exactly the marks for its own
+/// glyphs. Wrapping first and mapping ranges afterwards is the alternative, and
+/// it does not survive [`word_wrap`] collapsing whitespace runs: the offsets
+/// stop matching the moment a line has two spaces in it.
+///
+/// `marks` must be one per character of `content`; a shorter one is padded with
+/// plain, so a mismatch degrades to unstyled text rather than panicking.
+fn word_wrap_marked(
+    content: &str,
+    marks: &[InlineMark],
+    width: usize,
+) -> Vec<(String, Vec<InlineMark>)> {
+    let width = width.max(1);
+    let chars: Vec<(char, InlineMark)> = content
+        .chars()
+        .enumerate()
+        .map(|(i, c)| (c, marks.get(i).copied().unwrap_or_default()))
+        .collect();
+
+    let mut out: Vec<(String, Vec<InlineMark>)> = Vec::new();
+    let mut cur: Vec<(char, InlineMark)> = Vec::new();
+    // Set per paragraph below; the initial value is never read.
+    let mut cur_w;
+    let flush = |cur: &mut Vec<(char, InlineMark)>, out: &mut Vec<(String, Vec<InlineMark>)>| {
+        out.push((
+            cur.iter().map(|(c, _)| *c).collect(),
+            cur.iter().map(|(_, m)| *m).collect(),
+        ));
+        cur.clear();
+    };
+
+    for para in chars.split(|(c, _)| *c == '\n') {
+        cur.clear();
+        cur_w = 0;
+        // Words are runs of non-whitespace, which is what `split_whitespace`
+        // gives the unmarked version.
+        for word in para.split(|(c, _)| c.is_whitespace()) {
+            if word.is_empty() {
+                continue;
+            }
+            let ww: usize = word.iter().map(|(c, _)| char_width(*c)).sum();
+            let sep = usize::from(!cur.is_empty());
+            if cur_w + sep + ww <= width {
+                if sep == 1 {
+                    cur.push((' ', InlineMark::default()));
+                }
+                cur.extend_from_slice(word);
+                cur_w += sep + ww;
+                continue;
+            }
+            if !cur.is_empty() {
+                cur_w = 0;
+                flush(&mut cur, &mut out);
+            }
+            if ww <= width {
+                cur.extend_from_slice(word);
+                cur_w = ww;
+            } else {
+                // A word wider than the whole line: hard-break it by columns.
+                for &(ch, m) in word {
+                    let cw = char_width(ch);
+                    if cur_w + cw > width && !cur.is_empty() {
+                        cur_w = 0;
+                        flush(&mut cur, &mut out);
+                    }
+                    cur.push((ch, m));
+                    cur_w += cw;
+                }
+            }
+        }
+        flush(&mut cur, &mut out);
+    }
+    if out.is_empty() {
+        out.push((String::new(), Vec::new()));
+    }
+    out
+}
+
 pub fn hard_wrap(content: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut out: Vec<String> = Vec::new();
@@ -695,27 +885,129 @@ pub fn truncate_to_width(s: &str, width: usize) -> String {
 /// already produced.
 fn text_spans(
     text: &str,
+    marks: &[InlineMark],
     text_styles: TextStyles,
     layout: BodyLayout<'_>,
     base: Style,
     theme: &Theme,
 ) -> Vec<Span<'static>> {
-    let spans = styles::styled_spans(text, text_styles, layout.revealed, base, theme);
+    let spans = styles::styled_spans_at(
+        text,
+        text_styles,
+        layout.revealed,
+        base,
+        theme,
+        layout.anim_frame,
+    );
+    // Inline markdown decorates whatever the message's own styles produced,
+    // rather than replacing it: a `**bold**` run inside a `rainbow` message
+    // keeps its per-character colours and gains the bold modifier.
+    let spans = apply_marks(spans, marks, theme);
     // An unrevealed spoiler is drawn as a mask, so there is no `@you` on screen
     // to pick out, and colouring the mask cells would leak whereabouts in the
     // hidden text the mention sits. The row-level marker still fires: see
     // [`mentions`].
     if text_styles.spoiler && !layout.revealed {
+        // A masked spoiler is already unreadable; corrupting the mask would say
+        // nothing and cost columns.
         return spans;
     }
     let Some(handle) = layout.mention else {
-        return spans;
+        return corrupt(spans, text_styles, layout);
     };
     let ranges = mention_ranges(text, handle);
     if ranges.is_empty() {
+        return corrupt(spans, text_styles, layout);
+    }
+    // The ranges were measured on `text`; the spans may carry an animated copy
+    // of it. `styles::animate_text` guarantees the animation is
+    // byte-length-preserving precisely so these still line up. Belt and braces:
+    // if that ever stops holding, skip the highlight rather than slice at a
+    // byte offset that is no longer a character boundary and panic.
+    let rendered: usize = spans.iter().map(|s| s.content.len()).sum();
+    if rendered != text.len() {
         return spans;
     }
-    highlight_runs(spans, &ranges, theme)
+    let spans = highlight_runs(spans, &ranges, theme);
+    corrupt(spans, text_styles, layout)
+}
+
+/// Apply `glitch`'s glyph corruption, if this row is glitching.
+///
+/// **The last pass over a row, deliberately.** It adds characters, and both the
+/// inline-markdown marks (held per character) and the `@mention` ranges
+/// (measured in bytes) are indexed against the row as written. Corrupting
+/// earlier would slide them both.
+fn corrupt(
+    spans: Vec<Span<'static>>,
+    text_styles: TextStyles,
+    layout: BodyLayout<'_>,
+) -> Vec<Span<'static>> {
+    match layout.anim_frame {
+        Some(frame) if text_styles.glitch => styles::corrupt_spans(spans, frame),
+        _ => spans,
+    }
+}
+
+/// Layer inline-markdown marks onto already-styled spans.
+///
+/// Works off the spans rather than the text so it composes with whatever
+/// [`styles::styled_spans`] did: one span for an ordinary row, one per
+/// character for `rainbow`. Safe because every path that reaches here emits
+/// spans whose contents concatenate back to exactly the row text, which is what
+/// lets character offsets be tracked across them.
+fn apply_marks(
+    spans: Vec<Span<'static>>,
+    marks: &[InlineMark],
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    if marks.iter().all(|m| m.is_plain()) {
+        return spans;
+    }
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut at = 0usize;
+    for span in spans {
+        let style = span.style;
+        let text = span.content.into_owned();
+        let mut buf = String::new();
+        let mut cur: Option<Style> = None;
+        for ch in text.chars() {
+            let mark = marks.get(at).copied().unwrap_or_default();
+            at += 1;
+            let st = decorate_mark(style, mark, theme);
+            if cur != Some(st) {
+                if let Some(prev) = cur.take() {
+                    out.push(Span::styled(std::mem::take(&mut buf), prev));
+                }
+                cur = Some(st);
+            }
+            buf.push(ch);
+        }
+        if let Some(st) = cur {
+            out.push(Span::styled(buf, st));
+        }
+    }
+    out
+}
+
+/// Fold one character's inline mark into the style it already had.
+fn decorate_mark(base: Style, mark: InlineMark, theme: &Theme) -> Style {
+    let mut style = base;
+    if mark.strong {
+        style = style.add_modifier(Modifier::BOLD);
+    }
+    if mark.emphasis {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    if mark.code {
+        // A colour rather than a background: a background would fight the
+        // selected-row highlight, and chat rows are already dense.
+        style = style.fg(theme.accent);
+    }
+    if mark.link {
+        style = style.add_modifier(Modifier::UNDERLINED);
+    }
+    style
 }
 
 /// Re-style the bytes covered by `ranges`, splitting spans where a range starts
@@ -837,10 +1129,50 @@ fn body_rows(msg: ChatMessage<'_>, layout: BodyLayout<'_>) -> Vec<BodyRow> {
                     .map(BodyRow::Art),
             );
         } else if msg.extras.is_action {
-            let line = format!("* {} {}", author_of(msg.username), text.trim());
-            rows.extend(word_wrap(&line, width).into_iter().map(BodyRow::Action));
+            // Only the body is substituted, not the `* username` wrapper this
+            // builds around it: the wrapper is ours, not something the sender
+            // styled, and leeting or flipping someone's name in it would read
+            // as a different person having spoken.
+            let body = if layout.revealed {
+                std::borrow::Cow::Borrowed(text.trim())
+            } else {
+                text_styles.transform(text.trim())
+            };
+            let (plain, body_marks) = super::markdown::inline_marks(&body);
+            let prefix = format!("* {} ", author_of(msg.username));
+            // The wrapper is ours, not the sender's, so it is never marked.
+            let mut marks = vec![InlineMark::default(); prefix.chars().count()];
+            marks.extend(body_marks);
+            let line = format!("{prefix}{plain}");
+            rows.extend(
+                word_wrap_marked(&line, &marks, width)
+                    .into_iter()
+                    .map(|(t, m)| BodyRow::Action(t, m)),
+            );
         } else {
-            rows.extend(word_wrap(text, width).into_iter().map(BodyRow::Text));
+            // Before the wrap, never after: `flip` reverses the whole string,
+            // so wrapping first would reverse each row on its own and scramble
+            // the reading order between them. See `TextStyles::transform`.
+            // `revealed` means "show me what this really says", which for a
+            // substituted body is the text before the substitution.
+            let text = if layout.revealed {
+                std::borrow::Cow::Borrowed(text)
+            } else {
+                text_styles.transform(text)
+            };
+            // Substitute, then parse markdown, then wrap, in that order.
+            // Substitution first because `flip` reverses the whole string, and
+            // because the substitutions leave `*` and backticks alone (a
+            // flipped symmetric marker is still itself), so markup still
+            // parses. Markdown before the wrap because it *removes* characters,
+            // and a wrap computed on the un-stripped text breaks in the wrong
+            // columns.
+            let (plain, marks) = super::markdown::inline_marks(&text);
+            rows.extend(
+                word_wrap_marked(&plain, &marks, width)
+                    .into_iter()
+                    .map(|(t, m)| BodyRow::Text(t, m)),
+            );
         }
     }
 
@@ -851,14 +1183,47 @@ fn body_rows(msg: ChatMessage<'_>, layout: BodyLayout<'_>) -> Vec<BodyRow> {
                 .map(BodyRow::Highlight),
         );
     }
-    rows.extend(chips_of(msg.extras, width).into_iter().map(BodyRow::Chip));
+    // A still image becomes a reserved gap when the screen can paint one, and
+    // an `[image]` chip otherwise. Only the still image: a GIF cannot be
+    // animated here and a song is not a picture, so both keep their chips.
+    let inline_url = layout.image_rows.and_then(|_| inline_image_url(msg.extras));
+    if let (Some(rows_reserved), Some(url)) = (layout.image_rows, inline_url.as_deref()) {
+        rows.push(BodyRow::ImageGap {
+            url: url.to_string(),
+            rows: rows_reserved,
+        });
+    }
+    rows.extend(
+        chips_of(msg.extras, width, inline_url.as_deref())
+            .into_iter()
+            .map(BodyRow::Chip),
+    );
 
-    // Last, so the cap counts every row the message actually produced.
+    // Last, so the cap counts every row the message actually produced. Measured
+    // in *screen* rows, not entries, since an image gap is worth many of them:
+    // a cap counted by entries would let one picture blow past the pane, which
+    // is the exact failure `max_rows` exists to prevent.
     if let Some(max) = layout.max_rows {
         let max = max.max(1);
-        if rows.len() > max {
-            let hidden = rows.len() - max + 1;
-            rows.truncate(max - 1);
+        let screen_rows = |r: &BodyRow| match r {
+            BodyRow::ImageGap { rows, .. } => *rows as usize,
+            _ => 1,
+        };
+        let total: usize = rows.iter().map(screen_rows).sum();
+        if total > max {
+            let mut kept = 0usize;
+            let mut used = 0usize;
+            for row in &rows {
+                let h = screen_rows(row);
+                // Leave a row for the marker itself.
+                if used + h > max.saturating_sub(1) {
+                    break;
+                }
+                used += h;
+                kept += 1;
+            }
+            let hidden = total - used;
+            rows.truncate(kept);
             rows.push(BodyRow::Truncated(hidden));
         }
     }
@@ -893,14 +1258,92 @@ fn highlights(msg: ChatMessage<'_>) -> Vec<String> {
     out
 }
 
+/// Where this message's reserved image gap sits, as `(url, rows_above, rows)`.
+///
+/// `rows_above` counts body rows before the gap, so a caller that knows where
+/// the message's body starts on screen knows where the picture goes. `None`
+/// when the layout reserved no gap, or the message has no still image, or the
+/// row cap cut the gap off before it could be drawn.
+///
+/// Derived from the same [`body_rows`] the pane was drawn from, so it cannot
+/// drift from what is actually on screen the way a re-derived guess would.
+#[must_use]
+pub fn image_gap(msg: ChatMessage<'_>, layout: BodyLayout<'_>) -> Option<(String, u16, u16)> {
+    let mut above: u16 = 0;
+    for row in body_rows(msg, layout) {
+        match row {
+            BodyRow::ImageGap { url, rows } => return Some((url, above, rows)),
+            _ => above = above.saturating_add(1),
+        }
+    }
+    None
+}
+
+/// How many terminal rows an image actually needs, given the columns it will be
+/// drawn into.
+///
+/// The band used to be a flat `image_height` for every picture, which is wrong
+/// in both directions: a wide banner letterboxes into twenty rows and wastes a
+/// dozen of them, and a small avatar is blown up to fill a band it never needed.
+/// Sizing from the real aspect ratio makes a picture take the room it deserves
+/// and no more.
+///
+/// - `cols` is the content width the image is drawn into.
+/// - `font` is the terminal's cell size in pixels, from the graphics probe.
+/// - `max` is the configured ceiling, so a portrait photo still cannot swallow
+///   the pane.
+///
+/// **Never upscales.** An image smaller than the target box keeps its own size,
+/// because stretching a 32-pixel avatar across twenty rows looks worse than
+/// leaving it small and costs more of the screen.
+#[must_use]
+pub fn fitted_image_rows(img: (u32, u32), cols: u16, font: (u16, u16), max: u16) -> u16 {
+    let (iw, ih) = img;
+    let (fw, fh) = (u32::from(font.0).max(1), u32::from(font.1).max(1));
+    if iw == 0 || ih == 0 {
+        return max.max(1);
+    }
+    let box_w = u32::from(cols).max(1) * fw;
+    // Scale to fit the width, but never past 1:1.
+    let px_h = if iw <= box_w {
+        ih
+    } else {
+        // Round rather than truncate, so a hair over a row boundary still gets
+        // the row it needs instead of being clipped.
+        ((u64::from(ih) * u64::from(box_w) + u64::from(iw) / 2) / u64::from(iw)) as u32
+    };
+    let rows = px_h.div_ceil(fh);
+    u16::try_from(rows).unwrap_or(u16::MAX).clamp(1, max.max(1))
+}
+
+/// The still image a screen could paint inline for this message, if any.
+///
+/// Only `imageUrl`. A GIF is animated and this pipeline draws one static frame,
+/// so showing it inline would silently misrepresent it; a song has no picture at
+/// all. Both keep their chips and open in a real viewer.
+#[must_use]
+pub fn inline_image_url(extras: &MessageExtras) -> Option<String> {
+    extras
+        .image_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+}
+
 /// The attachment chips a message carries, already truncated to `width`.
-fn chips_of(extras: &MessageExtras, width: usize) -> Vec<ChipLink> {
+fn chips_of(extras: &MessageExtras, width: usize, drawn_inline: Option<&str>) -> Vec<ChipLink> {
     let mut chips = Vec::new();
     for (label, url) in [
         (IMAGE_CHIP, extras.image_url.as_deref()),
         (GIF_CHIP, extras.gif_url.as_deref()),
     ] {
         if let Some(url) = url.map(str::trim).filter(|u| !u.is_empty()) {
+            // Already reserved as a gap: a chip as well would name the picture
+            // twice, once above itself.
+            if drawn_inline == Some(url) {
+                continue;
+            }
             chips.push(ChipLink {
                 label: truncate_to_width(label, width),
                 url: url.to_string(),
@@ -1127,6 +1570,308 @@ mod tests {
             .collect()
     }
 
+    /// The rendered text of a message's body rows, marks stripped.
+    fn body_text(msg: ChatMessage<'_>, width: usize) -> String {
+        let theme = Theme::default();
+        body_lines(msg, BodyLayout::new(width), &theme)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn an_animated_mention_with_multibyte_text_does_not_panic() {
+        // End to end for the same bug: an animated style, a mention of the
+        // reader, and characters whose case mapping changes width.
+        let extras = MessageExtras {
+            style: Some(cs_api::MessageStyle::One("glitch".into())),
+            ..Default::default()
+        };
+        let msg = ChatMessage {
+            username: "trinity",
+            content: "hey @neo \u{df}\u{130}\u{131} stra\u{df}e caf\u{e9} \u{4f60}\u{597d}",
+            extras: &extras,
+        };
+        let theme = Theme::default();
+        for frame in 0..24 {
+            let layout = BodyLayout::new(30)
+                .with_mention("neo")
+                .with_anim_frame(frame);
+            // The assertion is simply that this returns at all.
+            let lines = body_lines(msg, layout, &theme);
+            assert!(!lines.is_empty(), "frame {frame}");
+        }
+    }
+
+    #[test]
+    fn a_wide_image_takes_only_the_rows_it_needs() {
+        // The case that motivated this: a 4:1 banner used to letterbox into the
+        // full twenty-row band and waste most of it.
+        let rows = fitted_image_rows((800, 200), 60, (8, 16), 20);
+        assert!(
+            (5..=10).contains(&rows),
+            "a 4:1 banner in 60 columns should be well under the cap, got {rows}",
+        );
+    }
+
+    #[test]
+    fn a_tall_image_is_capped_rather_than_swallowing_the_pane() {
+        let rows = fitted_image_rows((200, 4000), 60, (8, 16), 20);
+        assert_eq!(rows, 20, "the configured ceiling still holds");
+    }
+
+    #[test]
+    fn a_small_image_is_never_blown_up() {
+        // Stretching a 32-pixel avatar across twenty rows looks worse and costs
+        // more screen than leaving it alone.
+        let rows = fitted_image_rows((32, 32), 60, (8, 16), 20);
+        assert_eq!(rows, 2, "32 pixels tall is two 16-pixel rows, not twenty");
+    }
+
+    #[test]
+    fn a_degenerate_image_falls_back_to_the_cap() {
+        // Zero dimensions mean we could not read the header; reserving the full
+        // band is the safe guess, since too few rows would clip the picture.
+        assert_eq!(fitted_image_rows((0, 0), 60, (8, 16), 20), 20);
+    }
+
+    #[test]
+    fn the_row_count_never_reaches_zero() {
+        // A zero-row gap would make the image invisible while still consuming a
+        // `BodyRow`, which reads as a rendering bug rather than a small picture.
+        for dims in [(1, 1), (10_000, 1), (1, 10_000)] {
+            assert!(fitted_image_rows(dims, 60, (8, 16), 20) >= 1, "{dims:?}");
+        }
+    }
+
+    #[test]
+    fn control_characters_in_a_message_never_reach_the_terminal() {
+        // Phase 9 Task 9.12: markdown rendering was the one change in the
+        // parity plan that could route message text around ratatui's own
+        // control-character stripping. It does not: `inline_marks` yields text
+        // events that still go through spans and `Buffer::set_string`.
+        let extras = MessageExtras::default();
+        let hostile = "before\u{1b}[2Jafter\u{1b}]0;title\u{7}end\u{0}nul";
+        let msg = ChatMessage {
+            username: "neo",
+            content: hostile,
+            extras: &extras,
+        };
+        let theme = Theme::default();
+        let lines = body_lines(msg, BodyLayout::new(80), &theme);
+
+        let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 10));
+        for (y, line) in lines.iter().enumerate() {
+            buf.set_line(0, y as u16, line, 80);
+        }
+        let painted: String = buf.content().iter().map(|c| c.symbol()).collect();
+        for (name, ch) in [("ESC", '\u{1b}'), ("BEL", '\u{7}'), ("NUL", '\u{0}')] {
+            assert!(
+                !painted.contains(ch),
+                "{name} reached the screen buffer: a message could then repaint \
+                 or retitle the reader's terminal",
+            );
+        }
+        assert!(painted.contains("before") && painted.contains("after"));
+    }
+
+    #[test]
+    fn inline_markdown_is_rendered_in_a_message_body() {
+        let extras = MessageExtras::default();
+        let msg = ChatMessage {
+            username: "neo",
+            content: "a **bold** word",
+            extras: &extras,
+        };
+        assert_eq!(
+            body_text(msg, 40).trim(),
+            "a bold word",
+            "the markers are consumed, not printed",
+        );
+    }
+
+    #[test]
+    fn a_chat_line_that_looks_like_a_block_is_left_alone() {
+        // The failure mode this guards: a message beginning `#` becoming a
+        // heading, or `- x` becoming a bullet, in a chat room.
+        for content in ["# hello", "- hello", "> hello", "```", "--- "] {
+            let extras = MessageExtras::default();
+            let msg = ChatMessage {
+                username: "neo",
+                content,
+                extras: &extras,
+            };
+            assert_eq!(
+                body_text(msg, 40).trim(),
+                content.trim(),
+                "{content:?} must render as typed",
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_marks_survive_a_wrap_and_land_on_the_right_row() {
+        // The invariant `word_wrap_marked` exists for: wrapping first and
+        // mapping ranges afterwards does not survive whitespace collapsing.
+        let marked = vec![InlineMark::default(); 5];
+        let rows = word_wrap_marked("aaa bbb ccc", &marked, 7);
+        for (text, marks) in &rows {
+            assert_eq!(
+                marks.len(),
+                text.chars().count(),
+                "every row carries exactly one mark per character: {text:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_marked_run_keeps_its_marks_across_the_wrap_point() {
+        let (plain, marks) = super::super::markdown::inline_marks("xx **aaaa bbbb** yy");
+        let rows = word_wrap_marked(&plain, &marks, 8);
+        // Every character of "aaaa bbbb" is strong, wherever it landed.
+        for (text, row_marks) in &rows {
+            for (i, c) in text.chars().enumerate() {
+                if "ab".contains(c) {
+                    assert!(
+                        row_marks[i].strong,
+                        "{c:?} in row {text:?} lost its mark at the wrap",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn markdown_composes_with_a_per_character_rainbow() {
+        // `rainbow` emits one span per character and markdown layers onto it;
+        // the danger is one of them dropping the other's work.
+        let extras = MessageExtras {
+            style: Some(cs_api::MessageStyle::One("rainbow".into())),
+            ..Default::default()
+        };
+        let msg = ChatMessage {
+            username: "neo",
+            content: "a **bold** word",
+            extras: &extras,
+        };
+        let theme = Theme::default();
+        let lines = body_lines(msg, BodyLayout::new(40), &theme);
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("bold") && !text.contains('*'));
+        let bolded = lines[0]
+            .spans
+            .iter()
+            .filter(|s| s.style.add_modifier.contains(Modifier::BOLD))
+            .count();
+        assert!(bolded > 0, "the bold survived the rainbow");
+        let coloured: std::collections::HashSet<_> =
+            lines[0].spans.iter().filter_map(|s| s.style.fg).collect();
+        assert!(coloured.len() > 1, "and the rainbow survived the bold");
+    }
+
+    #[test]
+    fn a_substituted_body_still_renders_its_markup() {
+        // Ordering check for the substitute-then-parse decision: `l33t` leaves
+        // `*` alone, so the markup still parses after substitution.
+        let extras = MessageExtras {
+            style: Some(cs_api::MessageStyle::One("l33t".into())),
+            ..Default::default()
+        };
+        let msg = ChatMessage {
+            username: "neo",
+            content: "a **test** word",
+            extras: &extras,
+        };
+        let rendered = body_text(msg, 40);
+        assert!(
+            rendered.contains("7357") && !rendered.contains('*'),
+            "leeted and un-marked: {rendered:?}",
+        );
+    }
+
+    #[test]
+    fn an_image_gap_makes_the_body_taller_by_exactly_its_rows() {
+        // The invariant the whole inline-image layout rests on: `body_height`
+        // and `body_lines` must agree, or every message below a picture in a
+        // height-summed pane sits in the wrong place.
+        let extras = MessageExtras {
+            image_url: Some("https://cdn.example/pic.png".into()),
+            ..Default::default()
+        };
+        let msg = ChatMessage {
+            username: "neo",
+            content: "look at this",
+            extras: &extras,
+        };
+
+        let chipped = BodyLayout::new(40);
+        let inlined = BodyLayout::new(40).with_image_rows(8);
+
+        let chip_h = body_height(msg, chipped);
+        let inline_h = body_height(msg, inlined);
+        assert_eq!(
+            inline_h,
+            chip_h + 8 - 1,
+            "the gap replaces the one-row chip with eight rows",
+        );
+        assert_eq!(
+            body_lines(msg, inlined, &Theme::default()).len(),
+            inline_h as usize,
+            "body_height and body_lines must agree exactly",
+        );
+    }
+
+    #[test]
+    fn an_inlined_image_drops_its_chip_but_a_gif_keeps_one() {
+        let extras = MessageExtras {
+            image_url: Some("https://cdn.example/pic.png".into()),
+            gif_url: Some("https://cdn.example/a.gif".into()),
+            ..Default::default()
+        };
+        let msg = ChatMessage {
+            username: "neo",
+            content: "",
+            extras: &extras,
+        };
+        let chips = message_chips(msg, BodyLayout::new(40).with_image_rows(6));
+        let labels: Vec<&str> = chips.iter().map(|c| c.label.as_str()).collect();
+        assert!(
+            !labels.contains(&"[image]"),
+            "the still image is drawn, so naming it as well is redundant: {labels:?}",
+        );
+        assert!(
+            labels.contains(&"[gif]"),
+            "a GIF is animated and this pipeline paints one frame, so it keeps \
+             its chip and opens in a real viewer: {labels:?}",
+        );
+    }
+
+    #[test]
+    fn the_row_cap_counts_an_image_gap_at_full_height() {
+        // Counting the gap as one entry would let a single picture blow past
+        // the pane, which is the failure `max_rows` exists to prevent.
+        let extras = MessageExtras {
+            image_url: Some("https://cdn.example/pic.png".into()),
+            ..Default::default()
+        };
+        let msg = ChatMessage {
+            username: "neo",
+            content: "hello",
+            extras: &extras,
+        };
+        let capped = BodyLayout::new(40).with_image_rows(20).with_max_rows(5);
+        assert!(
+            body_height(msg, capped) <= 5,
+            "a twenty row picture must not escape a five row cap",
+        );
+    }
+
     #[test]
     fn word_wrap_breaks_words_newlines_and_long_tokens() {
         // Behaviour promoted verbatim from the cIRC screen.
@@ -1298,7 +2043,7 @@ mod tests {
         let msg = ChatMessage::new("neo", "hi", &e);
         assert_eq!(rows(msg, 40), vec!["  hi"]);
         assert_eq!(jukebox_track(&e), None);
-        assert_eq!(open_action(&e), OpenAction::None);
+        assert_eq!(open_action(&e, ""), OpenAction::None);
     }
 
     #[test]
@@ -1673,7 +2418,7 @@ mod tests {
             ..MessageExtras::default()
         };
         assert_eq!(
-            open_action(&audio),
+            open_action(&audio, ""),
             OpenAction::Play(JukeboxTrack {
                 url: "https://youtu.be/dQw4w9WgXcQ".into(),
                 artist: "Art of Noise".into(),
@@ -1687,10 +2432,10 @@ mod tests {
             ..MessageExtras::default()
         };
         assert_eq!(
-            open_action(&gif),
+            open_action(&gif, ""),
             OpenAction::Open("https://cdn.example/a.gif".into()),
         );
-        assert_eq!(open_action(&extras()), OpenAction::None);
+        assert_eq!(open_action(&extras(), ""), OpenAction::None);
     }
 
     #[test]
@@ -2011,5 +2756,48 @@ mod tests {
             text.contains("\u{1b}]8;;https://cdn.example/pic.png\u{1b}\\"),
             "the chip must carry an OSC 8 link: {text:?}",
         );
+    }
+
+    #[test]
+    fn the_kelvin_sign_does_not_slide_a_mention_range() {
+        // U+212A KELVIN SIGN is uppercase and lowercases to a 1-byte `k`, so a
+        // case flip on it shortens the row by two bytes. That was enough to
+        // slide every later `@mention` byte range and slice mid-character.
+        // Kept from an adversarial reviewer's reproduction, since it is a
+        // sharper case than the ones written by hand.
+        let extras = MessageExtras {
+            style: Some(cs_api::MessageStyle::One("glitch".into())),
+            ..Default::default()
+        };
+        let content = "\u{212a} @neo\u{2026}tail";
+        let msg = ChatMessage {
+            username: "trinity",
+            content,
+            extras: &extras,
+        };
+        let theme = Theme::default();
+        for frame in 0..64usize {
+            let layout = BodyLayout::new(80)
+                .with_mention("neo")
+                .with_anim_frame(frame);
+            let lines = body_lines(msg, layout, &theme);
+            let rendered: String = lines
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .map(|s| s.content.as_ref())
+                .collect();
+            // With the combining marks stripped: hanging them off glyphs is
+            // what glitch *does*, so "tail" legitimately renders as
+            // "ta\u{334}il". What must not happen is the tail going missing,
+            // which is what a slid range produced.
+            let bare: String = rendered
+                .chars()
+                .filter(|c| !('\u{0300}'..='\u{036f}').contains(c))
+                .collect();
+            assert!(
+                bare.contains("tail"),
+                "frame {frame} lost the row's tail: {rendered:?}",
+            );
+        }
     }
 }

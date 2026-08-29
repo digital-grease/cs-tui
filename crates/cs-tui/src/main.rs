@@ -52,6 +52,17 @@ struct Cli {
 /// shell for as long as a slow or blackholed resolver takes. Whatever is still
 /// in flight by then is best-effort anyway: a presence withdrawal, a typing
 /// clear, an update check.
+/// Map our config name onto `ratatui-image`'s protocol enum.
+fn protocol_type(p: crate::config::GraphicsProtocol) -> ratatui_image::picker::ProtocolType {
+    use ratatui_image::picker::ProtocolType;
+    match p {
+        crate::config::GraphicsProtocol::Kitty => ProtocolType::Kitty,
+        crate::config::GraphicsProtocol::Iterm2 => ProtocolType::Iterm2,
+        crate::config::GraphicsProtocol::Sixel => ProtocolType::Sixel,
+        crate::config::GraphicsProtocol::Halfblocks => ProtocolType::Halfblocks,
+    }
+}
+
 fn main() -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -147,14 +158,44 @@ async fn run() -> Result<()> {
             ..Default::default()
         };
         match ratatui_image::picker::Picker::from_query_stdio_with_options(query_opts) {
-            Ok(p) => {
-                tracing::info!(protocol = ?p.protocol_type(), "terminal image graphics detected");
+            Ok(mut p) => {
+                // The probe answers both "which protocol" and "what size is a
+                // cell", and only the first is ever wrong. So an override
+                // replaces the protocol on a successful probe rather than
+                // skipping it: the font metrics are still the real ones.
+                if let Some(forced) = config::get().graphics_protocol {
+                    p.set_protocol_type(protocol_type(forced));
+                    tracing::info!(protocol = ?p.protocol_type(), "terminal image graphics forced by config");
+                } else {
+                    tracing::info!(protocol = ?p.protocol_type(), "terminal image graphics detected");
+                }
                 Some(p)
             }
-            Err(e) => {
-                tracing::info!(error = %e, "no terminal image graphics; using [image] placeholders");
-                None
-            }
+            Err(e) => match config::get().graphics_protocol {
+                // A terminal that refuses the query can still be capable, and
+                // the override exists exactly for that case. Fall back to a
+                // conservative cell size, since the probe never told us one.
+                Some(forced) => {
+                    tracing::info!(error = %e, ?forced, "graphics probe failed; using the configured protocol");
+                    // `from_fontsize` is deprecated in favour of the query we
+                    // just watched fail, and `halfblocks()` would pin the
+                    // protocol we are overriding. Constructing from an explicit
+                    // cell size is the only way to honour the override when the
+                    // terminal will not answer, so the deprecation is allowed
+                    // here deliberately. 8x16 is the common default; a wrong
+                    // guess only affects aspect ratio, not whether it draws.
+                    #[allow(deprecated)]
+                    let mut p = ratatui_image::picker::Picker::from_fontsize(
+                        ratatui_image::FontSize::new(8, 16),
+                    );
+                    p.set_protocol_type(protocol_type(forced));
+                    Some(p)
+                }
+                None => {
+                    tracing::info!(error = %e, "no terminal image graphics; using [image] placeholders");
+                    None
+                }
+            },
         }
     };
 

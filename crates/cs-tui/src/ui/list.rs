@@ -32,6 +32,16 @@ pub struct TabState<T> {
     /// from 0 each frame (which pins the selection to the bottom row when
     /// scrolling back up). Updated by [`render_body`].
     list_offset: Cell<usize>,
+    /// How many whole items the last render fitted on screen, so PgUp and PgDn
+    /// move a real page rather than a guessed number of rows.
+    ///
+    /// A fixed jump was the obvious alternative and is wrong here: items are
+    /// not a uniform height. A feed card is three or four rows of text, but one
+    /// carrying an inline picture is a dozen, so "ten items" can mean half a
+    /// screen or three screens depending on what happens to be in the list.
+    /// Recorded by [`render_body`], which is the only place that knows both the
+    /// heights and the area.
+    page_items: Cell<usize>,
 }
 
 // Manual `Default` — `#[derive(Default)]` would add a `T: Default` bound that the
@@ -46,6 +56,7 @@ impl<T> Default for TabState<T> {
             error: None,
             loaded: false,
             list_offset: Cell::new(0),
+            page_items: Cell::new(0),
         }
     }
 }
@@ -100,6 +111,25 @@ impl<T> TabState<T> {
     /// view rather than jumping).
     pub fn shift_offset(&self, delta: usize) {
         self.list_offset.set(self.list_offset.get() + delta);
+    }
+
+    /// Shift the persisted scroll offset back, for items dropped off the *top*.
+    ///
+    /// The mirror of [`Self::shift_offset`], for a bounded history that trims
+    /// its oldest entries: without it the offset still points at rows that are
+    /// no longer there, and the pane jumps.
+    pub fn shift_offset_back(&self, delta: usize) {
+        self.list_offset
+            .set(self.list_offset.get().saturating_sub(delta));
+    }
+
+    /// How many whole items the last render fitted on screen.
+    ///
+    /// One before the first render, so paging before anything is drawn behaves
+    /// like a single step rather than jumping nowhere.
+    #[must_use]
+    pub fn page_items(&self) -> usize {
+        self.page_items.get().max(1)
     }
 
     /// The scroll offset the last [`render_body`] settled on: an index into the
@@ -177,6 +207,12 @@ pub fn render_body<T, F>(
             SelectionStyle::Fill => theme.selection_style(),
             SelectionStyle::Bar => theme.accent_style(),
         };
+        // Heights read before `List::new` takes the items, and from those very
+        // items, so the page size matches what is tiled rather than an estimate.
+        let heights: Vec<u16> = items
+            .iter()
+            .map(|i| u16::try_from(i.height()).unwrap_or(u16::MAX))
+            .collect();
         let list = List::new(items)
             .highlight_style(highlight)
             .highlight_symbol("▌ ")
@@ -191,6 +227,18 @@ pub fn render_body<T, F>(
         // (only when the selection leaves the window) instead of snapping the
         // selection to the bottom row on every upward move.
         state.list_offset.set(list_state.offset());
+        let mut used = 0u16;
+        let fitted = heights
+            .iter()
+            .skip(list_state.offset())
+            .take_while(|&&h| {
+                used = used.saturating_add(h);
+                used <= area.height
+            })
+            .count();
+        // At least one: an item taller than the pane still counts as a page, or
+        // PgDn would never move past it.
+        state.page_items.set(fitted.max(1));
         return;
     }
     if let Some(msg) = &state.error {

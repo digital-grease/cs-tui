@@ -18,6 +18,71 @@ use serde::Deserialize;
 use time::{OffsetDateTime, UtcOffset};
 
 use crate::ui::nav::RootKind;
+
+/// A terminal graphics protocol the user can force, bypassing the probe.
+///
+/// Mirrors `ratatui_image::picker::ProtocolType`, kept as our own type so the
+/// config surface does not depend on that crate's naming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphicsProtocol {
+    /// Kitty graphics protocol.
+    Kitty,
+    /// iTerm2 inline images.
+    Iterm2,
+    /// Sixel.
+    Sixel,
+    /// Unicode half blocks: no protocol at all, works anywhere, looks coarse.
+    Halfblocks,
+}
+
+impl GraphicsProtocol {
+    /// Parse a config name, case-insensitively. `None` for anything unknown.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "kitty" => Some(Self::Kitty),
+            "iterm2" | "iterm" => Some(Self::Iterm2),
+            "sixel" => Some(Self::Sixel),
+            "halfblocks" | "half-blocks" | "blocks" => Some(Self::Halfblocks),
+            _ => None,
+        }
+    }
+}
+/// How an image is resampled when it is scaled to fit the rows it was given.
+///
+/// Mirrors the subset of `image`'s filters worth putting in front of a reader,
+/// kept as our own type so the config surface does not depend on that crate's
+/// naming. The cost is paid once per picture per size, when its protocol is
+/// built, and never again while scrolling: the protocol is cached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ImageSharpness {
+    /// Nearest neighbour. Cheapest, keeps hard edges on pixel art, and leaves
+    /// visible aliasing on a downscaled photograph. The historical behavior,
+    /// and still the default, so this setting costs nothing until it is set.
+    #[default]
+    Crisp,
+    /// Bilinear. Softens the aliasing `crisp` leaves, at little cost.
+    Smooth,
+    /// Catmull-Rom. A sharper cubic, and a reasonable middle.
+    Medium,
+    /// Lanczos3. The best downscale of the four and the slowest.
+    Sharp,
+}
+
+impl ImageSharpness {
+    /// Parse a config name, case-insensitively. `None` for anything unknown.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "crisp" | "nearest" | "none" => Some(Self::Crisp),
+            "smooth" | "triangle" | "linear" | "bilinear" => Some(Self::Smooth),
+            "medium" | "catmull-rom" | "catmullrom" | "cubic" => Some(Self::Medium),
+            "sharp" | "lanczos" | "lanczos3" | "best" => Some(Self::Sharp),
+            _ => None,
+        }
+    }
+}
+
 use crate::ui::theme::Theme;
 
 /// Parsed `config.toml`. Lenient: unknown keys are ignored and a parse error
@@ -52,9 +117,16 @@ pub struct Config {
     pub compact: Option<bool>,
     pub preview_length: Option<usize>,
     pub image_height: Option<u16>,
+    /// Resampling filter for scaled images: `crisp` | `smooth` | `medium` |
+    /// `sharp`.
+    pub image_sharpness: Option<String>,
+    pub graphics_protocol: Option<String>,
+    pub animate_styles: Option<bool>,
     pub start_section: Option<String>,
     pub nsfw: Option<bool>,
     pub editor: Option<String>,
+    /// Command used to open a link, instead of the OS default handler.
+    pub browser: Option<String>,
     pub confirm_deletes: Option<bool>,
     /// Background feed auto-refresh: prepend new entries at the top.
     pub feed_autorefresh: Option<bool>,
@@ -139,15 +211,49 @@ pub enum TimeFormat {
 #[derive(Debug, Clone)]
 pub struct Runtime {
     pub time_format: TimeFormat,
+    /// What the config asked for, or `None` when it said nothing. Lets chat
+    /// default differently from the feeds while still obeying an explicit
+    /// choice; see [`Runtime::chat_time_format`].
+    pub explicit_time_format: Option<TimeFormat>,
     pub tz_offset: UtcOffset,
     pub compact: bool,
     pub preview_length: usize,
     pub image_height: u16,
+    /// How a scaled image is resampled.
+    ///
+    /// Defaults to [`ImageSharpness::Crisp`], which is nearest neighbour and
+    /// exactly what every render site passed before this was configurable, so
+    /// the default changes nothing about what a reader already sees.
+    pub image_sharpness: ImageSharpness,
+    /// Animate the `blink`, `wave` and `glitch` text styles.
+    ///
+    /// Off by default, and the default is the recommendation. Animation means
+    /// redrawing the chat pane on a timer for decoration alone: a wakeup
+    /// several times a second for as long as any animated message is loaded,
+    /// whether or not anyone is looking. On a laptop that is real battery for
+    /// a visual flourish, which is why the static approximations exist.
+    pub animate_styles: bool,
+    /// Force a terminal graphics protocol instead of probing for one.
+    ///
+    /// The probe is a capability query the terminal answers, and some answer it
+    /// wrongly or not at all: a terminal that claims kitty support it does not
+    /// have paints a screenful of escape bytes, and one that stays silent gets
+    /// no images even though it could show them. `None` probes, which is right
+    /// almost always. `Some` is the escape hatch for when it is not.
+    pub graphics_protocol: Option<GraphicsProtocol>,
     pub start_section: RootKind,
     pub nsfw: bool,
     /// External editor command. `None` (the default) uses the built-in editor;
     /// `$VISUAL`/`$EDITOR` are deliberately not consulted.
     pub editor: Option<String>,
+    /// Command used to open a link, instead of the OS default handler.
+    ///
+    /// `None` (the default) hands the URL to `xdg-open`, `open`, or `cmd /C
+    /// start`. Set, it is split on whitespace and run directly, with no shell
+    /// between us and it. Only http and https URLs are ever opened either way:
+    /// the scheme check in [`crate::ui::open`] runs first and does not care
+    /// what the handler is.
+    pub browser: Option<String>,
     pub confirm_deletes: bool,
     /// Render links as OSC 8 terminal hyperlinks (clickable even when long
     /// enough to wrap, which defeats a terminal's own URL detection).
@@ -204,13 +310,18 @@ impl Default for Runtime {
     fn default() -> Self {
         Self {
             time_format: TimeFormat::Relative,
+            explicit_time_format: None,
             tz_offset: UtcOffset::UTC,
             compact: false,
             preview_length: 200,
             image_height: 20,
+            image_sharpness: ImageSharpness::Crisp,
+            graphics_protocol: None,
+            animate_styles: false,
             start_section: RootKind::Feed,
             nsfw: false,
             editor: None,
+            browser: None,
             confirm_deletes: true,
             hyperlinks: true,
             feed_autorefresh: true,
@@ -312,6 +423,10 @@ const TEMPLATE: &str = r##"# cs-tui configuration. Edit and restart cs-tui.
 # ── Time ─────────────────────────────────────────────────────────────────────
 
 # List timestamps: "relative" ("2h ago") or "absolute" ("2026-05-31 14:30").
+# Timestamp style for feeds and lists: relative | absolute. Chat (cIRC, C-Mail)
+# defaults to absolute regardless, since "3h" on forty consecutive lines says
+# nothing about when anything was said; setting this explicitly applies it
+# everywhere, chat included.
 #time_format = "relative"
 
 # Timezone for absolute timestamps: "utc" or a fixed UTC offset like
@@ -361,11 +476,35 @@ const TEMPLATE: &str = r##"# cs-tui configuration. Edit and restart cs-tui.
 # ($VISUAL/$EDITOR are intentionally NOT consulted.)
 #editor = "nvim"
 
+# Command used to open a link, instead of the OS default handler (xdg-open,
+# open, or `cmd /C start`). Split on spaces and run directly, with no shell, so
+# quotes, globs and pipes are not interpreted. The URL is appended as the last
+# argument, unless an argument contains %s, which is replaced by it instead.
+# Only http and https links are ever opened, whatever this is set to.
+#browser = "firefox --new-tab"
+
 # Characters of post content shown in list previews.
 #preview_length = 200
 
 # Max rows for the inline image strip in post detail.
 #image_height = 20
+# How an image is resampled when it is scaled to fit: crisp (default), smooth,
+# medium, or sharp. `crisp` is nearest-neighbour, which is cheapest and keeps
+# hard edges on pixel art, but leaves visible aliasing on a downscaled
+# photograph; the other three are progressively better at photographs and cost
+# more CPU. That cost is paid once per picture per size, when it is first drawn,
+# and not again while you scroll.
+#image_sharpness = "sharp"
+# Force a terminal graphics protocol instead of probing for one: kitty, iterm2,
+# sixel, or halfblocks. Unset probes, which is right almost always; set this
+# only when the probe gets it wrong (no images in a terminal that supports them,
+# or a screenful of escape bytes in one that doesn't).
+#graphics_protocol = "kitty"
+# Animate the blink, wave and glitch text styles instead of drawing static
+# approximations of them. WARNING: this redraws the chat pane several times a
+# second for as long as any animated message is on screen, whether or not you
+# are looking at it, which costs battery for decoration. Off by default.
+#animate_styles = false
 
 # Initial jukebox volume for a fresh session (0-130; above 100 is soft
 # amplification). Adjust live with [ and ].
@@ -478,16 +617,20 @@ impl Config {
     /// keeping the default for anything unset or unparseable.
     pub fn to_runtime(&self) -> Runtime {
         let d = Runtime::default();
+        // Parsed once and kept as an `Option`, because chat and the feeds
+        // default differently but must both obey an explicit choice.
+        let explicit_time_format = match self.time_format.as_deref().map(str::to_ascii_lowercase) {
+            Some(s) if s == "absolute" => Some(TimeFormat::Absolute),
+            Some(s) if s == "relative" => Some(TimeFormat::Relative),
+            Some(other) => {
+                tracing::warn!(value = other, "unknown time_format; using the defaults");
+                None
+            }
+            None => None,
+        };
         Runtime {
-            time_format: match self.time_format.as_deref().map(str::to_ascii_lowercase) {
-                Some(s) if s == "absolute" => TimeFormat::Absolute,
-                Some(s) if s == "relative" => TimeFormat::Relative,
-                Some(other) => {
-                    tracing::warn!(value = other, "unknown time_format; using relative");
-                    d.time_format
-                }
-                None => d.time_format,
-            },
+            time_format: explicit_time_format.unwrap_or(d.time_format),
+            explicit_time_format,
             tz_offset: match self.timezone.as_deref() {
                 Some(s) => parse_tz(s).unwrap_or_else(|| {
                     tracing::warn!(value = s, "unparseable timezone; using utc");
@@ -501,6 +644,25 @@ impl Config {
                 .unwrap_or(d.preview_length)
                 .clamp(20, 2000),
             image_height: self.image_height.unwrap_or(d.image_height).clamp(1, 60),
+            // An unreadable name falls back to the default filter rather than
+            // to no image, on the same reasoning as the protocol override
+            // below: getting this wrong should cost the override, not the
+            // feature.
+            image_sharpness: match self.image_sharpness.as_deref() {
+                Some(s) => ImageSharpness::parse(s).unwrap_or_else(|| {
+                    tracing::warn!(value = s, "unknown image_sharpness; using crisp");
+                    d.image_sharpness
+                }),
+                None => d.image_sharpness,
+            },
+            // An unreadable name falls back to probing rather than to no
+            // images: getting this wrong should cost the override, not the
+            // feature.
+            graphics_protocol: self
+                .graphics_protocol
+                .as_deref()
+                .and_then(GraphicsProtocol::parse),
+            animate_styles: self.animate_styles.unwrap_or(d.animate_styles),
             start_section: match self.start_section.as_deref() {
                 Some(s) => parse_section(s).unwrap_or_else(|| {
                     tracing::warn!(value = s, "unknown start_section; using feed");
@@ -510,6 +672,10 @@ impl Config {
             },
             nsfw: self.nsfw.unwrap_or(d.nsfw),
             editor: self.editor.clone().filter(|s| !s.trim().is_empty()),
+            // Blank means "unset", not "spawn nothing": a browser of "" or "  "
+            // would otherwise fail to launch on every link with no way to tell
+            // why. Falls back to the OS handler.
+            browser: self.browser.clone().filter(|s| !s.trim().is_empty()),
             confirm_deletes: self.confirm_deletes.unwrap_or(d.confirm_deletes),
             hyperlinks: self.hyperlinks.unwrap_or(d.hyperlinks),
             feed_autorefresh: self.feed_autorefresh.unwrap_or(d.feed_autorefresh),
@@ -669,12 +835,78 @@ fn parse_section(s: &str) -> Option<RootKind> {
     })
 }
 
+impl Runtime {
+    /// Which time format chat should use.
+    ///
+    /// **Chat defaults to absolute where the feeds default to relative**, and
+    /// the asymmetry is deliberate. In a feed, "3h" answers the question you
+    /// have: how fresh is this. In a conversation you are scrolling back
+    /// through, "3h" on forty consecutive lines answers nothing at all, and
+    /// hides the thing you actually want, which is when something was said and
+    /// how long the gaps were.
+    ///
+    /// An explicit `time_format` in the config still wins in both places, so
+    /// this changes the default rather than removing the choice.
+    #[must_use]
+    pub fn chat_time_format(&self) -> TimeFormat {
+        self.explicit_time_format.unwrap_or(TimeFormat::Absolute)
+    }
+}
+
 /// Format a list timestamp per the active `time_format`.
 #[must_use]
 pub fn format_list_timestamp(t: OffsetDateTime) -> String {
     match get().time_format {
         TimeFormat::Relative => format_relative(t),
         TimeFormat::Absolute => format_absolute(t),
+    }
+}
+
+/// A chat message's timestamp: wall-clock `HH:MM` in the configured timezone.
+///
+/// Chat is the one place a *relative* stamp reads badly. In a feed "3h" answers
+/// the question you have; in a log you are scrolling back through, "3h" on forty
+/// consecutive lines tells you nothing about when anything happened or how long
+/// a gap was. A clock time does, and it is what every other chat client shows.
+///
+/// Chat defaults to absolute even though the feeds default to relative; see
+/// [`Runtime::chat_time_format`] for why the two differ.
+#[must_use]
+pub fn format_chat_timestamp(t: OffsetDateTime) -> String {
+    let rt = get();
+    format_chat_time_with(t, rt.chat_time_format(), rt.tz_offset)
+}
+
+/// [`format_chat_timestamp`] with the settings passed in rather than read from
+/// the process global.
+///
+/// Split out so it can be tested: `init` is a `OnceLock` set, so a test that
+/// installs a config only wins if it happens to run before anything else
+/// touches the global, which test order does not guarantee.
+#[must_use]
+pub fn format_chat_time_with(t: OffsetDateTime, format: TimeFormat, offset: UtcOffset) -> String {
+    match format {
+        TimeFormat::Relative => format_relative(t),
+        TimeFormat::Absolute => {
+            let now = OffsetDateTime::now_utc().to_offset(offset);
+            let t = t.to_offset(offset);
+            let tt = t.time();
+            // A bare clock is right for today and actively misleading for
+            // anything older: scrollback from three days ago reads as if it
+            // happened this morning. Older messages carry their date.
+            if t.date() == now.date() {
+                format!("{:02}:{:02}", tt.hour(), tt.minute())
+            } else {
+                let d = t.date();
+                format!(
+                    "{:02}-{:02} {:02}:{:02}",
+                    u8::from(d.month()),
+                    d.day(),
+                    tt.hour(),
+                    tt.minute()
+                )
+            }
+        }
     }
 }
 
@@ -712,6 +944,96 @@ fn format_relative(t: OffsetDateTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_chat_timestamp_is_a_clock_when_absolute_and_relative_otherwise() {
+        // Chat is the one place relative reads badly: "3h" on forty consecutive
+        // lines says nothing about when anything happened or how long a gap
+        // was. The setting still decides, this just makes chat honour it.
+        let t = OffsetDateTime::from_unix_timestamp(1_719_700_200).unwrap();
+        // 2024, so it is never "today" and carries its date.
+        let shown = format_chat_time_with(t, TimeFormat::Absolute, UtcOffset::UTC);
+        assert_eq!(
+            shown, "06-29 22:30",
+            "an old message says which day, or scrollback reads as today",
+        );
+        let today = OffsetDateTime::now_utc();
+        assert_eq!(
+            format_chat_time_with(today, TimeFormat::Absolute, UtcOffset::UTC).len(),
+            5,
+            "today is a bare clock",
+        );
+        assert!(
+            !format_chat_time_with(t, TimeFormat::Relative, UtcOffset::UTC).contains(':'),
+            "relative stays relative for readers who prefer it everywhere",
+        );
+    }
+
+    #[test]
+    fn chat_defaults_to_absolute_while_the_feeds_default_to_relative() {
+        // The asymmetry is the point: a feed wants "how fresh is this", a
+        // conversation wants "when was this said".
+        let d = Config::default().to_runtime();
+        assert_eq!(d.time_format, TimeFormat::Relative, "feeds");
+        assert_eq!(d.chat_time_format(), TimeFormat::Absolute, "chat");
+    }
+
+    #[test]
+    fn an_explicit_time_format_applies_everywhere_including_chat() {
+        for (asked, want) in [
+            ("relative", TimeFormat::Relative),
+            ("absolute", TimeFormat::Absolute),
+        ] {
+            let rt = Config {
+                time_format: Some(asked.into()),
+                ..Config::default()
+            }
+            .to_runtime();
+            assert_eq!(rt.time_format, want, "{asked} in the feeds");
+            assert_eq!(rt.chat_time_format(), want, "{asked} in chat too");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_time_format_falls_back_to_each_default() {
+        let rt = Config {
+            time_format: Some("sundial".into()),
+            ..Config::default()
+        }
+        .to_runtime();
+        assert_eq!(rt.time_format, TimeFormat::Relative);
+        assert_eq!(
+            rt.chat_time_format(),
+            TimeFormat::Absolute,
+            "a bad value costs the setting, not the sensible per-surface default",
+        );
+    }
+
+    #[test]
+    fn a_graphics_protocol_name_parses_case_insensitively_with_aliases() {
+        use GraphicsProtocol::{Halfblocks, Iterm2, Kitty, Sixel};
+        for (name, want) in [
+            ("kitty", Kitty),
+            ("KITTY", Kitty),
+            ("  Sixel ", Sixel),
+            ("iterm2", Iterm2),
+            ("iterm", Iterm2),
+            ("halfblocks", Halfblocks),
+            ("half-blocks", Halfblocks),
+            ("blocks", Halfblocks),
+        ] {
+            assert_eq!(GraphicsProtocol::parse(name), Some(want), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_graphics_protocol_falls_back_to_probing() {
+        // Not to "no images": getting the override wrong should cost the
+        // override, not the feature.
+        for name in ["", "kitteh", "png", "true"] {
+            assert!(GraphicsProtocol::parse(name).is_none(), "{name:?}");
+        }
+    }
 
     #[test]
     fn parse_color_handles_hex_reset_and_index() {
@@ -756,10 +1078,96 @@ mod tests {
     }
 
     #[test]
+    fn every_config_field_is_documented_in_the_template() {
+        // The enumeration guard, and the reason it is written this way.
+        //
+        // The list below is an **exhaustive struct literal on purpose**: no
+        // `..Default::default()`. Adding a field to `Config` therefore fails to
+        // compile until it is named here, and then fails this test until it is
+        // also documented in the starter template. A hand-maintained list of
+        // key names, which this used to be, catches neither: a new field can
+        // miss both the list and the template and nothing notices.
+        let all = Config {
+            theme: Some(String::new()),
+            colors: None,
+            selection: Some(String::new()),
+            background_mode: Some(String::new()),
+            compact: Some(false),
+            time_format: Some(String::new()),
+            timezone: Some(String::new()),
+            start_section: Some(String::new()),
+            nsfw: Some(false),
+            confirm_deletes: Some(false),
+            feed_autorefresh: Some(false),
+            feed_refresh_secs: Some(0),
+            notifications_refresh_secs: Some(0),
+            cmail_refresh_secs: Some(0),
+            cmail_bell: Some(false),
+            circ_presence: Some(false),
+            cmail_typing: Some(false),
+            update_check: Some(false),
+            editor: Some(String::new()),
+            browser: Some(String::new()),
+            preview_length: Some(0),
+            image_height: Some(0),
+            image_sharpness: Some(String::new()),
+            graphics_protocol: Some(String::new()),
+            animate_styles: Some(false),
+            audio_volume: Some(0),
+            shuffle: Some(false),
+            mouse: Some(false),
+            images: Some(false),
+            hyperlinks: Some(false),
+            api_base: Some(String::new()),
+        };
+        // Touch it so an unused-field warning cannot hide a mistake.
+        let _ = &all;
+
+        for key in [
+            "theme",
+            "[colors]",
+            "selection",
+            "background_mode",
+            "compact",
+            "time_format",
+            "timezone",
+            "start_section",
+            "nsfw",
+            "confirm_deletes",
+            "feed_autorefresh",
+            "feed_refresh_secs",
+            "notifications_refresh_secs",
+            "cmail_refresh_secs",
+            "cmail_bell",
+            "circ_presence",
+            "cmail_typing",
+            "update_check",
+            "editor",
+            "browser",
+            "preview_length",
+            "image_height",
+            "image_sharpness",
+            "graphics_protocol",
+            "animate_styles",
+            "audio_volume",
+            "shuffle",
+            "mouse",
+            "images",
+            "hyperlinks",
+            "api_base",
+        ] {
+            assert!(
+                TEMPLATE.contains(key),
+                "starter template is missing the `{key}` option"
+            );
+        }
+    }
+
+    #[test]
     fn template_documents_every_option() {
-        // Guards against drift: a new Config field must be shown (commented) in
-        // the starter template so users can discover and edit it. If you add a
-        // field, add its line to the template and this list.
+        // Kept alongside the compiler-enforced check above as the plain
+        // key-presence assertion.
+        #[allow(unused)]
         for key in [
             "theme",
             "[colors]",
@@ -782,6 +1190,8 @@ mod tests {
             "editor",
             "preview_length",
             "image_height",
+            "graphics_protocol",
+            "animate_styles",
             "audio_volume",
             "shuffle",
             "mouse",

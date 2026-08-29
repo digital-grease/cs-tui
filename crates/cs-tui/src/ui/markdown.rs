@@ -31,6 +31,126 @@ pub enum ImageUrls {
     Hide,
 }
 
+/// What inline markdown does to a run of characters.
+///
+/// Deliberately not a `Style`: the caller composes this with whatever the
+/// message's own text styles already did (a per-character rainbow, a spoiler
+/// mask), and it needs to know *what* the markup meant, not just how it looked.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InlineMark {
+    /// `**strong**`.
+    pub strong: bool,
+    /// `*emphasis*` or `_emphasis_`.
+    pub emphasis: bool,
+    /// `` `code` ``.
+    pub code: bool,
+    /// Inside a `[link](url)` or a bare URL.
+    pub link: bool,
+}
+
+impl InlineMark {
+    /// Whether this run carries any markup at all.
+    #[must_use]
+    pub fn is_plain(self) -> bool {
+        self == Self::default()
+    }
+}
+
+/// Parse *inline* markdown, returning the text with its markers removed and a
+/// per-character record of what each character was marked with.
+///
+/// **Inline only, and that is the whole point.** A chat message is not a
+/// document: a line beginning `#`, `-`, `>` or ``` must render literally rather
+/// than becoming a heading, a list, a quote or a code fence, and a newline in
+/// the middle of a message must stay a newline rather than being reflowed into
+/// a paragraph. So each line is parsed on its own, only inline constructs are
+/// honoured, and the line structure is preserved exactly.
+///
+/// The per-character vector (rather than ranges) is what lets the caller wrap
+/// the text afterwards without having to map ranges across the wrap: a wrapped
+/// row is a slice of characters, and its marks are the matching slice.
+///
+/// ```ignore
+/// let (text, marks) = markdown::inline_marks("a **bold** word");
+/// assert_eq!(text, "a bold word");
+/// ```
+#[must_use]
+pub fn inline_marks(input: &str) -> (String, Vec<InlineMark>) {
+    let mut text = String::new();
+    let mut marks: Vec<InlineMark> = Vec::new();
+    for (i, line) in input.split('\n').enumerate() {
+        if i > 0 {
+            text.push('\n');
+            marks.push(InlineMark::default());
+        }
+        push_line(line, &mut text, &mut marks);
+    }
+    (text, marks)
+}
+
+/// Parse one line's inline markup into `text`/`marks`.
+///
+/// Uses `pulldown_cmark` for the inline grammar, but takes only the inline
+/// events: a block event that is not the single wrapping paragraph means the
+/// line looked like a block to the parser, and the line is emitted verbatim
+/// instead. That is the guard that keeps `# not a heading` and `- not a list`
+/// rendering as typed.
+fn push_line(line: &str, text: &mut String, marks: &mut Vec<InlineMark>) {
+    let verbatim = |text: &mut String, marks: &mut Vec<InlineMark>| {
+        for c in line.chars() {
+            text.push(c);
+            marks.push(InlineMark::default());
+        }
+    };
+    if line.trim().is_empty() {
+        verbatim(text, marks);
+        return;
+    }
+    let mut cur = InlineMark::default();
+    let mut out = String::new();
+    let mut out_marks: Vec<InlineMark> = Vec::new();
+    let mut depth_paragraph = 0usize;
+    for ev in Parser::new(line) {
+        match ev {
+            Event::Start(Tag::Paragraph) => depth_paragraph += 1,
+            Event::End(TagEnd::Paragraph) => {}
+            Event::Start(Tag::Strong) => cur.strong = true,
+            Event::End(TagEnd::Strong) => cur.strong = false,
+            Event::Start(Tag::Emphasis) => cur.emphasis = true,
+            Event::End(TagEnd::Emphasis) => cur.emphasis = false,
+            Event::Start(Tag::Link { .. }) => cur.link = true,
+            Event::End(TagEnd::Link) => cur.link = false,
+            Event::Text(t) => {
+                for c in t.chars() {
+                    out.push(c);
+                    out_marks.push(cur);
+                }
+            }
+            Event::Code(t) => {
+                let mut m = cur;
+                m.code = true;
+                for c in t.chars() {
+                    out.push(c);
+                    out_marks.push(m);
+                }
+            }
+            // Anything else means this line is not a plain paragraph of inline
+            // content: a heading, list, quote, fence, rule, image or raw HTML.
+            // Emit the line as typed rather than reinterpreting it.
+            _ => {
+                verbatim(text, marks);
+                return;
+            }
+        }
+    }
+    if depth_paragraph != 1 {
+        verbatim(text, marks);
+        return;
+    }
+    text.push_str(&out);
+    marks.extend(out_marks);
+}
+
 /// Render markdown source into a vector of styled ratatui lines. Image URLs are
 /// surfaced as plain text (see [`ImageUrls`]); use [`render_markdown_with`] to
 /// suppress them where the image is drawn as graphics. URLs in the result are
@@ -412,6 +532,92 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn inline_markup_is_honoured_and_its_markers_removed() {
+        let (text, marks) = inline_marks("a **bold** and `code` word");
+        assert_eq!(text, "a bold and code word");
+        let at = |needle: &str| text.find(needle).unwrap();
+        assert!(marks[at("bold")].strong);
+        assert!(marks[at("code")].code);
+        assert!(marks[at("word")].is_plain());
+        assert_eq!(marks.len(), text.chars().count(), "one mark per character");
+    }
+
+    #[test]
+    fn a_line_that_looks_like_a_block_renders_as_typed() {
+        // The whole reason this is inline-only: a chat message beginning with
+        // one of these is a message, not a document.
+        for line in [
+            "# not a heading",
+            "- not a list",
+            "> not a quote",
+            "--- not a rule",
+            "1. not ordered",
+        ] {
+            let (text, marks) = inline_marks(line);
+            assert_eq!(text, line, "{line:?} must render literally");
+            assert!(marks.iter().all(|m| m.is_plain()), "{line:?}");
+        }
+    }
+
+    #[test]
+    fn newlines_are_preserved_rather_than_reflowed() {
+        // A multi-line reply (a `/fortune`, say) keeps the breaks the server
+        // put in it; a document parser would collapse them into spaces.
+        let (text, _) = inline_marks("line one\nline two\n\nline four");
+        assert_eq!(text, "line one\nline two\n\nline four");
+    }
+
+    #[test]
+    fn a_block_looking_line_does_not_spoil_its_neighbours() {
+        let (text, marks) = inline_marks("**yes**\n# no\n**yes**");
+        assert_eq!(text, "yes\n# no\nyes");
+        assert!(marks[0].strong, "the first line still parses");
+        assert!(marks[text.find("# no").unwrap()].is_plain());
+    }
+
+    #[test]
+    fn a_link_marks_its_text_and_drops_the_brackets() {
+        let (text, marks) = inline_marks("see [the docs](https://example.com)");
+        assert_eq!(text, "see the docs");
+        assert!(marks[text.find("the docs").unwrap()].link);
+    }
+
+    #[test]
+    fn unmatched_markers_stay_literal() {
+        // Standard CommonMark behaviour, and what a reader typing an asterisk
+        // expects to see.
+        let (text, _) = inline_marks("2 * 3 * 4");
+        assert_eq!(text, "2 * 3 * 4");
+        let (text, _) = inline_marks("a_b_c");
+        assert_eq!(text, "a_b_c", "intraword underscores are not emphasis");
+    }
+
+    #[test]
+    fn every_line_yields_exactly_one_mark_per_character() {
+        // The invariant the caller relies on to slice marks alongside wrapped
+        // rows. If it ever breaks, styling silently lands on the wrong glyphs.
+        for input in [
+            "plain",
+            "**bold**",
+            "# heading-ish",
+            "a\nb\nc",
+            "mixed **bold** and `code`",
+            "",
+            "\n\n",
+            "émile **café**",
+        ] {
+            let (text, marks) = inline_marks(input);
+            assert_eq!(
+                marks.len(),
+                text.chars().count(),
+                "{input:?} produced {} marks for {} chars",
+                marks.len(),
+                text.chars().count(),
+            );
+        }
     }
 
     #[test]

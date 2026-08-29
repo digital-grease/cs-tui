@@ -220,11 +220,13 @@ impl TopicFeedScreen {
             return TopicFeedIntent::None;
         }
         let visible = self.visible_indices();
-        match super::list_nav::navigate(
+        let page = self.list.page_items();
+        match super::list_nav::navigate_paged(
             key.code,
             &mut self.list.selected,
             visible.len(),
             self.list.next_cursor.is_some(),
+            page,
         ) {
             super::list_nav::ListNav::LoadMore => {
                 self.list.loading = true;

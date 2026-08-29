@@ -167,6 +167,12 @@ pub struct TabBarStatus {
     /// the badge has to say "99+", which [`UnreadCount::badge`] decides.
     pub unread_count: UnreadCount,
     pub cmail_unread_count: u32,
+    /// Messages that arrived in a backgrounded cIRC room.
+    ///
+    /// Scoped to the one room the reader left open, not to every room they
+    /// could join: `GET /v1/circ` carries no per-room unread count, so an
+    /// all-rooms badge is not something the API can support yet.
+    pub circ_unread_count: usize,
     pub can_go_back: bool,
     pub offline: bool,
 }
@@ -192,6 +198,10 @@ pub fn render_tab_bar(frame: &mut Frame<'_>, area: Rect, status: TabBarStatus, t
             let badge = match *k {
                 RootKind::Notifications => badge(unread.any(), &unread.badge()),
                 RootKind::Cmail => badge(cmail > 0, &cmail.to_string()),
+                RootKind::Circ => badge(
+                    status.circ_unread_count > 0,
+                    &status.circ_unread_count.to_string(),
+                ),
                 _ => String::new(),
             };
             format!("{}·{}{}", k.shortcut(), k.label(), badge)

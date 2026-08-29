@@ -40,6 +40,8 @@ struct ImageSlot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PostDetailIntent {
+    /// Put text on the reader's clipboard.
+    CopyText(String),
     /// Return to the previous screen.
     Back,
     /// Exit the app.
@@ -408,6 +410,15 @@ impl PostDetailScreen {
             }
             // `w` watches / unwatches the thread (post-level, ignores reply selection).
             KeyCode::Char('w') => PostDetailIntent::ToggleWatch,
+            // `l` copies the entry's permalink. Only when it has a slug: a
+            // link built from a missing half would 404, which is worse than
+            // the key doing nothing.
+            KeyCode::Char('l') => match self.entry.slug.as_deref().and_then(|slug| {
+                super::clipboard::entry_permalink(&self.entry.author_username, slug)
+            }) {
+                Some(url) => PostDetailIntent::CopyText(url),
+                None => PostDetailIntent::None,
+            },
             // `o` opens the jukebox link in the browser — the selected reply's
             // link when one is selected, otherwise the post's.
             KeyCode::Char('o') => match self.jukebox_url() {
@@ -744,13 +755,11 @@ impl PostDetailScreen {
                     let Some(raw) = bytes.get(&slot.url) else {
                         continue;
                     };
-                    let proto = image::load_from_memory(raw)
-                        .map_err(|e| e.to_string())
-                        .and_then(|img| {
-                            picker
-                                .new_protocol(img, target, Resize::Fit(None))
-                                .map_err(|e| e.to_string())
-                        });
+                    let proto = super::images::decode_bounded(raw).and_then(|img| {
+                        picker
+                            .new_protocol(img, target, Resize::Fit(super::images::filter()))
+                            .map_err(|e| e.to_string())
+                    });
                     match proto {
                         Ok(proto) => {
                             protocols.insert(slot.url.clone(), (proto, target));

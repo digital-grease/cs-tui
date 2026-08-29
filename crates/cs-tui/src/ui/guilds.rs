@@ -46,11 +46,13 @@ impl GuildsScreen {
         if self.list.loading {
             return GuildsIntent::None;
         }
-        match super::list_nav::navigate(
+        let page = self.list.page_items();
+        match super::list_nav::navigate_paged(
             key.code,
             &mut self.list.selected,
             self.list.items.len(),
             self.list.next_cursor.is_some(),
+            page,
         ) {
             super::list_nav::ListNav::LoadMore => {
                 self.list.loading = true;

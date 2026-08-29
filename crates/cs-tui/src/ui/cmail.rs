@@ -11,7 +11,8 @@
 //! render, since a flag going stale produces no event, and the outbound one is
 //! reported to the shell as [`CmailIntent::TypingActive`] /
 //! [`CmailIntent::TypingIdle`] so the shell can throttle the network calls.
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -19,11 +20,15 @@ use cs_api::{
     CmailConversation, CmailMessage, CmailPresence, CmailPresenceUpdate, CmailTypingResponse,
     CmailTypingStatus, CmailUser,
 };
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, ListItem, Paragraph};
 use ratatui::Frame;
+
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::Protocol;
+use ratatui_image::{Image, Resize};
 
 use super::chat;
 use super::list::{self, TabState};
@@ -92,6 +97,11 @@ fn avatar_span(user: &CmailUser) -> Span<'static> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CmailIntent {
+    /// Say something to the reader without touching the conversation.
+    ///
+    /// C-Mail has no local-notice mechanism the way cIRC does, so a refusal
+    /// surfaces as a toast rather than as a line in the transcript.
+    Warn(String),
     RefreshConversations,
     OpenConversation {
         conversation_id: String,
@@ -222,7 +232,6 @@ impl TypingState {
     }
 }
 
-#[derive(Debug)]
 pub struct CmailScreen {
     pub conversations: TabState<CmailConversation>,
     pub mode: CmailMode,
@@ -239,9 +248,105 @@ pub struct CmailScreen {
     revealed: HashSet<String>,
     /// The other participant's live typing state.
     typing: TypingState,
+    /// Raw bytes of images already fetched, keyed by URL. Same model as cIRC:
+    /// decoding is lazy, at render time, once the target cell size is known.
+    image_bytes: RefCell<HashMap<String, Vec<u8>>>,
+    /// URLs already asked for, so a failed fetch is not retried in a loop.
+    image_requested: RefCell<HashSet<String>>,
+    /// URLs whose fetch failed; they fall back to a chip instead of a band.
+    image_failed: RefCell<HashSet<String>>,
+    /// Encoded protocols with the size they were built for, so a resize
+    /// rebuilds rather than drawing a stale picture.
+    image_protocols: RefCell<HashMap<String, (Protocol, Size)>>,
+}
+
+impl std::fmt::Debug for CmailScreen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CmailScreen")
+            .field("conversations", &self.conversations)
+            .field("mode", &self.mode)
+            .field("draft", &self.draft)
+            .field("composing", &self.composing)
+            .field("outgoing", &self.outgoing)
+            .field("conv_filter", &self.conv_filter)
+            .field("revealed", &self.revealed)
+            .field("typing", &self.typing)
+            .field("images_cached", &self.image_bytes.borrow().len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl CmailScreen {
+    /// The conversation currently open, if any.
+    #[must_use]
+    pub fn open_conversation_id(&self) -> Option<&str> {
+        match &self.mode {
+            CmailMode::Conversation { conversation, .. } => {
+                Some(conversation.conversation_id.as_str())
+            }
+            _ => None,
+        }
+    }
+
+    /// Record that `url` could not be fetched, so no band is held open for it.
+    ///
+    /// Without this the layout reserves rows for a picture that will never
+    /// arrive *and* suppresses the `[image]` chip, because as far as the layout
+    /// knows one is being drawn. The reader gets a blank hole with nothing to
+    /// explain it. Marking the URL failed puts the chip back.
+    pub fn note_image_failed(&self, url: &str) {
+        self.image_failed.borrow_mut().insert(url.to_string());
+    }
+
+    /// The bytes already fetched for `url`, for the fullscreen modal.
+    #[must_use]
+    pub fn held_image_bytes(&self, url: &str) -> Option<Vec<u8>> {
+        self.image_bytes.borrow().get(url).cloned()
+    }
+
+    /// Hand the screen the bytes of an image it asked for.
+    pub fn cache_image_bytes(&self, url: String, bytes: Vec<u8>) {
+        self.image_bytes.borrow_mut().insert(url, bytes);
+    }
+
+    /// Image URLs in the open conversation worth fetching now.
+    ///
+    /// Everything held, not only what is on screen, so scrolling back does not
+    /// show a blank gap for the length of a round trip. Each URL is handed out
+    /// once per session.
+    pub fn image_urls_to_fetch(&self, conversation_id: &str, limit: usize) -> Vec<String> {
+        let CmailMode::Conversation {
+            conversation,
+            messages,
+        } = &self.mode
+        else {
+            return Vec::new();
+        };
+        if conversation.conversation_id != conversation_id {
+            return Vec::new();
+        }
+        let mut requested = self.image_requested.borrow_mut();
+        let bytes = self.image_bytes.borrow();
+        messages
+            .items
+            .iter()
+            .filter_map(|m| chat::inline_image_url(&m.extras))
+            // Three steps, and the order of all three matters. Skip what is
+            // already held or already asked for, *then* cap the batch, and only
+            // then mark. Capping before the skip would re-take the same URLs
+            // every call and hand back nothing; marking before the cap would
+            // spend URLs that were never fetched, and a spent URL is never
+            // offered again.
+            .filter(|url| !bytes.contains_key(url) && !requested.contains(url))
+            .take(limit)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .inspect(|url| {
+                requested.insert(url.clone());
+            })
+            .collect()
+    }
+
     pub fn new() -> Self {
         Self {
             conversations: TabState::loading(),
@@ -252,6 +357,10 @@ impl CmailScreen {
             conv_filter: None,
             revealed: HashSet::new(),
             typing: TypingState::default(),
+            image_bytes: RefCell::new(HashMap::new()),
+            image_requested: RefCell::new(HashSet::new()),
+            image_failed: RefCell::new(HashSet::new()),
+            image_protocols: RefCell::new(HashMap::new()),
         }
     }
 
@@ -790,12 +899,18 @@ impl CmailScreen {
         }
     }
 
-    pub fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
+    pub fn render(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        theme: &Theme,
+        picker: Option<&Picker>,
+    ) {
         match &self.mode {
             CmailMode::Conversations | CmailMode::Starting { .. } => {
                 self.render_conversations(frame, area, theme)
             }
-            CmailMode::Conversation { .. } => self.render_conversation(frame, area, theme),
+            CmailMode::Conversation { .. } => self.render_conversation(frame, area, theme, picker),
         }
     }
 
@@ -868,7 +983,13 @@ impl CmailScreen {
         frame.render_widget(Paragraph::new(status_line), layout[status_idx]);
     }
 
-    fn render_conversation(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
+    fn render_conversation(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        theme: &Theme,
+        picker: Option<&Picker>,
+    ) {
         let CmailMode::Conversation {
             conversation,
             messages,
@@ -917,8 +1038,26 @@ impl CmailScreen {
         // enough DM would hide the entire thread. One row is left for the
         // message's own header.
         let body_cap = (layout[0].height as usize).saturating_sub(1).max(1);
+        // Same gate as cIRC: a graphics-capable terminal, images on, and a pane
+        // tall enough that reserving rows still leaves the thread readable.
+        let image_rows: Option<u16> = picker.filter(|_| layout[0].height > 6).map(|_| {
+            crate::config::get()
+                .image_height
+                .min(layout[0].height / 2)
+                .max(1)
+        });
         let body_layout = chat::BodyLayout::new(body_width).with_max_rows(body_cap);
-        let heights = message_row_heights(&messages.items, unread_from, body_layout);
+        // Per message rather than per pane, so a failed fetch can opt one
+        // message out and get its `[image]` chip back instead of a blank band.
+        let rows_for = |m: &CmailMessage| -> Option<u16> {
+            let cap = image_rows?;
+            let url = chat::inline_image_url(&m.extras)?;
+            if self.image_failed.borrow().contains(&url) {
+                return None;
+            }
+            Some(cap)
+        };
+        let heights = message_row_heights(&messages.items, unread_from, body_layout, &rows_for);
         let content_rows: usize = heights.iter().map(|&h| usize::from(h)).sum();
         let mut messages_area = bottom_aligned_messages_area(layout[0], content_rows);
         // When the thread overflows the pane, ratatui's `List` tiles whole items
@@ -949,6 +1088,11 @@ impl CmailScreen {
         let now_local = time::OffsetDateTime::now_utc().to_offset(crate::config::get().tz_offset);
         let last_day: std::cell::Cell<Option<(i32, u16)>> = std::cell::Cell::new(None);
         let idx = std::cell::Cell::new(0usize);
+        // How many separator lines this screen injected above each message's
+        // own body. Recorded as the closure runs rather than recomputed
+        // afterwards: the day-separator rule lives in the closure, and a second
+        // copy of it would be free to drift from the one that actually drew.
+        let lead_lines: RefCell<Vec<u16>> = RefCell::new(Vec::new());
         list::render_body(
             frame,
             messages_area,
@@ -969,13 +1113,92 @@ impl CmailScreen {
                     lines.push(separator_line("new", theme));
                 }
                 idx.set(idx.get() + 1);
+                lead_lines
+                    .borrow_mut()
+                    .push(u16::try_from(lines.len()).unwrap_or(u16::MAX));
                 // Reveal state is per message and per reader, so it rides on the
                 // layout handed to this one body.
                 let item_layout = body_layout.with_revealed(self.revealed.contains(&m.id));
+                let item_layout = match rows_for(m) {
+                    Some(rows) => item_layout.with_image_rows(rows),
+                    None => item_layout,
+                };
                 lines.extend(message_lines(m, other, theme, item_layout));
                 ListItem::new(lines)
             },
         );
+        // Paint each reserved gap, now the list has settled. Positions come
+        // from the same `heights` the pane was laid out with, plus the
+        // separator count the closure just recorded, so a day divider above a
+        // picture shifts it by exactly as much as it shifted the text.
+        if let (Some(picker), Some(rows_reserved)) = (picker, image_rows) {
+            let target = Size::new(u16::try_from(body_width).unwrap_or(u16::MAX), rows_reserved);
+            let leads = lead_lines.borrow();
+            let mut protocols = self.image_protocols.borrow_mut();
+            let bytes = self.image_bytes.borrow();
+            let pane_bottom = messages_area.y.saturating_add(messages_area.height);
+            let mut y = messages_area.y;
+            let start = messages.list_offset();
+            for (n, m) in messages.items.iter().enumerate().skip(start) {
+                if y >= pane_bottom {
+                    break;
+                }
+                let h = heights.get(n).copied().unwrap_or(0);
+                let item_layout = body_layout.with_revealed(self.revealed.contains(&m.id));
+                let item_layout = match rows_for(m) {
+                    Some(rows) => item_layout.with_image_rows(rows),
+                    None => item_layout,
+                };
+                if let Some((url, above, gap_rows)) =
+                    chat::image_gap(chat::ChatMessage::from(m), item_layout)
+                {
+                    let lead = leads.get(n).copied().unwrap_or(0);
+                    // Separators, then the speaker header, then the body rows
+                    // above the gap.
+                    let top = y
+                        .saturating_add(lead)
+                        .saturating_add(1)
+                        .saturating_add(above);
+                    let visible_rows = gap_rows.min(pane_bottom.saturating_sub(top));
+                    if top < pane_bottom && visible_rows > 0 {
+                        let stale = protocols
+                            .get(&url)
+                            .map_or(true, |(_, built)| *built != target);
+                        if stale {
+                            if let Some(raw) = bytes.get(&url) {
+                                match super::images::decode_bounded(raw).and_then(|img| {
+                                    picker
+                                        .new_protocol(
+                                            img,
+                                            target,
+                                            Resize::Fit(super::images::filter()),
+                                        )
+                                        .map_err(|e| e.to_string())
+                                }) {
+                                    Ok(proto) => {
+                                        protocols.insert(url.clone(), (proto, target));
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!(error = %e, url = %url, "cmail image encode failed");
+                                    }
+                                }
+                            }
+                        }
+                        if let Some((proto, _)) = protocols.get(&url) {
+                            let img_area = Rect::new(
+                                messages_area.x.saturating_add(4),
+                                top,
+                                target.width,
+                                visible_rows,
+                            );
+                            frame.render_widget(Image::new(proto).allow_clipping(true), img_area);
+                        }
+                    }
+                }
+                y = y.saturating_add(h);
+            }
+        }
+
         // Attachment chips become clickable links only after the pane is drawn,
         // and only against the very rect it was drawn into. Gated on the
         // `hyperlinks` config like every other OSC 8 surface in the client, so
@@ -1099,7 +1322,10 @@ impl CmailScreen {
             // Offer `o` and `v` only where they do something, so the line stays
             // short and never promises an action the selection can't take.
             if let Some(m) = self.selected_message() {
-                if !matches!(chat::open_action(&m.extras), chat::OpenAction::None) {
+                if !matches!(
+                    chat::open_action(&m.extras, &m.content),
+                    chat::OpenAction::None
+                ) {
                     hint.push_str("o open · ");
                 }
                 if chat::has_spoiler(&m.extras) {
@@ -1168,6 +1394,14 @@ impl CmailScreen {
                 let content = self.draft.trim().to_string();
                 if content.is_empty() {
                     return CmailIntent::None;
+                }
+                // The server posts anything it does not recognize as literal
+                // text, so a typo'd command becomes a message reading "/dcie"
+                // in the conversation. Refuse it here instead. Names only; bad
+                // syntax in a real command still goes for its 400.
+                if !super::commands::is_known(&content, super::commands::Surface::Cmail) {
+                    let word = super::commands::command_word(&content).to_string();
+                    return CmailIntent::Warn(format!("unknown command: {word}"));
                 }
                 // Show it immediately; the echo/reload replaces it.
                 self.outgoing.push(Outgoing {
@@ -1249,7 +1483,7 @@ impl CmailScreen {
         let Some(m) = self.selected_message() else {
             return CmailIntent::None;
         };
-        match chat::open_action(&m.extras) {
+        match chat::open_action(&m.extras, &m.content) {
             chat::OpenAction::Play(track) => CmailIntent::PlayJukebox(track),
             chat::OpenAction::Open(url) => CmailIntent::OpenUrl(url),
             chat::OpenAction::None => CmailIntent::None,
@@ -1396,6 +1630,7 @@ fn message_row_heights(
     messages: &[CmailMessage],
     unread_from: Option<usize>,
     layout: chat::BodyLayout<'_>,
+    image_rows: &dyn Fn(&CmailMessage) -> Option<u16>,
 ) -> Vec<u16> {
     let mut heights = Vec::with_capacity(messages.len());
     let mut last_day: Option<(i32, u16)> = None;
@@ -1411,7 +1646,15 @@ fn message_row_heights(
         if unread_from == Some(i) {
             extra += 1;
         }
-        heights.push(extra.saturating_add(chat::message_height(m.into(), layout, 1)));
+        // The very layout each message is drawn with, image band included. A
+        // pane-wide layout here would measure a message that opted out of its
+        // band (a failed fetch) as taller than it draws, and every row and
+        // picture below it would drift.
+        let item_layout = match image_rows(m) {
+            Some(rows) => layout.with_image_rows(rows),
+            None => layout,
+        };
+        heights.push(extra.saturating_add(chat::message_height(m.into(), item_layout, 1)));
     }
     heights
 }
@@ -1632,6 +1875,78 @@ pub(crate) fn format_epoch_millis_relative(ms: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_image_message_shows_its_chip_without_graphics() {
+        let mut m = message("m1", "look", 1);
+        m.extras.image_url = Some("https://cdn.example/pic.png".into());
+        let s = open_with_messages(vec![m], None);
+        let joined = screen_text(&s, 60, 14);
+        assert!(
+            joined.contains("[image]"),
+            "a terminal without graphics keeps the chip it always had:\n{joined}",
+        );
+    }
+
+    #[test]
+    fn a_conversation_image_is_fetched_once_and_only_for_the_open_thread() {
+        let mut m = message("m1", "look", 1);
+        m.extras.image_url = Some("https://cdn.example/pic.png".into());
+        let s = open_with_messages(vec![m], None);
+        assert_eq!(
+            s.image_urls_to_fetch("c1", 8),
+            vec!["https://cdn.example/pic.png".to_string()],
+        );
+        assert!(
+            s.image_urls_to_fetch("c1", 8).is_empty(),
+            "handing the same URL out twice would re-fetch it on every message",
+        );
+        assert!(s.image_urls_to_fetch("other", 8).is_empty());
+    }
+
+    #[test]
+    fn a_mistyped_command_is_refused_in_a_conversation_too() {
+        // The same server behavior as cIRC: an unrecognized command is posted
+        // as literal text rather than rejected, so the client has to refuse it.
+        let mut s = open_with_messages(vec![], None);
+        s.handle_key(key(KeyCode::Char('c')));
+        for c in "/dcie 2d6".chars() {
+            s.handle_key(key(KeyCode::Char(c)));
+        }
+        let intent = s.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(&intent, CmailIntent::Warn(msg) if msg.contains("/dcie")),
+            "expected a warning naming the command, got {intent:?}",
+        );
+    }
+
+    #[test]
+    fn a_circ_only_command_is_refused_in_a_conversation() {
+        // `/art` and the `/mute` family are cIRC-only per the spec and are a
+        // 400 here, so there is no reason to send them.
+        let mut s = open_with_messages(vec![], None);
+        s.handle_key(key(KeyCode::Char('c')));
+        for c in "/mute someone".chars() {
+            s.handle_key(key(KeyCode::Char(c)));
+        }
+        assert!(matches!(
+            s.handle_key(key(KeyCode::Enter)),
+            CmailIntent::Warn(_)
+        ));
+    }
+
+    #[test]
+    fn a_real_command_still_sends_in_a_conversation() {
+        let mut s = open_with_messages(vec![], None);
+        s.handle_key(key(KeyCode::Char('c')));
+        for c in "/me waves".chars() {
+            s.handle_key(key(KeyCode::Char(c)));
+        }
+        assert!(matches!(
+            s.handle_key(key(KeyCode::Enter)),
+            CmailIntent::SendMessage { .. }
+        ));
+    }
+
     use super::*;
     use crossterm::event::{KeyEventKind, KeyEventState};
 
@@ -1711,7 +2026,9 @@ mod tests {
         let theme = Theme::cyber();
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| s.render(f, f.area(), &theme)).unwrap();
+        terminal
+            .draw(|f| s.render(f, f.area(), &theme, None))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)
             .map(|y| {
@@ -1943,7 +2260,9 @@ mod tests {
         let theme = Theme::cyber();
         let backend = ratatui::backend::TestBackend::new(60, 12);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| s.render(f, f.area(), &theme)).unwrap();
+        terminal
+            .draw(|f| s.render(f, f.area(), &theme, None))
+            .unwrap();
 
         let buffer = terminal.backend().buffer();
         let row_text = |y| -> String {
@@ -1986,7 +2305,9 @@ mod tests {
         let theme = Theme::cyber();
         let backend = ratatui::backend::TestBackend::new(60, 12);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| s.render(f, f.area(), &theme)).unwrap();
+        terminal
+            .draw(|f| s.render(f, f.area(), &theme, None))
+            .unwrap();
 
         let buffer = terminal.backend().buffer();
         let text: String = (0..buffer.area.height)
@@ -2422,7 +2743,12 @@ mod tests {
                 ..cs_api::MessageExtras::default()
             },
         );
-        let heights = message_row_heights(&[plain, captioned], Some(1), chat::BodyLayout::new(40));
+        let heights = message_row_heights(
+            &[plain, captioned],
+            Some(1),
+            chat::BodyLayout::new(40),
+            &|_| None,
+        );
         assert_eq!(
             heights,
             vec![2 + 1, 3 + 1],

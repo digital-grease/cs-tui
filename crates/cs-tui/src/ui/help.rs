@@ -130,8 +130,12 @@ const COMMON: &[Row] = &[
         desc: "jump to bottom",
     },
     Row {
-        keys: "n / PgDn",
-        desc: "next page",
+        keys: "n",
+        desc: "fetch the next page of results",
+    },
+    Row {
+        keys: "PgUp / PgDn",
+        desc: "page through the list a screenful at a time (PgDn at the end fetches the next page)",
     },
     Row {
         keys: "Enter",
@@ -254,12 +258,12 @@ const CIRC: &[Row] = &[
         desc: "show / hide the room roster (who is in the room)",
     },
     Row {
-        keys: "Ctrl+B",
-        desc: "message select mode, for acting on one message (below)",
+        keys: "Ctrl+A",
+        desc: "actions for the message under the cursor (below). The composer is always live, so this is the only key in a room that is not typed",
     },
     Row {
         keys: "↑ / ↓",
-        desc: "scroll the room history (PgUp/PgDn too)",
+        desc: "move through the room history (PgUp/PgDn too)",
     },
     Row {
         keys: "← / →",
@@ -310,7 +314,7 @@ const CIRC_SELECT: &[Row] = &[
     },
     Row {
         keys: "Esc",
-        desc: "leave select mode, back to the composer",
+        desc: "close the menu, back to the composer",
     },
 ];
 
@@ -336,7 +340,7 @@ const JUKEBOX: &[Row] = &[
     },
     Row {
         keys: "o",
-        desc: "open the jukebox link in your browser",
+        desc: "open the attachment: a picture full screen when your terminal can draw it (any key closes), otherwise in your browser",
     },
     Row {
         keys: "s",
@@ -413,7 +417,7 @@ fn help_lines(theme: &Theme, desc_width: usize) -> Vec<Line<'static>> {
     group(&mut lines, "Profile", PROFILE);
     group(&mut lines, "Guilds", GUILDS);
     group(&mut lines, "cIRC room", CIRC);
-    group(&mut lines, "cIRC message select (Ctrl+B)", CIRC_SELECT);
+    group(&mut lines, "cIRC message actions (Ctrl+A)", CIRC_SELECT);
     group(&mut lines, "C-Mail conversation", CMAIL);
     group(&mut lines, "Editor (compose)", EDITOR);
     group(&mut lines, "Jukebox", JUKEBOX);
@@ -643,7 +647,7 @@ mod tests {
         // cIRC room and its select mode.
         assert!(text.contains("Ctrl+U"));
         assert!(text.contains("show / hide the room roster"));
-        assert!(text.contains("Ctrl+B"));
+        assert!(text.contains("Ctrl+A"));
         assert!(text.contains("d then y"));
         assert!(text.contains("mute the author in this room"));
         // Attachments and spoilers, on both chat screens.

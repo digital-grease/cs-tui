@@ -16,7 +16,9 @@
 //!   (§ Who's in a room),
 //! - deleting, flagging, muting, opening an attachment and revealing a spoiler
 //!   all need a bare letter, which the always-on composer owns, so they live in
-//!   a message-select sub-mode entered with `Ctrl+B`.
+//!   a message-action menu opened with `Ctrl+A`, which is the only key in a
+//!   room that is not typed.
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -24,12 +26,17 @@ use cs_api::{
     CircMessage, CircMessageUpdate, CircPresenceEntry, CircPresenceResponse, CircPresenceUpdate,
     CircRoom, CircRoomUser, MessageExtras,
 };
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, ListItem, Paragraph};
 use ratatui::Frame;
 
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::Protocol;
+use ratatui_image::{Image, Resize};
+
+use super::app::MAX_RECONNECT_ATTEMPTS;
 use super::audio::JukeboxTrack;
 use super::chat::{self, BodyLayout, ChatMessage, OpenAction};
 use super::cmail::{
@@ -39,6 +46,7 @@ use super::cmail::{
 use super::editor::Segment;
 use super::flag::FlagPromptKey;
 use super::list::{self, TabState};
+use super::mention;
 use super::theme::Theme;
 
 const MAX_OUTGOING_ROWS: usize = 4;
@@ -59,9 +67,18 @@ const COMPOSER_GUTTER: &str = "  ";
 /// and rows have scrolled off above it.
 const COMPOSER_MORE: &str = "… ";
 
-/// Columns the roster pane takes when it is open (`Ctrl+U`). Wide enough for a
-/// handle plus the admin star and the idle mark.
-const ROSTER_WIDTH: u16 = 20;
+/// Columns the roster pane takes, border included.
+///
+/// Sized for the worst case a row can hold rather than for a typical name: one
+/// leading space, a 20-character username, the admin mark and the idle mark,
+/// which is 26 columns, plus the pane's left border.
+///
+/// This was 20, which clipped. `Paragraph` truncates rather than wraps, so a
+/// long name silently lost its admin and idle marks off the right edge, which
+/// is precisely the information the row exists to carry. The pane is shown at
+/// this width or not at all (see `render_room`); an in-between width would
+/// bring the clipping straight back.
+const ROSTER_WIDTH: u16 = 27;
 
 /// Narrowest message pane worth keeping. Below this the roster pane stays
 /// folded away however the toggle is set, so a small terminal never squeezes
@@ -81,9 +98,66 @@ const IDLE_MARK: &str = "\u{1f4a4}";
 /// here would read as a second cursor. An `@` says what the mark means anyway.
 const MENTION_MARK: &str = "@ ";
 
+/// Messages a PageUp or PageDown moves the selection by.
+///
+/// A fixed count rather than a pane-height calculation: messages vary wildly in
+/// height (a decoded `/art` picture is dozens of rows, a `/me` is two), so
+/// "one screenful" is not a stable number of messages and would make the key
+/// feel different from one press to the next.
+const PAGE_JUMP: usize = 10;
+
+/// How many messages a room keeps before it starts dropping the oldest.
+///
+/// A room left open all day would otherwise grow without limit, and each
+/// message drags its decoded art and cached image bytes along with it. Ten
+/// pages of the API's 50-message maximum is far more than anyone scrolls back
+/// through in a session, and what falls off is re-fetched on demand.
+const MAX_HELD_MESSAGES: usize = 500;
+
 /// The wire `content` of a deleted message (§ Delete Your Message). Never
 /// rendered: [`super::chat::body_lines`] draws a tombstone instead.
 const DELETED_CONTENT: &str = "[DELETED]";
+
+/// Prefixes a local-only notice, the way an IRC client marks its own output.
+const NOTICE_PREFIX: &str = "*** ";
+
+/// Build a local-only notice to append to the open room's transcript.
+///
+/// These never went to the server and never come back from it: a `/help` reply
+/// arrives only in the send response (§ Commands), and a refused command was
+/// never sent at all. They exist for the session and die with the room.
+///
+/// **The empty `id` is load-bearing, not laziness.** It is what makes the
+/// message inert: [`CircScreen::selected_deletable_id`] refuses an empty id, so
+/// `d` cannot delete it; the `F` arm filters on the same, so it cannot be
+/// reported; the empty `username` makes `m` a no-op, since muting needs a
+/// handle; and carrying no extras leaves `o` and `v` nothing to act on. The
+/// cursor may still rest on one, which is harmless, and that is the trade for
+/// keeping the message list 1:1 with the rendered rows that selection,
+/// pagination and scrolling all index against.
+///
+/// [`CircScreen::apply_live`] skips whole updates with an empty id, so a server
+/// message can never overwrite a notice, and a notice can never be mistaken for
+/// one.
+fn local_notice(text: &str, timestamp: i64) -> CircMessage {
+    CircMessage {
+        id: String::new(),
+        user_id: String::new(),
+        username: String::new(),
+        is_chat_admin: false,
+        content: text.to_string(),
+        timestamp,
+        extras: MessageExtras::default(),
+    }
+}
+
+/// Whether this row is a local notice rather than something someone posted.
+///
+/// Both halves are checked: a real message always carries an id, so the pair is
+/// unambiguous even against a malformed payload.
+fn is_local_notice(m: &CircMessage) -> bool {
+    m.id.is_empty() && m.username.is_empty()
+}
 
 /// What the cIRC screen asks the shell to do after a key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +218,12 @@ pub enum CircIntent {
     },
     /// Mute a handle in this room (§ Commands, "Muting"). Muting is a slash
     /// command, not an endpoint, so the shell posts `/mute <username>`.
+    /// Put the selected message's text on the clipboard.
+    CopyText(String),
+    /// Open the selected message author's profile.
+    OpenProfile { username: String },
+    /// Start or resume a C-Mail conversation with the selected author.
+    OpenDm { username: String, user_id: String },
     MuteUser {
         /// Room slug (`:roomId`).
         room_id: String,
@@ -182,29 +262,54 @@ pub enum CircMode {
         /// Its history. `selected` indexes the *visible* view, i.e. what is
         /// left after muted authors are filtered out.
         messages: TabState<CircMessage>,
-        /// Message-select sub-mode state (`Ctrl+B`).
+        /// Message-action menu state (`Ctrl+A`).
         select: SelectState,
         /// Who is in the room (§ Who's in a room).
         roster: Roster,
     },
 }
 
-/// The message-select sub-mode, entered with `Ctrl+B`.
+/// What the room's live message stream is doing, for the room header.
+///
+/// A dropped stream used to be invisible: the REST poll alongside it kept the
+/// room updating, so a reader had no way to tell live updates from a three
+/// second lag, and neither did we. Surfacing it is what makes a regression in
+/// the stream noticeable instead of silently absorbed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CircStreamState {
+    /// Connected, or not yet started.
+    #[default]
+    Live,
+    /// Dropped, with attempt `n` of the ladder in flight.
+    Reconnecting(u32),
+    /// The ladder was exhausted. Stays until the room is re-entered.
+    Lost,
+}
+
+/// The message-action menu, opened with `Ctrl+A`.
 ///
 /// Every bare letter in a room goes to the always-on composer, so the per
 /// message actions (delete, flag, open, reveal, mute) need a mode of their own
 /// where the composer is not focused.
 #[derive(Debug, Default)]
 pub struct SelectState {
-    /// Whether the mode has the keyboard.
-    active: bool,
+    /// Whether the per-message action menu is open.
+    ///
+    /// Replaces what used to be a *mode*. The composer in a room is always
+    /// live, so a mode in which bare letters meant `d`elete, `m`ute and so on
+    /// left the reader with an active editor in which some letters typed, some
+    /// navigated and some acted. That is not a rule anyone can hold in their
+    /// head, and an adversarial review found it could delete a message from an
+    /// ordinary typed word. Now exactly one key is special: it opens this menu,
+    /// the menu owns the keyboard while it is up, and every other key types.
+    menu_open: bool,
     /// Two-step delete: `d` arms it, `y` confirms (the convention journal,
     /// bookmarks and post detail already use).
     confirming_delete: bool,
     /// The open flag-reason prompt, if any.
     flag: Option<MessageFlagPrompt>,
-    /// Ids of the messages whose spoiler the reader has revealed with `v`.
-    /// Reader state, not message state, so it lives here and dies with the room.
+    /// Ids of the messages whose spoiler or substituted text the reader has
+    /// revealed. Reader state, not message state, so it dies with the room.
     revealed: HashSet<String>,
 }
 
@@ -363,6 +468,13 @@ struct ComposerView {
     /// First visible row, and how many rows are visible (`1..=cap`).
     first: usize,
     rows: usize,
+    /// Index in `chars` where the mention ghost begins, when one is showing.
+    ///
+    /// Everything from here on is a preview, not text: it is styled as such,
+    /// and it is not in the draft. Building it into `chars` rather than
+    /// appending it after the fact is what lets the ghost take part in wrapping
+    /// and scrolling like anything else, instead of needing its own width math.
+    ghost_from: Option<usize>,
 }
 
 /// The draft as the characters the composer actually draws, plus where the caret
@@ -372,7 +484,7 @@ struct ComposerView {
 /// composer is a strip under the conversation rather than an editor of its own,
 /// so a newline stays the inline `⏎` marker it has always been. Only the width
 /// starts a new row.
-fn composer_display(draft: &Composer) -> (Vec<char>, usize) {
+fn composer_display(draft: &Composer, ghost: &str) -> (Vec<char>, usize, Option<usize>) {
     let mut chars: Vec<char> = Vec::with_capacity(draft.text.len());
     let mut caret = 0;
     for (i, c) in draft.text.chars().enumerate() {
@@ -388,7 +500,17 @@ fn composer_display(draft: &Composer) -> (Vec<char>, usize) {
     if draft.cursor >= draft.len() {
         caret = chars.len();
     }
-    (chars, caret)
+    // The ghost sits exactly at the caret, so the caret cell lands on its first
+    // character. Deliberate: the preview then reads as a continuation of what
+    // you are typing rather than something parked after a gap.
+    let ghost_from = (!ghost.is_empty()).then(|| {
+        let at = caret;
+        let tail: Vec<char> = chars.split_off(at);
+        chars.extend(ghost.chars());
+        chars.extend(tail);
+        at
+    });
+    (chars, caret, ghost_from)
 }
 
 /// Wrap `draft` to `width` content columns, showing at most `cap` rows.
@@ -396,9 +518,9 @@ fn composer_display(draft: &Composer) -> (Vec<char>, usize) {
 /// A draft that outgrows `cap` scrolls rather than growing further, and the
 /// window always holds the caret: it rides the bottom row while you type, and
 /// Home takes both it and the window back to the start.
-fn layout_composer(draft: &Composer, width: usize, cap: usize) -> ComposerView {
+fn layout_composer(draft: &Composer, width: usize, cap: usize, ghost: &str) -> ComposerView {
     let cap = cap.max(1);
-    let (chars, caret) = composer_display(draft);
+    let (chars, caret, ghost_from) = composer_display(draft, ghost);
     // `wrap_line` always yields at least one segment, so `segs` is never empty.
     let segs = super::editor::wrap_line(&chars, width.max(1));
     let (caret_row, _) = super::editor::caret_in_line(&chars, &segs, caret);
@@ -413,6 +535,7 @@ fn layout_composer(draft: &Composer, width: usize, cap: usize) -> ComposerView {
         caret_row,
         first,
         rows,
+        ghost_from,
     }
 }
 
@@ -427,8 +550,40 @@ fn composer_width(area_width: u16) -> usize {
 /// wrapped continuations, and a reverse-video caret, the same block the shared
 /// single-line fields use.
 fn composer_lines(view: &ComposerView, theme: &Theme) -> Vec<Line<'static>> {
-    let caret_style = theme.base().add_modifier(Modifier::REVERSED);
-    let run = |range: std::ops::Range<usize>| view.chars[range].iter().collect::<String>();
+    let ghost_style = theme.muted_style();
+    // The caret sits on the ghost's first character, so it has to carry the
+    // ghost's colour too. Reversed in the draft's own colour there would read
+    // as a character you had actually typed.
+    let caret_style = if view.ghost_from == Some(view.caret) {
+        ghost_style.add_modifier(Modifier::REVERSED)
+    } else {
+        theme.base().add_modifier(Modifier::REVERSED)
+    };
+    let style_at = |i: usize| match view.ghost_from {
+        Some(from) if i >= from => ghost_style,
+        _ => theme.base(),
+    };
+    // A run may straddle the ghost boundary, so it is emitted per style rather
+    // than as one span.
+    let run_spans = |range: std::ops::Range<usize>| -> Vec<Span<'static>> {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut buf = String::new();
+        let mut current: Option<Style> = None;
+        for i in range {
+            let st = style_at(i);
+            if current != Some(st) {
+                if let Some(prev) = current.take() {
+                    spans.push(Span::styled(std::mem::take(&mut buf), prev));
+                }
+                current = Some(st);
+            }
+            buf.push(view.chars[i]);
+        }
+        if let Some(st) = current {
+            spans.push(Span::styled(buf, st));
+        }
+        spans
+    };
     (view.first..view.first + view.rows)
         .map(|r| {
             let seg = view.segs[r];
@@ -442,14 +597,14 @@ fn composer_lines(view: &ComposerView, theme: &Theme) -> Vec<Line<'static>> {
             };
             let mut spans = vec![gutter];
             if r != view.caret_row {
-                spans.push(Span::styled(run(seg.start..seg.end), theme.base()));
+                spans.extend(run_spans(seg.start..seg.end));
                 return Line::from(spans);
             }
             let at = view.caret.clamp(seg.start, seg.end);
-            spans.push(Span::styled(run(seg.start..at), theme.base()));
+            spans.extend(run_spans(seg.start..at));
             if at < seg.end {
                 spans.push(Span::styled(view.chars[at].to_string(), caret_style));
-                spans.push(Span::styled(run(at + 1..seg.end), theme.base()));
+                spans.extend(run_spans(at + 1..seg.end));
             } else {
                 // Caret past the last character of the row.
                 spans.push(Span::styled(" ", caret_style));
@@ -460,7 +615,6 @@ fn composer_lines(view: &ComposerView, theme: &Theme) -> Vec<Line<'static>> {
 }
 
 /// The cIRC screen: a room list, and one open room at a time.
-#[derive(Debug)]
 pub struct CircScreen {
     /// The room list.
     pub rooms: TabState<CircRoom>,
@@ -481,6 +635,57 @@ pub struct CircScreen {
     /// to keep `d` off other people's messages and `F` off your own; unknown
     /// means both are offered and the server has the final say (403).
     viewer_user_id: Option<String>,
+    /// What the open room's live stream is doing, for the header.
+    stream_state: CircStreamState,
+    /// Animation frame for `blink`/`wave`/`glitch`, advanced by the shell only
+    /// while `animate_styles` is on and a message on screen actually animates.
+    anim_frame: usize,
+    /// How many times Tab has been pressed on the current mention token.
+    ///
+    /// Only a counter, wrapped against the live match count wherever it is
+    /// read, never a snapshot of the candidates. That way someone leaving the
+    /// room stops being offered mid-cycle, and someone joining becomes
+    /// reachable, without the reader having to retype the query. The accepted
+    /// cost is that a roster change between two Tab presses can land the same
+    /// position on a different person, which is better than confidently
+    /// offering someone who has gone.
+    mention_cycle: Option<usize>,
+    /// Raw bytes of images already fetched, keyed by URL. `RefCell` because
+    /// `render` takes `&self` and decoding is lazy: an image is only turned
+    /// into a protocol the first time it scrolls into view.
+    image_bytes: RefCell<HashMap<String, Vec<u8>>>,
+    /// URLs already asked for, so the fetch driver does not re-request one that
+    /// is in flight or that failed. Never retried within a session.
+    image_requested: RefCell<HashSet<String>>,
+    /// URLs whose fetch failed; they fall back to a chip instead of a band.
+    image_failed: RefCell<HashSet<String>>,
+    /// Pixel dimensions per URL, read from the header once the bytes arrive, so
+    /// the reserved band can shrink from the fallback ceiling to what the
+    /// picture actually needs. See `chat::fitted_image_rows`.
+    image_dims: RefCell<HashMap<String, (u32, u32)>>,
+    /// Encoded protocols, keyed by URL, with the cell size they were built for
+    /// so a resize rebuilds them instead of drawing a stale picture.
+    ///
+    /// Skipped by `Debug`: `Protocol` does not implement it, and a screenful of
+    /// encoded pixel data is not something a debug dump wants anyway.
+    image_protocols: RefCell<HashMap<String, (Protocol, Size)>>,
+}
+
+impl std::fmt::Debug for CircScreen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CircScreen")
+            .field("rooms", &self.rooms)
+            .field("mode", &self.mode)
+            .field("draft", &self.draft)
+            .field("outgoing", &self.outgoing)
+            .field("roster_open", &self.roster_open)
+            .field("muted", &self.muted)
+            .field("viewer_user_id", &self.viewer_user_id)
+            .field("stream_state", &self.stream_state)
+            .field("mention_cycle", &self.mention_cycle)
+            .field("images_cached", &self.image_bytes.borrow().len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl CircScreen {
@@ -495,6 +700,14 @@ impl CircScreen {
             roster_open: false,
             muted: HashMap::new(),
             viewer_user_id: None,
+            stream_state: CircStreamState::default(),
+            anim_frame: 0,
+            mention_cycle: None,
+            image_bytes: RefCell::new(HashMap::new()),
+            image_requested: RefCell::new(HashSet::new()),
+            image_failed: RefCell::new(HashSet::new()),
+            image_dims: RefCell::new(HashMap::new()),
+            image_protocols: RefCell::new(HashMap::new()),
         }
     }
 
@@ -513,7 +726,7 @@ impl CircScreen {
     pub fn is_text_input(&self) -> bool {
         match &self.mode {
             CircMode::Rooms => false,
-            CircMode::Room { select, .. } => !select.active || select.flag.is_some(),
+            CircMode::Room { .. } => true,
         }
     }
 
@@ -530,7 +743,7 @@ impl CircScreen {
             prompt.paste(text);
             return;
         }
-        if select.active {
+        if select.menu_open {
             return;
         }
         self.draft.insert_str(text);
@@ -544,7 +757,7 @@ impl CircScreen {
         let CircMode::Room { select, .. } = &mut self.mode else {
             return;
         };
-        select.active = false;
+        select.menu_open = false;
         select.confirming_delete = false;
         select.flag = None;
         self.draft.set(content);
@@ -602,8 +815,8 @@ impl CircScreen {
             select.confirming_delete = false;
             return Some(CircIntent::None);
         }
-        if select.active {
-            select.active = false;
+        if select.menu_open {
+            select.menu_open = false;
             return Some(CircIntent::None);
         }
         self.reset_composer();
@@ -663,6 +876,10 @@ impl CircScreen {
     /// Switch to the room view for `room_id`, with an empty composer, no select
     /// mode and an empty roster. A no-op for a room that is not in the list.
     pub fn open_room(&mut self, room_id: &str) {
+        // A new room means a new stream generation, so last room's verdict has
+        // nothing to say about this one. Also what makes the persistent "live
+        // updates lost" clear on re-entry, which is the documented recovery.
+        self.stream_state = CircStreamState::Live;
         if let Some(room) = self
             .rooms
             .items
@@ -706,6 +923,42 @@ impl CircScreen {
         }
     }
 
+    /// Append a local-only notice to the open room's transcript.
+    ///
+    /// Used for a command reply the server answers inline (`/help` and the
+    /// `/mute` family return `{ "data": { "reply": "..." } }` and post nothing)
+    /// and for a command this client refused to send. Both are the client
+    /// talking to one reader, so neither belongs on the wire.
+    ///
+    /// Timestamped `now` so it sorts to the bottom next to whatever prompted
+    /// it. A message arriving later sorts below it, which is correct: the
+    /// notice really did happen first.
+    ///
+    /// No-op unless `room_id` is the room actually open, so a reply that
+    /// arrives after the reader has moved on is dropped rather than pasted into
+    /// the wrong room.
+    pub fn append_notice(&mut self, room_id: &str, text: &str) {
+        let muted = self.muted.get(room_id);
+        let CircMode::Room { room, messages, .. } = &mut self.mode else {
+            return;
+        };
+        if room.room_id() != room_id {
+            return;
+        }
+        let text = text.trim_end();
+        if text.is_empty() {
+            return;
+        }
+        let view = visible_indices(&messages.items, muted);
+        let was_at_bottom = view.is_empty() || messages.selected + 1 >= view.len();
+        messages.items.push(local_notice(text, now_ms()));
+        messages.loaded = true;
+        if was_at_bottom {
+            let view_len = visible_indices(&messages.items, muted).len();
+            messages.selected = view_len.saturating_sub(1);
+        }
+    }
+
     /// Merge live updates into the open room (de-duped, timestamp order; follows
     /// the tail when pinned to the bottom).
     ///
@@ -730,9 +983,13 @@ impl CircScreen {
         // post-merge one.
         let view = visible_indices(&messages.items, muted);
         let was_at_bottom = view.is_empty() || messages.selected + 1 >= view.len();
+        // Notices all carry an empty id by design, so anchoring on one would
+        // match the *first* notice in the room rather than the row the reader
+        // was on. `None` falls back to the index-clamp below, which is right.
         let selected_id = view
             .get(messages.selected)
-            .map(|&i| messages.items[i].id.clone());
+            .map(|&i| messages.items[i].id.clone())
+            .filter(|id| !id.is_empty());
 
         let mut changed = false;
         for update in updates {
@@ -766,6 +1023,8 @@ impl CircScreen {
         messages
             .items
             .sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then_with(|| a.id.cmp(&b.id)));
+        // Only while following the tail: see `trim_history`.
+        trim_history(messages, muted, was_at_bottom);
         messages.loading = false;
         messages.loaded = true;
 
@@ -894,6 +1153,236 @@ impl CircScreen {
         }
     }
 
+    /// Names worth offering for an `@mention`, best first.
+    ///
+    /// Everyone currently in the room, then anyone else who has a message in
+    /// the history we hold. The second half matters: someone who spoke and then
+    /// went offline is still who you want to reply to, and they are gone from
+    /// the roster. Online names win a tie, since they are the ones who can read
+    /// it now.
+    ///
+    /// Local notices are excluded: they have no author, and "*** " is not
+    /// somebody.
+    fn mention_pool(&self) -> Vec<String> {
+        let CircMode::Room {
+            messages, roster, ..
+        } = &self.mode
+        else {
+            return Vec::new();
+        };
+        let now = now_ms();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut pool: Vec<String> = Vec::new();
+        let push = |name: &str, pool: &mut Vec<String>, seen: &mut HashSet<String>| {
+            let name = name.trim();
+            if name.is_empty() {
+                return;
+            }
+            if seen.insert(name.to_lowercase()) {
+                pool.push(name.to_string());
+            }
+        };
+        let mut online: Vec<&CircPresenceEntry> = roster
+            .entries
+            .iter()
+            .filter(|e| e.is_visible(now, roster.stale_after_ms))
+            .collect();
+        online.sort_by_key(|e| e.username.to_lowercase());
+        for entry in online {
+            push(&entry.username, &mut pool, &mut seen);
+        }
+        for m in &messages.items {
+            if is_local_notice(m) {
+                continue;
+            }
+            push(&m.username, &mut pool, &mut seen);
+        }
+        pool
+    }
+
+    /// The mention token under the caret and the candidate currently offered.
+    ///
+    /// Re-resolved on every call rather than cached, which is what keeps the
+    /// offer honest as people come and go. `None` when the caret is not in a
+    /// mention, nothing matches, or the whole name is already typed.
+    fn mention_offer(&self) -> Option<(mention::Query, String, String)> {
+        let query = mention::query_at(&self.draft.text, self.draft.cursor)?;
+        let pool = self.mention_pool();
+        let matches = mention::matches(&pool, &query.prefix);
+        if matches.is_empty() {
+            return None;
+        }
+        // Index 0 is the passive default, shown before any Tab is pressed, so
+        // the first Tab has to move to 1 or it would look like a no-op.
+        let idx = self.mention_cycle.unwrap_or(0) % matches.len();
+        let candidate = matches[idx].to_string();
+        let ghost = mention::remainder(&candidate, &query.prefix)?;
+        Some((query, candidate, ghost))
+    }
+
+    /// Whether the open room is holding any messages.
+    ///
+    /// For tests that need to prove a background event really landed in a
+    /// parked room rather than being dropped on the floor.
+    #[must_use]
+    #[cfg(test)]
+    pub fn render_probe_is_empty(&self) -> bool {
+        match &self.mode {
+            CircMode::Room { messages, .. } => messages.items.is_empty(),
+            CircMode::Rooms => true,
+        }
+    }
+
+    /// Whether the open room is showing anything that animates.
+    ///
+    /// The gate on the animation clock. Deliberately asks about the *held*
+    /// messages rather than a flag set once: a room becomes animated when such
+    /// a message arrives and stops being animated when it scrolls out of the
+    /// buffer, and the clock should follow both without anyone remembering to
+    /// turn it off.
+    #[must_use]
+    pub fn wants_animation(&self) -> bool {
+        if !crate::config::get().animate_styles {
+            return false;
+        }
+        let CircMode::Room { messages, .. } = &self.mode else {
+            return false;
+        };
+        messages
+            .items
+            .iter()
+            .any(|m| super::styles::TextStyles::from_message(m.extras.style.as_ref()).animates())
+    }
+
+    /// Advance the animation clock by one frame.
+    pub fn tick_animation(&mut self) {
+        self.anim_frame = self.anim_frame.wrapping_add(1);
+    }
+
+    /// How many of `updates` are messages this room does not already hold.
+    ///
+    /// The unread badge counts what the reader has not seen, and the live
+    /// stream re-delivers: the REST poll resends a whole page, and a
+    /// reconnect replays. Counting raw deliveries would inflate the badge into
+    /// a number that means nothing. A patch is never news either, since it
+    /// changes a message that is already here.
+    ///
+    /// Muted authors are skipped: their messages will not be shown, so
+    /// advertising them as unread would send the reader looking for something
+    /// they cannot see.
+    #[must_use]
+    pub fn count_unheld(&self, room_id: &str, updates: &[CircMessageUpdate]) -> usize {
+        let muted = self.muted.get(room_id);
+        let CircMode::Room { room, messages, .. } = &self.mode else {
+            return 0;
+        };
+        if room.room_id() != room_id {
+            return 0;
+        }
+        updates
+            .iter()
+            .filter_map(|u| match u {
+                CircMessageUpdate::Full(m) if !m.id.is_empty() => Some(m),
+                _ => None,
+            })
+            .filter(|m| muted.map_or(true, |set| !set.contains(&m.username.trim().to_lowercase())))
+            .filter(|m| !messages.items.iter().any(|held| held.id == m.id))
+            .count()
+    }
+
+    /// Record that `url` could not be fetched, so no band is held open for it.
+    ///
+    /// Without this the layout reserves rows for a picture that will never
+    /// arrive *and* suppresses the `[image]` chip, because as far as the layout
+    /// knows one is being drawn. The reader gets a blank hole with nothing to
+    /// explain it. Marking the URL failed puts the chip back.
+    pub fn note_image_failed(&self, url: &str) {
+        self.image_failed.borrow_mut().insert(url.to_string());
+    }
+
+    /// The bytes already fetched for `url`, for the fullscreen modal.
+    #[must_use]
+    pub fn held_image_bytes(&self, url: &str) -> Option<Vec<u8>> {
+        self.image_bytes.borrow().get(url).cloned()
+    }
+
+    /// Hand the screen the bytes of an image it asked for.
+    ///
+    /// Decoding is deliberately *not* done here: it happens lazily at render
+    /// time, once, when the picture first scrolls into view, because the target
+    /// cell size is only known then.
+    /// Trim the image caches to what is worth keeping.
+    ///
+    /// Called from the render, where the set of URLs actually reachable on
+    /// screen is known. Without it the caches were insert-only for the session
+    /// and grew past whatever `MAX_HELD_MESSAGES` was holding back.
+    fn evict_images(&self, keep: &[String]) {
+        super::images::evict_to_cap(&mut self.image_bytes.borrow_mut(), keep);
+        super::images::evict_to_cap(&mut self.image_protocols.borrow_mut(), keep);
+        super::images::evict_to_cap(&mut self.image_dims.borrow_mut(), keep);
+    }
+
+    pub fn cache_image_bytes(&self, url: String, bytes: Vec<u8>) {
+        // Read just the header for dimensions. Decoding the whole picture here
+        // would do the expensive work for an image that may never scroll into
+        // view, and the size is all the layout needs.
+        if let Some(dims) = super::images::probe_dimensions(&bytes) {
+            self.image_dims.borrow_mut().insert(url.clone(), dims);
+        }
+        self.image_bytes.borrow_mut().insert(url, bytes);
+    }
+
+    /// Image URLs in the open room that are worth fetching now.
+    ///
+    /// Everything currently held, not merely what is on screen: history is
+    /// paged in a screenful at a time, so a message just above the fold is about
+    /// to be scrolled to, and fetching on demand would show a blank gap for as
+    /// long as the round trip takes. Each URL is handed out once per session,
+    /// so a failed fetch is not retried in a loop.
+    pub fn image_urls_to_fetch(&self, room_id: &str, limit: usize) -> Vec<String> {
+        let CircMode::Room { room, messages, .. } = &self.mode else {
+            return Vec::new();
+        };
+        if room.room_id() != room_id {
+            return Vec::new();
+        }
+        let mut requested = self.image_requested.borrow_mut();
+        let bytes = self.image_bytes.borrow();
+        messages
+            .items
+            .iter()
+            .filter_map(|m| chat::inline_image_url(&m.extras))
+            // Three steps, and the order of all three matters. Skip what is
+            // already held or already asked for, *then* cap the batch, and only
+            // then mark. Capping before the skip would re-take the same URLs
+            // every call and hand back nothing; marking before the cap would
+            // spend URLs that were never fetched, and a spent URL is never
+            // offered again.
+            .filter(|url| !bytes.contains_key(url) && !requested.contains(url))
+            .take(limit)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .inspect(|url| {
+                requested.insert(url.clone());
+            })
+            .collect()
+    }
+
+    /// Record what the open room's live message stream is doing (see Reading a
+    /// room in real time).
+    ///
+    /// Ignored unless `room_id` is the room actually open, so a late report from
+    /// a stream the reader has already left cannot label the new room.
+    pub fn apply_stream_state(&mut self, room_id: &str, state: CircStreamState) {
+        let CircMode::Room { room, .. } = &self.mode else {
+            return;
+        };
+        if room.room_id() != room_id {
+            return;
+        }
+        self.stream_state = state;
+    }
+
     /// Replace the handles muted in `room_id` (§ Commands, "Muting").
     ///
     /// Muting is not filtered server-side: the history endpoint still returns a
@@ -1006,15 +1495,19 @@ impl CircScreen {
             return CircIntent::RetryFailed { room_id, contents };
         }
 
-        if ctrl && key.code == KeyCode::Char('b') {
-            if let CircMode::Room { select, .. } = &mut self.mode {
-                select.active = !select.active;
-                select.confirming_delete = false;
+        // One special key: it opens the action menu for the message under the
+        // cursor. Everything else in a room types.
+        if ctrl && key.code == KeyCode::Char('a') {
+            if self.selected_message(&room_id).is_some() {
+                if let CircMode::Room { select, .. } = &mut self.mode {
+                    select.menu_open = true;
+                    select.confirming_delete = false;
+                }
             }
             return CircIntent::None;
         }
 
-        if self.select_is_active() {
+        if self.menu_is_open() {
             return self.handle_select_key(key, &room_id);
         }
 
@@ -1022,8 +1515,33 @@ impl CircScreen {
         // sends, Ctrl+E expands to the editor, and the vertical keys scroll the
         // history. The horizontal keys — ←/→, Home and End — belong to the
         // composer's caret, the way they do in every other field in the client;
-        // jumping the history to its ends is select mode's Home/End (Ctrl+B),
-        // which has no text to move a caret through.
+        // jumping the history to its ends is the action menu's Home/End
+        // (Ctrl+A), which has no text to move a caret through.
+        // Tab cycles the mention preview and Space commits it; every other key
+        // ends the preview, leaving exactly what was typed. Nothing is ever
+        // inserted without one of those two, so the ghost can never turn into
+        // text the reader did not ask for.
+        match key.code {
+            KeyCode::Tab if !ctrl => {
+                if self.mention_offer().is_some() {
+                    self.mention_cycle = Some(self.mention_cycle.map_or(1, |n| n + 1));
+                }
+                return CircIntent::None;
+            }
+            KeyCode::Char(' ') if !ctrl => {
+                if let Some((query, candidate, _)) = self.mention_offer() {
+                    let (text, caret) =
+                        mention::splice(&self.draft.text, &query, self.draft.cursor, &candidate);
+                    self.draft.set(text);
+                    self.draft.cursor = caret;
+                }
+                self.mention_cycle = None;
+                self.draft.insert(' ');
+                return CircIntent::None;
+            }
+            _ => self.mention_cycle = None,
+        }
+
         match key.code {
             KeyCode::Char('e') if ctrl => CircIntent::StartCompose {
                 room_id,
@@ -1032,6 +1550,20 @@ impl CircScreen {
             KeyCode::Enter => {
                 let content = send_content(&self.draft.text);
                 if content.trim().is_empty() {
+                    return CircIntent::None;
+                }
+                // A mistyped command is not an error to the server: anything it
+                // does not recognize is posted verbatim, so `/dcie 2d6` becomes
+                // a message reading "/dcie 2d6" in front of the whole room.
+                // Refuse it here instead. Names only; a recognized command with
+                // bad syntax still goes for its 400 (see the Commands section).
+                if !super::commands::is_known(&content, super::commands::Surface::Circ) {
+                    let word = super::commands::command_word(&content).to_string();
+                    // The draft is deliberately KEPT. The whole point of
+                    // refusing locally is to let the reader fix a typo; clearing
+                    // it destroys the message they were trying to send, which is
+                    // worse than the thing this guard exists to prevent.
+                    self.append_notice(&room_id, &format!("unknown command: {word}"));
                     return CircIntent::None;
                 }
                 self.outgoing.push(Outgoing {
@@ -1065,6 +1597,14 @@ impl CircScreen {
                 self.draft.move_end();
                 CircIntent::None
             }
+            // The vertical keys scroll the history and nothing else. An
+            // earlier round had `up` from the composer enter message-select
+            // mode, copying the reference client; Task 14.1 removed both that
+            // gesture and the mode it entered, because a room whose composer is
+            // always live cannot also have letters that mean commands. The
+            // actions live behind `Ctrl+A` now, so an arrow key is never a mode
+            // change and a reader scrolling back stays a reader scrolling back.
+            //
             KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => {
                 self.scroll_messages(key.code, &room_id)
             }
@@ -1076,9 +1616,53 @@ impl CircScreen {
         }
     }
 
+    /// Move the history cursor one step for a mouse-wheel notch.
+    ///
+    /// Returns whether it handled the event, which is only when a room is open.
+    ///
+    /// Kept as its own path rather than routed through the `up`/`down` keys.
+    /// It once mattered for correctness, when those keys entered and left
+    /// message-select mode and a wheel notch could therefore change mode under
+    /// a reader who was only scrolling. Task 14.1 removed that mode, so the two
+    /// paths now agree; this stays separate because a notch still has to
+    /// resolve to exactly one row (see `coalesce_scroll`).
+    pub fn wheel_scroll(&mut self, up: bool) -> bool {
+        let room_id = match &self.mode {
+            CircMode::Room { room, messages, .. } => {
+                if messages.loading {
+                    return true;
+                }
+                room.room_id().to_string()
+            }
+            CircMode::Rooms => return false,
+        };
+        // The cursor indexes the *visible* view, so the clamp has to count what
+        // a muted author leaves behind, not the raw history.
+        let len = match &self.mode {
+            CircMode::Room { messages, .. } => {
+                visible_indices(&messages.items, self.muted.get(&room_id)).len()
+            }
+            CircMode::Rooms => return false,
+        };
+        let CircMode::Room { messages, .. } = &mut self.mode else {
+            return false;
+        };
+        messages.selected = if up {
+            messages.selected.saturating_sub(1)
+        } else {
+            messages
+                .selected
+                .saturating_add(1)
+                .min(len.saturating_sub(1))
+        };
+        true
+    }
+
+    /// Whether the open room has any message the cursor could land on.
+    ///
     /// Whether message-select mode has the keyboard.
-    fn select_is_active(&self) -> bool {
-        matches!(&self.mode, CircMode::Room { select, .. } if select.active)
+    fn menu_is_open(&self) -> bool {
+        matches!(&self.mode, CircMode::Room { select, .. } if select.menu_open)
     }
 
     /// Whether the flag-reason prompt is up.
@@ -1201,8 +1785,8 @@ impl CircScreen {
                 }
                 CircIntent::None
             }
-            KeyCode::Char('o') => match self.selected_message(room_id).map(|m| &m.extras) {
-                Some(extras) => match chat::open_action(extras) {
+            KeyCode::Char('o') => match self.selected_message(room_id) {
+                Some(m) => match chat::open_action(&m.extras, &m.content) {
                     OpenAction::Play(track) => CircIntent::PlayJukebox(track),
                     OpenAction::Open(url) => CircIntent::OpenUrl(url),
                     OpenAction::None => CircIntent::None,
@@ -1210,13 +1794,20 @@ impl CircScreen {
                 None => CircIntent::None,
             },
             KeyCode::Char('v') => {
-                let Some((id, spoiler)) = self
-                    .selected_message(room_id)
-                    .map(|m| (m.id.clone(), chat::has_spoiler(&m.extras)))
-                else {
+                // Also reveals a substituted body. `l33t`, `flip` and `cursive`
+                // rewrite the text (see `ui::styles`), and a flipped sentence is
+                // genuinely hard to read, so the same key that unmasks a spoiler
+                // shows the original. Both are "show me what this really says".
+                let Some((id, revealable)) = self.selected_message(room_id).map(|m| {
+                    let styles = super::styles::TextStyles::from_message(m.extras.style.as_ref());
+                    (
+                        m.id.clone(),
+                        chat::has_spoiler(&m.extras) || styles.substitutes(),
+                    )
+                }) else {
                     return CircIntent::None;
                 };
-                if !spoiler {
+                if !revealable {
                     return CircIntent::None;
                 }
                 if let CircMode::Room { select, .. } = &mut self.mode {
@@ -1226,6 +1817,32 @@ impl CircScreen {
                     }
                 }
                 CircIntent::None
+            }
+            KeyCode::Char('p') => match self.selected_author(room_id) {
+                Some((username, _)) => CircIntent::OpenProfile { username },
+                None => CircIntent::None,
+            },
+            KeyCode::Char('c') => {
+                // Your own profile is reachable from the menu, and a
+                // conversation with yourself is not a thing, so neither is
+                // offered on your own message.
+                if self.selected_is_mine(room_id) == Some(true) {
+                    return CircIntent::None;
+                }
+                match self.selected_author(room_id) {
+                    Some((username, user_id)) => CircIntent::OpenDm { username, user_id },
+                    None => CircIntent::None,
+                }
+            }
+            KeyCode::Char('y') => {
+                let Some(text) = self
+                    .selected_message(room_id)
+                    .map(|m| chat::summary_text(&m.extras, &m.content))
+                    .filter(|t| !t.trim().is_empty())
+                else {
+                    return CircIntent::None;
+                };
+                CircIntent::CopyText(text)
             }
             KeyCode::Char('m') => {
                 // § Commands describes muting as hiding someone else's messages.
@@ -1247,8 +1864,37 @@ impl CircScreen {
                     None => CircIntent::None,
                 }
             }
+            // Anything else closes the menu and goes back to the composer,
+            // including a plain letter: the menu is a momentary overlay, not a
+            // mode to be stuck in.
+            // `j`/`k` and friends still move the cursor *within* the menu;
+            // anything else closes it and types, because the menu is a
+            // momentary overlay rather than a mode to be stuck in.
+            KeyCode::Char(c)
+                if !c.is_control() && !super::list_nav::is_nav_key(KeyCode::Char(c)) =>
+            {
+                if let CircMode::Room { select, .. } = &mut self.mode {
+                    select.menu_open = false;
+                    select.confirming_delete = false;
+                }
+                self.draft.insert(c);
+                CircIntent::None
+            }
             code => self.scroll_messages(code, room_id),
         }
+    }
+
+    /// The selected message's author, as `(username, user_id)`.
+    ///
+    /// `None` for a local notice or anything else without a real author, which
+    /// is what keeps the per-author keys inert on those rows.
+    fn selected_author(&self, room_id: &str) -> Option<(String, String)> {
+        let m = self.selected_message(room_id)?;
+        if is_local_notice(m) {
+            return None;
+        }
+        let username = m.username.trim();
+        (!username.is_empty()).then(|| (username.to_string(), m.user_id.clone()))
     }
 
     /// The id of the selected message when it is one we may delete: our own, or
@@ -1315,6 +1961,20 @@ impl CircScreen {
                     before,
                 };
             }
+            // `list_nav` has no PageUp arm and only handles PageDown when more
+            // history is loadable, so both would otherwise fall through and do
+            // nothing. Handled here rather than by widening `list_nav`, which
+            // Feed, Bookmarks and Notifications also use: a paging change there
+            // is a wider blast radius than this task wants.
+            KeyCode::PageUp => {
+                messages.selected = messages.selected.saturating_sub(PAGE_JUMP);
+            }
+            KeyCode::PageDown => {
+                messages.selected = messages
+                    .selected
+                    .saturating_add(PAGE_JUMP)
+                    .min(view_len.saturating_sub(1));
+            }
             other => {
                 super::list_nav::navigate(other, &mut messages.selected, view_len, false);
             }
@@ -1323,10 +1983,16 @@ impl CircScreen {
     }
 
     /// Draw the room list, or the open room.
-    pub fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
+    pub fn render(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        theme: &Theme,
+        picker: Option<&Picker>,
+    ) {
         match &self.mode {
             CircMode::Rooms => self.render_rooms(frame, area, theme),
-            CircMode::Room { .. } => self.render_room(frame, area, theme),
+            CircMode::Room { .. } => self.render_room(frame, area, theme, picker),
         }
     }
 
@@ -1360,7 +2026,13 @@ impl CircScreen {
         );
     }
 
-    fn render_room(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
+    fn render_room(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        theme: &Theme,
+        picker: Option<&Picker>,
+    ) {
         let CircMode::Room {
             room,
             messages,
@@ -1374,6 +2046,39 @@ impl CircScreen {
             format!(" cs-tui • cIRC • #{} ", room.room_id())
         } else {
             format!(" cs-tui • cIRC • #{} · {} ", room.room_id(), room.name)
+        };
+        // Live status on the title: who is here, whether older history is on
+        // its way, and what the stream is doing. All three used to be invisible
+        // with the roster closed, which is the default.
+        let present = match &self.mode {
+            CircMode::Room { roster, .. } => {
+                let now = now_ms();
+                roster
+                    .entries
+                    .iter()
+                    .filter(|e| e.is_visible(now, roster.stale_after_ms))
+                    .count()
+            }
+            CircMode::Rooms => 0,
+        };
+        let title = if present > 0 {
+            format!("{title}· {present} here ")
+        } else {
+            title
+        };
+        let title = if messages.loading && messages.loaded {
+            // Only for a *later* page: the first load already says "loading" in
+            // the pane itself, and saying it twice reads as two things loading.
+            format!("{title}(loading history…) ")
+        } else {
+            title
+        };
+        let title = match self.stream_state {
+            CircStreamState::Live => title,
+            CircStreamState::Reconnecting(n) => {
+                format!("{title}(live updates lost, reconnecting {n}/{MAX_RECONNECT_ATTEMPTS}) ")
+            }
+            CircStreamState::Lost => format!("{title}(live updates lost) "),
         };
         let block = Block::default()
             .borders(Borders::ALL)
@@ -1437,10 +2142,57 @@ impl CircScreen {
         // has only just opened, or we never published presence) simply leaves
         // every message rendered the way it was before.
         let mention = self.viewer_handle();
+        // Inline pictures need a graphics-capable terminal, images left on, and
+        // a pane tall enough that reserving rows still leaves the conversation
+        // readable. Otherwise the `[image]` chip stands in, which is what a
+        // terminal without graphics should see anyway.
+        let image_rows: Option<u16> = picker.filter(|_| layout[0].height > 6).map(|_| {
+            crate::config::get()
+                .image_height
+                .min(layout[0].height / 2)
+                .max(1)
+        });
+        let animating = self.wants_animation();
+        // A picture's band is sized from its own aspect ratio once its header
+        // has been read, capped at `image_rows`. Before the bytes arrive the cap
+        // stands in, so a picture never appears clipped; the band shrinks when
+        // the real size is known, which costs one reflow and saves the rows a
+        // wide image would otherwise waste.
+        let font = picker.map_or((8, 16), |p| {
+            let fs = p.font_size();
+            (fs.width, fs.height)
+        });
+        let rows_for = |m: &CircMessage| -> Option<u16> {
+            let cap = image_rows?;
+            let url = chat::inline_image_url(&m.extras)?;
+            // A fetch that failed reserves nothing: no band, and the `[image]`
+            // chip comes back, so the reader sees a link rather than a hole.
+            if self.image_failed.borrow().contains(&url) {
+                return None;
+            }
+            Some(match self.image_dims.borrow().get(&url) {
+                Some(&dims) => chat::fitted_image_rows(
+                    dims,
+                    u16::try_from(body_width).unwrap_or(u16::MAX),
+                    font,
+                    cap,
+                ),
+                None => cap,
+            })
+        };
         let layout_of = |m: &CircMessage| {
             let layout = BodyLayout::new(body_width)
                 .with_revealed(select.revealed.contains(&m.id))
                 .with_max_rows(body_cap);
+            let layout = match rows_for(m) {
+                Some(rows) => layout.with_image_rows(rows),
+                None => layout,
+            };
+            let layout = if animating {
+                layout.with_anim_frame(self.anim_frame)
+            } else {
+                layout
+            };
             match mention {
                 Some(handle) => layout.with_mention(handle),
                 None => layout,
@@ -1450,7 +2202,7 @@ impl CircScreen {
             .iter()
             .map(|&i| {
                 let m = &messages.items[i];
-                chat::message_height(ChatMessage::from(m), layout_of(m), 1)
+                circ_message_height(m, theme, layout_of(m))
             })
             .collect();
         let content_rows: usize = heights.iter().map(|&h| h as usize).sum();
@@ -1487,6 +2239,94 @@ impl CircScreen {
             "no messages yet — start typing",
             |m| ListItem::new(circ_message_lines(m, theme, layout_of(m))),
         );
+        // Keep only what the room still holds; a session's worth of decoded
+        // protocols is far more memory than the messages they belong to.
+        {
+            let keep: Vec<String> = messages
+                .items
+                .iter()
+                .filter_map(|m| chat::inline_image_url(&m.extras))
+                .collect();
+            self.evict_images(&keep);
+        }
+
+        // Paint each reserved gap, now that the list has settled where every
+        // message sits. Positions come from the same `heights` the pane was
+        // laid out with and the same `layout_of` the bodies were built from, so
+        // this cannot drift from what is on screen the way a re-derived guess
+        // would.
+        if let (Some(picker), Some(_)) = (picker, image_rows) {
+            let cols = u16::try_from(body_width).unwrap_or(u16::MAX);
+            let mut protocols = self.image_protocols.borrow_mut();
+            let bytes = self.image_bytes.borrow();
+            let pane_bottom = messages_area.y.saturating_add(messages_area.height);
+            let mut y = messages_area.y;
+            for (&i, &h) in visible
+                .iter()
+                .zip(heights.iter())
+                .skip(messages.list_offset())
+            {
+                if y >= pane_bottom {
+                    break;
+                }
+                let m = &messages.items[i];
+                if let Some((url, above, gap_rows)) =
+                    chat::image_gap(ChatMessage::from(m), layout_of(m))
+                {
+                    // Encode at the band this message actually reserved, not at
+                    // the ceiling, or a wide picture is letterboxed into rows
+                    // the layout never gave it.
+                    let target = Size::new(cols, gap_rows);
+                    // One row for the speaker header, then the body rows above
+                    // the gap.
+                    let top = y.saturating_add(1).saturating_add(above);
+                    // Clip against the pane rather than resizing, so a picture
+                    // scrolling in from the bottom slides rather than squashes.
+                    let visible_rows = gap_rows.min(pane_bottom.saturating_sub(top));
+                    if top < pane_bottom && visible_rows > 0 {
+                        // `is_none_or` would read better but is newer than
+                        // this crate's MSRV.
+                        let stale = protocols
+                            .get(&url)
+                            .map_or(true, |(_, built)| *built != target);
+                        if stale {
+                            if let Some(raw) = bytes.get(&url) {
+                                match super::images::decode_bounded(raw).and_then(|img| {
+                                    picker
+                                        .new_protocol(
+                                            img,
+                                            target,
+                                            Resize::Fit(super::images::filter()),
+                                        )
+                                        .map_err(|e| e.to_string())
+                                }) {
+                                    Ok(proto) => {
+                                        protocols.insert(url.clone(), (proto, target));
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!(error = %e, url = %url, "circ image encode failed");
+                                    }
+                                }
+                            }
+                        }
+                        if let Some((proto, _)) = protocols.get(&url) {
+                            let img_area = Rect::new(
+                                // Past the list's highlight gutter and the
+                                // body's own indent, so the picture lines up
+                                // with the text above it.
+                                messages_area.x.saturating_add(4),
+                                top,
+                                target.width,
+                                visible_rows,
+                            );
+                            frame.render_widget(Image::new(proto).allow_clipping(true), img_area);
+                        }
+                    }
+                }
+                y = y.saturating_add(h);
+            }
+        }
+
         // Attachment chips become clickable only after the pane has drawn, and
         // only against the same rect and the same message order. Gated on the
         // `hyperlinks` config like every other OSC 8 surface in the client, so
@@ -1495,15 +2335,21 @@ impl CircScreen {
             // Only the rows the list actually drew, which start at the offset it
             // just settled on. Handing over chips for scrolled-off messages
             // would slide every link onto the wrong message's attachment.
-            let chips = chat::collect_chips(
-                visible
-                    .iter()
-                    .skip(messages.list_offset())
-                    .map(|&i| ChatMessage::from(&messages.items[i])),
-                // Same cap the bodies were drawn with, or a chip cut by the cap
-                // would still be listed and shift the links.
-                BodyLayout::new(body_width).with_max_rows(body_cap),
-            );
+            // Built from `layout_of`, the very layout the bodies were drawn
+            // with, not from a fresh one. A bare layout reserves no image band,
+            // so it still lists the `[image]` chip that a drawn picture
+            // suppresses; `apply_chip_links` walks chips against the runs it
+            // finds on screen and stops at the first mismatch, so that one
+            // phantom entry silently killed *every* attachment link in a room
+            // containing an inline image.
+            let chips: Vec<chat::ChipLink> = visible
+                .iter()
+                .skip(messages.list_offset())
+                .flat_map(|&i| {
+                    let m = &messages.items[i];
+                    chat::message_chips(ChatMessage::from(m), layout_of(m))
+                })
+                .collect();
             chat::apply_chip_links(frame.buffer_mut(), messages_area, &chips, theme);
         }
 
@@ -1513,7 +2359,7 @@ impl CircScreen {
         let selected = visible
             .get(messages.selected)
             .map(|&i| &messages.items[i])
-            .filter(|_| select.active);
+            .filter(|_| select.menu_open);
         self.render_footer(
             frame,
             layout[2],
@@ -1570,10 +2416,19 @@ impl CircScreen {
         let CircMode::Room { select, .. } = &self.mode else {
             return 1;
         };
-        if select.flag.is_some() || select.confirming_delete || select.active {
+        if select.flag.is_some() || select.confirming_delete || select.menu_open {
             return 1;
         }
-        layout_composer(&self.draft, composer_width(width), usize::from(cap)).rows as u16
+        layout_composer(
+            &self.draft,
+            composer_width(width),
+            usize::from(cap),
+            // The ghost occupies columns, so a preview that pushes the draft
+            // onto another row has to be counted here too, or the pane and the
+            // composer would disagree about how tall it is.
+            &self.mention_offer().map_or_else(String::new, |(_, _, g)| g),
+        )
+        .rows as u16
     }
 
     fn render_footer(
@@ -1613,7 +2468,7 @@ impl CircScreen {
                 ))],
                 "y confirm · esc cancel".to_string(),
             )
-        } else if select.active {
+        } else if select.menu_open {
             let mine = selected.and_then(|m| {
                 let viewer = self.viewer_user_id.as_deref()?;
                 Some(!m.user_id.is_empty() && m.user_id == viewer)
@@ -1629,14 +2484,16 @@ impl CircScreen {
                 &self.draft,
                 composer_width(rows[0].width),
                 usize::from(rows[0].height),
+                &self.mention_offer().map_or_else(String::new, |(_, _, g)| g),
             );
             (
                 composer_lines(&view, theme),
+                // Only the keys that change with state are spelled out; the
+                // hint has to fit on one row and `?` covers the rest.
                 if has_older {
-                    "enter send · ↑ older · ctrl+b select · ctrl+u users · ctrl+e editor · esc back"
-                        .to_string()
+                    "enter send · ↑ older · ctrl+a actions · ctrl+u users · esc back".to_string()
                 } else {
-                    "enter send · ctrl+b select · ctrl+u users · ctrl+e editor · esc back"
+                    "enter send · ctrl+a actions · ctrl+u users · ctrl+e editor · esc back"
                         .to_string()
                 },
             )
@@ -1693,27 +2550,38 @@ fn select_hint(selected: Option<&CircMessage>, mine: Option<bool>) -> String {
     let Some(m) = selected else {
         return "j/k select · esc exit".to_string();
     };
+    // A local notice has no author, so every per-author key is inert on it.
+    if is_local_notice(m) {
+        return "esc close".to_string();
+    }
     // Every key here is gated by its handler, so the hint has to be gated the
     // same way or it advertises a key that silently does nothing. `mine` is
     // `None` when the viewer is unknown, in which case offer everything and let
     // the server decide, which is what the handlers do too.
-    let mut parts = vec!["j/k"];
+    let mut parts = vec!["j/k move"];
     if mine != Some(false) && !m.extras.deleted && !m.id.is_empty() {
         parts.push("d delete");
     }
     if mine != Some(true) {
         parts.push("F flag");
     }
-    if !matches!(chat::open_action(&m.extras), OpenAction::None) {
+    if !matches!(chat::open_action(&m.extras, &m.content), OpenAction::None) {
         parts.push("o open");
     }
-    if chat::has_spoiler(&m.extras) {
+    if chat::has_spoiler(&m.extras)
+        || super::styles::TextStyles::from_message(m.extras.style.as_ref()).substitutes()
+    {
         parts.push("v reveal");
     }
     if mine != Some(true) {
         parts.push("m mute");
     }
-    parts.push("esc exit");
+    parts.push("y copy");
+    parts.push("p profile");
+    if mine != Some(true) {
+        parts.push("c dm");
+    }
+    parts.push("esc close");
     parts.join(" · ")
 }
 
@@ -1737,8 +2605,9 @@ fn render_roster(frame: &mut Frame<'_>, area: Rect, theme: &Theme, roster: &Rost
         .iter()
         .filter(|e| e.is_visible(now, roster.stale_after_ms))
         .collect();
-    // The endpoint sorts by username, so the pane does too.
-    people.sort_by_key(|e| e.username.to_lowercase());
+    // Admins first, then everyone else, each block alphabetical. Who can act on
+    // a report is worth finding at a glance, and the block is short.
+    people.sort_by_key(|e| (!e.is_chat_admin, e.username.to_lowercase()));
 
     let mut lines = vec![Line::from(Span::styled(
         format!(" in room · {}", people.len()),
@@ -1773,6 +2642,15 @@ fn render_roster(frame: &mut Frame<'_>, area: Rect, theme: &Theme, roster: &Rost
         lines.push(Line::from(spans));
     }
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// One message's timestamp, per the reader's `time_format`.
+fn format_chat_timestamp(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    match time::OffsetDateTime::from_unix_timestamp(secs) {
+        Ok(t) => crate::config::format_chat_timestamp(t),
+        Err(_) => String::new(),
+    }
 }
 
 /// Wall clock in milliseconds since the Unix epoch.
@@ -1843,6 +2721,45 @@ fn is_art_draft(draft: &str) -> bool {
     rest.is_empty() || rest.starts_with(char::is_whitespace)
 }
 
+/// Drop the oldest messages once a room has held more than [`MAX_HELD_MESSAGES`].
+///
+/// A room left open all day otherwise grows without limit, and every message
+/// carries its decoded art and its cached image bytes with it. Trimming from the
+/// front is safe because the cursor is anchored by id across the merge and
+/// re-resolved after it; scrolling back up simply re-pages the history from the
+/// server, which is what it does at the end of the buffer anyway.
+///
+/// Only ever trims when doing so leaves a full pane's worth, so this cannot
+/// empty a quiet room.
+fn trim_history(
+    messages: &mut TabState<CircMessage>,
+    muted: Option<&HashSet<String>>,
+    at_bottom: bool,
+) {
+    if messages.items.len() <= MAX_HELD_MESSAGES {
+        return;
+    }
+    // Normally never while the reader is scrolled back: trimming takes from the
+    // front, which is exactly the history someone paging backwards has just
+    // loaded and is reading.
+    //
+    // But "scrolled back" is a frozen cursor for a *parked* room, whose reader
+    // is not looking at it at all, so deferring there switched the cap off for
+    // as long as the room stayed backgrounded. Past a hard ceiling the cap wins
+    // regardless: an unbounded buffer is worse than a scroll position, and the
+    // trimmed history re-pages from the server on demand.
+    if !at_bottom && messages.items.len() <= MAX_HELD_MESSAGES.saturating_mul(2) {
+        return;
+    }
+    let drop = messages.items.len() - MAX_HELD_MESSAGES;
+    // How many of the dropped rows were actually on screen, so the view index
+    // shifts by what the reader would have seen leave.
+    let shown_before = visible_indices(&messages.items[..drop], muted).len();
+    messages.items.drain(..drop);
+    messages.selected = messages.selected.saturating_sub(shown_before);
+    messages.shift_offset_back(shown_before);
+}
+
 fn apply_older_messages(
     messages: &mut TabState<CircMessage>,
     result: Result<(Vec<CircMessage>, Option<String>), String>,
@@ -1901,6 +2818,9 @@ fn circ_message_lines(
     theme: &Theme,
     layout: BodyLayout<'_>,
 ) -> Vec<Line<'static>> {
+    if is_local_notice(m) {
+        return notice_lines(&m.content, theme, layout);
+    }
     let for_me = layout
         .mention
         .is_some_and(|handle| chat::mentions(ChatMessage::from(m), handle));
@@ -1919,8 +2839,56 @@ fn circ_message_lines(
 /// Kept even for an action (`/me`), whose body already reads `* username …`,
 /// and even for a deleted message: § Delete Your Message keeps the author's name
 /// and the original timestamp, and the header is the only place either appears.
+/// Rows one message occupies in the pane, notices included.
+///
+/// **The single place message height is decided.** `heights` used to call
+/// `chat::message_height(.., 1)` for every row, which adds a speaker-header row,
+/// while `circ_message_lines` short-circuits a local notice to `notice_lines`
+/// and draws no header at all. Every row and every inline image below a notice
+/// was therefore off by one, and the pane's bottom-anchoring was computed from a
+/// total that was too large. Same agreement bug as `body_height` had for image
+/// gaps, in a path added after that lesson, which is why it now goes through one
+/// function instead of two that merely ought to match.
+fn circ_message_height(m: &CircMessage, theme: &Theme, layout: BodyLayout<'_>) -> u16 {
+    u16::try_from(circ_message_lines(m, theme, layout).len()).unwrap_or(u16::MAX)
+}
+
+/// A local notice: `*** text`, no speaker row, no timestamp.
+///
+/// Deliberately shaped unlike a message. It has no author and no time, because
+/// nobody said it and it did not happen at a moment in the conversation; it is
+/// the client talking. Continuation rows align under the text rather than under
+/// the prefix, so a wrapped `/help` reply reads as one block.
+fn notice_lines(text: &str, theme: &Theme, layout: BodyLayout<'_>) -> Vec<Line<'static>> {
+    let style = theme.muted_style().add_modifier(Modifier::ITALIC);
+    let pad = " ".repeat(NOTICE_PREFIX.len());
+    let width = layout.width.saturating_sub(NOTICE_PREFIX.len()).max(1);
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    // Each source line wraps on its own, so a multi-line reply (which `/help`
+    // is) keeps the breaks the server put in it instead of reflowing into one
+    // paragraph.
+    for source in text.lines() {
+        for (i, row) in chat::word_wrap(source, width).into_iter().enumerate() {
+            let lead = if rows.is_empty() && i == 0 {
+                NOTICE_PREFIX
+            } else {
+                pad.as_str()
+            };
+            rows.push(Line::from(Span::styled(format!("{lead}{row}"), style)));
+        }
+    }
+    if rows.is_empty() {
+        rows.push(Line::from(Span::styled(NOTICE_PREFIX.to_string(), style)));
+    }
+    if let Some(max) = layout.max_rows {
+        rows.truncate(max.max(1));
+    }
+    rows
+}
+
 fn circ_message_header(m: &CircMessage, theme: &Theme, for_me: bool) -> Line<'static> {
-    let when = format_epoch_millis_relative(m.timestamp);
+    // A chat log wants a clock, not "3h": see `format_chat_timestamp`.
+    let when = format_chat_timestamp(m.timestamp);
     let name = if m.username.is_empty() {
         "?".to_string()
     } else {
@@ -2010,10 +2978,11 @@ mod tests {
     }
 
     /// A room holding `msgs`, with select mode already entered.
+    /// A room with the action menu open on the newest message.
     fn selecting(msgs: Vec<CircMessage>) -> CircScreen {
         let mut s = open("general");
         s.apply_messages("general", true, Ok((msgs, None)));
-        s.handle_key(ctrl(KeyCode::Char('b')));
+        s.handle_key(ctrl(KeyCode::Char('a')));
         s
     }
 
@@ -2035,7 +3004,11 @@ mod tests {
         let theme = Theme::cyber();
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|f| s.render(f, f.area(), &theme)).unwrap();
+        // No picker in tests: the pane renders chips, which is also what a
+        // terminal without graphics support sees.
+        terminal
+            .draw(|f| s.render(f, f.area(), &theme, None))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)
             .map(|y| {
@@ -2224,6 +3197,112 @@ mod tests {
             CircIntent::OpenRoom {
                 room_id: "general".into()
             }
+        );
+    }
+
+    #[test]
+    fn a_mistyped_command_is_refused_locally_and_never_sent() {
+        // The whole point: the server posts anything it does not recognize as
+        // literal text, so without this the room sees "/dcie 2d6".
+        let mut s = open("general");
+        typed(&mut s, "/dcie 2d6");
+        let intent = s.handle_key(key(KeyCode::Enter));
+        assert_eq!(intent, CircIntent::None, "nothing is sent");
+        assert!(s.outgoing.is_empty(), "and nothing is queued as outgoing");
+        let joined = render_rows(&s, 14).join("\n");
+        assert!(
+            joined.contains("unknown command: /dcie"),
+            "the reader is told which word was refused:\n{joined}",
+        );
+    }
+
+    #[test]
+    fn refusing_a_command_keeps_what_was_typed() {
+        // Clearing the draft here destroyed the message the reader was trying to
+        // fix, which is worse than the mistyped command this guard prevents.
+        let mut s = open("general");
+        typed(&mut s, "/dcie 2d6");
+        s.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            s.draft.text, "/dcie 2d6",
+            "the typo is still there to be corrected",
+        );
+        assert_eq!(s.draft.cursor, s.draft.len(), "with the caret where it was");
+    }
+
+    #[test]
+    fn a_real_command_still_sends() {
+        let mut s = open("general");
+        typed(&mut s, "/dice:6");
+        let intent = s.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(intent, CircIntent::SendMessage { .. }),
+            "a documented /dice form is not refused: {intent:?}",
+        );
+    }
+
+    #[test]
+    fn a_notice_renders_without_an_author_or_a_timestamp() {
+        let mut s = open("general");
+        s.apply_messages("general", true, Ok((vec![], None)));
+        s.append_notice("general", "commands: /me /dice /help");
+        let rows = render_rows(&s, 14);
+        let joined = rows.join("\n");
+        assert!(
+            rows.iter().any(|r| r.contains("*** commands:")),
+            "the notice is prefixed like IRC client output:\n{joined}",
+        );
+        let notice_row = rows
+            .iter()
+            .find(|r| r.contains("***"))
+            .expect("the notice is on screen");
+        assert!(
+            !notice_row.contains('\u{b7}'),
+            "the notice row carries no ' \u{b7} timestamp' speaker separator, since \
+             nobody said it and it happened at no point in the conversation: \
+             {notice_row:?}",
+        );
+    }
+
+    #[test]
+    fn a_multi_line_reply_keeps_every_line() {
+        // This is the regression the toast caused: /help is a command list, and
+        // `first_line` showed one line of it, capped, then dropped it.
+        let mut s = open("general");
+        s.apply_messages("general", true, Ok((vec![], None)));
+        s.append_notice("general", "line one\nline two\nline three");
+        let joined = render_rows(&s, 14).join("\n");
+        for line in ["line one", "line two", "line three"] {
+            assert!(joined.contains(line), "{line} survived:\n{joined}");
+        }
+    }
+
+    #[test]
+    fn a_notice_cannot_be_deleted_flagged_or_muted() {
+        // The empty id and username are what make this true; see `local_notice`.
+        let mut s = open("general");
+        s.apply_messages("general", true, Ok((vec![], None)));
+        s.append_notice("general", "unknown command: /nope");
+        s.handle_key(ctrl(KeyCode::Char('a')));
+        assert!(s.menu_is_open(), "select mode is on the notice");
+        for k in ['d', 'F', 'm'] {
+            assert_eq!(
+                s.handle_key(key(KeyCode::Char(k))),
+                CircIntent::None,
+                "{k} must do nothing to a notice: it is not a real message",
+            );
+        }
+    }
+
+    #[test]
+    fn a_notice_is_dropped_for_a_room_that_is_not_open() {
+        let mut s = open("general");
+        s.apply_messages("general", true, Ok((vec![], None)));
+        s.append_notice("other-room", "should not appear");
+        let joined = render_rows(&s, 14).join("\n");
+        assert!(
+            !joined.contains("should not appear"),
+            "a late reply for another room is not pasted into this one:\n{joined}",
         );
     }
 
@@ -2532,6 +3611,217 @@ mod tests {
     }
 
     #[test]
+    fn a_room_left_open_all_day_stops_growing() {
+        let mut s = room_knowing_us(vec![]);
+        // Well past the cap, arriving the way live messages do.
+        let updates: Vec<CircMessageUpdate> = (0..MAX_HELD_MESSAGES + 120)
+            .map(|i| full(message(&format!("m{i}"), "trinity", "hi", i as i64)))
+            .collect();
+        s.apply_live("general", updates);
+        let held = held(&s);
+        assert_eq!(held.len(), MAX_HELD_MESSAGES, "the buffer is bounded");
+        assert_eq!(
+            held.last().map(|m| m.id.as_str()),
+            Some(format!("m{}", MAX_HELD_MESSAGES + 119).as_str()),
+            "and it keeps the newest, not the first it happened to see",
+        );
+    }
+
+    #[test]
+    fn a_frozen_cursor_cannot_switch_the_history_cap_off_forever() {
+        // A parked room keeps merging messages but its selection is frozen
+        // wherever the reader left it, so "scrolled back" stayed true forever
+        // and the cap never applied. Past a hard ceiling the cap wins.
+        let seed: Vec<CircMessage> = (0..MAX_HELD_MESSAGES)
+            .map(|i| message(&format!("m{i}"), "trinity", "hi", i as i64))
+            .collect();
+        let mut s = room_knowing_us(seed);
+        s.handle_key(ctrl(KeyCode::Char('a')));
+        s.handle_key(key(KeyCode::Home));
+
+        let more: Vec<CircMessageUpdate> = (0..MAX_HELD_MESSAGES + 100)
+            .map(|i| {
+                full(message(
+                    &format!("later{i}"),
+                    "neo",
+                    "hi",
+                    (MAX_HELD_MESSAGES + i) as i64,
+                ))
+            })
+            .collect();
+        s.apply_live("general", more);
+
+        assert!(
+            held(&s).len() <= MAX_HELD_MESSAGES.saturating_mul(2),
+            "the ceiling holds even with the cursor off the tail: {} held",
+            held(&s).len(),
+        );
+    }
+
+    #[test]
+    fn a_notice_under_the_cursor_does_not_teleport_it_on_a_merge() {
+        // Every notice has an empty id, so anchoring the cursor on one matched
+        // the first notice in the room rather than the row the reader was on.
+        let mut s = room_knowing_us(vec![
+            message("m1", "trinity", "one", 1),
+            message("m2", "neo", "two", 2),
+        ]);
+        s.append_notice("general", "first notice");
+        s.append_notice("general", "second notice");
+        // Sit on the last notice, then scroll back one so the merge takes the
+        // anchored path rather than the follow-the-tail path.
+        s.handle_key(ctrl(KeyCode::Char('a')));
+        s.handle_key(key(KeyCode::End));
+        s.handle_key(key(KeyCode::Up));
+        let before = match &s.mode {
+            CircMode::Room { messages, .. } => messages.selected,
+            CircMode::Rooms => unreachable!(),
+        };
+        s.apply_live("general", vec![full(message("m3", "trinity", "three", 3))]);
+        let after = match &s.mode {
+            CircMode::Room { messages, .. } => messages.selected,
+            CircMode::Rooms => unreachable!(),
+        };
+        assert_eq!(
+            before, after,
+            "the cursor stayed where it was instead of jumping to the first notice",
+        );
+    }
+
+    #[test]
+    fn history_is_not_trimmed_out_from_under_someone_reading_it() {
+        // Found in review: trimming takes from the front, which is exactly what
+        // a reader paging backwards has just loaded. Doing it while they are
+        // scrolled up would delete what is on their screen and move the cursor.
+        let seed: Vec<CircMessage> = (0..MAX_HELD_MESSAGES)
+            .map(|i| message(&format!("m{i}"), "trinity", "hi", i as i64))
+            .collect();
+        let mut s = room_knowing_us(seed);
+        // Scroll back, so the next merge is not following the tail.
+        s.handle_key(ctrl(KeyCode::Char('a')));
+        s.handle_key(key(KeyCode::Home));
+
+        let more: Vec<CircMessageUpdate> = (0..50)
+            .map(|i| {
+                full(message(
+                    &format!("later{i}"),
+                    "neo",
+                    "hi",
+                    (MAX_HELD_MESSAGES + i) as i64,
+                ))
+            })
+            .collect();
+        s.apply_live("general", more);
+
+        assert!(
+            held(&s).len() > MAX_HELD_MESSAGES,
+            "the cap waits until the reader is following the tail again: {} held",
+            held(&s).len(),
+        );
+        assert_eq!(
+            held(&s).first().map(|m| m.id.as_str()),
+            Some("m0"),
+            "and the oldest message they were reading is still there",
+        );
+    }
+
+    #[test]
+    fn trimming_keeps_the_cursor_on_the_newest_message() {
+        let mut s = room_knowing_us(vec![]);
+        let updates: Vec<CircMessageUpdate> = (0..MAX_HELD_MESSAGES + 10)
+            .map(|i| full(message(&format!("m{i}"), "trinity", "hi", i as i64)))
+            .collect();
+        s.apply_live("general", updates);
+        let CircMode::Room { messages, .. } = &s.mode else {
+            unreachable!()
+        };
+        assert_eq!(
+            messages.selected,
+            MAX_HELD_MESSAGES - 1,
+            "a trim must not leave the cursor pointing past the end, or into \
+             the wrong message",
+        );
+    }
+
+    #[test]
+    fn the_header_says_who_is_here_without_opening_the_roster() {
+        // The count used to live only inside the Ctrl+U pane, so a reader with
+        // it closed, which is the default, had no idea anyone was there.
+        let mut s = open("general");
+        let now = now_ms();
+        s.apply_room_users(
+            "general",
+            Ok(vec![
+                CircRoomUser {
+                    user_id: "u1".into(),
+                    username: "trinity".into(),
+                    is_chat_admin: false,
+                    last_seen: now,
+                    last_activity: Some(now),
+                },
+                CircRoomUser {
+                    user_id: "u2".into(),
+                    username: "neo".into(),
+                    is_chat_admin: false,
+                    last_seen: now,
+                    last_activity: Some(now),
+                },
+            ]),
+        );
+        assert!(
+            !s.roster_open,
+            "precondition: the pane is closed by default"
+        );
+        let joined = render_rows_wide(&s, 100, 14).join("\n");
+        assert!(
+            joined.contains("2 here"),
+            "the header carries the count:\n{joined}",
+        );
+    }
+
+    #[test]
+    fn unread_counts_only_messages_the_room_does_not_already_hold() {
+        // The stream re-delivers: the REST poll resends a whole page and a
+        // reconnect replays. Counting raw deliveries would inflate the badge
+        // into a number that means nothing.
+        let s = room_knowing_us(vec![message("m1", "trinity", "old", 1)]);
+        let updates = vec![
+            full(message("m1", "trinity", "old", 1)),
+            full(message("m2", "neo", "new", 2)),
+        ];
+        assert_eq!(s.count_unheld("general", &updates), 1);
+    }
+
+    #[test]
+    fn unread_ignores_muted_authors_and_patches() {
+        let mut s = room_knowing_us(vec![message("m1", "trinity", "here", 1)]);
+        s.set_muted_users("general", &["spam".to_string()]);
+        let updates = vec![
+            full(message("m2", "spam", "buy things", 2)),
+            CircMessageUpdate::Partial {
+                id: "m1".into(),
+                patch: CircMessagePatch {
+                    deleted: Some(true),
+                    ..Default::default()
+                },
+            },
+        ];
+        assert_eq!(
+            s.count_unheld("general", &updates),
+            0,
+            "a muted author's message will not be shown, and a patch changes a \
+             message already here; neither is news",
+        );
+    }
+
+    #[test]
+    fn unread_is_zero_for_a_room_that_is_not_the_open_one() {
+        let s = room_knowing_us(vec![]);
+        let updates = vec![full(message("m1", "neo", "hi", 1))];
+        assert_eq!(s.count_unheld("other-room", &updates), 0);
+    }
+
+    #[test]
     fn live_merge_dedupes_and_follows_tail() {
         let mut s = open("general");
         s.apply_messages(
@@ -2552,6 +3842,57 @@ mod tests {
         assert_eq!(messages.items.len(), 2);
         assert_eq!(messages.items[1].content, "yo");
         assert_eq!(messages.selected, 1);
+    }
+
+    #[test]
+    fn the_header_says_when_live_updates_are_dropping_and_when_they_are_gone() {
+        // A dropped stream used to be invisible, because the REST poll kept the
+        // room updating and nothing said the difference. This is the signal.
+        let mut s = open("general");
+        let clean = render_rows_wide(&s, 100, 14).join("\n");
+        assert!(
+            !clean.contains("live updates"),
+            "a healthy room says nothing:\n{clean}",
+        );
+
+        s.apply_stream_state("general", CircStreamState::Reconnecting(3));
+        let retrying = render_rows_wide(&s, 100, 14).join("\n");
+        assert!(
+            retrying.contains(&format!("reconnecting 3/{MAX_RECONNECT_ATTEMPTS}")),
+            "the attempt count is shown so the reader can see progress:\n{retrying}",
+        );
+
+        s.apply_stream_state("general", CircStreamState::Lost);
+        let lost = render_rows_wide(&s, 100, 14).join("\n");
+        assert!(
+            lost.contains("(live updates lost)") && !lost.contains("reconnecting"),
+            "and the final state is stated plainly:\n{lost}",
+        );
+    }
+
+    #[test]
+    fn a_stream_report_for_another_room_is_ignored() {
+        let mut s = open("general");
+        s.apply_stream_state("other-room", CircStreamState::Lost);
+        let joined = render_rows_wide(&s, 100, 14).join("\n");
+        assert!(
+            !joined.contains("live updates lost"),
+            "a late report from a room we already left cannot label this one:\n{joined}",
+        );
+    }
+
+    #[test]
+    fn re_entering_a_room_clears_a_lost_stream_indicator() {
+        // The documented recovery from an exhausted ladder is to leave and come
+        // back, so re-entry has to actually reset it.
+        let mut s = open("general");
+        s.apply_stream_state("general", CircStreamState::Lost);
+        s.open_room("general");
+        let joined = render_rows_wide(&s, 100, 14).join("\n");
+        assert!(
+            !joined.contains("live updates lost"),
+            "re-entry starts a fresh stream generation and a fresh verdict:\n{joined}",
+        );
     }
 
     #[test]
@@ -2665,6 +4006,119 @@ mod tests {
     }
 
     #[test]
+    fn a_notice_is_measured_at_exactly_the_height_it_draws() {
+        // A notice draws no speaker header, but `heights` used to add one for
+        // every row, so the pane and every inline image below a notice sat a row
+        // off. Both now go through `circ_message_height`.
+        let theme = Theme::cyber();
+        let layout = BodyLayout::new(40);
+        let notice = local_notice("*** something happened", 1);
+        assert_eq!(
+            circ_message_height(&notice, &theme, layout) as usize,
+            circ_message_lines(&notice, &theme, layout).len(),
+        );
+        let normal = message("m1", "trinity", "an ordinary line", 1);
+        assert_eq!(
+            circ_message_height(&normal, &theme, layout) as usize,
+            circ_message_lines(&normal, &theme, layout).len(),
+        );
+        assert!(
+            circ_message_height(&notice, &theme, layout)
+                < circ_message_height(&normal, &theme, layout),
+            "a notice really is shorter, which is what the old measurement missed",
+        );
+    }
+
+    #[test]
+    fn a_failed_image_fetch_gives_the_chip_back_instead_of_a_blank_band() {
+        let mut m = message("m1", "trinity", "look", 1);
+        m.extras.image_url = Some("https://cdn.example/pic.png".into());
+        let s = room_knowing_us(vec![m]);
+        s.note_image_failed("https://cdn.example/pic.png");
+        let joined = render_rows(&s, 14).join("\n");
+        assert!(
+            joined.contains("[image]"),
+            "a picture that will never arrive is a link, not a hole:\n{joined}",
+        );
+    }
+
+    #[test]
+    fn without_graphics_an_image_message_still_shows_its_chip() {
+        // The fallback path, and the one every test renders on: no picker means
+        // no gap is reserved, so the pane looks exactly as it did before inline
+        // images existed.
+        let mut m = message("m1", "trinity", "look at this", 1);
+        m.extras.image_url = Some("https://cdn.example/pic.png".into());
+        let s = room_knowing_us(vec![m]);
+        let joined = render_rows(&s, 14).join("\n");
+        assert!(
+            joined.contains("[image]"),
+            "a terminal without graphics gets the chip it always had:\n{joined}",
+        );
+    }
+
+    #[test]
+    fn an_image_is_only_fetched_once_and_only_for_the_open_room() {
+        let mut m = message("m1", "trinity", "pic", 1);
+        m.extras.image_url = Some("https://cdn.example/pic.png".into());
+        let s = room_knowing_us(vec![m]);
+
+        let first = s.image_urls_to_fetch("general", 8);
+        assert_eq!(first, vec!["https://cdn.example/pic.png".to_string()]);
+        assert!(
+            s.image_urls_to_fetch("general", 8).is_empty(),
+            "handing the same URL out twice would re-fetch it on every message \
+             that arrives",
+        );
+        assert!(
+            s.image_urls_to_fetch("other-room", 8).is_empty(),
+            "a room that is not open has nothing to fetch",
+        );
+    }
+
+    #[test]
+    fn capping_the_fetch_batch_does_not_spend_the_urls_it_skips() {
+        // `image_urls_to_fetch` marks a URL requested as it hands it out, and a
+        // URL marked but never fetched is never offered again. Capping the batch
+        // outside the function would therefore have stranded every picture past
+        // the first few, permanently.
+        let msgs: Vec<CircMessage> = (0..10)
+            .map(|i| {
+                let mut m = message(&format!("m{i}"), "trinity", "pic", i as i64);
+                m.extras.image_url = Some(format!("https://cdn.example/{i}.png"));
+                m
+            })
+            .collect();
+        let s = room_knowing_us(msgs);
+
+        let first = s.image_urls_to_fetch("general", 3);
+        assert_eq!(first.len(), 3, "the batch is capped");
+        let second = s.image_urls_to_fetch("general", 3);
+        assert_eq!(second.len(), 3, "the next call picks up where it left off");
+        assert!(
+            first.iter().all(|u| !second.contains(u)),
+            "and does not re-offer what was already handed out",
+        );
+        let rest = s.image_urls_to_fetch("general", 99);
+        assert_eq!(rest.len(), 4, "every remaining picture is still reachable");
+    }
+
+    #[test]
+    fn a_gif_or_song_is_never_offered_for_inline_fetching() {
+        // Only still images are painted. A GIF would be shown as one frozen
+        // frame, and a song has no picture at all, so both keep their chips and
+        // must not cost a download.
+        let mut m = message("m1", "trinity", "", 1);
+        m.extras.gif_url = Some("https://cdn.example/a.gif".into());
+        m.extras.audio_attachment = Some(AudioAttachment {
+            src: "https://youtu.be/x".into(),
+            ..Default::default()
+        });
+        let s = room_knowing_us(vec![m]);
+        assert!(s.image_urls_to_fetch("general", 8).is_empty());
+    }
+
+    #[test]
     fn attachment_renders_as_a_chip_not_as_a_duplicated_url() {
         let mut s = open("general");
         let mut m = message("m1", "neo", "https://cdn.example/a.gif", 1_000);
@@ -2706,24 +4160,120 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_b_unfocuses_the_composer_and_esc_returns_it() {
-        let mut s = selecting(vec![message("m1", "neo", "hi", 1_000)]);
-        assert!(
-            !s.is_text_input(),
-            "select mode hands the keyboard back to the shell's shortcuts"
-        );
-        // A bare letter now acts on the message instead of typing into the draft.
-        s.handle_key(key(KeyCode::Char('j')));
-        assert_eq!(
-            s.draft.text, "",
-            "select mode must not type into the composer"
-        );
+    fn typing_a_word_never_deletes_a_message() {
+        // The bug an adversarial review found, and the reason `up` entering
+        // select mode needed more than the gesture: select mode reads letters as
+        // commands, so after a stray `up` the word "already" arms delete on its
+        // `d` and confirms on its `y`. Typing must fall back to typing.
+        let mut s = selecting(vec![message("m1", "neo", "mine", 1)]);
+        s.set_viewer_user_id("uid-neo".into());
+        if let CircMode::Room { messages, .. } = &mut s.mode {
+            messages.items[0].user_id = "uid-neo".into();
+        }
+        for c in "already".chars() {
+            let intent = s.handle_key(key(KeyCode::Char(c)));
+            assert!(
+                !matches!(intent, CircIntent::DeleteMessage { .. }),
+                "typing {c:?} deleted a message",
+            );
+        }
+        assert!(!s.menu_is_open(), "the first letter dropped back to typing");
+        assert_eq!(s.draft.text, "already", "and every letter was typed");
+    }
 
-        // Esc unwinds select mode before it unwinds the room.
+    #[test]
+    fn the_action_menu_still_navigates_with_j_and_k() {
+        // The other side of that fix: `j`/`k` are navigation here, and must not
+        // be mistaken for the reader starting to type.
+        let mut s = selecting(vec![
+            message("m1", "trinity", "one", 1),
+            message("m2", "neo", "two", 2),
+        ]);
+        s.handle_key(key(KeyCode::Char('k')));
+        assert!(s.menu_is_open(), "k navigates rather than exiting");
+        assert!(s.draft.text.is_empty(), "and types nothing");
+    }
+
+    #[test]
+    fn a_mouse_wheel_notch_never_changes_mode() {
+        // `wheel_scroll` exists because a synthesised `Up` would put a reader
+        // who was only scrolling into a mode that reads their next word as
+        // commands.
+        let mut s = room_knowing_us(vec![
+            message("m1", "trinity", "one", 1),
+            message("m2", "neo", "two", 2),
+        ]);
+        assert!(s.wheel_scroll(true), "a room handles the notch");
+        assert!(!s.menu_is_open(), "scrolling is not entering a mode");
+        assert!(s.wheel_scroll(false));
+        assert!(!s.menu_is_open());
+    }
+
+    #[test]
+    fn ctrl_a_opens_the_action_menu_and_esc_closes_it() {
+        let mut s = selecting(vec![message("m1", "neo", "hi", 1_000)]);
+        assert!(s.menu_is_open(), "ctrl+a opens the menu");
+        assert!(
+            s.is_text_input(),
+            "a room always captures text: the composer is never handed away",
+        );
+        // Navigation keys move the cursor inside the menu without typing.
+        s.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(s.draft.text, "", "j moves, it does not type");
+
+        // Esc closes the menu before it leaves the room.
         assert_eq!(s.handle_escape(), Some(CircIntent::None));
+        assert!(!s.menu_is_open());
         assert!(matches!(s.mode, CircMode::Room { .. }));
-        assert!(s.is_text_input());
         assert_eq!(s.handle_escape(), Some(CircIntent::BackToRooms));
+    }
+
+    #[test]
+    fn any_ordinary_letter_closes_the_menu_and_types() {
+        // The whole point of dropping the mode: an active composer in which
+        // some letters typed, some navigated and some acted was a rule nobody
+        // could hold. Exactly one key is special now.
+        let mut s = selecting(vec![message("m1", "neo", "hi", 1_000)]);
+        for c in "hello".chars() {
+            s.handle_key(key(KeyCode::Char(c)));
+        }
+        assert!(!s.menu_is_open());
+        assert_eq!(s.draft.text, "hello");
+    }
+
+    #[test]
+    fn select_mode_y_copies_the_message_text() {
+        let mut s = selecting(vec![message("m1", "trinity", "worth keeping", 1)]);
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('y'))),
+            CircIntent::CopyText("worth keeping".into()),
+        );
+    }
+
+    #[test]
+    fn copying_an_attachment_only_message_copies_its_url() {
+        // A `/gif` posted with no caption has no text, and copying an empty
+        // string would look like the key did nothing.
+        let mut m = message("m1", "trinity", "", 1);
+        m.extras.gif_url = Some("https://cdn.example/a.gif".into());
+        let mut s = selecting(vec![m]);
+        assert!(matches!(
+            s.handle_key(key(KeyCode::Char('y'))),
+            CircIntent::CopyText(t) if t.contains("gif")
+        ));
+    }
+
+    #[test]
+    fn an_armed_delete_takes_y_before_copy_does() {
+        // `y` means both "confirm" and "copy". The confirm branch is checked
+        // first, so an armed delete is never turned into a copy, which would
+        // leave the reader thinking they had deleted something.
+        let mut s = selecting(vec![message("m1", "neo", "oops", 1_000)]);
+        s.handle_key(key(KeyCode::Char('d')));
+        assert!(matches!(
+            s.handle_key(key(KeyCode::Char('y'))),
+            CircIntent::DeleteMessage { .. }
+        ));
     }
 
     #[test]
@@ -2745,8 +4295,12 @@ mod tests {
         let mut s = selecting(vec![message("m1", "neo", "oops", 1_000)]);
         s.handle_key(key(KeyCode::Char('d')));
         assert_eq!(s.handle_key(key(KeyCode::Char('n'))), CircIntent::None);
-        // The arming is gone, so `y` on its own does nothing.
-        assert_eq!(s.handle_key(key(KeyCode::Char('y'))), CircIntent::None);
+        // The arming is gone, so a bare `y` must not delete. It copies instead,
+        // which is why this checks the variant rather than `None`.
+        assert!(!matches!(
+            s.handle_key(key(KeyCode::Char('y'))),
+            CircIntent::DeleteMessage { .. }
+        ));
     }
 
     #[test]
@@ -2754,7 +4308,13 @@ mod tests {
         let mut s = selecting(vec![message("m1", "trinity", "hi", 1_000)]);
         s.set_viewer_user_id("uid-neo".into());
         assert_eq!(s.handle_key(key(KeyCode::Char('d'))), CircIntent::None);
-        assert_eq!(s.handle_key(key(KeyCode::Char('y'))), CircIntent::None);
+        // `y` is also the copy key, so the property under test is not "does
+        // nothing" but "does not delete": arming never happened, so a stray
+        // confirm must not reach the endpoint.
+        assert!(!matches!(
+            s.handle_key(key(KeyCode::Char('y'))),
+            CircIntent::DeleteMessage { .. }
+        ));
     }
 
     #[test]
@@ -2821,7 +4381,83 @@ mod tests {
         s.handle_key(key(KeyCode::Char('F')));
         assert_eq!(s.handle_escape(), Some(CircIntent::None));
         assert!(!s.flag_prompt_is_open());
-        assert!(s.select_is_active(), "the prompt closes, the mode stays");
+        assert!(s.menu_is_open(), "the prompt closes, the mode stays");
+    }
+
+    #[test]
+    fn select_mode_p_opens_the_author_profile_and_c_opens_a_dm() {
+        let mut s = selecting(vec![message("m1", "trinity", "hi", 1)]);
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('p'))),
+            CircIntent::OpenProfile {
+                username: "trinity".into()
+            },
+        );
+        assert!(matches!(
+            s.handle_key(key(KeyCode::Char('c'))),
+            CircIntent::OpenDm { username, .. } if username == "trinity"
+        ));
+    }
+
+    #[test]
+    fn select_mode_offers_your_own_profile_but_not_a_dm_to_yourself() {
+        let mut s = selecting(vec![message("m1", "neo", "mine", 1)]);
+        s.set_viewer_user_id("uid-neo".into());
+        if let CircMode::Room { messages, .. } = &mut s.mode {
+            messages.items[0].user_id = "uid-neo".into();
+        }
+        assert!(matches!(
+            s.handle_key(key(KeyCode::Char('p'))),
+            CircIntent::OpenProfile { .. }
+        ));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('c'))),
+            CircIntent::None,
+            "a conversation with yourself is not a thing",
+        );
+    }
+
+    #[test]
+    fn select_mode_pages_with_pgup_and_pgdown() {
+        let msgs: Vec<CircMessage> = (0..30)
+            .map(|i| message(&format!("m{i}"), "trinity", "hi", i))
+            .collect();
+        let mut s = selecting(msgs);
+        // `selecting` leaves the cursor on the newest message.
+        let CircMode::Room { messages, .. } = &s.mode else {
+            unreachable!()
+        };
+        let start = messages.selected;
+        s.handle_key(key(KeyCode::PageUp));
+        let CircMode::Room { messages, .. } = &s.mode else {
+            unreachable!()
+        };
+        let after_up = messages.selected;
+        assert!(
+            after_up < start,
+            "PageUp moves the selection; it used to fall through to a nav \
+             helper with no PageUp arm and do nothing",
+        );
+        s.handle_key(key(KeyCode::PageDown));
+        let CircMode::Room { messages, .. } = &s.mode else {
+            unreachable!()
+        };
+        assert!(messages.selected > after_up, "and PageDown comes back");
+    }
+
+    #[test]
+    fn a_notice_offers_none_of_the_per_author_keys() {
+        let mut s = open("general");
+        s.apply_messages("general", true, Ok((vec![], None)));
+        s.append_notice("general", "unknown command: /nope");
+        s.handle_key(ctrl(KeyCode::Char('a')));
+        for k in ['p', 'c'] {
+            assert_eq!(
+                s.handle_key(key(KeyCode::Char(k))),
+                CircIntent::None,
+                "{k} needs an author, and a notice has none",
+            );
+        }
     }
 
     #[test]
@@ -2866,9 +4502,56 @@ mod tests {
     }
 
     #[test]
+    fn a_url_typed_in_a_message_can_finally_be_opened() {
+        // Before this it was reachable by no path at all: `open_action` read
+        // attachments only, and OSC 8 linkifying is applied to chips rather
+        // than to body text.
+        let mut s = selecting(vec![message(
+            "m1",
+            "trinity",
+            "have a look at https://example.com/x please",
+            1,
+        )]);
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('o'))),
+            CircIntent::OpenUrl("https://example.com/x".into()),
+        );
+    }
+
+    #[test]
+    fn an_attachment_still_wins_over_a_url_in_the_text() {
+        let mut m = message("m1", "trinity", "see https://example.com/x", 1);
+        m.extras.image_url = Some("https://cdn.example/pic.png".into());
+        let mut s = selecting(vec![m]);
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('o'))),
+            CircIntent::OpenUrl("https://cdn.example/pic.png".into()),
+            "the attachment is what the message is for; a link in the prose is \
+             an aside",
+        );
+    }
+
+    #[test]
     fn select_mode_o_does_nothing_without_an_attachment() {
         let mut s = selecting(vec![message("m1", "neo", "just words", 1_000)]);
         assert_eq!(s.handle_key(key(KeyCode::Char('o'))), CircIntent::None);
+    }
+
+    #[test]
+    fn the_animation_clock_is_off_unless_it_is_earning_its_keep() {
+        // The battery guard, and the reason the default is off. `wants_animation`
+        // is what gates the clock, so it has to be false in every case where
+        // running one would be redrawing for nothing.
+        let mut plain = message("m1", "trinity", "hi", 1);
+        plain.extras.style = Some(MessageStyle::One("rainbow".into()));
+        let s = room_knowing_us(vec![plain]);
+        assert!(
+            !s.wants_animation(),
+            "a style with nothing to animate does not start a clock",
+        );
+
+        let s = room_knowing_us(vec![]);
+        assert!(!s.wants_animation(), "nor does an empty room");
     }
 
     #[test]
@@ -2903,6 +4586,32 @@ mod tests {
         s.handle_key(key(KeyCode::Char('v')));
         let rehidden = render_rows(&s, 12);
         assert!(!rehidden.iter().any(|r| r.contains("butler")));
+    }
+
+    #[test]
+    fn v_reveals_a_substituted_message_too() {
+        // A flipped sentence is genuinely hard to read, and `v` already means
+        // "show me what this really says". Asserted on the flipped glyphs
+        // rather than on the plain text, because the select footer deliberately
+        // shows the original either way: a substitution is decoration, not a
+        // secret, so unlike a spoiler it need not be hidden there.
+        let mut m = message("m1", "trinity", "hello there", 1);
+        m.extras.style = Some(MessageStyle::One("flip".into()));
+        let mut s = selecting(vec![m]);
+        let flipped = "\u{1dd}\u{279}\u{1dd}\u{265}\u{287}";
+        assert!(
+            render_rows(&s, 14).join("\n").contains(flipped),
+            "precondition: the body starts flipped",
+        );
+        s.handle_key(key(KeyCode::Char('v')));
+        let after = render_rows(&s, 14).join("\n");
+        assert!(!after.contains(flipped), "v shows the original:\n{after}");
+        assert!(after.contains("hello there"));
+        s.handle_key(key(KeyCode::Char('v')));
+        assert!(
+            render_rows(&s, 14).join("\n").contains(flipped),
+            "and toggles back",
+        );
     }
 
     #[test]
@@ -2969,7 +4678,7 @@ mod tests {
             )),
         );
         s.set_muted_users("general", &["smith".to_string()]);
-        s.handle_key(ctrl(KeyCode::Char('b')));
+        s.handle_key(ctrl(KeyCode::Char('a')));
         // The cursor sits on the newest visible message, and moving up lands on
         // the other visible one rather than on the muted message between them.
         assert_eq!(
@@ -3056,6 +4765,146 @@ mod tests {
         s
     }
 
+    /// A room with three people present and one who has spoken and left.
+    fn room_with_people() -> CircScreen {
+        let mut s = open("general");
+        let now = now_ms();
+        let user = |id: &str, name: &str| CircRoomUser {
+            user_id: id.into(),
+            username: name.into(),
+            is_chat_admin: false,
+            last_seen: now,
+            last_activity: Some(now),
+        };
+        s.apply_room_users(
+            "general",
+            Ok(vec![
+                user("u1", "trinity"),
+                user("u2", "trace"),
+                user("u3", "neo"),
+            ]),
+        );
+        s.apply_messages(
+            "general",
+            true,
+            Ok((vec![message("m1", "morpheus", "wake up", 1)], None)),
+        );
+        s
+    }
+
+    #[test]
+    fn tab_previews_a_mention_without_touching_the_draft() {
+        let mut s = room_with_people();
+        typed(&mut s, "@tr");
+        let before = s.draft.text.clone();
+        s.handle_key(key(KeyCode::Tab));
+        assert_eq!(
+            s.draft.text, before,
+            "nothing is inserted without Space: the preview is a preview",
+        );
+        let shown = composer_text(&s, 60, 14);
+        assert!(
+            shown.contains("@trace") || shown.contains("@trinity"),
+            "the completion is previewed on screen:\n{shown}",
+        );
+    }
+
+    #[test]
+    fn tab_cycles_and_wraps_through_the_matches() {
+        let mut s = room_with_people();
+        typed(&mut s, "@tr");
+        // Two matches, trace and trinity, in roster order.
+        let first = s.mention_offer().expect("a match").1;
+        s.handle_key(key(KeyCode::Tab));
+        let second = s.mention_offer().expect("a match").1;
+        assert_ne!(
+            first, second,
+            "the first Tab must visibly move: index 0 is already showing",
+        );
+        s.handle_key(key(KeyCode::Tab));
+        assert_eq!(
+            s.mention_offer().expect("a match").1,
+            first,
+            "cycling wraps rather than running out",
+        );
+    }
+
+    #[test]
+    fn space_commits_exactly_what_was_previewed() {
+        let mut s = room_with_people();
+        typed(&mut s, "@tr");
+        let previewed = s.mention_offer().expect("a match").1;
+        s.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(s.draft.text, format!("@{previewed} "));
+        assert_eq!(
+            s.draft.cursor,
+            s.draft.len(),
+            "the caret follows the inserted name and its space",
+        );
+    }
+
+    #[test]
+    fn any_other_key_clears_the_preview_and_leaves_the_draft_alone() {
+        let mut s = room_with_people();
+        typed(&mut s, "@tr");
+        s.handle_key(key(KeyCode::Tab));
+        assert!(s.mention_cycle.is_some());
+        s.handle_key(key(KeyCode::Char('a')));
+        assert!(s.mention_cycle.is_none(), "the cycle ends");
+        assert_eq!(
+            s.draft.text, "@tra",
+            "and exactly what was typed survives, with nothing spliced in",
+        );
+    }
+
+    #[test]
+    fn someone_who_spoke_and_left_is_still_completable() {
+        // The reason the pool is not just the roster: they are who you want to
+        // reply to, and they are gone from the online list.
+        let mut s = room_with_people();
+        typed(&mut s, "@mor");
+        assert_eq!(
+            s.mention_offer().map(|(_, c, _)| c),
+            Some("morpheus".to_string()),
+        );
+    }
+
+    #[test]
+    fn an_email_address_never_starts_a_completion() {
+        let mut s = room_with_people();
+        typed(&mut s, "mail me at bob@tr");
+        assert!(
+            s.mention_offer().is_none(),
+            "`bob@tr` is an address, not a mention of trace",
+        );
+        s.handle_key(key(KeyCode::Char(' ')));
+        assert_eq!(
+            s.draft.text, "mail me at bob@tr ",
+            "and Space just types a space",
+        );
+    }
+
+    #[test]
+    fn a_bare_at_offers_the_room() {
+        let mut s = room_with_people();
+        typed(&mut s, "@");
+        assert!(
+            s.mention_offer().is_some(),
+            "@ plus Tab is how you browse who is here",
+        );
+    }
+
+    #[test]
+    fn a_fully_typed_name_draws_no_ghost() {
+        let mut s = room_with_people();
+        typed(&mut s, "@neo");
+        assert!(
+            s.mention_offer().is_none(),
+            "there is nothing left to preview, so an empty ghost would just \
+             park the caret oddly",
+        );
+    }
+
     #[test]
     fn a_message_that_names_you_is_marked_in_the_gutter() {
         let s = room_knowing_us(vec![
@@ -3075,6 +4924,49 @@ mod tests {
         assert!(
             rows.iter().any(|r| r.contains("hey @neo, you around?")),
             "the text itself is untouched:\n{joined}",
+        );
+    }
+
+    #[test]
+    fn a_substituted_style_rewrites_the_body_but_keeps_the_gutter_mark() {
+        // The documented trade in `ui::styles`: substituting the text moves the
+        // bytes `mention_ranges` works over, so the in-body highlight is lost,
+        // but `chat::mentions` reads the raw `content` and so the row-level
+        // marker survives. This test is what makes that trade visible, and is
+        // the one to revisit if the mention-offset question is ever reopened.
+        let mut m = message("m1", "trinity", "hey @neo, you around?", 1);
+        m.extras.style = Some(MessageStyle::One("l33t".into()));
+        let s = room_knowing_us(vec![m]);
+        let rows = render_rows(&s, 14);
+        let joined = rows.join("\n");
+        assert!(
+            rows.iter().any(|r| r.contains("h3y @n30")),
+            "the body is leeted, not passed through untouched:\n{joined}",
+        );
+        assert!(
+            !joined.contains("hey @neo"),
+            "the raw text is not also drawn:\n{joined}",
+        );
+        assert!(
+            joined.contains(&format!("{MENTION_MARK}trinity")),
+            "the gutter still marks a message that names us, since it reads \
+             the raw content:\n{joined}",
+        );
+    }
+
+    #[test]
+    fn a_flipped_message_reverses_the_whole_body_before_it_wraps() {
+        // Reversing after the wrap would reverse each row on its own, which
+        // scrambles the reading order between rows. Checked here rather than in
+        // `ui::styles` because only the render path exercises the ordering.
+        let mut m = message("m1", "trinity", "sox", 1);
+        m.extras.style = Some(MessageStyle::One("flip".into()));
+        let s = room_knowing_us(vec![m]);
+        let rows = render_rows(&s, 14);
+        let joined = rows.join("\n");
+        assert!(
+            rows.iter().any(|r| r.contains("xos")),
+            "the body is reversed:\n{joined}",
         );
     }
 
@@ -3118,6 +5010,80 @@ mod tests {
             joined.contains(&format!("{MENTION_MARK}trinity")),
             "our own message named us:\n{joined}",
         );
+    }
+
+    #[test]
+    fn the_roster_fits_a_max_length_name_with_both_marks() {
+        // The bug this replaced: at 20 columns `Paragraph` truncated the row,
+        // so a long name lost the admin and idle marks off the right edge, and
+        // those marks are the whole reason the row is not just a name.
+        let mut s = open("general");
+        let now = now_ms();
+        s.roster_open = true;
+        s.apply_room_users(
+            "general",
+            Ok(vec![CircRoomUser {
+                user_id: "u1".into(),
+                // 20 characters, the API's documented maximum.
+                username: "abcdefghijklmnopqrst".into(),
+                is_chat_admin: true,
+                last_seen: now,
+                // Long enough ago to read as idle.
+                last_activity: Some(now - 3_600_000),
+            }]),
+        );
+        let joined = render_rows_wide(&s, 100, 14).join("\n");
+        assert!(
+            joined.contains("abcdefghijklmnopqrst"),
+            "the whole name fits:\n{joined}",
+        );
+        let row = joined
+            .lines()
+            .find(|l| l.contains("abcdefghijklmnopqrst"))
+            .expect("the row is on screen");
+        assert!(
+            row.contains('\u{2605}') && row.contains(IDLE_MARK),
+            "and so do both marks, which is what 20 columns clipped: {row:?}",
+        );
+    }
+
+    #[test]
+    fn the_roster_lists_admins_before_everyone_else() {
+        let mut s = open("general");
+        let now = now_ms();
+        s.roster_open = true;
+        let user = |id: &str, name: &str, admin: bool| CircRoomUser {
+            user_id: id.into(),
+            username: name.into(),
+            is_chat_admin: admin,
+            last_seen: now,
+            last_activity: Some(now),
+        };
+        s.apply_room_users(
+            "general",
+            Ok(vec![
+                user("u1", "alice", false),
+                user("u2", "zara", true),
+                user("u3", "bob", false),
+                user("u4", "adam", true),
+            ]),
+        );
+        let rows = render_rows_wide(&s, 100, 14);
+        let order: Vec<&str> = ["adam", "zara", "alice", "bob"]
+            .into_iter()
+            .filter(|n| rows.iter().any(|r| r.contains(n)))
+            .collect();
+        let pos = |name: &str| {
+            rows.iter()
+                .position(|r| r.contains(name))
+                .unwrap_or(usize::MAX)
+        };
+        assert_eq!(order.len(), 4, "everyone is listed");
+        assert!(
+            pos("adam") < pos("zara") && pos("zara") < pos("alice"),
+            "admins first (alphabetical), then everyone else (alphabetical): {rows:?}",
+        );
+        assert!(pos("alice") < pos("bob"));
     }
 
     #[test]
@@ -3241,12 +5207,12 @@ mod tests {
     }
 
     #[test]
-    fn editor_content_returns_the_keyboard_to_the_composer() {
+    fn editor_content_closes_the_action_menu() {
         let mut s = selecting(vec![message("m1", "neo", "hi", 1_000)]);
-        assert!(!s.is_text_input());
+        assert!(s.menu_is_open());
         s.set_draft_and_focus("back to typing".to_string());
         assert!(s.is_text_input());
-        assert!(!s.select_is_active());
+        assert!(!s.menu_is_open());
     }
 
     #[test]

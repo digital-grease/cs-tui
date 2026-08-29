@@ -21,11 +21,11 @@ Early development. Most of the documented v0.8.6 REST surface is implemented, in
 - **Compose** posts and replies in the built-in editor (soft-wrapping, multi-line paste, no external editor required); delete your own entries
 - **Edit** your own entry or reply with `e` (`E` on your profile's Posts tab). The API allows this on supporter accounts for 5 minutes after posting, and says so when it doesn't
 - **Flag** an entry, a reply, or a cIRC message for review with `F`, with an optional reason. Reporting is idempotent and can't be withdrawn
-- **cIRC** chat rooms with live streaming: a room roster (`Ctrl+U`) showing who's there and who's idle, presence published on your behalf, and a message-select mode (`Ctrl+B`) to delete your own message, flag one, open an attachment, reveal a spoiler, or mute the author
+- **cIRC** chat rooms with live streaming: a room roster (`Ctrl+U`) showing who's there and who's idle, presence published on your behalf, and an action menu (`Ctrl+A`) to delete your own message, flag one, open an attachment, reveal a spoiler, or mute the author
 - **C-Mail** private conversations with live streaming, an unread badge, and a typing indicator in both directions
 - **Chat attachments** as compact chips: `[image]`, `[gif]` and `[♪ artist - title]`, clickable via OSC 8 when `hyperlinks` is on, with `o` to open the link or play the track in the jukebox
 - **Text styles and ASCII art**: `/art` is decoded and drawn as sent, `/rainbow` colors per character, `/quiet` dims, `/spoiler` stays masked until you press `v`, and `/blink`, `/wave`, `/slow` and `/glitch` get a static stand-in. Nothing animates. `/l33t`, `/flip`, `/comic`, `/cursive` and `/times` rewrite the text rather than style it, so cs-tui shows exactly what the server sent and adds nothing of its own
-- **Muted users**: `/mute` and `/unmute` in a room (or `m` in message-select mode) hide that person's messages for you; it's the same mute list the website uses
+- **Muted users**: `/mute` and `/unmute` in a room (or `m` in the `Ctrl+A` action menu) hide that person's messages for you; it's the same mute list the website uses
 - **Guilds**: browse member groups, view threads/members, join, leave, move your profile badge between guilds, and post threads. v0.8.6's apprenticeships are modelled throughout: the guild you are a member or founder of is the badge on your profile, joining another while you have one makes you an apprentice there (five at most), and promoting an apprenticeship moves the badge to it while the guild it replaces becomes an apprenticeship, so you stay in both
 - **Journal** (private notes) with revision history
 - **Settings** round-trip that preserves fields the client doesn't model
@@ -106,20 +106,24 @@ composes):
 | Guild | `P` then `y` | Make this guild your profile badge |
 | Guild | `L` then `y` | Leave, an apprenticeship included (founders leave on the web) |
 | cIRC room | `Ctrl+U` | Show / hide the room roster |
-| cIRC room | `Ctrl+B` | Enter message-select mode |
-| cIRC message select | `j` / `k` | Pick a message |
-| cIRC message select | `d` then `y` | Delete your own message |
-| cIRC message select | `F` | Flag the message |
-| cIRC message select | `o` | Open the attachment, or play the track |
-| cIRC message select | `v` | Reveal a spoiler |
-| cIRC message select | `m` | Mute the author in this room |
-| cIRC message select | `Esc` | Back to the composer |
+| cIRC room | `Ctrl+A` | Open the action menu for the message under the cursor |
+| cIRC room | `↑` / `↓` | Move through the room history (`PgUp` / `PgDn` too) |
+| cIRC action menu | `j` / `k` | Pick a message |
+| cIRC action menu | `Home` / `End` | Jump to the oldest / newest message held |
+| cIRC action menu | `d` then `y` | Delete your own message |
+| cIRC action menu | `F` | Flag the message |
+| cIRC action menu | `o` | Open the image or GIF, or play the track |
+| cIRC action menu | `v` | Reveal a spoiler |
+| cIRC action menu | `m` | Mute the author in this room |
+| cIRC action menu | `Esc` | Close the menu, back to the composer |
 | C-Mail conversation | `o` | Open the attachment, or play the track |
 | C-Mail conversation | `v` | Reveal a spoiler |
 
 In a cIRC room the composer always has focus, so every letter you type goes
 into the message. That is why the room's own actions are chords, and why
-deleting or flagging a message goes through the select mode.
+deleting or flagging a message goes through the `Ctrl+A` menu: while the menu is
+up it owns the keyboard, and `Ctrl+A` is the only key in a room that is not
+typed.
 
 ### Themes
 
@@ -210,8 +214,11 @@ location is auto-created).
 | `audio_volume` | `50` | Starting jukebox volume for a fresh session (0 to 130; above 100 is soft amplification). Adjust live with `[` / `]`. |
 | `shuffle` | `false` | Start each session with shuffle mode armed (playback still begins by hand). See [Jukebox playback](#jukebox-playback-optional). |
 | `editor` | _(unset, uses the built-in editor)_ | Set to an external editor command (e.g. `nvim`) to compose in it instead of the built-in editor. GUI editors must block until the file is closed, so use a wait flag: `code --wait`, `subl -w`, `gnome-text-editor --standalone`. Leave unset to use the built-in editor. `$VISUAL`/`$EDITOR` are no longer consulted (an environment editor that forks or is missing was silently aborting composes). |
+| `browser` | _(unset, uses the OS default handler)_ | Command used to open a link, instead of `xdg-open` / `open` / `cmd /C start`. Split on spaces and run directly, with no shell, so quotes and globs are not interpreted. `%s` in an argument is replaced by the URL; without one it is appended (`firefox --new-tab`, `qutebrowser %s --target tab`). Only http and https links are ever opened, whatever this is set to. |
 | `preview_length` | `200` | Characters of post content shown in list previews (clamped 20 to 2000). |
 | `image_height` | `20` | Max rows for the inline image strip in post detail (clamped 1 to 60). |
+| `image_sharpness` | `crisp` | How an image is resampled when it is scaled to fit: `crisp` (nearest neighbour, cheapest, keeps hard edges on pixel art), `smooth`, `medium`, or `sharp` (best on downscaled photographs, slowest). The cost is paid once per picture per size, when it is first drawn, and not again while you scroll. |
+| `graphics_protocol` | _(unset, probes)_ | Force a terminal graphics protocol instead of probing for one: `kitty`, `iterm2`, `sixel`, or `halfblocks`. Leave unset unless the probe gets it wrong, which shows up as no images in a terminal that supports them, or a screenful of escape bytes in one that does not. |
 
 ### What other people can see
 
@@ -237,6 +244,7 @@ Cyberspace, and publishes nothing to anyone you talk to.
 |---|---|---|
 | `mouse` | `false` | Capture the scroll wheel for in-app scrolling. Off keeps native terminal select/copy. `--mouse` forces it on. |
 | `images` | `true` | Render inline images on graphics-capable terminals. `--no-images` forces it off. |
+| `animate_styles` | `false` | Animate the `blink`, `wave` and `glitch` text styles instead of drawing static approximations of them. This redraws the chat pane several times a second for as long as an animated message is on screen, whether or not you are looking at it, which is real battery on a laptop. Off by default for that reason. |
 | `hyperlinks` | `true` | Make links clickable via OSC 8 terminal hyperlinks (Ghostty, kitty, WezTerm, iTerm2, foot, recent VTE terminals, Windows Terminal, tmux ≥ 3.4). Off surfaces the bare URL for the terminal's own URL detection instead. |
 | `api_base` | `https://api.cyberspace.online` | Override the API base URL. |
 

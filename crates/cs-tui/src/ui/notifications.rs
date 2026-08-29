@@ -30,6 +30,10 @@ const MAX_AUTO_PAGES: u8 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotificationsIntent {
+    /// Jump to the cIRC room a `chat_mention` points at.
+    OpenCircRoom {
+        room_slug: String,
+    },
     /// Load next cursor page.
     LoadMore,
     /// Re-fetch from scratch.
@@ -234,6 +238,15 @@ impl NotificationsScreen {
                     // `actor_name`, which the row is labelled with, cannot tell
                     // the two apart.
                     let actor = n.actor_profile().map(String::from);
+                    // A chat mention names its room in metadata rather than in
+                    // `target_id`, so it is resolved before the post path: the
+                    // `navigable` guard below would otherwise send it to the
+                    // actor's profile, which is not what the reader asked for.
+                    if let Some(slug) = n.chat_room_slug() {
+                        return NotificationsIntent::OpenCircRoom {
+                            room_slug: slug.to_string(),
+                        };
+                    }
                     // A DM notification opens the conversation with its sender
                     // rather than trying to resolve a post.
                     if n.kind == NotificationType::DmMessage {
@@ -274,11 +287,13 @@ impl NotificationsScreen {
         if self.list.loading {
             return NotificationsIntent::None;
         }
-        match super::list_nav::navigate(
+        let page = self.list.page_items();
+        match super::list_nav::navigate_paged(
             key.code,
             &mut self.list.selected,
             self.list.items.len(),
             self.list.next_cursor.is_some(),
+            page,
         ) {
             super::list_nav::ListNav::LoadMore => {
                 self.list.loading = true;
@@ -702,6 +717,37 @@ mod tests {
             next = s.apply_more(Ok((vec![], Some(format!("c{pages}")))));
         }
         pages
+    }
+
+    #[test]
+    fn enter_on_a_chat_mention_jumps_to_its_room() {
+        let mut n = notif("n1", NotificationType::ChatMention, None, None);
+        n.actor_username = Some("trinity".into());
+        n.metadata.room_slug = Some("general".into());
+        let mut s = NotificationsScreen::new();
+        let _ = s.apply_initial(Ok((vec![n], None)));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            NotificationsIntent::OpenCircRoom {
+                room_slug: "general".into()
+            },
+        );
+    }
+
+    #[test]
+    fn a_chat_mention_without_a_room_falls_back_to_the_actor() {
+        // The key is undocumented, so a server that stops sending it must
+        // degrade rather than dead-end.
+        let mut n = notif("n1", NotificationType::ChatMention, None, None);
+        n.actor_username = Some("trinity".into());
+        let mut s = NotificationsScreen::new();
+        let _ = s.apply_initial(Ok((vec![n], None)));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            NotificationsIntent::OpenUser {
+                username: "trinity".into()
+            },
+        );
     }
 
     #[test]

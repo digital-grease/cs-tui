@@ -197,6 +197,56 @@ pub fn render_linked_paragraph(
     }
 }
 
+/// Every URL in plain text, in order, deduplicated.
+///
+/// Same scheme set and same trailing-punctuation trimming as the on-screen
+/// linkifier, so what a reader can click and what an "open links" key offers
+/// never disagree. Shared with [`line_urls`] through [`scan_urls`].
+///
+/// ```ignore
+/// for url in hyperlink::urls_in_text(&message.content) { ... }
+/// ```
+#[must_use]
+pub fn urls_in_text(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    for (_, _, url) in scan_urls(&chars) {
+        if !out.iter().any(|u| u == &url) {
+            out.push(url);
+        }
+    }
+    out
+}
+
+/// Scan `chars` for scheme-led URL tokens, as (start index, end index, url).
+///
+/// The shared core of [`urls_in_text`] and [`line_urls`]: one definition of
+/// what a URL is, so the clickable text and the openable list cannot drift.
+fn scan_urls(chars: &[char]) -> Vec<(usize, usize, String)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if let Some(scheme_len) = scheme_at(chars, i) {
+            let mut j = i + scheme_len;
+            while j < chars.len() && is_url_char(chars[j]) {
+                j += 1;
+            }
+            // Trim trailing punctuation that usually abuts a URL rather than
+            // belonging to it ("(see https://x.com)." -> "https://x.com").
+            while j > i + scheme_len && is_trailing_punct(chars[j - 1]) {
+                j -= 1;
+            }
+            if j > i + scheme_len {
+                out.push((i, j, chars[i..j].iter().collect()));
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
 /// Find URL tokens on one logical line, each as (start column, display width,
 /// url). Builds the line's text with a per-character column map — so wide glyphs
 /// before a URL shift its column correctly — then scans for scheme-led tokens.
@@ -213,31 +263,14 @@ fn line_urls(line: &Line<'_>) -> Vec<(u16, u16, String)> {
     }
     col_of.push(col); // end sentinel
 
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        if let Some(scheme_len) = scheme_at(&chars, i) {
-            let mut j = i + scheme_len;
-            while j < chars.len() && is_url_char(chars[j]) {
-                j += 1;
-            }
-            // Trim trailing punctuation that usually abuts a URL rather than
-            // belonging to it ("(see https://x.com)." → "https://x.com").
-            while j > i + scheme_len && is_trailing_punct(chars[j - 1]) {
-                j -= 1;
-            }
-            if j > i + scheme_len {
-                let url: String = chars[i..j].iter().collect();
-                let c0 = col_of[i];
-                let c1 = col_of[j];
-                out.push((c0, c1.saturating_sub(c0), url));
-                i = j;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    out
+    scan_urls(&chars)
+        .into_iter()
+        .map(|(i, j, url)| {
+            let c0 = col_of[i];
+            let c1 = col_of[j];
+            (c0, c1.saturating_sub(c0), url)
+        })
+        .collect()
 }
 
 /// If one of [`SCHEMES`] starts at `chars[i]` (case-insensitive), its char length.

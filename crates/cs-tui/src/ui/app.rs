@@ -1,4 +1,5 @@
 //! Top-level App state and event loop.
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,14 +18,18 @@ use cs_api::{
     NotificationsFilter, PokeResponse, ProfileUpdate, PromotedGuild, Reply, Settings,
     SettingsUpdate, Topic, UnreadCount, User, UserGuild,
 };
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
 use ratatui::DefaultTerminal;
 use ratatui_image::picker::Picker;
+use ratatui_image::protocol::Protocol;
+use ratatui_image::{Image, Resize};
 use tokio::sync::{mpsc, Notify};
 use tokio::time::MissedTickBehavior;
 
 use super::bookmarks::{BookmarksIntent, BookmarksScreen};
-use super::circ::{CircIntent, CircScreen};
+use super::circ::{CircIntent, CircScreen, CircStreamState};
 use super::cmail::{CmailIntent, CmailScreen};
 use super::compose::{launch_editor, ComposeIntent, ComposeKind, ComposeScreen};
 use super::edit_profile::{EditProfileIntent, EditProfileScreen};
@@ -333,6 +338,14 @@ pub enum BgEvent {
         epoch: u64,
         response: Box<CircPresenceResponse>,
     },
+    /// What the open room's live message stream is doing, for the header
+    /// indicator. Epoch-tagged like every other room event, so a report from a
+    /// stream the reader has left is dropped.
+    CircStreamState {
+        room_id: String,
+        epoch: u64,
+        state: CircStreamState,
+    },
     CircSent {
         room_id: String,
         content: String,
@@ -576,10 +589,28 @@ pub enum BgEvent {
         result: Result<String, String>,
     },
     ImageFetched {
-        post_id: String,
+        /// Which screen asked. A post id for post detail, a room id for cIRC:
+        /// the bytes are dropped unless that screen is still the one showing,
+        /// so navigating away mid-fetch cannot paint a picture into a room it
+        /// does not belong to.
+        owner: ImageOwner,
         url: String,
         result: Result<Vec<u8>, String>,
     },
+}
+
+/// Who a fetched image belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageOwner {
+    /// A post-detail screen, keyed by post id.
+    Post(String),
+    /// A cIRC room, keyed by room id.
+    CircRoom(String),
+    /// A C-Mail conversation, keyed by conversation id.
+    CmailConversation(String),
+    /// The feed. Unkeyed: there is only one, and its entries persist across
+    /// refreshes, so bytes are never delivered to the wrong list.
+    Feed,
 }
 
 #[allow(clippy::large_enum_variant)] // Boxing isn't worth the indirection here.
@@ -636,6 +667,16 @@ impl Screen {
 /// Intent captured from a screen before we drop its borrow on `self.screen`.
 #[derive(Debug, PartialEq)]
 enum Action {
+    /// Say something to the reader as a transient toast.
+    Warn(String),
+    /// Put text on the reader's clipboard.
+    CopyText {
+        text: String,
+    },
+    /// Jump to a cIRC room named by a notification, remembering where from.
+    CircDeepLink {
+        room_slug: String,
+    },
     None,
     Quit,
     LoginSubmit {
@@ -1003,6 +1044,38 @@ pub struct App {
     /// `cmail_stream_epoch`). It also governs the room's presence stream and
     /// its heartbeat, so leaving the room stops all four tasks at once.
     circ_stream_epoch: Arc<AtomicU64>,
+    /// The cIRC room left running while the reader is on another tab.
+    ///
+    /// `goto_root` used to drop the whole screen, which is why leaving the tab
+    /// meant leaving the room. Parking it keeps its history, its composer draft
+    /// and its image caches, so coming back resumes rather than reloads.
+    parked_circ: Option<Box<CircScreen>>,
+    /// The room whose background tasks are alive, whether or not it is on
+    /// screen. Tracked separately from the visible screen so the polite
+    /// `DELETE .../presence` still knows what to leave on quit.
+    live_circ_room: Option<String>,
+    /// Messages that arrived in the parked room since the reader looked away.
+    circ_unread: usize,
+    /// The image shown full screen, as `(url, bytes)`, or `None`.
+    ///
+    /// Holds its own bytes rather than a reference into a screen's cache, so
+    /// the modal survives the screen changing underneath it and cannot be left
+    /// pointing at a dropped room.
+    image_modal: Option<(String, Vec<u8>)>,
+    /// The modal's encoded protocol and the box it was built for.
+    image_modal_proto: RefCell<Option<(Protocol, Size)>>,
+    /// A deep-linked room slug waiting for the room list to arrive.
+    pending_circ_room: Option<String>,
+    /// Where `Esc` should return to from a deep-linked room, when it was not
+    /// reached through the tab bar.
+    circ_return_to: Option<RootKind>,
+    /// Wall-clock ms of the last thing heard on the open conversation's SSE
+    /// stream. Same contract as [`Self::circ_stream_live_ms`].
+    cmail_stream_live_ms: Arc<AtomicI64>,
+    /// Wall-clock ms of the last thing heard on the open room's SSE stream,
+    /// keepalives included. `0` means "nothing yet". Read by the REST poll to
+    /// decide whether it is a safety net or the delivery mechanism.
+    circ_stream_live_ms: Arc<AtomicI64>,
     /// Milliseconds since the Unix epoch of the user's last keystroke while a
     /// cIRC room is in play, published with every presence heartbeat
     /// (§ Announce Your Presence). Shared with the heartbeat task, which reads
@@ -1185,6 +1258,15 @@ impl App {
             cmail_poller_started: false,
             cmail_stream_epoch: Arc::new(AtomicU64::new(0)),
             circ_stream_epoch: Arc::new(AtomicU64::new(0)),
+            parked_circ: None,
+            live_circ_room: None,
+            circ_unread: 0,
+            image_modal: None,
+            image_modal_proto: RefCell::new(None),
+            pending_circ_room: None,
+            circ_return_to: None,
+            circ_stream_live_ms: Arc::new(AtomicI64::new(0)),
+            cmail_stream_live_ms: Arc::new(AtomicI64::new(0)),
             circ_activity_ms: Arc::new(AtomicI64::new(0)),
             circ_activity_notify: Arc::new(Notify::new()),
             viewer_user_id: None,
@@ -1234,6 +1316,69 @@ impl App {
         self.images_on = !self.images_on;
         self.force_clear = true;
         self.ensure_detail_images_fetched();
+        self.ensure_circ_images_fetched();
+        self.ensure_cmail_images_fetched();
+        self.ensure_feed_images_fetched();
+    }
+
+    /// Spawn fetches for every image in the open cIRC room.
+    ///
+    /// Cheap to call repeatedly: the screen hands out each URL once per session.
+    /// No-op off cIRC, with images disabled, or on a terminal without graphics,
+    /// which is what keeps a text-only terminal from downloading pictures it can
+    /// never draw.
+    /// Spawn fetches for every image in the open C-Mail conversation.
+    ///
+    /// Same shape and same gating as the cIRC driver: cheap to call repeatedly,
+    /// and a no-op on a terminal that cannot draw pictures, so a text-only
+    /// terminal never downloads one.
+    /// Spawn fetches for every image the feed can show.
+    ///
+    /// Same gating as the other drivers: nothing is downloaded on a terminal
+    /// that cannot draw it.
+    fn ensure_feed_images_fetched(&self) {
+        if !self.images_on || self.picker.is_none() {
+            return;
+        }
+        let Screen::Feed(s) = &self.screen else {
+            return;
+        };
+        for url in s.image_urls_to_fetch(MAX_IMAGE_FETCHES_AT_ONCE) {
+            self.spawn_fetch_image(ImageOwner::Feed, url);
+        }
+    }
+
+    fn ensure_cmail_images_fetched(&self) {
+        if !self.images_on || self.picker.is_none() {
+            return;
+        }
+        let Screen::Cmail(s) = &self.screen else {
+            return;
+        };
+        let Some(id) = s.open_conversation_id().map(str::to_string) else {
+            return;
+        };
+        for url in s.image_urls_to_fetch(&id, MAX_IMAGE_FETCHES_AT_ONCE) {
+            self.spawn_fetch_image(ImageOwner::CmailConversation(id.clone()), url);
+        }
+    }
+
+    fn ensure_circ_images_fetched(&self) {
+        if !self.images_on || self.picker.is_none() {
+            return;
+        }
+        let Screen::Circ(s) = &self.screen else {
+            return;
+        };
+        let Some(room_id) = s.open_room_id().map(str::to_string) else {
+            return;
+        };
+        // Bounded: a room full of pictures used to launch one detached task and
+        // one HTTPS request per URL, all at once. The rest are picked up by the
+        // next call, which happens on every message that arrives.
+        for url in s.image_urls_to_fetch(&room_id, MAX_IMAGE_FETCHES_AT_ONCE) {
+            self.spawn_fetch_image(ImageOwner::CircRoom(room_id.clone()), url);
+        }
     }
 
     /// Spawn fetches for every image the post-detail screen can show — the post's
@@ -1255,7 +1400,7 @@ impl App {
                 continue;
             }
             if s.mark_requested(url.clone()) {
-                self.spawn_fetch_image(post_id.clone(), url);
+                self.spawn_fetch_image(ImageOwner::Post(post_id.clone()), url);
             }
         }
     }
@@ -1314,6 +1459,13 @@ impl App {
         // select arm); it animates the countdown without waking an idle TUI.
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        // The animation clock is separate and much faster, and its `select!`
+        // branch is disabled unless something on screen actually animates. A
+        // disabled branch is never polled, so an ordinary session takes no
+        // extra wakeups at all: the cost lands only on a reader who turned
+        // `animate_styles` on *and* is looking at an animated message.
+        let mut anim = tokio::time::interval(super::styles::anim_tick());
+        anim.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         // One long-lived input reader feeding a channel. The previous approach
         // spawned a fresh `spawn_blocking(event::read)` per select! iteration;
@@ -1388,6 +1540,11 @@ impl App {
                 _ = ticker.tick(), if self.needs_tick() => {
                     self.on_tick();
                 }
+                _ = anim.tick(), if self.needs_anim_tick() => {
+                    if let Screen::Circ(s) = &mut self.screen {
+                        s.tick_animation();
+                    }
+                }
             }
             // A background call may have proven the session dead; logging out
             // needs an await, so it happens here rather than in the sync bg
@@ -1413,6 +1570,14 @@ impl App {
     /// countdown, and it is also the clock the C-Mail typing indicator needs:
     /// a flag going stale produces no event to react to, so the row only comes
     /// down if something re-renders (§ Typing Indicator).
+    /// Whether the animation clock should be running.
+    ///
+    /// Only for the visible cIRC screen: a parked room animating in the
+    /// background would be redrawing something nobody can see.
+    fn needs_anim_tick(&self) -> bool {
+        matches!(&self.screen, Screen::Circ(s) if s.wants_animation())
+    }
+
     fn needs_tick(&self) -> bool {
         self.toast.is_some()
             // A published typing flag has to keep the clock running even when
@@ -1480,6 +1645,7 @@ impl App {
                 frame,
                 tab_area,
                 TabBarStatus {
+                    circ_unread_count: self.circ_unread,
                     current,
                     unread_count: self.unread_count,
                     cmail_unread_count: self.cmail_unread_count,
@@ -1491,10 +1657,27 @@ impl App {
 
             match &self.screen {
                 Screen::Login(s) => s.render(frame, screen_area, &self.theme),
-                Screen::Feed(s) => s.render(frame, screen_area, &self.theme),
+                Screen::Feed(s) => s.render(
+                    frame,
+                    screen_area,
+                    &self.theme,
+                    self.picker.as_ref().filter(|_| self.images_on),
+                ),
                 Screen::Notifications(s) => s.render(frame, screen_area, &self.theme),
-                Screen::Cmail(s) => s.render(frame, screen_area, &self.theme),
-                Screen::Circ(s) => s.render(frame, screen_area, &self.theme),
+                Screen::Cmail(s) => s.render(
+                    frame,
+                    screen_area,
+                    &self.theme,
+                    self.picker.as_ref().filter(|_| self.images_on),
+                ),
+                Screen::Circ(s) => s.render(
+                    frame,
+                    screen_area,
+                    &self.theme,
+                    // One gate, same as post detail: the `i` toggle and the
+                    // config both flow through `images_on`.
+                    self.picker.as_ref().filter(|_| self.images_on),
+                ),
                 Screen::Search(s) => s.render(frame, screen_area, &self.theme),
                 Screen::Bookmarks(s) => s.render(frame, screen_area, &self.theme),
                 Screen::Topics(s) => s.render(frame, screen_area, &self.theme),
@@ -1540,6 +1723,82 @@ impl App {
         if let Some(help) = &self.help {
             help.render(frame, full_area, &self.theme);
         }
+        // Above everything, including the menu: it is a deliberate, modal look
+        // at one picture, and anything drawn over it would be drawn over pixels
+        // rather than over cells.
+        self.render_image_modal(frame, full_area);
+    }
+
+    /// The bytes of `url`, if a screen has already fetched it and we could
+    /// draw it.
+    ///
+    /// Deliberately only what is *already* cached: opening the modal must be
+    /// instant, and a picture that has not been fetched has nothing to show but
+    /// a blank rectangle. Those still go to the browser, which is what happened
+    /// before this existed.
+    fn held_image_bytes(&self, url: &str) -> Option<Vec<u8>> {
+        if self.picker.is_none() || !self.images_on {
+            return None;
+        }
+        match &self.screen {
+            Screen::Circ(s) => s.held_image_bytes(url),
+            Screen::Cmail(s) => s.held_image_bytes(url),
+            Screen::Feed(s) => s.held_image_bytes(url),
+            _ => None,
+        }
+    }
+
+    /// Draw the fullscreen image, if one is open.
+    ///
+    /// Sized to the pane rather than to `image_height`: the whole point of the
+    /// modal is to escape the inline band's ceiling. Still `Resize::Fit` and
+    /// still never upscaled beyond the box, so a small picture stays small
+    /// rather than being smeared across the terminal.
+    fn render_image_modal(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let Some((url, bytes)) = &self.image_modal else {
+            return;
+        };
+        let Some(picker) = self.picker.as_ref() else {
+            return;
+        };
+        // Clear the cells underneath, or the screen behind shows through the
+        // transparent parts of the picture.
+        frame.render_widget(ratatui::widgets::Clear, area);
+        let inner = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: area.height.saturating_sub(1),
+        };
+        let target = Size::new(inner.width, inner.height);
+        let mut slot = self.image_modal_proto.borrow_mut();
+        let stale = slot.as_ref().map_or(true, |(_, built)| *built != target);
+        if stale {
+            match super::images::decode_bounded(bytes).and_then(|img| {
+                picker
+                    .new_protocol(img, target, Resize::Fit(super::images::filter()))
+                    .map_err(|e| e.to_string())
+            }) {
+                Ok(proto) => *slot = Some((proto, target)),
+                Err(e) => {
+                    tracing::debug!(error = %e, %url, "modal image encode failed");
+                    return;
+                }
+            }
+        }
+        if let Some((proto, _)) = slot.as_ref() {
+            frame.render_widget(Image::new(proto).allow_clipping(true), inner);
+        }
+        let hint = Line::from(Span::styled(" any key closes ", self.theme.muted_style()));
+        frame.render_widget(
+            Paragraph::new(hint),
+            Rect {
+                x: area.x,
+                y: area.y.saturating_add(area.height.saturating_sub(1)),
+                width: area.width,
+                height: 1,
+            },
+        );
     }
 
     /// Phase 1 of input handling: map a key on the active screen to an Action.
@@ -1587,6 +1846,9 @@ impl App {
                 FeedIntent::None => Action::None,
             },
             Screen::Notifications(s) => match s.handle_key(key) {
+                NotificationsIntent::OpenCircRoom { room_slug } => {
+                    Action::CircDeepLink { room_slug }
+                }
                 NotificationsIntent::Quit => Action::Quit,
                 NotificationsIntent::Refresh => Action::NotificationsRefresh,
                 NotificationsIntent::LoadMore => Action::NotificationsMore {
@@ -1616,6 +1878,7 @@ impl App {
             },
             Screen::Cmail(s) => match s.handle_key(key) {
                 CmailIntent::Quit => Action::Quit,
+                CmailIntent::Warn(msg) => Action::Warn(msg),
                 CmailIntent::RefreshConversations => Action::CmailRefresh,
                 CmailIntent::OpenConversation { conversation_id } => {
                     Action::CmailOpen { conversation_id }
@@ -1695,11 +1958,19 @@ impl App {
                     message_id,
                     reason,
                 },
+                CircIntent::OpenProfile { username } => Action::ProfileOpenUser { username },
+                CircIntent::OpenDm { username, user_id } => Action::OpenCmailWith {
+                    username,
+                    // The id saves a lookup when we have it; an empty one means
+                    // the message never carried it, and the username is enough.
+                    user_id: (!user_id.is_empty()).then_some(user_id),
+                },
                 CircIntent::MuteUser { room_id, username } => {
                     Action::CircMuteUser { room_id, username }
                 }
                 CircIntent::LoadRoomUsers { room_id } => Action::CircLoadRoomUsers { room_id },
                 CircIntent::OpenUrl(url) => Action::OpenUrl { url },
+                CircIntent::CopyText(text) => Action::CopyText { text },
                 CircIntent::PlayJukebox(track) => Action::PlayPressed { track: Some(track) },
                 CircIntent::None => Action::None,
             },
@@ -1770,6 +2041,7 @@ impl App {
                 TopicFeedIntent::None => Action::None,
             },
             Screen::PostDetail(s) => match s.handle_key(key) {
+                PostDetailIntent::CopyText(text) => Action::CopyText { text },
                 PostDetailIntent::Quit => Action::Quit,
                 PostDetailIntent::Back => Action::PopScreen,
                 PostDetailIntent::RefreshReplies => Action::PostDetailRefreshReplies {
@@ -2083,12 +2355,53 @@ impl App {
             // is enabled in main; motion tracking is not, so the mouse doesn't
             // flood events when moved.
             Event::Mouse(m) => match m.kind {
-                event::MouseEventKind::ScrollDown => synthetic_key(KeyCode::Down),
-                event::MouseEventKind::ScrollUp => synthetic_key(KeyCode::Up),
+                event::MouseEventKind::ScrollDown => {
+                    // Symmetry with ScrollUp: `down` leaves select mode at the
+                    // tail, and a wheel notch should not do that either.
+                    if let Screen::Circ(s) = &mut self.screen {
+                        if s.wheel_scroll(false) {
+                            return;
+                        }
+                    }
+                    synthetic_key(KeyCode::Down)
+                }
+                event::MouseEventKind::ScrollUp => {
+                    // A wheel notch is a *scroll* and must never change mode. In
+                    // cIRC `up` now enters message-select, where letters are read
+                    // as commands, so synthesising `Up` here would put a reader
+                    // who was only scrolling into a mode where the next word they
+                    // type runs `d`, `y`, `m` and `F` against their own messages.
+                    // Scroll that pane directly instead of going through a key.
+                    if let Screen::Circ(s) = &mut self.screen {
+                        if s.wheel_scroll(true) {
+                            return;
+                        }
+                    }
+                    synthetic_key(KeyCode::Up)
+                }
                 _ => return,
             },
             _ => return,
         };
+
+        // A modal picture swallows the next key, whatever it is.
+        //
+        // This must be the FIRST handler. It used to sit far below, after Esc,
+        // after the 1-8 and arrow section navigation, after Ctrl+F and after the
+        // player keys, so "any key closes" was simply false: Esc with a picture
+        // open left the cIRC room, wiped the composer draft and the queued
+        // failed sends, and left the picture painted over the room list. A
+        // reader dismissing a photo means "close this", never "quit", "delete"
+        // or "take me somewhere else".
+        if self.image_modal.is_some() {
+            self.image_modal = None;
+            *self.image_modal_proto.borrow_mut() = None;
+            // The picture was painted in pixels over the cells; ratatui only
+            // repaints cells it believes changed, so the frame underneath has to
+            // be redrawn from scratch.
+            self.force_clear = true;
+            return;
+        }
 
         // The help overlay owns the keyboard while it is up: scroll keys move
         // its body, Ctrl+C still quits, anything else dismisses it.
@@ -2200,6 +2513,17 @@ impl App {
                 if let Some(intent) = s.handle_escape() {
                     if matches!(intent, CircIntent::BackToRooms) {
                         self.leave_circ_presence(open_room);
+                        // Leaving the room, not the tab, so its tasks stop and
+                        // the parked slot is cleared: nothing is left to resume.
+                        self.drop_parked_circ();
+                        // Reached by a notification deep link rather than
+                        // through the tab bar, so going "back" means the screen
+                        // the reader actually came from, not the room list they
+                        // never saw.
+                        if let Some(origin) = self.circ_return_to.take() {
+                            self.goto_root(origin);
+                            return;
+                        }
                         self.spawn_circ_rooms();
                     }
                     return;
@@ -2478,27 +2802,15 @@ impl App {
             Action::CmailTypingIdle { conversation_id } => {
                 self.clear_cmail_typing_for(&conversation_id);
             }
+            Action::Warn(msg) => self.toast = Some(Toast::warning(msg)),
+            Action::CircDeepLink { room_slug } => self.circ_deep_link(room_slug),
             Action::CircRefresh => {
-                let open_room = self.open_circ_room();
+                let open_room = self.live_circ_room.take();
                 self.leave_circ_presence(open_room);
+                self.circ_unread = 0;
                 self.spawn_circ_rooms();
             }
-            Action::CircOpen { room_id } => {
-                let previous = self.open_circ_room();
-                self.leave_circ_presence(previous);
-                if let Screen::Circ(s) = &mut self.screen {
-                    s.open_room(&room_id);
-                    if let Some(user_id) = self.viewer_user_id.clone() {
-                        s.set_viewer_user_id(user_id);
-                    }
-                }
-                // Walking into a room is activity, so the first heartbeat
-                // doesn't report an hour-old keystroke and read as idle.
-                self.circ_activity_ms.store(now_millis(), Ordering::Relaxed);
-                self.spawn_circ_messages(room_id.clone(), None);
-                self.spawn_circ_room_watch(room_id.clone());
-                self.spawn_circ_muted_users(room_id);
-            }
+            Action::CircOpen { room_id } => self.enter_circ_room(room_id),
             Action::CircLoadOlder { room_id, before } => {
                 self.spawn_circ_messages(room_id, before);
             }
@@ -2521,8 +2833,12 @@ impl App {
                 }
             }
             Action::CircBackToRooms => {
-                let open_room = self.open_circ_room();
+                // Leaving the room itself, not the tab: this is the polite
+                // leave the spec asks for, and the point where the room really
+                // does stop being ours.
+                let open_room = self.live_circ_room.take();
                 self.leave_circ_presence(open_room);
+                self.circ_unread = 0;
                 if let Screen::Circ(s) = &mut self.screen {
                     s.mode = super::circ::CircMode::Rooms;
                 }
@@ -2774,7 +3090,31 @@ impl App {
                 self.start_compose(ComposeKind::NewEntry, String::new())
                     .await;
             }
+            Action::CopyText { text } => {
+                // OSC 52 has no reply, so a terminal that ignores it looks
+                // exactly like one that acted. The toast says what we did, not
+                // what the terminal did with it.
+                match super::clipboard::copy(&text) {
+                    Ok(true) => self.toast = Some(Toast::confirmation("copied")),
+                    Ok(false) => {
+                        self.toast = Some(Toast::warning("too long to copy"));
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "clipboard write failed");
+                        self.toast = Some(Toast::warning("couldn't copy"));
+                    }
+                }
+            }
             Action::OpenUrl { url } => {
+                // A picture we can already draw opens here rather than in a
+                // browser: the reader asked to see it, and we are a client that
+                // can show it. Anything else, and any terminal without
+                // graphics, still goes to the browser.
+                if let Some(bytes) = self.held_image_bytes(&url) {
+                    self.image_modal = Some((url, bytes));
+                    *self.image_modal_proto.borrow_mut() = None;
+                    return;
+                }
                 // Hands the link to the desktop browser. No network of ours, so
                 // it's fine offline; just report success/failure via a toast.
                 match super::open::open_url(&url) {
@@ -2989,6 +3329,8 @@ impl App {
                 if let Screen::Feed(s) = &mut self.screen {
                     s.apply_initial(result);
                 }
+                // New entries may carry pictures we have not asked for yet.
+                self.ensure_feed_images_fetched();
             }
             BgEvent::FeedMore(result) => {
                 if let Ok((entries, _)) = &result {
@@ -2997,6 +3339,8 @@ impl App {
                 if let Screen::Feed(s) = &mut self.screen {
                     s.apply_more(result);
                 }
+                // New entries may carry pictures we have not asked for yet.
+                self.ensure_feed_images_fetched();
             }
             BgEvent::FeedHead(entries) => {
                 self.shuffle_pool.harvest(&entries);
@@ -3028,6 +3372,8 @@ impl App {
                     self.spawn_feed_initial();
                     self.toast = Some(Toast::confirmation("↑ new posts"));
                 }
+                // New entries may carry pictures we have not asked for yet.
+                self.ensure_feed_images_fetched();
             }
             BgEvent::UpdateAvailable { release, announce } => {
                 if announce {
@@ -3084,6 +3430,8 @@ impl App {
                 if ok && initial {
                     self.spawn_cmail_mark_read(conversation_id);
                 }
+                // New history can carry pictures we have not asked for yet.
+                self.ensure_cmail_images_fetched();
             }
             BgEvent::CmailLive {
                 conversation_id,
@@ -3170,6 +3518,8 @@ impl App {
                 if let Screen::Circ(s) = &mut self.screen {
                     s.apply_rooms(result);
                 }
+                // A deep link may have been waiting on exactly this list.
+                self.try_open_pending_circ_room();
             }
             BgEvent::CircMessages {
                 room_id,
@@ -3177,9 +3527,11 @@ impl App {
                 result,
             } => {
                 let ok = result.is_ok();
-                if let Screen::Circ(s) = &mut self.screen {
+                if let Some(s) = self.circ_mut() {
                     s.apply_messages(&room_id, initial, result);
                 }
+                // New history can carry pictures we have not asked for yet.
+                self.ensure_circ_images_fetched();
                 if ok && initial {
                     self.spawn_circ_mark_read(room_id);
                 }
@@ -3190,10 +3542,21 @@ impl App {
                 updates,
             } => {
                 if epoch == self.circ_stream_epoch.load(Ordering::SeqCst) {
-                    if let Screen::Circ(s) = &mut self.screen {
+                    // Count what arrives while the reader is elsewhere. Done
+                    // before the merge, since `apply_live` de-dupes against
+                    // history and a re-delivered message is not news.
+                    let fresh = if matches!(self.screen, Screen::Circ(_)) {
+                        0
+                    } else {
+                        self.circ_ref()
+                            .map_or(0, |s| s.count_unheld(&room_id, &updates))
+                    };
+                    if let Some(s) = self.circ_mut() {
                         s.apply_live(&room_id, updates);
                     }
+                    self.circ_unread = self.circ_unread.saturating_add(fresh);
                 }
+                self.ensure_circ_images_fetched();
             }
             BgEvent::CircRoomUsers {
                 room_id,
@@ -3201,7 +3564,7 @@ impl App {
                 result,
             } => {
                 if epoch == self.circ_stream_epoch.load(Ordering::SeqCst) {
-                    if let Screen::Circ(s) = &mut self.screen {
+                    if let Some(s) = self.circ_mut() {
                         s.apply_room_users(&room_id, result);
                     }
                 }
@@ -3212,7 +3575,7 @@ impl App {
                 updates,
             } => {
                 if epoch == self.circ_stream_epoch.load(Ordering::SeqCst) {
-                    if let Screen::Circ(s) = &mut self.screen {
+                    if let Some(s) = self.circ_mut() {
                         s.apply_presence_updates(&room_id, updates);
                     }
                 }
@@ -3223,8 +3586,19 @@ impl App {
                 response,
             } => {
                 if epoch == self.circ_stream_epoch.load(Ordering::SeqCst) {
-                    if let Screen::Circ(s) = &mut self.screen {
+                    if let Some(s) = self.circ_mut() {
                         s.apply_presence_cadence(&room_id, &response);
+                    }
+                }
+            }
+            BgEvent::CircStreamState {
+                room_id,
+                epoch,
+                state,
+            } => {
+                if epoch == self.circ_stream_epoch.load(Ordering::SeqCst) {
+                    if let Some(s) = self.circ_mut() {
+                        s.apply_stream_state(&room_id, state);
                     }
                 }
             }
@@ -3253,7 +3627,7 @@ impl App {
                 }
             },
             BgEvent::CircMutedUsers { room_id, usernames } => {
-                if let Screen::Circ(s) = &mut self.screen {
+                if let Some(s) = self.circ_mut() {
                     s.set_muted_users(&room_id, &usernames);
                 }
             }
@@ -3264,14 +3638,27 @@ impl App {
                 result,
             } => {
                 if let Some(reply) = reply {
-                    // A slash command (e.g. /help) answered inline — show it.
-                    self.toast = Some(Toast::confirmation(first_line(&reply)));
+                    // A slash command answered inline (§ Commands: /help and
+                    // the /mute family post nothing and reply in the send
+                    // response). This used to be a toast, which put it through
+                    // `first_line` — one line, capped at 100 characters, then
+                    // gone. /help is a multi-line command list, so that showed
+                    // the reader a fragment of the one thing they asked for.
+                    // It belongs in the transcript, where it can be read and
+                    // scrolled back to.
+                    // Through `circ_mut`, like every sibling handler: a reply
+                    // that lands while the room is parked or covered used to be
+                    // dropped on the floor.
+                    if let Some(s) = self.circ_mut() {
+                        s.append_notice(&room_id, &reply);
+                    }
                 }
-                let reload = if let Screen::Circ(s) = &mut self.screen {
-                    s.finish_send(&room_id, &content, result)
-                } else {
-                    false
-                };
+                // `finish_send` is the ONLY thing that clears the optimistic
+                // outgoing row, so missing it while parked left a permanent
+                // "sending" ghost and could silently lose the message.
+                let reload = self
+                    .circ_mut()
+                    .is_some_and(|s| s.finish_send(&room_id, &content, result));
                 // A mute command typed straight into the composer changes the
                 // stored list just as the `m` key does, and nothing is filtered
                 // server-side, so the view only follows if we re-read it.
@@ -4049,23 +4436,69 @@ impl App {
                     }
                 }
             },
-            BgEvent::ImageFetched {
-                post_id,
-                url,
-                result,
-            } => match result {
+            BgEvent::ImageFetched { owner, url, result } => match result {
                 Ok(bytes) => {
-                    // Cache the bytes on the matching post-detail screen; the
-                    // render pass decodes and overlays them inline once the
-                    // image's gap scrolls into view. If the user navigated away,
-                    // the post id won't match and the bytes are simply dropped.
-                    if let Screen::PostDetail(s) = &self.screen {
-                        if s.entry.post_id == post_id {
+                    // Cache on whichever screen asked; the render pass decodes
+                    // and overlays once the gap is on screen. If the user
+                    // navigated away the owner won't match and the bytes are
+                    // simply dropped.
+                    // cIRC first and through `circ_mut`, because a room can be
+                    // parked or covered while its picture is still downloading.
+                    // Dropping the bytes there was permanent: the URL is marked
+                    // requested at hand-out and never offered again.
+                    if let ImageOwner::CircRoom(room_id) = &owner {
+                        let room_id = room_id.clone();
+                        if let Some(s) = self.circ_mut() {
+                            if s.open_room_id() == Some(room_id.as_str()) {
+                                s.cache_image_bytes(url, bytes);
+                            }
+                        }
+                        return;
+                    }
+                    match (&owner, &self.screen) {
+                        (ImageOwner::Post(post_id), Screen::PostDetail(s))
+                            if s.entry.post_id == *post_id =>
+                        {
                             s.cache_image_bytes(url, bytes);
                         }
+
+                        (ImageOwner::CmailConversation(id), Screen::Cmail(s))
+                            if s.open_conversation_id() == Some(id.as_str()) =>
+                        {
+                            s.cache_image_bytes(url, bytes);
+                        }
+                        (ImageOwner::Feed, Screen::Feed(s)) => {
+                            s.cache_image_bytes(url, bytes);
+                        }
+                        _ => {}
                     }
                 }
-                Err(msg) => tracing::debug!(error = msg, url, "image fetch failed"),
+                Err(msg) => {
+                    // Tell the screen, or the reserved band stays blank forever:
+                    // the row count is held open for a picture that will never
+                    // arrive, and the `[image]` chip is suppressed because one is
+                    // nominally being drawn, so the reader gets an unexplained
+                    // hole in the conversation.
+                    tracing::debug!(error = msg, url = %url, "image fetch failed");
+                    match &owner {
+                        ImageOwner::CircRoom(_) => {
+                            if let Some(s) = self.circ_mut() {
+                                s.note_image_failed(&url);
+                            }
+                        }
+                        ImageOwner::CmailConversation(_) => {
+                            if let Screen::Cmail(s) = &self.screen {
+                                s.note_image_failed(&url);
+                            }
+                        }
+                        ImageOwner::Feed => {
+                            if let Screen::Feed(s) = &self.screen {
+                                s.note_image_failed(&url);
+                            }
+                        }
+                        ImageOwner::Post(_) => {}
+                    }
+                }
             },
         }
     }
@@ -4101,6 +4534,8 @@ impl App {
         // in-flight refill walk so its result can't repopulate the cleared
         // pool after (re-)login.
         self.player_stop();
+        // A parked room belongs to the session that opened it.
+        self.drop_parked_circ();
         self.shuffle = false;
         self.shuffle_pool.clear();
         self.shuffle_epoch.fetch_add(1, Ordering::SeqCst);
@@ -4143,6 +4578,158 @@ impl App {
     /// The back stack counts: pushing search (or a profile) over an open room
     /// doesn't take the user out of it, and the room's streams keep running, so
     /// quitting from up there still has presence to withdraw.
+    /// The cIRC screen, on screen or parked.
+    ///
+    /// Background events have to reach the room even while the reader is
+    /// elsewhere, or a parked room would silently stop updating and the unread
+    /// Really let go of a cIRC room: stop its tasks and forget it.
+    ///
+    /// The counterpart to parking. Used when the reader leaves the room itself
+    /// rather than the tab, and on logout.
+    /// Enter a room: leave the previous one, start its tasks, reset the badge.
+    ///
+    /// Shared by the room list's Enter key and by a notification deep link, so
+    /// the two cannot drift into opening rooms differently.
+    fn enter_circ_room(&mut self, room_id: String) {
+        let previous = self.live_circ_room.replace(room_id.clone());
+        self.leave_circ_presence(previous);
+        self.circ_unread = 0;
+        if let Screen::Circ(s) = &mut self.screen {
+            s.open_room(&room_id);
+            if let Some(user_id) = self.viewer_user_id.clone() {
+                s.set_viewer_user_id(user_id);
+            }
+        }
+        // Walking into a room is activity, so the first heartbeat doesn't
+        // report an hour-old keystroke and read as idle.
+        self.circ_activity_ms.store(now_millis(), Ordering::Relaxed);
+        self.spawn_circ_messages(room_id.clone(), None);
+        self.spawn_circ_room_watch(room_id.clone());
+        self.spawn_circ_muted_users(room_id);
+    }
+
+    /// Open a cIRC room named by a `chat_mention`, remembering where we came
+    /// from so `Esc` goes back there rather than to the room list.
+    ///
+    /// The room list may not be loaded yet, and on a cold start it certainly is
+    /// not, so the slug is stashed and consumed once the list arrives. Anything
+    /// that fails along the way (no such room, the list never loads) simply
+    /// leaves the reader on the room list, which is a fair place to be.
+    fn circ_deep_link(&mut self, room_slug: String) {
+        self.circ_return_to = self.current_root;
+        // Armed *before* `goto_root`, because that now clears a stale origin
+        // whenever cIRC is reached any other way, and would otherwise wipe the
+        // one this link just set.
+        self.pending_circ_room = Some(room_slug.clone());
+        self.goto_root(RootKind::Circ);
+        // Resuming a parked room would ignore the link entirely, so a deep link
+        // always goes to the room it names.
+        if let Screen::Circ(s) = &self.screen {
+            if s.open_room_id() == Some(room_slug.as_str()) {
+                return;
+            }
+        }
+        // `goto_root` has already consumed `parked_circ` by this point, so the
+        // old drop-and-reload block here was dead code and the stated invariant
+        // "a deep link always goes to the room it names" did not hold. Check the
+        // *resumed* screen instead: if it came back into some other room, leave
+        // it properly before following the link.
+        let resumed_other = matches!(
+            &self.screen,
+            Screen::Circ(s) if s.open_room_id().is_some_and(|id| id != room_slug)
+        );
+        if resumed_other {
+            let leaving = self.live_circ_room.take();
+            self.leave_circ_presence(leaving);
+            self.drop_parked_circ();
+            self.screen = Screen::Circ(CircScreen::new());
+            self.spawn_circ_rooms();
+        }
+        self.try_open_pending_circ_room();
+    }
+
+    /// Enter the stashed deep-link room, if its slug is in the loaded list.
+    fn try_open_pending_circ_room(&mut self) {
+        let Some(slug) = self.pending_circ_room.clone() else {
+            return;
+        };
+        let (loaded, known) = match &self.screen {
+            Screen::Circ(s) => (
+                s.rooms.loaded,
+                s.rooms.items.iter().any(|r| r.room_id() == slug),
+            ),
+            _ => (false, false),
+        };
+        if !known {
+            // Disarm once the list has actually arrived and does not contain it.
+            // Left armed, a link to a room that no longer exists would fire on
+            // any later room-list load for the rest of the session, yanking the
+            // reader into a room they never asked for.
+            if loaded {
+                self.pending_circ_room = None;
+                self.circ_return_to = None;
+            }
+            return;
+        }
+        self.pending_circ_room = None;
+        self.enter_circ_room(slug);
+    }
+
+    fn drop_parked_circ(&mut self) {
+        self.parked_circ = None;
+        self.live_circ_room = None;
+        self.circ_unread = 0;
+        self.circ_stream_epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The cIRC screen, on screen or parked.
+    ///
+    /// Background events have to reach the room even while the reader is
+    /// elsewhere, or a parked room would silently stop updating and the unread
+    /// badge would count nothing.
+    fn circ_mut(&mut self) -> Option<&mut CircScreen> {
+        // Three places a live room can be, and all three must be reachable or
+        // its background events are silently thrown away:
+        //   1. on screen;
+        //   2. under a pushed screen (a profile opened with `p`, the `Ctrl+E`
+        //      editor, search) - the room is still open, just covered;
+        //   3. parked behind another tab.
+        // (2) was missed when parking was added. It mattered little while the
+        // REST poll healed it within 3s, and a great deal once that poll backed
+        // off to 45s, because the stream keeps stamping liveness whether or not
+        // the event was applied - so the poll stays slow exactly while the
+        // events it would replace are being dropped.
+        if matches!(&self.screen, Screen::Circ(_)) {
+            let Screen::Circ(s) = &mut self.screen else {
+                unreachable!("just matched")
+            };
+            return Some(s);
+        }
+        if let Some(s) = self
+            .back_stack
+            .iter_mut()
+            .rev()
+            .find_map(|screen| match screen {
+                Screen::Circ(s) => Some(s),
+                _ => None,
+            })
+        {
+            return Some(s);
+        }
+        self.parked_circ.as_deref_mut()
+    }
+
+    /// The same, read-only.
+    fn circ_ref(&self) -> Option<&CircScreen> {
+        std::iter::once(&self.screen)
+            .chain(self.back_stack.iter().rev())
+            .find_map(|screen| match screen {
+                Screen::Circ(s) => Some(s),
+                _ => None,
+            })
+            .or(self.parked_circ.as_deref())
+    }
+
     fn open_circ_room(&self) -> Option<String> {
         std::iter::once(&self.screen)
             .chain(self.back_stack.iter().rev())
@@ -4252,7 +4839,7 @@ impl App {
         self.cmail_stream_epoch.fetch_add(1, Ordering::SeqCst);
         let room = crate::config::get()
             .circ_presence
-            .then(|| self.open_circ_room())
+            .then(|| self.live_circ_room.clone())
             .flatten();
         let conversation = self.typing.take_published();
         if room.is_none() && conversation.is_none() {
@@ -4553,20 +5140,64 @@ impl App {
     }
 
     fn goto_root(&mut self, target: RootKind) {
-        // Leaving a section leaves whatever it was publishing about the user
-        // (§ Leave a Room, § Typing Indicator).
-        let open_room = self.open_circ_room();
-        self.leave_circ_presence(open_room);
+        // An open cIRC room is *parked*, not left: its streams, heartbeat and
+        // unread count keep running while the reader is on another tab, and it
+        // resumes as it was on return. Presence keeps being published, but
+        // `note_circ_activity` stops recording activity the moment cIRC is no
+        // longer the visible screen, so the server marks the reader idle rather
+        // than active. The spec's state for "present but not looking" is idle,
+        // not absent (§ Announce Your Presence).
+        // The room may be on screen, or under a pushed screen: `p` on a message
+        // opens a profile and `Ctrl+E` opens the editor, both of which push the
+        // CircScreen onto the back stack, and `back_stack.clear()` below is
+        // about to drop it. Without this the room's five tasks keep running and
+        // its presence keeps being published for a room with no screen anywhere.
+        let circ_in_stack = self
+            .back_stack
+            .iter()
+            .rposition(|s| matches!(s, Screen::Circ(_)));
+        if let Some(idx) = circ_in_stack {
+            if !matches!(&self.screen, Screen::Circ(_)) {
+                let taken = self.back_stack.remove(idx);
+                let has_room = matches!(&taken, Screen::Circ(s) if s.open_room_id().is_some());
+                match (target != RootKind::Circ && has_room, taken) {
+                    (true, Screen::Circ(s)) => self.parked_circ = Some(Box::new(s)),
+                    _ => {
+                        let leaving = self.live_circ_room.take();
+                        self.leave_circ_presence(leaving);
+                        self.drop_parked_circ();
+                    }
+                }
+            }
+        }
+        if matches!(&self.screen, Screen::Circ(_)) {
+            let in_room = matches!(&self.screen, Screen::Circ(s) if s.open_room_id().is_some());
+            if target != RootKind::Circ && in_room {
+                // A placeholder for the instant between taking the room out and
+                // the `match target` below assigning the real screen.
+                let taken = std::mem::replace(&mut self.screen, Screen::Circ(CircScreen::new()));
+                if let Screen::Circ(s) = taken {
+                    self.parked_circ = Some(Box::new(s));
+                }
+            } else {
+                // Either leaving cIRC from the room list, where there is
+                // nothing worth keeping alive, or pressing the cIRC key while
+                // already in a room. The second is the escape hatch back to the
+                // room list, and it is a real leave: the room is about to be
+                // replaced by a fresh list with no way back to it, so its
+                // streams, heartbeat and presence must stop with it. Parking
+                // without this leaked all three for a room the reader could no
+                // longer see.
+                let leaving = self.live_circ_room.take();
+                self.leave_circ_presence(leaving);
+                self.drop_parked_circ();
+            }
+        }
         self.leave_cmail_conversation();
-        // Withdrawing is not enough on its own: the room's heartbeat and both
-        // sections' streams are keyed on their generation, not on which screen
-        // is showing. Leaving the section without bumping them lets the next
-        // beat announce the user straight back into the room they just left,
-        // and leaves the conversation's poll and streams running for a
-        // conversation that is closed. Bump unconditionally, so every "left the
-        // section" path tears its tasks down; re-entering spawns a fresh
-        // generation anyway.
-        self.circ_stream_epoch.fetch_add(1, Ordering::SeqCst);
+        // The cIRC epoch is deliberately NOT bumped here any more: its tasks
+        // are keyed on their generation, and bumping would stop the very
+        // streams a parked room needs. C-Mail still tears down, since its
+        // conversation really is closed.
         self.cmail_stream_epoch.fetch_add(1, Ordering::SeqCst);
         self.back_stack.clear();
         self.current_root = Some(target);
@@ -4588,10 +5219,52 @@ impl App {
                 self.screen = Screen::Cmail(CmailScreen::new());
                 self.spawn_cmail_conversations();
             }
-            RootKind::Circ => {
-                self.screen = Screen::Circ(CircScreen::new());
-                self.spawn_circ_rooms();
+            // Reaching cIRC any other way than the deep link itself clears the
+            // remembered origin, or a later `Esc` from an unrelated room would
+            // teleport the reader to whatever tab a long-forgotten notification
+            // came from.
+            RootKind::Circ if self.pending_circ_room.is_none() => {
+                self.circ_return_to = None;
+                match self.parked_circ.take() {
+                    Some(parked) => {
+                        self.screen = Screen::Circ(*parked);
+                        let seen = self.circ_unread > 0;
+                        self.circ_unread = 0;
+                        self.ensure_circ_images_fetched();
+                        // Clearing the badge locally is only half of it: the
+                        // server still holds the room unread, so the website and
+                        // any other client keep showing it. Only when there was
+                        // something to clear, to stay well inside the 60/min
+                        // mark-read budget on rapid tab flipping.
+                        if seen {
+                            if let Some(room_id) = self.live_circ_room.clone() {
+                                self.spawn_circ_mark_read(room_id);
+                            }
+                        }
+                    }
+                    None => {
+                        self.screen = Screen::Circ(CircScreen::new());
+                        self.spawn_circ_rooms();
+                    }
+                }
             }
+            RootKind::Circ => match self.parked_circ.take() {
+                // Resume the room exactly as it was: history, draft, images and
+                // all. Its streams never stopped, so nothing needs respawning.
+                Some(parked) => {
+                    self.screen = Screen::Circ(*parked);
+                    self.circ_unread = 0;
+                    // Image fetching is gated on cIRC being the visible screen,
+                    // so pictures that arrived while parked were never asked
+                    // for. Without this they stay blank gaps until the next
+                    // message happens to trigger the driver.
+                    self.ensure_circ_images_fetched();
+                }
+                None => {
+                    self.screen = Screen::Circ(CircScreen::new());
+                    self.spawn_circ_rooms();
+                }
+            },
             RootKind::Bookmarks => {
                 self.screen = Screen::Bookmarks(BookmarksScreen::new());
                 self.spawn_bookmarks_initial();
@@ -4815,12 +5488,15 @@ impl App {
     fn spawn_cmail_stream(&self, conversation_id: String) {
         let epoch = self.cmail_stream_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         let epoch_ref = self.cmail_stream_epoch.clone();
+        // A fresh conversation distrusts its stream until it proves itself.
+        self.cmail_stream_live_ms.store(0, Ordering::Relaxed);
         tokio::spawn(cmail_stream_loop(
             self.client.clone(),
             self.bg_tx.clone(),
             conversation_id.clone(),
             epoch,
             epoch_ref.clone(),
+            self.cmail_stream_live_ms.clone(),
         ));
         tokio::spawn(cmail_conversation_poll_loop(
             self.client.clone(),
@@ -4828,6 +5504,7 @@ impl App {
             conversation_id.clone(),
             epoch,
             epoch_ref.clone(),
+            self.cmail_stream_live_ms.clone(),
         ));
         // The other participant's typing flag: the live node, plus one read so
         // an indicator that is already up shows before the first event.
@@ -4906,6 +5583,9 @@ impl App {
     fn spawn_circ_room_watch(&self, room_id: String) {
         let epoch = self.circ_stream_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         let epoch_ref = self.circ_stream_epoch.clone();
+        // A fresh room starts distrusting the stream, so the poll runs fast
+        // until this room's stream has actually said something.
+        self.circ_stream_live_ms.store(0, Ordering::Relaxed);
         // Live SSE.
         tokio::spawn(circ_stream_loop(
             self.client.clone(),
@@ -4913,14 +5593,16 @@ impl App {
             room_id.clone(),
             epoch,
             epoch_ref.clone(),
+            self.circ_stream_live_ms.clone(),
         ));
-        // Polling fallback (fast, so it feels like instant messaging).
+        // REST fallback, paced against whether the stream is actually working.
         tokio::spawn(circ_room_poll_loop(
             self.client.clone(),
             self.bg_tx.clone(),
             room_id.clone(),
             epoch,
             epoch_ref.clone(),
+            self.circ_stream_live_ms.clone(),
         ));
         // Who's in the room: one REST snapshot now, then the live node
         // (§ Who's in a room, § Reading a room in real time), plus a slow REST
@@ -5747,16 +6429,12 @@ impl App {
         self.ensure_detail_images_fetched();
     }
 
-    fn spawn_fetch_image(&self, post_id: String, url: String) {
+    fn spawn_fetch_image(&self, owner: ImageOwner, url: String) {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
             let result = client.fetch_image(&url).await.map_err(|e| e.to_string());
-            let _ = tx.send(BgEvent::ImageFetched {
-                post_id,
-                url,
-                result,
-            });
+            let _ = tx.send(BgEvent::ImageFetched { owner, url, result });
         });
     }
 
@@ -6893,11 +7571,18 @@ async fn cmail_conversation_poll_loop(
     conversation_id: String,
     epoch: u64,
     epoch_ref: Arc<AtomicU64>,
+    live_ms: Arc<AtomicI64>,
 ) {
-    // 4s: snappy for a DM while staying well under the 45/min read cap.
-    const POLL_SECS: u64 = 4;
+    // Paced off whether the stream is carrying, exactly as cIRC is: snappy for
+    // a DM when the poll is the delivery mechanism, nearly free when it is a
+    // safety net. Was a flat 4s, which assumed the stream never worked; since
+    // the SSE total-deadline fix it usually does.
     loop {
-        tokio::time::sleep(Duration::from_secs(POLL_SECS)).await;
+        tokio::time::sleep(circ_poll_interval(
+            live_ms.load(Ordering::Relaxed),
+            now_millis(),
+        ))
+        .await;
         if epoch != epoch_ref.load(Ordering::SeqCst) {
             return;
         }
@@ -6934,6 +7619,7 @@ async fn cmail_stream_loop(
     conversation_id: String,
     epoch: u64,
     epoch_ref: Arc<AtomicU64>,
+    live_ms: Arc<AtomicI64>,
 ) {
     // A JSON-string value for `orderBy`, percent-encoded, plus a bounded window —
     // both required by the RTDB security rules (v0.8.4 § Reading in real time).
@@ -6943,7 +7629,6 @@ async fn cmail_stream_loop(
     // ~1h token life, so this comfortably covers a long session while bounding a
     // pathological refresh/revoke loop.
     let mut reconnects: u32 = 0;
-    const MAX_RECONNECTS: u32 = 24;
 
     loop {
         if superseded(&epoch_ref) {
@@ -6956,22 +7641,50 @@ async fn cmail_stream_loop(
         let rtdb = match RtdbClient::new(tokens.rtdb_url, tokens.id_token) {
             Ok(c) => c,
             Err(e) => {
-                tracing::debug!(error = %e, "cmail rtdb client build failed; live updates off");
-                return;
+                // Retryable, same as cIRC: a transport error ends this
+                // connection, not the subscription.
+                tracing::debug!(error = %e, "cmail rtdb client build failed; live updates off; reconnecting");
+                break;
             }
         };
         let mut rx = match rtdb.subscribe(&path, &params).await {
             Ok(rx) => rx,
             Err(e) => {
-                tracing::debug!(error = %e, "cmail rtdb subscribe failed; live updates off");
-                return;
+                // A refused subscribe is an attempt, not the end. Only
+                // `circ_stream_loop` learned this; the rest returned, so one
+                // refusal ended live updates for the cmail message stream until the
+                // reader navigated away and back.
+                tracing::debug!(error = %e, "cmail rtdb subscribe failed; live updates off; reconnecting");
+                if superseded(&epoch_ref) {
+                    return;
+                }
+                reconnects += 1;
+                if reconnects > MAX_RECONNECT_ATTEMPTS {
+                    return;
+                }
+                tokio::time::sleep(reconnect_delay(reconnects)).await;
+                let _ = client.refresh().await;
+                continue;
             }
         };
 
+        // The subscription is live again, so the failure budget starts over.
+        // It counted *lifetime* drops before, which with the ladder widened from
+        // token-expiry-only to every close meant six disconnects for the whole
+        // life of the task. An hourly token refresh alone burned one each, so a
+        // long session reached "live updates lost" permanently while the network
+        // was perfectly healthy. Six *consecutive* failures is the intended
+        // meaning.
+        reconnects = 0;
         let mut token_expired = false;
         while let Some(ev) = rx.recv().await {
             if superseded(&epoch_ref) {
                 return;
+            }
+            // Anything at all, keepalives included, proves the stream carries;
+            // a quiet conversation would otherwise look like a dead one.
+            if ev.is_ok() {
+                live_ms.store(now_millis(), Ordering::Relaxed);
             }
             match ev {
                 Ok(SseEvent {
@@ -7016,14 +7729,19 @@ async fn cmail_stream_loop(
             }
         }
 
-        if !token_expired || superseded(&epoch_ref) {
+        if superseded(&epoch_ref) {
             return;
         }
+        // `token_expired` no longer gates the retry: a plain transport drop is
+        // just as worth reconnecting, and giving up on one meant live updates
+        // stopped for the rest of the conversation.
+        let _ = token_expired;
         reconnects += 1;
-        if reconnects > MAX_RECONNECTS || client.refresh().await.is_err() {
+        if reconnects > MAX_RECONNECT_ATTEMPTS {
             return;
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(reconnect_delay(reconnects)).await;
+        let _ = client.refresh().await;
     }
 }
 
@@ -7033,17 +7751,68 @@ async fn cmail_stream_loop(
 /// into the view (`apply_live` de-dupes). This is the reliable refresh path for
 /// the room — it works even when the SSE stream doesn't — at a fast cadence
 /// suited to chat. Stops when its stream generation is superseded (room left).
+/// Poll cadence when the stream is not demonstrably carrying: fast enough that
+/// the room reads as instant messaging with no stream at all.
+const FAST_POLL_SECS: u64 = 3;
+
+/// How long the cIRC REST poll waits, given when the stream was last heard from.
+///
+/// The cadence is earned, not assumed. While the stream is proving itself (an
+/// event, a keepalive, anything inside the trust window) the poll is a genuine
+/// safety net and can be slow. Before that, and any time the stream goes quiet,
+/// the poll *is* the delivery mechanism and has to be fast enough for a chat
+/// room.
+///
+/// A flat slow poll was the first attempt and it was wrong: it assumed the SSE
+/// timeout fix works against the live server, which is verified locally but not
+/// end to end. If that assumption were ever false, a flat slow poll would turn a
+/// three second worst case into a forty five second one. Pacing off observed
+/// liveness removes the assumption rather than betting on it, and self-corrects
+/// within one trust window if the stream dies mid-session.
+///
+/// `last_live_ms` of `0` means nothing has been heard yet, which is the state a
+/// freshly opened room starts in.
+fn circ_poll_interval(last_live_ms: i64, now_ms: i64) -> Duration {
+    const FAST_SECS: u64 = FAST_POLL_SECS;
+    /// Roughly 1.3 reads a minute against the 45/min cap.
+    const SLOW_SECS: u64 = 45;
+    /// Comfortably longer than Firebase's keepalive spacing, so an ordinary gap
+    /// between keepalives never trips the poll back into fast mode.
+    const TRUST_WINDOW_MS: i64 = 90_000;
+
+    let trusted = last_live_ms > 0 && now_ms.saturating_sub(last_live_ms) < TRUST_WINDOW_MS;
+    Duration::from_secs(if trusted { SLOW_SECS } else { FAST_SECS })
+}
+
 async fn circ_room_poll_loop(
     client: Client,
     tx: mpsc::UnboundedSender<BgEvent>,
     room_id: String,
     epoch: u64,
     epoch_ref: Arc<AtomicU64>,
+    live_ms: Arc<AtomicI64>,
 ) {
-    // 3s ≈ 20 reads/min, well under the 45/min cap while feeling near-instant.
-    const POLL_SECS: u64 = 3;
+    let interval = |live_ms: &Arc<AtomicI64>| {
+        circ_poll_interval(live_ms.load(Ordering::Relaxed), now_millis())
+    };
+    // Whether the poll last ran as a safety net or as the delivery mechanism.
+    // Logged only when it changes, so a debug run shows exactly when the live
+    // stream started or stopped carrying without a line every few seconds.
+    // This is the signal that answers "is SSE actually delivering", which
+    // cannot be settled from the tests alone.
+    let mut was_trusted: Option<bool> = None;
     loop {
-        tokio::time::sleep(Duration::from_secs(POLL_SECS)).await;
+        let wait = interval(&live_ms);
+        let trusted = wait.as_secs() > FAST_POLL_SECS;
+        if was_trusted != Some(trusted) {
+            was_trusted = Some(trusted);
+            if trusted {
+                tracing::debug!(room_id, "circ live stream is carrying; poll backing off");
+            } else {
+                tracing::debug!(room_id, "circ poll is the delivery mechanism; stream quiet");
+            }
+        }
+        tokio::time::sleep(wait).await;
         if epoch != epoch_ref.load(Ordering::SeqCst) {
             return;
         }
@@ -7126,18 +7895,41 @@ async fn circ_room_users_poll_loop(
     }
 }
 
+/// How many times a dropped live stream is re-established before giving up.
+///
+/// Exported so the room header can say "3/6" rather than just "reconnecting".
+pub const MAX_RECONNECT_ATTEMPTS: u32 = 6;
+
+/// How many image downloads may be in flight from one driver call.
+///
+/// Each is a detached task holding an HTTPS connection. A room or feed full of
+/// pictures used to start all of them at once; the remainder are picked up by
+/// the next call, which happens whenever anything new arrives.
+const MAX_IMAGE_FETCHES_AT_ONCE: usize = 4;
+
+/// Backoff before reconnect attempt `n` (1-based).
+///
+/// Ramps and then holds at fifteen seconds, so a brief blip recovers almost
+/// immediately while a real outage is not hammered. Six attempts spans roughly
+/// half a minute of backoff plus however long each attempt itself takes.
+fn reconnect_delay(attempt: u32) -> Duration {
+    const LADDER: [u64; 5] = [1, 2, 4, 8, 15];
+    let idx = (attempt.max(1) as usize - 1).min(LADDER.len() - 1);
+    Duration::from_secs(LADDER[idx])
+}
+
 async fn circ_stream_loop(
     client: Client,
     tx: mpsc::UnboundedSender<BgEvent>,
     room_id: String,
     epoch: u64,
     epoch_ref: Arc<AtomicU64>,
+    live_ms: Arc<AtomicI64>,
 ) {
     let params: [(&str, &str); 2] = [("orderBy", "%22timestamp%22"), ("limitToLast", "50")];
     let path = circ_messages_path(&room_id);
     let superseded = |epoch_ref: &Arc<AtomicU64>| epoch != epoch_ref.load(Ordering::SeqCst);
     let mut reconnects: u32 = 0;
-    const MAX_RECONNECTS: u32 = 24;
 
     loop {
         if superseded(&epoch_ref) {
@@ -7157,15 +7949,67 @@ async fn circ_stream_loop(
         let mut rx = match rtdb.subscribe(&path, &params).await {
             Ok(rx) => rx,
             Err(e) => {
-                tracing::debug!(error = %e, "circ rtdb subscribe failed; live updates off");
-                return;
+                // A failed reconnect is still a reconnect attempt, so fall
+                // through to the ladder instead of ending the subscription on
+                // the first refusal.
+                tracing::debug!(error = %e, "circ rtdb subscribe failed; reconnecting");
+                if superseded(&epoch_ref) {
+                    return;
+                }
+                reconnects += 1;
+                if reconnects > MAX_RECONNECT_ATTEMPTS {
+                    let _ = tx.send(BgEvent::CircStreamState {
+                        room_id: room_id.clone(),
+                        epoch,
+                        state: CircStreamState::Lost,
+                    });
+                    return;
+                }
+                let _ = tx.send(BgEvent::CircStreamState {
+                    room_id: room_id.clone(),
+                    epoch,
+                    state: CircStreamState::Reconnecting(reconnects),
+                });
+                tokio::time::sleep(reconnect_delay(reconnects)).await;
+                let _ = client.refresh().await;
+                continue;
             }
         };
 
+        // Back on the air. Sent unconditionally rather than only after a
+        // reconnect: it is idempotent, and it means the header cannot get stuck
+        // showing a stale "reconnecting" if an attempt succeeds.
+        if reconnects > 0
+            && tx
+                .send(BgEvent::CircStreamState {
+                    room_id: room_id.clone(),
+                    epoch,
+                    state: CircStreamState::Live,
+                })
+                .is_err()
+        {
+            return;
+        }
+
+        // The subscription is live again, so the failure budget starts over.
+        // It counted *lifetime* drops before, which with the ladder widened from
+        // token-expiry-only to every close meant six disconnects for the whole
+        // life of the task. An hourly token refresh alone burned one each, so a
+        // long session reached "live updates lost" permanently while the network
+        // was perfectly healthy. Six *consecutive* failures is the intended
+        // meaning.
+        reconnects = 0;
         let mut token_expired = false;
         while let Some(ev) = rx.recv().await {
             if superseded(&epoch_ref) {
                 return;
+            }
+            // Anything at all, keepalives included, proves the stream is
+            // carrying. Keepalives matter most: a quiet room produces no
+            // messages, and without counting them an idle room would look
+            // indistinguishable from a dead stream.
+            if ev.is_ok() {
+                live_ms.store(now_millis(), Ordering::Relaxed);
             }
             match ev {
                 Ok(SseEvent {
@@ -7206,20 +8050,52 @@ async fn circ_stream_loop(
                     ..
                 }) => {}
                 Err(e) => {
-                    tracing::debug!(error = %e, "circ rtdb stream error; live updates off");
-                    return;
+                    // Any transport error ends this connection but not the
+                    // subscription: fall through to the ladder rather than
+                    // giving up. This used to `return`, which meant a single
+                    // blip took live updates out for the rest of the session.
+                    tracing::debug!(error = %e, "circ rtdb stream error; reconnecting");
+                    break;
                 }
             }
         }
 
-        if !token_expired || superseded(&epoch_ref) {
+        if superseded(&epoch_ref) {
             return;
         }
+        // Every close is retryable except an explicit `cancel` (handled above by
+        // returning): EOF, a transport error and `auth_revoked` all mean the
+        // same thing to a reader, which is that the room stopped being live.
         reconnects += 1;
-        if reconnects > MAX_RECONNECTS || client.refresh().await.is_err() {
+        if reconnects > MAX_RECONNECT_ATTEMPTS {
+            let _ = tx.send(BgEvent::CircStreamState {
+                room_id: room_id.clone(),
+                epoch,
+                state: CircStreamState::Lost,
+            });
             return;
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        if tx
+            .send(BgEvent::CircStreamState {
+                room_id: room_id.clone(),
+                epoch,
+                state: CircStreamState::Reconnecting(reconnects),
+            })
+            .is_err()
+        {
+            return;
+        }
+        tokio::time::sleep(reconnect_delay(reconnects)).await;
+        // Refresh unconditionally: the token is the one cause we can actually
+        // fix, and a refresh that was not needed is cheap.
+        if client.refresh().await.is_err() && token_expired {
+            let _ = tx.send(BgEvent::CircStreamState {
+                room_id: room_id.clone(),
+                epoch,
+                state: CircStreamState::Lost,
+            });
+            return;
+        }
     }
 }
 
@@ -7240,7 +8116,6 @@ async fn circ_presence_stream_loop(
     let path = circ_presence_path(&room_id);
     let superseded = |epoch_ref: &Arc<AtomicU64>| epoch != epoch_ref.load(Ordering::SeqCst);
     let mut reconnects: u32 = 0;
-    const MAX_RECONNECTS: u32 = 24;
 
     loop {
         if superseded(&epoch_ref) {
@@ -7260,11 +8135,32 @@ async fn circ_presence_stream_loop(
         let mut rx = match rtdb.subscribe(&path, &[]).await {
             Ok(rx) => rx,
             Err(e) => {
-                tracing::debug!(error = %e, "circ presence subscribe failed; roster falls back to the REST poll");
-                return;
+                // A refused subscribe is an attempt, not the end. Only
+                // `circ_stream_loop` learned this; the rest returned, so one
+                // refusal ended live updates for the circ presence stream until the
+                // reader navigated away and back.
+                tracing::debug!(error = %e, "circ presence subscribe failed; roster falls back to the REST poll; reconnecting");
+                if superseded(&epoch_ref) {
+                    return;
+                }
+                reconnects += 1;
+                if reconnects > MAX_RECONNECT_ATTEMPTS {
+                    return;
+                }
+                tokio::time::sleep(reconnect_delay(reconnects)).await;
+                let _ = client.refresh().await;
+                continue;
             }
         };
 
+        // The subscription is live again, so the failure budget starts over.
+        // It counted *lifetime* drops before, which with the ladder widened from
+        // token-expiry-only to every close meant six disconnects for the whole
+        // life of the task. An hourly token refresh alone burned one each, so a
+        // long session reached "live updates lost" permanently while the network
+        // was perfectly healthy. Six *consecutive* failures is the intended
+        // meaning.
+        reconnects = 0;
         let mut token_expired = false;
         while let Some(ev) = rx.recv().await {
             if superseded(&epoch_ref) {
@@ -7306,20 +8202,33 @@ async fn circ_presence_stream_loop(
                     ..
                 }) => {}
                 Err(e) => {
-                    tracing::debug!(error = %e, "circ presence stream error; roster falls back to the REST poll");
-                    return;
+                    // Retryable, same as the message stream. Tracked on this
+                    // loop's own counter: the two drop and recover
+                    // independently, so one shared counter would let a healthy
+                    // stream's success reset a failing stream's backoff.
+                    tracing::debug!(error = %e, "circ presence stream error; reconnecting");
+                    break;
                 }
             }
         }
 
-        if !token_expired || superseded(&epoch_ref) {
+        if superseded(&epoch_ref) {
             return;
         }
+        // `token_expired` no longer gates the retry: a plain transport drop is
+        // just as worth reconnecting, and the roster going quietly stale was the
+        // whole complaint. Kept only so the terminal-event arm still has
+        // somewhere to record what it saw.
+        let _ = token_expired;
         reconnects += 1;
-        if reconnects > MAX_RECONNECTS || client.refresh().await.is_err() {
+        if reconnects > MAX_RECONNECT_ATTEMPTS {
             return;
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(reconnect_delay(reconnects)).await;
+        // Deliberately no header indicator for this one: the roster is
+        // supplementary, it has its own 30s REST fallback, and a second banner
+        // would crowd the one that matters.
+        let _ = client.refresh().await;
     }
 }
 
@@ -7399,7 +8308,6 @@ async fn cmail_presence_stream_loop(
     let path = cmail_presence_path(&conversation_id);
     let superseded = |epoch_ref: &Arc<AtomicU64>| epoch != epoch_ref.load(Ordering::SeqCst);
     let mut reconnects: u32 = 0;
-    const MAX_RECONNECTS: u32 = 24;
 
     loop {
         if superseded(&epoch_ref) {
@@ -7412,18 +8320,41 @@ async fn cmail_presence_stream_loop(
         let rtdb = match RtdbClient::new(tokens.rtdb_url, tokens.id_token) {
             Ok(c) => c,
             Err(e) => {
-                tracing::debug!(error = %e, "cmail presence rtdb client build failed");
-                return;
+                // Retryable, same as cIRC: a transport error ends this
+                // connection, not the subscription.
+                tracing::debug!(error = %e, "cmail presence rtdb client build failed; reconnecting");
+                break;
             }
         };
         let mut rx = match rtdb.subscribe(&path, &[]).await {
             Ok(rx) => rx,
             Err(e) => {
-                tracing::debug!(error = %e, "cmail presence subscribe failed; indicator off");
-                return;
+                // A refused subscribe is an attempt, not the end. Only
+                // `circ_stream_loop` learned this; the rest returned, so one
+                // refusal ended live updates for the cmail presence stream until the
+                // reader navigated away and back.
+                tracing::debug!(error = %e, "cmail presence subscribe failed; indicator off; reconnecting");
+                if superseded(&epoch_ref) {
+                    return;
+                }
+                reconnects += 1;
+                if reconnects > MAX_RECONNECT_ATTEMPTS {
+                    return;
+                }
+                tokio::time::sleep(reconnect_delay(reconnects)).await;
+                let _ = client.refresh().await;
+                continue;
             }
         };
 
+        // The subscription is live again, so the failure budget starts over.
+        // It counted *lifetime* drops before, which with the ladder widened from
+        // token-expiry-only to every close meant six disconnects for the whole
+        // life of the task. An hourly token refresh alone burned one each, so a
+        // long session reached "live updates lost" permanently while the network
+        // was perfectly healthy. Six *consecutive* failures is the intended
+        // meaning.
+        reconnects = 0;
         let mut token_expired = false;
         while let Some(ev) = rx.recv().await {
             if superseded(&epoch_ref) {
@@ -7471,14 +8402,19 @@ async fn cmail_presence_stream_loop(
             }
         }
 
-        if !token_expired || superseded(&epoch_ref) {
+        if superseded(&epoch_ref) {
             return;
         }
+        // `token_expired` no longer gates the retry: a plain transport drop is
+        // just as worth reconnecting, and giving up on one meant live updates
+        // stopped for the rest of the conversation.
+        let _ = token_expired;
         reconnects += 1;
-        if reconnects > MAX_RECONNECTS || client.refresh().await.is_err() {
+        if reconnects > MAX_RECONNECT_ATTEMPTS {
             return;
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(reconnect_delay(reconnects)).await;
+        let _ = client.refresh().await;
     }
 }
 
@@ -7489,7 +8425,6 @@ async fn cmail_presence_stream_loop(
 async fn cmail_conversations_stream_loop(client: Client, tx: mpsc::UnboundedSender<BgEvent>) {
     tokio::time::sleep(Duration::from_secs(3)).await;
     let mut reconnects: u32 = 0;
-    const MAX_RECONNECTS: u32 = 24;
 
     loop {
         let tokens = client.tokens().await;
@@ -7516,11 +8451,28 @@ async fn cmail_conversations_stream_loop(client: Client, tx: mpsc::UnboundedSend
         let mut rx = match rtdb.subscribe(&path, &[]).await {
             Ok(rx) => rx,
             Err(e) => {
-                tracing::debug!(error = %e, "cmail conversations subscribe failed; badge stays on poll");
-                return;
+                // This loop is spawned once per session and never respawned, so
+                // returning here pinned the unread badge to its slow poll for
+                // the rest of the session with no recovery path at all.
+                tracing::debug!(error = %e, "cmail conversations subscribe failed; reconnecting");
+                reconnects += 1;
+                if reconnects > MAX_RECONNECT_ATTEMPTS {
+                    return;
+                }
+                tokio::time::sleep(reconnect_delay(reconnects)).await;
+                let _ = client.refresh().await;
+                continue;
             }
         };
 
+        // The subscription is live again, so the failure budget starts over.
+        // It counted *lifetime* drops before, which with the ladder widened from
+        // token-expiry-only to every close meant six disconnects for the whole
+        // life of the task. An hourly token refresh alone burned one each, so a
+        // long session reached "live updates lost" permanently while the network
+        // was perfectly healthy. Six *consecutive* failures is the intended
+        // meaning.
+        reconnects = 0;
         let mut token_expired = false;
         while let Some(ev) = rx.recv().await {
             match ev {
@@ -7557,20 +8509,22 @@ async fn cmail_conversations_stream_loop(client: Client, tx: mpsc::UnboundedSend
                     ..
                 }) => {}
                 Err(e) => {
-                    tracing::debug!(error = %e, "cmail conversations stream error; badge stays on poll");
-                    return;
+                    // Retryable, like the other streams. This one drives the
+                    // unread badge; giving up on it left the badge on its slow
+                    // poll for the rest of the session.
+                    tracing::debug!(error = %e, "cmail conversations stream error; reconnecting");
+                    break;
                 }
             }
         }
 
-        if !token_expired {
-            return;
-        }
+        let _ = token_expired;
         reconnects += 1;
-        if reconnects > MAX_RECONNECTS || client.refresh().await.is_err() {
+        if reconnects > MAX_RECONNECT_ATTEMPTS {
             return;
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(reconnect_delay(reconnects)).await;
+        let _ = client.refresh().await;
     }
 }
 
@@ -7645,6 +8599,76 @@ fn first_line(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_poll_runs_fast_until_the_stream_has_proved_itself() {
+        // A freshly opened room has heard nothing, so the poll is the delivery
+        // mechanism and must stay at the old chat-grade cadence.
+        let now = 1_000_000_000;
+        assert_eq!(
+            super::circ_poll_interval(0, now).as_secs(),
+            3,
+            "nothing heard yet: poll like there is no stream at all",
+        );
+    }
+
+    #[test]
+    fn the_poll_backs_off_only_while_the_stream_is_carrying() {
+        let now = 1_000_000_000;
+        // Heard from a moment ago: the stream is doing the work.
+        assert_eq!(super::circ_poll_interval(now - 1_000, now).as_secs(), 45);
+        // Still inside the trust window, which is wider than Firebase's
+        // keepalive spacing so an ordinary quiet gap is not mistaken for death.
+        assert_eq!(super::circ_poll_interval(now - 89_000, now).as_secs(), 45);
+    }
+
+    #[test]
+    fn the_poll_speeds_back_up_when_the_stream_goes_quiet() {
+        // The property that makes the backoff safe: if the stream dies
+        // mid-session, this self-corrects within one trust window rather than
+        // leaving the reader on a 45s worst case.
+        let now = 1_000_000_000;
+        assert_eq!(
+            super::circ_poll_interval(now - 91_000, now).as_secs(),
+            3,
+            "a stream that stopped talking is not a stream",
+        );
+    }
+
+    #[test]
+    fn a_clock_that_jumps_backwards_does_not_strand_the_poll() {
+        // `saturating_sub` rather than a panic or a huge wrapped gap: a
+        // timestamp in the future reads as recent, which errs toward the slow
+        // poll only while the stream really was just heard from.
+        let now = 1_000_000_000;
+        assert_eq!(super::circ_poll_interval(now + 5_000, now).as_secs(), 45);
+    }
+
+    #[test]
+    fn the_reconnect_ladder_ramps_then_holds() {
+        // Ramp so a blip recovers almost at once, hold so a real outage is not
+        // hammered. Attempt 0 is defensive: callers pass a 1-based count.
+        let secs: Vec<u64> = (0..=MAX_RECONNECT_ATTEMPTS)
+            .map(|n| super::reconnect_delay(n).as_secs())
+            .collect();
+        assert_eq!(secs, vec![1, 1, 2, 4, 8, 15, 15]);
+    }
+
+    #[test]
+    fn the_ladder_spends_about_half_a_minute_before_giving_up() {
+        // The budget before the header says "live updates lost": long enough
+        // to ride out a blip, short enough that a reader is not left guessing.
+        // Roughly three quarters of a minute of backoff, plus however long each
+        // attempt itself takes to fail.
+        let total: u64 = (1..=MAX_RECONNECT_ATTEMPTS)
+            .map(|n| super::reconnect_delay(n).as_secs())
+            .sum();
+        assert_eq!(
+            total, 45,
+            "six attempts, delayed 1+2+4+8+15+15: the ladder holds at fifteen \
+             seconds rather than ending, so the last two attempts cost the same"
+        );
+    }
+
     use super::*;
 
     /// Flatten a rendered test buffer into one string for substring assertions.
@@ -9218,7 +10242,7 @@ mod tests {
     }
 
     #[test]
-    fn the_account_id_reaches_an_open_room_and_gates_the_select_keys() {
+    fn the_account_id_reaches_an_open_room_and_gates_the_action_keys() {
         let mut app = test_app();
         app.screen = Screen::Circ(circ_room_screen(
             "general",
@@ -9229,9 +10253,9 @@ mod tests {
 
         let mut screen = std::mem::replace(&mut app.screen, Screen::Feed(FeedScreen::new()));
         assert_eq!(
-            App::route_key(&mut screen, kev_ctrl(KeyCode::Char('b'))),
+            App::route_key(&mut screen, kev_ctrl(KeyCode::Char('a'))),
             Action::None,
-            "Ctrl+B enters message-select mode"
+            "Ctrl+A opens the message action menu"
         );
         assert_eq!(
             App::route_key(&mut screen, kev(KeyCode::Char('F'))),
@@ -9253,13 +10277,13 @@ mod tests {
     }
 
     #[test]
-    fn m_in_select_mode_asks_the_shell_to_mute_the_author() {
+    fn m_in_the_action_menu_asks_the_shell_to_mute_the_author() {
         let mut screen = Screen::Circ(circ_room_screen(
             "general",
             vec![circ_message("m1", "loud", "advert")],
         ));
         assert_eq!(
-            App::route_key(&mut screen, kev_ctrl(KeyCode::Char('b'))),
+            App::route_key(&mut screen, kev_ctrl(KeyCode::Char('a'))),
             Action::None
         );
         assert_eq!(
@@ -9655,25 +10679,366 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn leaving_a_section_tears_down_both_sections_live_tasks() {
-        // Regression: goto_root sent the polite leave-DELETE but left the stream
-        // generations alone, so the cIRC presence heartbeat sailed past its
-        // epoch guard and announced the user straight back into the room they
-        // had just left, for the rest of the session. The C-Mail half leaked the
-        // conversation's 4s poll and both of its streams the same way.
+    async fn leaving_a_section_tears_down_the_conversations_live_tasks() {
+        // Regression: goto_root sent the polite leave-DELETE but left the
+        // stream generations alone, so a section's background tasks sailed past
+        // their epoch guard and kept running for something already closed.
+        //
+        // The cIRC half of this deliberately changed in Phase 4: an open room
+        // is now *parked* rather than left, so its tasks are meant to survive a
+        // tab switch. The three tests below cover what replaced it.
         let mut app = test_app();
-        let circ_before = app.circ_stream_epoch.load(Ordering::SeqCst);
         let cmail_before = app.cmail_stream_epoch.load(Ordering::SeqCst);
 
         app.goto_root(RootKind::Feed);
 
         assert!(
-            app.circ_stream_epoch.load(Ordering::SeqCst) > circ_before,
-            "the room's heartbeat and streams must be invalidated on the way out",
-        );
-        assert!(
             app.cmail_stream_epoch.load(Ordering::SeqCst) > cmail_before,
             "the conversation's poll and streams must be invalidated on the way out",
+        );
+    }
+
+    fn app_in_a_room() -> App {
+        let mut app = test_app();
+        let mut circ = CircScreen::new();
+        circ.apply_rooms(Ok(vec![cs_api::CircRoom {
+            slug: "general".into(),
+            ..Default::default()
+        }]));
+        circ.open_room("general");
+        app.screen = Screen::Circ(circ);
+        app
+    }
+
+    #[tokio::test]
+    async fn a_picture_we_hold_opens_in_the_modal_rather_than_the_browser() {
+        // Without a picker there is nothing to draw, so this must still fall
+        // through to the browser: that is the behaviour every terminal without
+        // graphics keeps.
+        let app = test_app();
+        assert!(app.picker.is_none(), "precondition: no graphics in tests");
+        assert!(
+            app.held_image_bytes("https://cdn.example/pic.png")
+                .is_none(),
+            "nothing is offered to the modal when we could not draw it",
+        );
+    }
+
+    #[tokio::test]
+    async fn esc_closes_the_image_modal_without_leaving_the_room() {
+        // The bug an adversarial review found: the modal check sat below Esc,
+        // the section nav, Ctrl+F and the player keys, so Esc closed nothing,
+        // left the room, wiped the composer draft and left the picture painted
+        // over the room list. The old test passed only because it used `q` on
+        // the Feed, the one case the ordering happened to get right.
+        let mut app = app_in_a_room();
+        if let Screen::Circ(s) = &mut app.screen {
+            s.set_draft_and_focus("half a message".into());
+        }
+        app.live_circ_room = Some("general".into());
+        app.image_modal = Some(("u".into(), vec![1]));
+
+        app.handle_terminal_event(Event::Key(event::KeyEvent::from(KeyCode::Esc)))
+            .await;
+
+        assert!(app.image_modal.is_none(), "the picture closed");
+        assert!(
+            matches!(&app.screen, Screen::Circ(s) if s.open_room_id() == Some("general")),
+            "and the reader is still in the room",
+        );
+        assert!(
+            app.live_circ_room.is_some(),
+            "so the room was not left behind the picture",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_digit_does_not_change_tab_underneath_the_image_modal() {
+        // The same ordering bug via the 1-8 section navigation.
+        let mut app = app_in_a_room();
+        app.current_root = Some(RootKind::Circ);
+        app.image_modal = Some(("u".into(), vec![1]));
+
+        app.handle_terminal_event(Event::Key(event::KeyEvent::from(KeyCode::Char('2'))))
+            .await;
+
+        assert!(app.image_modal.is_none());
+        assert_eq!(
+            app.current_root,
+            Some(RootKind::Circ),
+            "the key closed the picture and did nothing else",
+        );
+    }
+
+    #[tokio::test]
+    async fn any_key_closes_the_image_modal_and_forces_a_repaint() {
+        // The picture is painted in pixels over the cells, and ratatui only
+        // repaints cells it believes changed, so closing has to force a clear
+        // or the image stays on screen over the frame beneath it.
+        let mut app = test_app();
+        app.image_modal = Some(("u".into(), vec![1, 2, 3]));
+        app.force_clear = false;
+
+        app.handle_terminal_event(Event::Key(event::KeyEvent::from(KeyCode::Char('j'))))
+            .await;
+
+        assert!(app.image_modal.is_none(), "the modal closed");
+        assert!(app.force_clear, "and the frame underneath is redrawn");
+    }
+
+    #[tokio::test]
+    async fn a_key_that_closes_the_modal_does_nothing_else() {
+        // The keystroke means "close this". Letting it also reach the screen
+        // would delete a post or send a message the reader never intended.
+        let mut app = test_app();
+        let mut feed = FeedScreen::new();
+        feed.apply_initial(Ok((vec![], None)));
+        app.screen = Screen::Feed(feed);
+        app.image_modal = Some(("u".into(), vec![1]));
+        // `q` quits from the feed; if the modal leaked the key through, this
+        // would end the session instead of closing a picture.
+        app.handle_terminal_event(Event::Key(event::KeyEvent::from(KeyCode::Char('q'))))
+            .await;
+
+        assert!(app.image_modal.is_none(), "the modal closed");
+        assert!(
+            !app.should_quit,
+            "and the key that closed it did nothing else",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deep_link_waits_for_the_room_list_then_opens_the_room() {
+        // On a cold jump the list is not loaded yet, so the slug has to be
+        // stashed and consumed when it arrives rather than dropped.
+        let mut app = test_app();
+        app.current_root = Some(RootKind::Notifications);
+        app.circ_deep_link("general".into());
+        assert_eq!(app.pending_circ_room.as_deref(), Some("general"));
+
+        app.handle_bg_event(BgEvent::CircRooms(Ok(vec![cs_api::CircRoom {
+            slug: "general".into(),
+            ..Default::default()
+        }])));
+
+        assert!(app.pending_circ_room.is_none(), "the link was consumed");
+        assert_eq!(app.live_circ_room.as_deref(), Some("general"));
+    }
+
+    #[tokio::test]
+    async fn a_deep_link_to_a_room_that_is_not_listed_leaves_the_reader_on_the_list() {
+        let mut app = test_app();
+        app.circ_deep_link("ghost".into());
+        app.handle_bg_event(BgEvent::CircRooms(Ok(vec![cs_api::CircRoom {
+            slug: "general".into(),
+            ..Default::default()
+        }])));
+        assert!(
+            app.live_circ_room.is_none(),
+            "no such room, so nothing is opened and the room list stands",
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unresolvable_deep_link_disarms_itself() {
+        // Left armed, a link to a room that no longer exists fired on any later
+        // room-list load for the rest of the session, yanking the reader into a
+        // room they never asked for.
+        let mut app = test_app();
+        app.current_root = Some(RootKind::Notifications);
+        app.circ_deep_link("ghost".into());
+        app.handle_bg_event(BgEvent::CircRooms(Ok(vec![cs_api::CircRoom {
+            slug: "general".into(),
+            ..Default::default()
+        }])));
+        assert!(app.pending_circ_room.is_none(), "the link disarmed");
+        assert!(app.circ_return_to.is_none(), "and so did its origin");
+    }
+
+    #[tokio::test]
+    async fn reaching_circ_through_the_tab_bar_forgets_a_stale_deep_link_origin() {
+        // Otherwise a later Esc from an unrelated room teleports the reader to
+        // whatever tab a long-forgotten notification came from.
+        let mut app = test_app();
+        app.circ_return_to = Some(RootKind::Notifications);
+        app.goto_root(RootKind::Circ);
+        assert!(app.circ_return_to.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_deep_link_remembers_where_it_came_from() {
+        let mut app = test_app();
+        app.current_root = Some(RootKind::Notifications);
+        app.circ_deep_link("general".into());
+        assert_eq!(
+            app.circ_return_to,
+            Some(RootKind::Notifications),
+            "Esc from a deep-linked room goes back to the notification, not to \
+             a room list the reader never saw",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_parked_room_counts_unread_and_the_badge_clears_on_return() {
+        let mut app = app_in_a_room();
+        app.goto_root(RootKind::Feed);
+
+        // A message arrives while the reader is on the Feed.
+        let epoch = app.circ_stream_epoch.load(Ordering::SeqCst);
+        app.handle_bg_event(BgEvent::CircLive {
+            room_id: "general".into(),
+            epoch,
+            updates: vec![cs_api::CircMessageUpdate::Full(cs_api::CircMessage {
+                id: "m1".into(),
+                username: "trinity".into(),
+                content: "you around?".into(),
+                timestamp: 1,
+                ..Default::default()
+            })],
+        });
+
+        assert_eq!(app.circ_unread, 1, "the badge counts what was missed");
+        assert!(
+            app.parked_circ
+                .as_ref()
+                .is_some_and(|s| !s.render_probe_is_empty()),
+            "and the message really landed in the parked room, not nowhere",
+        );
+
+        app.goto_root(RootKind::Circ);
+        assert_eq!(app.circ_unread, 0, "coming back clears it");
+        assert!(app.parked_circ.is_none(), "and the room is on screen again");
+    }
+
+    #[tokio::test]
+    async fn a_room_under_a_pushed_screen_is_not_leaked_on_a_tab_switch() {
+        // `p` on a message pushes a profile over the room, so the CircScreen
+        // moves into the back stack. `goto_root` only looked at `self.screen`,
+        // then cleared the back stack - dropping the only CircScreen while its
+        // five tasks kept running and its presence kept being published.
+        let mut app = app_in_a_room();
+        app.live_circ_room = Some("general".into());
+        // Any pushed screen does; a profile is the real case (`p` on a
+        // message), and the Feed is the cheapest to build.
+        let covered = std::mem::replace(&mut app.screen, Screen::Feed(FeedScreen::new()));
+        app.back_stack.push(covered);
+
+        app.goto_root(RootKind::Feed);
+
+        assert!(
+            app.parked_circ.is_some(),
+            "the covered room is parked, not dropped",
+        );
+        assert_eq!(
+            app.live_circ_room.as_deref(),
+            Some("general"),
+            "and it is still ours, so its tasks are still wanted",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_event_reaches_a_room_under_a_pushed_screen() {
+        // Pre-existing, but Task 2.5 made it matter: the poll that used to heal
+        // this within 3s now backs off to 45s while the stream keeps stamping
+        // liveness, so dropped events are not replaced for the better part of a
+        // minute.
+        let mut app = app_in_a_room();
+        // Any pushed screen does; a profile is the real case (`p` on a
+        // message), and the Feed is the cheapest to build.
+        let covered = std::mem::replace(&mut app.screen, Screen::Feed(FeedScreen::new()));
+        app.back_stack.push(covered);
+
+        let epoch = app.circ_stream_epoch.load(Ordering::SeqCst);
+        app.handle_bg_event(BgEvent::CircLive {
+            room_id: "general".into(),
+            epoch,
+            updates: vec![cs_api::CircMessageUpdate::Full(cs_api::CircMessage {
+                id: "m1".into(),
+                username: "trinity".into(),
+                content: "you around?".into(),
+                timestamp: 1,
+                ..Default::default()
+            })],
+        });
+
+        let landed = app
+            .back_stack
+            .iter()
+            .any(|s| matches!(s, Screen::Circ(c) if !c.render_probe_is_empty()));
+        assert!(landed, "the message reached the covered room");
+    }
+
+    #[tokio::test]
+    async fn leaving_the_circ_tab_parks_an_open_room_instead_of_ending_it() {
+        let mut app = app_in_a_room();
+        let epoch_before = app.circ_stream_epoch.load(Ordering::SeqCst);
+
+        app.goto_root(RootKind::Feed);
+
+        assert!(
+            app.parked_circ.is_some(),
+            "the room keeps its history, draft and caches for the return trip",
+        );
+        assert_eq!(
+            app.circ_stream_epoch.load(Ordering::SeqCst),
+            epoch_before,
+            "and its streams and heartbeat must NOT be invalidated: the reader \
+             is still in the room, just not looking at it",
+        );
+    }
+
+    #[tokio::test]
+    async fn pressing_the_circ_key_while_in_a_room_really_leaves_it() {
+        // The documented escape hatch back to the room list. Found in review:
+        // parking made this drop the screen while leaving the room's streams,
+        // heartbeat and presence running for a room with no way back to it.
+        let mut app = app_in_a_room();
+        app.live_circ_room = Some("general".into());
+        let epoch_before = app.circ_stream_epoch.load(Ordering::SeqCst);
+
+        app.goto_root(RootKind::Circ);
+
+        assert!(
+            app.circ_stream_epoch.load(Ordering::SeqCst) > epoch_before,
+            "the room's tasks must stop: it is gone from the screen for good",
+        );
+        assert!(app.live_circ_room.is_none(), "and it is no longer ours");
+        assert!(app.parked_circ.is_none());
+        assert!(
+            matches!(&app.screen, Screen::Circ(s) if s.open_room_id().is_none()),
+            "landing on the room list is the point of the escape hatch",
+        );
+    }
+
+    #[tokio::test]
+    async fn leaving_the_circ_tab_from_the_room_list_ends_it() {
+        // Nothing worth keeping alive, so this still tears down.
+        let mut app = test_app();
+        app.screen = Screen::Circ(CircScreen::new());
+        let epoch_before = app.circ_stream_epoch.load(Ordering::SeqCst);
+
+        app.goto_root(RootKind::Feed);
+
+        assert!(app.parked_circ.is_none());
+        assert!(app.circ_stream_epoch.load(Ordering::SeqCst) > epoch_before);
+    }
+
+    #[tokio::test]
+    async fn really_leaving_a_room_still_invalidates_its_heartbeat() {
+        // The bug this file has protected against since: without the epoch bump
+        // the presence heartbeat announces the reader straight back into a room
+        // they actually left, for the rest of the session. Parking must not
+        // have weakened that.
+        let mut app = app_in_a_room();
+        app.goto_root(RootKind::Feed);
+        let parked_epoch = app.circ_stream_epoch.load(Ordering::SeqCst);
+
+        app.drop_parked_circ();
+
+        assert!(app.parked_circ.is_none());
+        assert!(
+            app.circ_stream_epoch.load(Ordering::SeqCst) > parked_epoch,
+            "leaving the room for real must still stop its heartbeat",
         );
     }
 

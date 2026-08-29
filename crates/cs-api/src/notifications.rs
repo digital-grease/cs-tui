@@ -167,6 +167,20 @@ pub struct NotificationMetadata {
     /// Set on guild-thread notifications.
     #[serde(default)]
     pub is_guild_thread: Option<bool>,
+
+    /// cIRC room slug, on a `chat_mention`, for jumping to the room.
+    ///
+    /// Undocumented: § Notification object lists `targetType` as only `post` or
+    /// `reply` and describes `metadata` as open-ended, so a chat mention carries
+    /// no documented deep-link target. This key is what the server actually
+    /// sends, so it is read optionally and everything degrades to the old
+    /// behaviour when it is absent.
+    #[serde(default)]
+    pub room_slug: Option<String>,
+
+    /// cIRC room display name, alongside [`Self::room_slug`].
+    #[serde(default)]
+    pub room_name: Option<String>,
 }
 
 /// A notification record. Shape per API v0.8.6 § Notification object: the actor is
@@ -289,6 +303,22 @@ impl Notification {
     /// Original thread author, for `thread_reply` summaries.
     pub fn thread_author(&self) -> Option<&str> {
         self.metadata.author_username.as_deref()
+    }
+
+    /// The cIRC room a `chat_mention` points at, when the server named one.
+    ///
+    /// `None` for every other type, and for a `chat_mention` whose metadata
+    /// omits it, so a caller can treat the deep link as best-effort.
+    #[must_use]
+    pub fn chat_room_slug(&self) -> Option<&str> {
+        if self.kind != NotificationType::ChatMention {
+            return None;
+        }
+        self.metadata
+            .room_slug
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
     }
 
     /// Guild display name, for `guild_new_thread` summaries.
@@ -510,6 +540,38 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_chat_mention_carries_its_room_in_metadata() {
+        // Undocumented but real: the spec lists targetType as only post/reply,
+        // so a chat mention has no documented deep-link target and this key is
+        // the only way to know which room it means.
+        let n: Notification = serde_json::from_str(
+            r#"{"id":"n1","type":"chat_mention","actorUsername":"trinity",
+                "metadata":{"roomSlug":"general","roomName":"General"}}"#,
+        )
+        .unwrap();
+        assert_eq!(n.chat_room_slug(), Some("general"));
+        assert_eq!(n.metadata.room_name.as_deref(), Some("General"));
+    }
+
+    #[test]
+    fn a_chat_mention_without_a_room_degrades_instead_of_guessing() {
+        let n: Notification =
+            serde_json::from_str(r#"{"id":"n1","type":"chat_mention","actorUsername":"trinity"}"#)
+                .unwrap();
+        assert_eq!(n.chat_room_slug(), None);
+    }
+
+    #[test]
+    fn only_a_chat_mention_reports_a_room() {
+        // A stray roomSlug on another type is not a chat mention, and following
+        // it would take the reader somewhere they did not ask to go.
+        let n: Notification =
+            serde_json::from_str(r#"{"id":"n1","type":"reply","metadata":{"roomSlug":"general"}}"#)
+                .unwrap();
+        assert_eq!(n.chat_room_slug(), None);
+    }
 
     #[test]
     fn notification_type_deserializes_snake_case() {

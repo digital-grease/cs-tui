@@ -104,8 +104,46 @@ pub struct SseEvent {
 #[derive(Debug, Clone)]
 pub struct Client {
     http: reqwest::Client,
+    /// Separate client for SSE, because [`Self::http`]'s total-deadline timeout
+    /// is fatal to a long-lived stream. See [`stream_client`].
+    stream_http: reqwest::Client,
     base: String,
     token: String,
+}
+
+/// How long the SSE connect phase may take before it is treated as failed.
+///
+/// Bounds only the connect and header exchange, never the stream that follows.
+const STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long an established SSE stream may go silent before it is treated as dead.
+///
+/// Firebase sends a keepalive comment periodically, so real silence this long
+/// means the connection is gone in a way that produced no error, which is the
+/// failure a plain read would otherwise wait on forever.
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Build the client [`Client::subscribe`] streams over.
+///
+/// **This must not set `timeout`.** `reqwest`'s request timeout is a *total*
+/// deadline covering the response body, not an idle timeout, so a client built
+/// with `.timeout(30s)` kills every SSE stream after thirty seconds no matter
+/// how much data is still flowing. That is exactly what used to happen here:
+/// `subscribe` shared the REST client, so every cIRC and C-Mail live stream
+/// died at the thirty second mark with `error decoding response body`, which
+/// the callers read as an ordinary transport failure and gave up on. The REST
+/// poll alongside it hid the damage, which is why the streams looked like they
+/// merely "didn't work on some networks".
+///
+/// `read_timeout` is the idle equivalent: it applies per read rather than to
+/// the whole response, so a stream lives as long as it keeps producing bytes.
+fn stream_client(connect: Duration, idle: Duration) -> Result<reqwest::Client, RtdbError> {
+    reqwest::Client::builder()
+        .user_agent(DEFAULT_USER_AGENT)
+        .connect_timeout(connect)
+        .read_timeout(idle)
+        .build()
+        .map_err(scrub)
 }
 
 impl Client {
@@ -119,10 +157,12 @@ impl Client {
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(scrub)?;
+        let stream_http = stream_client(STREAM_CONNECT_TIMEOUT, STREAM_IDLE_TIMEOUT)?;
         let base = base.into();
         let base = base.trim_end_matches('/').to_string();
         Ok(Self {
             http,
+            stream_http,
             base,
             token: token.into(),
         })
@@ -218,7 +258,7 @@ impl Client {
     ) -> Result<mpsc::Receiver<Result<SseEvent, RtdbError>>, RtdbError> {
         let url = self.build_url(path, params);
         let resp = self
-            .http
+            .stream_http
             .get(url)
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .header(reqwest::header::CACHE_CONTROL, "no-cache")
@@ -474,5 +514,98 @@ mod tests {
         let ev = rx.recv().await.unwrap().unwrap();
         assert_eq!(ev.kind, SseEventKind::Put);
         assert_eq!(ev.data, 7);
+    }
+
+    /// Serve one SSE response, then dribble a keepalive comment every 50ms for
+    /// `ticks`, then go silent (holding the socket open) until dropped.
+    async fn dribble_sse(ticks: usize) -> String {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut junk = vec![0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut sock, &mut junk).await;
+            if sock
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\n\r\n",
+                )
+                .await
+                .is_err()
+            {
+                return;
+            }
+            for _ in 0..ticks {
+                if sock.write_all(b"2\r\n: \r\n").await.is_err() {
+                    return;
+                }
+                let _ = sock.flush().await;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            // Then hold the socket open, silent, so only an idle timeout ends it.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        format!("http://{addr}/x.json")
+    }
+
+    async fn drain(url: &str, client: reqwest::Client) -> Duration {
+        let resp = client.get(url).send().await.expect("headers arrive");
+        let mut stream = resp.bytes_stream();
+        let start = std::time::Instant::now();
+        while let Some(chunk) = stream.next().await {
+            if chunk.is_err() {
+                break;
+            }
+        }
+        start.elapsed()
+    }
+
+    #[tokio::test]
+    async fn the_rest_client_would_kill_a_live_stream_at_its_deadline() {
+        // The precondition for the test below, and the bug that was really
+        // here: `timeout` is a TOTAL deadline covering the response body, so a
+        // stream dies on it even while bytes are still arriving. This is what
+        // `subscribe` used to run on.
+        let url = dribble_sse(40).await;
+        let rest_like = reqwest::Client::builder()
+            .timeout(Duration::from_millis(300))
+            .build()
+            .unwrap();
+        let lived = drain(&url, rest_like).await;
+        assert!(
+            lived < Duration::from_millis(900),
+            "a total-deadline client cuts the stream off at its timeout, not on \
+             idleness; lived {lived:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_streaming_client_survives_as_long_as_bytes_keep_arriving() {
+        // Same server, same wall-clock, but built the way `subscribe` builds
+        // its client: it must outlive the deadline that killed the one above.
+        let url = dribble_sse(40).await;
+        let streaming = stream_client(Duration::from_secs(5), Duration::from_millis(300)).unwrap();
+        let lived = drain(&url, streaming).await;
+        assert!(
+            lived > Duration::from_millis(900),
+            "a 300ms *idle* timeout must not end a stream that produces a byte \
+             every 50ms; lived {lived:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_streaming_client_still_gives_up_on_a_silent_stream() {
+        // The other half: idle really is enforced, so a connection that dies
+        // without closing does not hang the reader forever.
+        let url = dribble_sse(2).await;
+        let streaming = stream_client(Duration::from_secs(5), Duration::from_millis(300)).unwrap();
+        let lived = drain(&url, streaming).await;
+        assert!(
+            lived < Duration::from_secs(2),
+            "once the server goes quiet the idle timeout ends it; lived {lived:?}",
+        );
     }
 }

@@ -39,3 +39,41 @@ jobs:
 
       - name: cargo build --release
         run: cargo build --workspace --release
+
+  audit:
+    name: dependency advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      # RustSec advisories against the committed Cargo.lock: known-vulnerable
+      # and unmaintained crates, and yanked versions. This is the security check
+      # that actually applies to a Rust TUI, as against the injection and
+      # credential-pattern grep a generic scanner runs: the client holds one
+      # bearer token, renders untrusted text through a widget layer that strips
+      # control characters, and shells out to exactly one opener. Those are
+      # review problems, not pattern-match problems.
+      #
+      # Run as its own job on purpose. An advisory published upstream starts
+      # failing this on a branch that changed nothing, and that should not take
+      # the build-and-test signal down with it while it is being triaged.
+      #
+      # Uses the plain binary rather than a check-run action so it needs no
+      # permissions beyond the workflow's `contents: read`.
+      #
+      # Vulnerabilities fail the job; `unsound` and `unmaintained` warnings are
+      # reported but do not. That is not laxness: `lru` is currently flagged
+      # unsound and reaches us only through `ratatui-core`, which pins the
+      # major version, so denying warnings would paint this job red over
+      # something no change of ours can fix. Vulnerabilities are the line that
+      # can actually be held.
+      - name: cargo audit
+        run: cargo audit
