@@ -2363,6 +2363,13 @@ impl App {
                             return;
                         }
                     }
+                    // Same reasoning on post detail, where the arrows now move
+                    // the reply selection: the wheel scrolls the thread, it
+                    // never picks a reply out of it.
+                    if let Screen::PostDetail(s) = &mut self.screen {
+                        s.wheel_scroll(false);
+                        return;
+                    }
                     synthetic_key(KeyCode::Down)
                 }
                 event::MouseEventKind::ScrollUp => {
@@ -2376,6 +2383,10 @@ impl App {
                         if s.wheel_scroll(true) {
                             return;
                         }
+                    }
+                    if let Screen::PostDetail(s) = &mut self.screen {
+                        s.wheel_scroll(true);
+                        return;
                     }
                     synthetic_key(KeyCode::Up)
                 }

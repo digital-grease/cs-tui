@@ -165,6 +165,10 @@ const COMMON: &[Row] = &[
 
 const POSTS: &[Row] = &[
     Row {
+        keys: "J/K or ↑/↓",
+        desc: "select the next / previous reply on post detail. The arrows scroll the post body first and start selecting once you reach the replies; J goes straight there, j / k always scroll a line",
+    },
+    Row {
         keys: "e",
         desc: "edit your own entry (on post detail, the selected reply)",
     },

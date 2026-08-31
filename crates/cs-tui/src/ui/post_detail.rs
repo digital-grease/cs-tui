@@ -371,23 +371,19 @@ impl PostDetailScreen {
             KeyCode::Backspace => PostDetailIntent::Back,
             KeyCode::Char('R') => PostDetailIntent::Reply,
             KeyCode::Char('Q') => PostDetailIntent::QuoteReply,
-            // J/K move a reply selection (capitalized so j/k still scroll); the
-            // selected reply scrolls into view via the recorded anchors.
-            KeyCode::Char('J') if !self.replies.is_empty() => {
-                let next = match self.selected_reply {
-                    Some(i) => (i + 1).min(self.replies.len() - 1),
-                    None => 0,
-                };
-                self.selected_reply = Some(next);
-                self.scroll_to_reply(next);
-                PostDetailIntent::None
-            }
-            KeyCode::Char('K') => {
-                if let Some(i) = self.selected_reply {
-                    let prev = i.saturating_sub(1);
-                    self.selected_reply = Some(prev);
-                    self.scroll_to_reply(prev);
-                }
+            // J/K move a reply selection (capitalized so j/k still scroll),
+            // and the arrows do the same once the reader has scrolled down to
+            // the replies: someone reading a thread reaches for the arrow keys,
+            // not for shift. Until then the arrows are a line scroll, so Down
+            // on a freshly opened post reads the post rather than leaping past
+            // it (see `arrows_select_replies`); J is the ungated "take me to
+            // the replies" key. Line scrolling always stays on j/k, space,
+            // PgUp/PgDn and g/G. The selected reply scrolls into view via the
+            // recorded anchors.
+            KeyCode::Char('J') if !self.replies.is_empty() => self.select_next_reply(),
+            KeyCode::Down if self.arrows_select_replies() => self.select_next_reply(),
+            KeyCode::Char('K') | KeyCode::Up if self.selected_reply.is_some() => {
+                self.select_prev_reply();
                 PostDetailIntent::None
             }
             // `b` bookmarks the selected reply, or the post when none is selected.
@@ -594,6 +590,96 @@ impl PostDetailScreen {
         if let Some(&anchor) = self.reply_anchors.borrow().get(i) {
             self.scroll = anchor.min(self.max_scroll.get());
         }
+    }
+
+    /// Whether the arrows move the reply selection yet, or are still a plain
+    /// line scroll.
+    ///
+    /// They only take over once the body has been scrolled down to the replies
+    /// — the first reply's anchor has reached the top of the view — so Down on
+    /// a freshly opened long post reads the post instead of jumping past it to
+    /// the thread. `J` is the explicit "take me to the replies" key and is
+    /// never gated. Two edge cases fold into the same test: with the whole
+    /// thread already on screen there is nothing to scroll through, so the
+    /// threshold is capped at `max_scroll` and the arrows select straight away;
+    /// and with no anchors recorded yet (no render since the replies arrived)
+    /// the arrows scroll, which self-corrects on the next frame.
+    fn arrows_select_replies(&self) -> bool {
+        if self.replies.is_empty() {
+            return false;
+        }
+        // Once a reply is selected the arrows stay on the selection, wherever
+        // the view has been scrolled to.
+        if self.selected_reply.is_some() {
+            return true;
+        }
+        self.reply_anchors
+            .borrow()
+            .first()
+            .is_some_and(|&first| self.scroll >= first.min(self.max_scroll.get()))
+    }
+
+    /// Move the reply selection one forward. With nothing selected it enters
+    /// the thread at the first reply at or below the fold, so entering the
+    /// replies never scrolls the view backwards over what has just been read.
+    /// On the last loaded reply it pulls the next page instead of sitting dead,
+    /// which is what `j` already does at the bottom of the scroll: holding the
+    /// key keeps the thread coming.
+    fn select_next_reply(&mut self) -> PostDetailIntent {
+        let last = self.replies.len().saturating_sub(1);
+        let next = match self.selected_reply {
+            Some(i) if i >= last => {
+                if self.next_replies_cursor.is_some() && !self.loading_replies {
+                    self.loading_replies = true;
+                    return PostDetailIntent::LoadMoreReplies;
+                }
+                last
+            }
+            Some(i) => i + 1,
+            None => {
+                let anchors = self.reply_anchors.borrow();
+                match anchors.iter().position(|&a| a >= self.scroll) {
+                    Some(i) => i.min(last),
+                    // Scrolled below every reply: enter at the last one. With
+                    // no anchors at all (no frame yet) there is nothing to be
+                    // below, so enter at the top of the thread.
+                    None if anchors.is_empty() => 0,
+                    None => last,
+                }
+            }
+        };
+        self.selected_reply = Some(next);
+        self.scroll_to_reply(next);
+        PostDetailIntent::None
+    }
+
+    /// Move the reply selection one back. Past the first reply the selection is
+    /// dropped rather than clamped, leaving the scroll where it is: focus
+    /// returns to the post (what `b`, `e`, `F` and `d` then act on) and further
+    /// `k`/Up scroll back up through the body, so the arrows alone walk the
+    /// whole thread in both directions.
+    fn select_prev_reply(&mut self) {
+        match self.selected_reply {
+            Some(0) | None => self.selected_reply = None,
+            Some(i) => {
+                self.selected_reply = Some(i - 1);
+                self.scroll_to_reply(i - 1);
+            }
+        }
+    }
+
+    /// One mouse-wheel notch, as a scroll of the body.
+    ///
+    /// `App` synthesises Up/Down for the wheel, and those now move the reply
+    /// selection, so the wheel needs its own path: a reader spinning the wheel
+    /// is scrolling, and must not thereby retarget `b`, `e`, `d` and `F` onto a
+    /// reply they never chose.
+    pub fn wheel_scroll(&mut self, up: bool) {
+        self.scroll = if up {
+            self.scroll.saturating_sub(1)
+        } else {
+            self.scroll.saturating_add(1).min(self.max_scroll.get())
+        };
     }
 
     pub fn apply_replies_more(&mut self, result: Result<(Vec<Reply>, Option<String>), String>) {
@@ -842,12 +928,12 @@ impl PostDetailScreen {
             format!("error: {msg} · esc back · r retry")
         } else if self.next_replies_cursor.is_some() {
             format!(
-                "{} replies · scroll down for more · esc back · J/K select reply · R reply · Q quote · b bookmark{open_hint}{watch_hint}{edit_hint} · F flag · d delete · r refresh",
+                "{} replies · scroll down for more · esc back · J/K or ↑↓ select reply · R reply · Q quote · b bookmark{open_hint}{watch_hint}{edit_hint} · F flag · d delete · r refresh",
                 self.replies.len()
             )
         } else {
             format!(
-                "{} replies · end · esc back · J/K select reply · R reply · Q quote · b bookmark{open_hint}{watch_hint}{edit_hint} · F flag · d delete · r refresh",
+                "{} replies · end · esc back · J/K or ↑↓ select reply · R reply · Q quote · b bookmark{open_hint}{watch_hint}{edit_hint} · F flag · d delete · r refresh",
                 self.replies.len()
             )
         };
@@ -1642,6 +1728,155 @@ mod tests {
         let intent = s.handle_key(key(KeyCode::Char('j')));
         assert_eq!(intent, PostDetailIntent::LoadMoreReplies);
         assert!(s.loading_replies);
+    }
+
+    /// A screen with two replies and the post body filling rows 0..10, as a
+    /// frame would have left it. The anchors are what gate the arrows, so a
+    /// headless test has to plant what `render` normally records.
+    fn screen_with_replies() -> PostDetailScreen {
+        let mut s = PostDetailScreen::new(entry("p1"));
+        s.apply_replies_initial(Ok((vec![reply("r1", "p1"), reply("r2", "p1")], None)));
+        s.max_scroll.set(100);
+        *s.reply_anchors.borrow_mut() = vec![10, 20];
+        s
+    }
+
+    #[test]
+    fn the_arrows_scroll_the_post_before_they_select_replies() {
+        let mut s = screen_with_replies();
+
+        // Down reads the post body instead of leaping past it to the thread.
+        for _ in 0..10 {
+            s.handle_key(key(KeyCode::Down));
+        }
+        assert_eq!(s.scroll, 10);
+        assert_eq!(s.selected_reply, None, "still reading the post");
+
+        // With the first reply at the top of the view the arrows take over.
+        s.handle_key(key(KeyCode::Down));
+        assert_eq!(s.selected_reply, Some(0));
+        assert_eq!(s.scroll, 10, "selecting it does not move the view");
+        s.handle_key(key(KeyCode::Down));
+        assert_eq!(s.selected_reply, Some(1));
+        assert_eq!(s.scroll, 20, "the next reply scrolls into view");
+        s.handle_key(key(KeyCode::Down));
+        assert_eq!(s.selected_reply, Some(1), "stays on the last reply");
+        s.handle_key(key(KeyCode::Up));
+        assert_eq!(s.selected_reply, Some(0));
+
+        // Selecting with the arrows retargets the reply-level keys, exactly as
+        // J/K do.
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('b'))),
+            PostDetailIntent::BookmarkReply {
+                reply_id: "r1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn capital_j_still_jumps_to_the_replies_from_anywhere() {
+        // The gate is on the arrows only: J means "take me to the thread".
+        let mut s = screen_with_replies();
+        s.handle_key(key(KeyCode::Char('J')));
+        assert_eq!(s.selected_reply, Some(0));
+        assert_eq!(s.scroll, 10, "and scrolls it into view");
+    }
+
+    #[test]
+    fn the_arrows_select_at_once_when_the_whole_thread_is_on_screen() {
+        // Nothing to scroll through, so gating Down on the body would leave it
+        // dead: the threshold is capped at max_scroll.
+        let mut s = screen_with_replies();
+        s.max_scroll.set(0);
+        s.handle_key(key(KeyCode::Down));
+        assert_eq!(s.selected_reply, Some(0));
+    }
+
+    #[test]
+    fn entering_the_replies_never_scrolls_the_view_backwards() {
+        // Already down at the second reply (G, PgDn, j…), Down enters the
+        // thread where the reader is, not back at the top of it.
+        let mut s = screen_with_replies();
+        s.scroll = 20;
+        s.handle_key(key(KeyCode::Down));
+        assert_eq!(s.selected_reply, Some(1));
+        assert_eq!(s.scroll, 20);
+    }
+
+    #[test]
+    fn up_past_the_first_reply_drops_back_to_the_post() {
+        let mut s = screen_with_replies();
+        s.scroll = 10;
+        s.handle_key(key(KeyCode::Down));
+        assert_eq!(s.selected_reply, Some(0));
+
+        s.handle_key(key(KeyCode::Up));
+        assert_eq!(s.selected_reply, None, "focus returns to the post");
+        assert_eq!(
+            s.scroll, 10,
+            "dropping the selection does not jump the view"
+        );
+
+        // With nothing selected the arrows are a plain line scroll again.
+        s.handle_key(key(KeyCode::Up));
+        assert_eq!(s.scroll, 9);
+        assert_eq!(
+            s.selected_reply, None,
+            "and scrolling back up stays out of the replies"
+        );
+    }
+
+    #[test]
+    fn arrows_scroll_when_there_are_no_replies() {
+        let mut s = PostDetailScreen::new(entry("p1"));
+        s.max_scroll.set(100);
+        s.handle_key(key(KeyCode::Down));
+        s.handle_key(key(KeyCode::Down));
+        assert_eq!(s.scroll, 2);
+        assert_eq!(s.selected_reply, None);
+        s.handle_key(key(KeyCode::Up));
+        assert_eq!(s.scroll, 1);
+    }
+
+    #[test]
+    fn down_on_the_last_reply_loads_the_next_page() {
+        let mut s = PostDetailScreen::new(entry("p1"));
+        s.apply_replies_initial(Ok((vec![reply("r1", "p1")], Some("c".into()))));
+        *s.reply_anchors.borrow_mut() = vec![10];
+        s.handle_key(key(KeyCode::Char('J')));
+        assert_eq!(s.selected_reply, Some(0));
+
+        let intent = s.handle_key(key(KeyCode::Down));
+        assert_eq!(intent, PostDetailIntent::LoadMoreReplies);
+        assert!(s.loading_replies);
+        assert_eq!(
+            s.selected_reply,
+            Some(0),
+            "the selection waits for the page"
+        );
+
+        // One request per press while it is in flight.
+        assert_eq!(
+            s.handle_key(key(KeyCode::Down)),
+            PostDetailIntent::None,
+            "no second request while loading"
+        );
+    }
+
+    #[test]
+    fn the_wheel_scrolls_without_moving_the_reply_selection() {
+        // The wheel synthesises Up/Down in App, which now select replies, so
+        // post detail scrolls the wheel itself.
+        let mut s = screen_with_replies();
+        s.scroll = 10;
+
+        s.wheel_scroll(false);
+        s.wheel_scroll(false);
+        assert_eq!(s.scroll, 12);
+        assert_eq!(s.selected_reply, None, "the wheel picks nothing");
+        s.wheel_scroll(true);
+        assert_eq!(s.scroll, 11);
     }
 
     #[test]
