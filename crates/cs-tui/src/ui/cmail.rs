@@ -1079,29 +1079,24 @@ impl CmailScreen {
         };
         let heights = message_row_heights(&messages.items, unread_from, body_layout, &rows_for);
         let content_rows: usize = heights.iter().map(|&h| usize::from(h)).sum();
-        let mut messages_area = bottom_aligned_messages_area(layout[0], content_rows);
-        // When the thread overflows the pane, ratatui's `List` tiles whole items
-        // top-down from the scroll offset and cannot show a partial one at the
-        // top, so it leaves the leftover rows blank at the *bottom*. Trim that
-        // leftover off the top, sizing the pane to the tallest suffix of whole
-        // messages that fits, so the newest message stays flush above the
-        // composer. (The same fix cIRC needed once its messages could wrap.)
-        if content_rows >= messages_area.height as usize {
-            let mut suffix = 0u16;
-            for &h in heights.iter().rev() {
-                if suffix + h > messages_area.height {
-                    break;
-                }
-                suffix += h;
-            }
-            // Only trim when at least one whole message fits; a single message
-            // taller than the pane is left to ratatui (shows its top, clipped).
-            if suffix > 0 {
-                let remainder = messages_area.height - suffix;
-                messages_area.y += remainder;
-                messages_area.height -= remainder;
-            }
-        }
+        // A thread shorter than the pane sits on the composer and grows down
+        // from the title, rather than opening stranded at the bottom of an
+        // otherwise empty screen.
+        let messages_area = bottom_aligned_messages_area(layout[0], content_rows);
+        // Once it overflows, the pane keeps its full height and scrolls by
+        // *row*: whatever message the top edge lands in is drawn short. ratatui's
+        // `List` tiles whole items and cannot do that itself, so it left the rows
+        // the next message up didn't fit in blank — and how many that was fell
+        // out of the pane height and the message heights alone, so nothing the
+        // reader could do closed the band. (The same fix cIRC needed; see
+        // [`list::row_window`].)
+        let win = list::row_window(
+            &heights,
+            messages.selected,
+            (messages.list_offset(), messages.top_clip()),
+            messages_area.height,
+        );
+        messages.set_window(win.first, win.top);
         // `render_body` calls the item closure for every message in order each
         // frame, so a couple of `Cell`s let us inject day separators and a single
         // "new" divider without an extra pass or breaking selection indices.
@@ -1113,14 +1108,14 @@ impl CmailScreen {
         // afterwards: the day-separator rule lives in the closure, and a second
         // copy of it would be free to drift from the one that actually drew.
         let lead_lines: RefCell<Vec<u16>> = RefCell::new(Vec::new());
-        list::render_body(
+        list::render_body_indexed(
             frame,
             messages_area,
             theme,
             messages,
             &visible,
             "no messages yet — c to compose",
-            |m| {
+            |pos, m| {
                 let mut lines: Vec<Line<'static>> = Vec::new();
                 if let Some(t) = local_datetime(m.timestamp) {
                     let key = day_key(t);
@@ -1144,6 +1139,17 @@ impl CmailScreen {
                     None => item_layout,
                 };
                 lines.extend(message_lines(m, other, theme, item_layout));
+                // The pane edges cut rows, not messages. Head before tail, so a
+                // message cut at *both* ends (one taller than the whole pane)
+                // still loses the right rows — and a day separator, being the
+                // topmost row this message drew, goes over the top edge with it.
+                if pos == win.first {
+                    lines.drain(..usize::from(win.top).min(lines.len()));
+                }
+                if pos == win.last {
+                    let keep = lines.len().saturating_sub(usize::from(win.bottom));
+                    lines.truncate(keep);
+                }
                 ListItem::new(lines)
             },
         );
@@ -1156,10 +1162,13 @@ impl CmailScreen {
             let leads = lead_lines.borrow();
             let mut protocols = self.image_protocols.borrow_mut();
             let bytes = self.image_bytes.borrow();
-            let pane_bottom = messages_area.y.saturating_add(messages_area.height);
-            let mut y = messages_area.y;
-            let start = messages.list_offset();
-            for (n, m) in messages.items.iter().enumerate().skip(start) {
+            let pane_top = i32::from(messages_area.y);
+            let pane_bottom = pane_top + i32::from(messages_area.height);
+            // The first message may be cut off at the top, so its rows begin
+            // *above* the pane. Signed, because a thread drawn near the top of
+            // the screen can lose more rows than the pane's own y.
+            let mut y = pane_top - i32::from(win.top);
+            for (n, m) in messages.items.iter().enumerate().skip(win.first) {
                 if y >= pane_bottom {
                     break;
                 }
@@ -1175,12 +1184,14 @@ impl CmailScreen {
                     let lead = leads.get(n).copied().unwrap_or(0);
                     // Separators, then the speaker header, then the body rows
                     // above the gap.
-                    let top = y
-                        .saturating_add(lead)
-                        .saturating_add(1)
-                        .saturating_add(above);
-                    let visible_rows = gap_rows.min(pane_bottom.saturating_sub(top));
-                    if top < pane_bottom && visible_rows > 0 {
+                    let top = y + i32::from(lead) + 1 + i32::from(above);
+                    // Clipped at the bottom only: the encoder builds a block of
+                    // rows top-down, so a band the pane cuts into from *above*
+                    // is left out rather than drawn from the wrong row. It is
+                    // back whole as soon as its message is.
+                    let visible_rows =
+                        u16::try_from(pane_bottom - top).map_or(0, |room| gap_rows.min(room));
+                    if top >= pane_top && top < pane_bottom && visible_rows > 0 {
                         let stale = protocols
                             .get(&url)
                             .map_or(true, |(_, built)| *built != target);
@@ -1207,7 +1218,7 @@ impl CmailScreen {
                         if let Some((proto, _)) = protocols.get(&url) {
                             let img_area = Rect::new(
                                 messages_area.x.saturating_add(4),
-                                top,
+                                u16::try_from(top).unwrap_or(u16::MAX),
                                 target.width,
                                 visible_rows,
                             );
@@ -1215,7 +1226,7 @@ impl CmailScreen {
                         }
                     }
                 }
-                y = y.saturating_add(h);
+                y += i32::from(h);
             }
         }
 
@@ -1227,15 +1238,40 @@ impl CmailScreen {
             // Only the rows the list actually drew, which start at the offset it
             // just settled on. Handing over chips for scrolled-off messages
             // would slide every link onto the wrong message's attachment.
+            //
+            // A message the pane cut off at the top is skipped outright, and the
+            // scan starts below the rows it kept: a chip clipped away would be
+            // the first mismatch, and `apply_chip_links` stops there, so it
+            // would take every link under it with it. Losing the links on one
+            // half-shown message is the cheaper failure, and they are back one
+            // row of scrolling later.
+            let head = if win.top > 0 {
+                heights
+                    .get(win.first)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_sub(win.top)
+            } else {
+                0
+            };
+            let scan = Rect {
+                y: messages_area.y.saturating_add(head),
+                height: messages_area.height.saturating_sub(head),
+                ..messages_area
+            };
             let chips = chat::collect_chips(
                 messages
                     .items
                     .iter()
-                    .skip(messages.list_offset())
+                    .skip(if win.top > 0 {
+                        win.first + 1
+                    } else {
+                        win.first
+                    })
                     .map(chat::ChatMessage::from),
                 body_layout,
             );
-            chat::apply_chip_links(frame.buffer_mut(), messages_area, &chips, theme);
+            chat::apply_chip_links(frame.buffer_mut(), scan, &chips, theme);
         }
 
         if out_rows > 0 {
@@ -2818,6 +2854,95 @@ mod tests {
     /// to be accounted for in the rows that come back.
     fn long_draft(n: usize) -> String {
         (0..n).map(|i| char::from(b'a' + (i % 26) as u8)).collect()
+    }
+
+    /// A thread of mixed heights: every fifth message wraps onto four rows,
+    /// which is what leaves a whole-message viewport with rows over.
+    fn mixed_heights(n: i64) -> CmailScreen {
+        let msgs: Vec<CmailMessage> = (0..n)
+            .map(|i| {
+                let body = if i % 5 == 0 {
+                    format!("long {} {}", i, "word ".repeat(20))
+                } else {
+                    format!("line {i}")
+                };
+                message(&format!("m{i}"), &body, 1_000 + i)
+            })
+            .collect();
+        open_with_messages(msgs, None)
+    }
+
+    /// The rows between the title and the footer, as drawn.
+    fn pane_rows(rows: &[String]) -> &[String] {
+        let footer = rows
+            .iter()
+            .position(|r| {
+                r.starts_with('\u{203a}') || r.starts_with('\u{2026}') || r.contains("c compose")
+            })
+            .expect("the footer should be on screen");
+        &rows[1..footer]
+    }
+
+    #[test]
+    fn a_thread_leaves_no_blank_band_under_its_title_at_any_height() {
+        // Regression: the pane tiled whole messages and blanked the rows the
+        // next message up didn't fit in. How many that was fell out of the pane
+        // height and the message heights alone, so nothing the reader could do
+        // closed the band — a terminal resized to an awkward height left a gap
+        // under the thread title that survived scrolling, leaving the thread,
+        // and restarting the client.
+        for height in 12..=30u16 {
+            let s = mixed_heights(40);
+            let rows = render_rows(&s, 50, height);
+            let pane = pane_rows(&rows);
+            assert!(
+                !pane.is_empty() && !pane.iter().any(|r| r.trim().is_empty()),
+                "height {height} left the thread pane holed:\n{}",
+                rows.join("\n"),
+            );
+        }
+    }
+
+    #[test]
+    fn the_message_straddling_the_top_edge_is_drawn_short_not_dropped() {
+        // The pane scrolls by row, so the message the top edge lands in keeps
+        // the rows that fit rather than being left out whole.
+        let s = mixed_heights(40);
+        let rows = render_rows(&s, 50, 14);
+        let pane = pane_rows(&rows);
+        // The top edge lands inside message 35, which keeps the rows that fit
+        // and loses its speaker row off the top rather than being left out.
+        assert!(
+            pane[0].contains("long 35") && !pane[0].contains('\u{b7}'),
+            "the top message should be drawn short, its speaker row cut off:\n{}",
+            rows.join("\n"),
+        );
+        assert!(
+            pane.last().is_some_and(|r| r.contains("line 39")),
+            "the newest message still sits flush above the composer:\n{}",
+            rows.join("\n"),
+        );
+    }
+
+    #[test]
+    fn scrolling_back_fills_the_thread_pane_too() {
+        // The blank band used to be taken off the *top* whatever the reader was
+        // looking at, so scrolling back showed fewer messages than fitted and
+        // still carried the gap.
+        for height in 12..=30u16 {
+            let mut s = mixed_heights(40);
+            let _ = render_rows(&s, 50, height);
+            for _ in 0..6 {
+                s.handle_key(key(KeyCode::Up));
+            }
+            let rows = render_rows(&s, 50, height);
+            let pane = pane_rows(&rows);
+            assert!(
+                !pane.iter().any(|r| r.trim().is_empty()),
+                "height {height} left a scrolled-back thread holed:\n{}",
+                rows.join("\n"),
+            );
+        }
     }
 
     #[test]

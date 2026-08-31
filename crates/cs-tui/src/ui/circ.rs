@@ -1947,38 +1947,46 @@ impl CircScreen {
             })
             .collect();
         let content_rows: usize = heights.iter().map(|&h| h as usize).sum();
-        let mut messages_area = bottom_aligned_messages_area(layout[0], content_rows);
-        // When the history overflows the pane, ratatui's `List` tiles whole
-        // items top-down from the scroll offset and can't show a partial item at
-        // the top, so it leaves the leftover rows blank at the *bottom* (e.g. the
-        // gap that appears above the composer while a send is pending). Trim that
-        // leftover off the top — sizing the pane to the tallest suffix of whole
-        // messages that fits — so the newest message stays flush above the
-        // composer.
-        if content_rows >= messages_area.height as usize {
-            let mut suffix = 0u16;
-            for &h in heights.iter().rev() {
-                if suffix + h > messages_area.height {
-                    break;
-                }
-                suffix += h;
-            }
-            // Only trim when at least one whole message fits; a single message
-            // taller than the pane is left to ratatui (shows its top, clipped).
-            if suffix > 0 {
-                let remainder = messages_area.height - suffix;
-                messages_area.y += remainder;
-                messages_area.height -= remainder;
-            }
-        }
-        list::render_body(
+        // A history shorter than the pane sits on the composer and grows down
+        // from the title, so a quiet room doesn't open with its three messages
+        // stranded at the bottom of an empty screen.
+        let messages_area = bottom_aligned_messages_area(layout[0], content_rows);
+        // Once it overflows, the pane keeps its full height and scrolls by
+        // *row*: whatever message the top edge lands in is drawn short. ratatui's
+        // `List` tiles whole items and can't do that itself, so it leaves the
+        // rows the next message up doesn't fit in blank — and since how many
+        // that is depends only on the pane height and the heights of the
+        // messages at the tail, the band never closed. Resizing a room to an
+        // awkward height left a gap under its title that survived scrolling,
+        // leaving the room, and restarting the client.
+        let win = list::row_window(
+            &heights,
+            messages.selected,
+            (messages.list_offset(), messages.top_clip()),
+            messages_area.height,
+        );
+        messages.set_window(win.first, win.top);
+        list::render_body_indexed(
             frame,
             messages_area,
             theme,
             messages,
             &visible,
             "no messages yet — start typing",
-            |m| ListItem::new(circ_message_lines(m, theme, layout_of(m))),
+            |pos, m| {
+                let mut lines = circ_message_lines(m, theme, layout_of(m));
+                // Top first, then bottom: both counts are against the message's
+                // own rows, so trimming the head before the tail keeps a message
+                // that is cut at *both* ends (one taller than the pane) honest.
+                if pos == win.first {
+                    lines.drain(..usize::from(win.top).min(lines.len()));
+                }
+                if pos == win.last {
+                    let keep = lines.len().saturating_sub(usize::from(win.bottom));
+                    lines.truncate(keep);
+                }
+                ListItem::new(lines)
+            },
         );
         // Keep only what the room still holds; a session's worth of decoded
         // protocols is far more memory than the messages they belong to.
@@ -2000,13 +2008,13 @@ impl CircScreen {
             let cols = u16::try_from(body_width).unwrap_or(u16::MAX);
             let mut protocols = self.image_protocols.borrow_mut();
             let bytes = self.image_bytes.borrow();
-            let pane_bottom = messages_area.y.saturating_add(messages_area.height);
-            let mut y = messages_area.y;
-            for (&i, &h) in visible
-                .iter()
-                .zip(heights.iter())
-                .skip(messages.list_offset())
-            {
+            let pane_top = i32::from(messages_area.y);
+            let pane_bottom = pane_top + i32::from(messages_area.height);
+            // The first message may be cut off at the top, so its rows begin
+            // *above* the pane. Signed, because a room drawn near the top of the
+            // screen can cut off more rows than the pane's own y.
+            let mut y = pane_top - i32::from(win.top);
+            for (&i, &h) in visible.iter().zip(heights.iter()).skip(win.first) {
                 if y >= pane_bottom {
                     break;
                 }
@@ -2020,11 +2028,16 @@ impl CircScreen {
                     let target = Size::new(cols, gap_rows);
                     // One row for the speaker header, then the body rows above
                     // the gap.
-                    let top = y.saturating_add(1).saturating_add(above);
+                    let top = y + 1 + i32::from(above);
                     // Clip against the pane rather than resizing, so a picture
                     // scrolling in from the bottom slides rather than squashes.
-                    let visible_rows = gap_rows.min(pane_bottom.saturating_sub(top));
-                    if top < pane_bottom && visible_rows > 0 {
+                    // Only at the bottom, though: the encoder builds a block of
+                    // rows top-down, so a band the pane cuts into from *above*
+                    // is left out rather than drawn from the wrong row. It comes
+                    // back whole as soon as its message is.
+                    let visible_rows =
+                        u16::try_from(pane_bottom - top).map_or(0, |room| gap_rows.min(room));
+                    if top >= pane_top && top < pane_bottom && visible_rows > 0 {
                         // `is_none_or` would read better but is newer than
                         // this crate's MSRV.
                         let stale = protocols
@@ -2056,7 +2069,7 @@ impl CircScreen {
                                 // body's own indent, so the picture lines up
                                 // with the text above it.
                                 messages_area.x.saturating_add(4),
-                                top,
+                                u16::try_from(top).unwrap_or(u16::MAX),
                                 target.width,
                                 visible_rows,
                             );
@@ -2064,7 +2077,7 @@ impl CircScreen {
                         }
                     }
                 }
-                y = y.saturating_add(h);
+                y += i32::from(h);
             }
         }
 
@@ -2083,15 +2096,39 @@ impl CircScreen {
             // finds on screen and stops at the first mismatch, so that one
             // phantom entry silently killed *every* attachment link in a room
             // containing an inline image.
+            //
+            // A message the pane cut off at the top is skipped outright, and the
+            // scan starts below the rows it kept: a chip clipped away would be
+            // the first mismatch and would take every link under it with it.
+            // Losing the links on one half-shown message is the cheaper failure,
+            // and it is whole again one row of scrolling later.
+            let head = if win.top > 0 {
+                heights
+                    .get(win.first)
+                    .copied()
+                    .unwrap_or(0)
+                    .saturating_sub(win.top)
+            } else {
+                0
+            };
+            let scan = Rect {
+                y: messages_area.y.saturating_add(head),
+                height: messages_area.height.saturating_sub(head),
+                ..messages_area
+            };
             let chips: Vec<chat::ChipLink> = visible
                 .iter()
-                .skip(messages.list_offset())
+                .skip(if win.top > 0 {
+                    win.first + 1
+                } else {
+                    win.first
+                })
                 .flat_map(|&i| {
                     let m = &messages.items[i];
                     chat::message_chips(ChatMessage::from(m), layout_of(m))
                 })
                 .collect();
-            chat::apply_chip_links(frame.buffer_mut(), messages_area, &chips, theme);
+            chat::apply_chip_links(frame.buffer_mut(), scan, &chips, theme);
         }
 
         if out_rows > 0 {
@@ -2764,6 +2801,101 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    /// A history of mixed heights: every fifth message wraps onto four rows,
+    /// which is what makes a whole-message viewport leave rows over.
+    fn mixed_heights(n: i64) -> CircScreen {
+        let mut s = open("general");
+        let msgs: Vec<CircMessage> = (0..n)
+            .map(|i| {
+                let body = if i % 5 == 0 {
+                    format!("long {} {}", i, "word ".repeat(20))
+                } else {
+                    format!("line {i}")
+                };
+                message(&format!("m{i}"), "neo", &body, 1_000 + i)
+            })
+            .collect();
+        s.apply_messages("general", true, Ok((msgs, None)));
+        s
+    }
+
+    /// The rows between the title and the composer, as drawn.
+    fn pane_rows(rows: &[String]) -> &[String] {
+        let composer = rows
+            .iter()
+            .position(|r| r.starts_with('\u{203a}'))
+            .expect("the composer prompt should be on screen");
+        &rows[1..composer]
+    }
+
+    #[test]
+    fn a_room_leaves_no_blank_band_under_its_title_at_any_height() {
+        // Regression: the pane tiled whole messages and blanked the rows the
+        // next message up didn't fit in. How many that was fell out of the pane
+        // height and the heights of the messages at the tail, so nothing the
+        // reader could do closed the band — resizing the terminal to an awkward
+        // height left a gap under the room title that survived scrolling,
+        // leaving the room, and restarting the client.
+        for height in 12..=30u16 {
+            let s = mixed_heights(40);
+            let rows = render_rows(&s, height);
+            let pane = pane_rows(&rows);
+            assert!(
+                !pane.is_empty() && !pane.iter().any(|r| r.trim().is_empty()),
+                "height {height} left the conversation pane holed:\n{}",
+                rows.join("\n"),
+            );
+        }
+    }
+
+    #[test]
+    fn the_message_straddling_the_top_edge_is_drawn_short_not_dropped() {
+        // The pane scrolls by row, so the message the top edge lands in keeps
+        // the rows that fit rather than being left out whole.
+        let s = mixed_heights(40);
+        let rows = render_rows(&s, 14);
+        let pane = pane_rows(&rows);
+        assert!(
+            pane[0].trim_start().starts_with("word"),
+            "the top message should resume mid-body:\n{}",
+            rows.join("\n"),
+        );
+        assert!(
+            !pane.iter().any(|r| r.contains("long 35")),
+            "…and its head is above the pane, not squeezed into it:\n{}",
+            rows.join("\n"),
+        );
+        assert!(
+            pane.last().is_some_and(|r| r.contains("line 39")),
+            "the newest message still sits flush above the composer:\n{}",
+            rows.join("\n"),
+        );
+    }
+
+    #[test]
+    fn scrolling_back_fills_the_pane_too() {
+        // The blank band used to be taken off the *top* whatever the reader was
+        // looking at, so scrolling back showed fewer messages than fitted and
+        // still carried the gap.
+        let mut s = mixed_heights(40);
+        let _ = render_rows(&s, 15);
+        for _ in 0..6 {
+            s.handle_key(key(KeyCode::Up));
+        }
+        let rows = render_rows(&s, 15);
+        let pane = pane_rows(&rows);
+        assert!(
+            !pane.iter().any(|r| r.trim().is_empty()),
+            "a scrolled-back room must use every row it has:\n{}",
+            rows.join("\n"),
+        );
+        assert!(
+            pane[1].contains("line 33"),
+            "the cursor stays at the top of the view it scrolled to:\n{}",
+            rows.join("\n"),
+        );
     }
 
     #[test]
