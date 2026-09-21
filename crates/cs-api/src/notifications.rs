@@ -1,4 +1,4 @@
-//! Notification types and endpoints (`/v1/notifications/*`, API v0.8.6
+//! Notification types and endpoints (`/v1/notifications/*`, API v0.8.10
 //! § Notifications).
 use reqwest::Method;
 use serde::{Deserialize, Deserializer};
@@ -11,8 +11,18 @@ use crate::error::Result;
 const DEFAULT_PAGE_LIMIT: u32 = 20;
 const MAX_PAGE_LIMIT: u32 = 50;
 
+/// How many distinct values the `type=` filter takes (API v0.8.10 § List
+/// Notifications: "1-30 distinct values; repeats are ignored").
+///
+/// v0.8.10 raised this from 20, but it is still short of the full type list, so
+/// the spec is explicit that omitting the filter is the only way to ask for
+/// every type. [`Client::list_notifications`] deduplicates and truncates to this
+/// rather than letting the server reject a 31-value filter outright, which would
+/// answer `400` and show the reader nothing at all.
+pub const MAX_NOTIFICATION_TYPE_FILTERS: usize = 30;
+
 /// The handle notifications about your own account carry instead of a real
-/// actor (API v0.8.6 § Notification object).
+/// actor (API v0.8.10 § Notification object).
 ///
 /// The spec's instruction is blunt: do not try to open a profile for it. Match
 /// on it through [`Notification::actor_profile`] rather than comparing strings
@@ -20,13 +30,13 @@ const MAX_PAGE_LIMIT: u32 = 50;
 pub const SYSTEM_ACTOR: &str = "system";
 
 /// How many `read-all` passes [`Client::mark_all_notifications_read`] will make
-/// before giving up. The server marks up to 5,000 per call (API v0.8.6 § Mark
+/// before giving up. The server marks up to 5,000 per call (API v0.8.10 § Mark
 /// All as Read), so this covers a quarter of a million unread notifications:
 /// far past any real inbox, and a bound means a server that never stops saying
 /// `hasMore` cannot spin the loop forever.
 const MAX_READ_ALL_PASSES: u32 = 50;
 
-/// The documented notification types (API v0.8.6 § List Notifications), plus
+/// The documented notification types (API v0.8.10 § List Notifications), plus
 /// `Unknown` for forward compatibility with future types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -52,6 +62,10 @@ pub enum NotificationType {
     GraffitiMention,
     DmMessage,
     GuildNewThread,
+    /// A message was posted in a guild's chat room (v0.8.10). Its `metadata`
+    /// carries the chat keys (`roomSlug`, `roomName`, `messageContent`) rather
+    /// than the guild-thread ones, so it points at a room, not a thread.
+    GuildChatMessage,
     SupporterGranted,
     SupporterRemoved,
     HackerGranted,
@@ -59,14 +73,22 @@ pub enum NotificationType {
     /// You were made a moderator (v0.8.6). One of the account notifications
     /// with no sender; `reason` explains what happened.
     ModeratorGranted,
-    /// Your moderator role was taken away (v0.8.6). No sender; see `reason`.
+    /// Your moderator role was taken away (v0.8.6). See `reason`.
     ModeratorRemoved,
-    /// Your account was granted API access (v0.8.6). No sender; see `reason`.
+    /// The set of things your moderator role lets you do changed (v0.8.10),
+    /// without the role itself being granted or taken away. See `reason`.
+    ModeratorPermissionsChanged,
+    /// Your account was granted API access (v0.8.6). See `reason`.
     ApiAccessGranted,
-    /// Your API access was taken away (v0.8.6). No sender; see `reason`. A
-    /// client that gets this is about to start failing on every call, so it is
-    /// worth surfacing loudly rather than filing quietly.
+    /// Your API access was taken away (v0.8.6). See `reason`. A client that
+    /// gets this is about to start failing on every call, so it is worth
+    /// surfacing loudly rather than filing quietly.
     ApiAccessRemoved,
+    /// You were granted the ability to edit your entries and replies past the
+    /// usual window (v0.8.10). See `reason`.
+    EditAccessGranted,
+    /// Your edit access was taken away (v0.8.10). See `reason`.
+    EditAccessRemoved,
     ImagePermissionGranted,
     ImagePermissionRemoved,
     AttachmentPermissionGranted,
@@ -85,6 +107,11 @@ pub enum NotificationType {
     /// budget is nearly spent, which is not something the client-side limiter
     /// in [`crate::EndpointKey`] can derive on its own.
     RateLimitWarning,
+    /// Somebody sent you a gift (v0.8.10). The sender is `actor_username`.
+    GiftReceived,
+    /// A gift you sent was delivered (v0.8.10). The recipient is
+    /// `actor_username`.
+    GiftSent,
     #[serde(other)]
     Unknown,
 }
@@ -109,14 +136,18 @@ impl NotificationType {
             Self::GraffitiMention => "graffiti_mention",
             Self::DmMessage => "dm_message",
             Self::GuildNewThread => "guild_new_thread",
+            Self::GuildChatMessage => "guild_chat_message",
             Self::SupporterGranted => "supporter_granted",
             Self::SupporterRemoved => "supporter_removed",
             Self::HackerGranted => "hacker_granted",
             Self::HackerRemoved => "hacker_removed",
             Self::ModeratorGranted => "moderator_granted",
             Self::ModeratorRemoved => "moderator_removed",
+            Self::ModeratorPermissionsChanged => "moderator_permissions_changed",
             Self::ApiAccessGranted => "api_access_granted",
             Self::ApiAccessRemoved => "api_access_removed",
+            Self::EditAccessGranted => "edit_access_granted",
+            Self::EditAccessRemoved => "edit_access_removed",
             Self::ImagePermissionGranted => "image_permission_granted",
             Self::ImagePermissionRemoved => "image_permission_removed",
             Self::AttachmentPermissionGranted => "attachment_permission_granted",
@@ -125,12 +156,14 @@ impl NotificationType {
             Self::SystemBanLifted => "system_ban_lifted",
             Self::PostCooldown => "post_cooldown",
             Self::RateLimitWarning => "rate_limit_warning",
+            Self::GiftReceived => "gift_received",
+            Self::GiftSent => "gift_sent",
             Self::Unknown => "unknown",
         }
     }
 }
 
-/// Type-dependent context attached to a notification (API v0.8.6
+/// Type-dependent context attached to a notification (API v0.8.10
 /// § Notification object). The server treats `metadata` as open-ended, so only
 /// the commonly-used keys are modelled here; unknown keys are ignored.
 ///
@@ -181,9 +214,15 @@ pub struct NotificationMetadata {
     /// cIRC room display name, alongside [`Self::room_slug`].
     #[serde(default)]
     pub room_name: Option<String>,
+
+    /// The chat message that triggered the notification (v0.8.10 § Notification
+    /// object lists `messageContent` among the chat keys), for a one-line
+    /// preview next to the summary.
+    #[serde(default)]
+    pub message_content: Option<String>,
 }
 
-/// A notification record. Shape per API v0.8.6 § Notification object: the actor is
+/// A notification record. Shape per API v0.8.10 § Notification object: the actor is
 /// denormalized onto `actorId` / `actorUsername`, and type-dependent context
 /// (deep-link slug, reply id, guild/thread info) lives under `metadata`.
 ///
@@ -273,6 +312,15 @@ impl Notification {
     /// one check covers the whole family and a caller cannot mistake the
     /// sentinel for a user by reading [`Notification::actor_name`].
     ///
+    /// The role and permission changes are *not* in that family, whatever the
+    /// pre-v0.8.10 reading of the spec said: § How notifications are generated
+    /// now states outright that `moderator_*`, `api_access_*`, `edit_access_*`,
+    /// `supporter_*`, `hacker_*`, `image_permission_*` and
+    /// `attachment_permission_*` "do carry `actorId` / `actorUsername` — the
+    /// staff member who made the change". Testing the handle rather than the
+    /// type is what makes that correction cost nothing here: those arrive with
+    /// a real actor and open a real profile.
+    ///
     /// The sentinel is recognised by its value rather than by
     /// [`Notification::kind`] deliberately: the type list is open-ended, so a
     /// system type this build has never heard of decodes as
@@ -286,10 +334,14 @@ impl Notification {
         }
     }
 
-    /// Whether this notification is about the reader's own account rather than
-    /// another user's action, so there is nobody to open. The inverse of
+    /// Whether this notification arrived with nobody to open — the reader's own
+    /// account speaking, rather than another user. The inverse of
     /// [`Notification::actor_profile`] being `Some`, spelled out for the call
     /// sites that only want the question answered.
+    ///
+    /// Not the same question as "is this about my own account": since v0.8.10 a
+    /// role change is about the reader's account *and* names the staff member
+    /// who made it, so it answers `false` here.
     #[must_use]
     pub fn is_from_system(&self) -> bool {
         self.actor_profile().is_none()
@@ -305,17 +357,40 @@ impl Notification {
         self.metadata.author_username.as_deref()
     }
 
-    /// The cIRC room a `chat_mention` points at, when the server named one.
+    /// The cIRC room this notification points at, when the server named one.
     ///
-    /// `None` for every other type, and for a `chat_mention` whose metadata
-    /// omits it, so a caller can treat the deep link as best-effort.
+    /// Answers for the two chat types — `chat_mention` and, since v0.8.10,
+    /// `guild_chat_message`, which § Notification object gives the same
+    /// `roomSlug` / `roomName` / `messageContent` keys. `None` for every other
+    /// type, and for a chat notification whose metadata omits the slug, so a
+    /// caller can treat the deep link as best-effort.
     #[must_use]
     pub fn chat_room_slug(&self) -> Option<&str> {
-        if self.kind != NotificationType::ChatMention {
+        if !matches!(
+            self.kind,
+            NotificationType::ChatMention | NotificationType::GuildChatMessage
+        ) {
             return None;
         }
         self.metadata
             .room_slug
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
+    /// The chat message behind a chat notification, for a one-line preview
+    /// (v0.8.10 § Notification object, `messageContent`).
+    ///
+    /// Trimmed, and `None` when empty or absent. Unlike
+    /// [`Notification::chat_room_slug`] this is not gated on the type: the key
+    /// is only ever sent for chat, and gating it would hide the preview on a
+    /// future chat type this build decodes as
+    /// [`NotificationType::Unknown`].
+    #[must_use]
+    pub fn message_preview(&self) -> Option<&str> {
+        self.metadata
+            .message_content
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -327,7 +402,7 @@ impl Notification {
     }
 }
 
-/// Result of [`Client::unread_notification_count`] (API v0.8.6 § Unread Count).
+/// Result of [`Client::unread_notification_count`] (API v0.8.10 § Unread Count).
 ///
 /// The count covers the same filtered set `GET /v1/notifications` returns, so a
 /// badge built on it matches the list the user then opens.
@@ -393,9 +468,33 @@ struct MarkAllResponse {
     #[serde(default)]
     updated: u32,
     /// True while unread notifications remain beyond the 5,000 this pass
-    /// marked (API v0.8.6 § Mark All as Read).
+    /// marked (API v0.8.10 § Mark All as Read).
     #[serde(default)]
     has_more: bool,
+}
+
+/// The `type=` values to send for a requested set of notification types.
+///
+/// Drops [`NotificationType::Unknown`] (a local placeholder, never a value the
+/// server accepts), removes repeats (§ List Notifications ignores them anyway,
+/// but they spend room against the cap), and truncates to
+/// [`MAX_NOTIFICATION_TYPE_FILTERS`]. Order follows the caller's, so a truncated
+/// filter keeps whichever types were asked for first.
+fn filter_type_values(types: &[NotificationType]) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::with_capacity(types.len());
+    for t in types {
+        if *t == NotificationType::Unknown {
+            continue;
+        }
+        let wire = t.wire();
+        if !out.contains(&wire) {
+            out.push(wire);
+        }
+        if out.len() == MAX_NOTIFICATION_TYPE_FILTERS {
+            break;
+        }
+    }
+    out
 }
 
 /// Filter for listing notifications.
@@ -435,9 +534,9 @@ impl Client {
             NotificationsFilter::Unread => query.push(("read", "false".to_string())),
             NotificationsFilter::Read => query.push(("read", "true".to_string())),
         }
-        if !types.is_empty() {
-            let joined: String = types.iter().map(|t| t.wire()).collect::<Vec<_>>().join(",");
-            query.push(("type", joined));
+        let wanted = filter_type_values(types);
+        if !wanted.is_empty() {
+            query.push(("type", wanted.join(",")));
         }
         self.request_page(
             EndpointKey::NotificationsList,
@@ -451,7 +550,7 @@ impl Client {
     /// `GET /v1/notifications/unread-count`. Cached server-side ~5 s, and
     /// marking anything read clears that cache, so the count drops on the next
     /// poll rather than lagging five seconds behind the user's own action
-    /// (API v0.8.6 § Unread Count).
+    /// (API v0.8.10 § Unread Count).
     ///
     /// Returns the count *and* [`UnreadCount::exact`], because the number alone
     /// is not enough to render the badge: above 100 unread the server counts
@@ -484,7 +583,7 @@ impl Client {
     /// read. Returns how many were marked, added up across every call made.
     ///
     /// One request marks at most 5,000 and answers `hasMore` when unread
-    /// notifications remain (API v0.8.6 § Mark All as Read), so this calls the
+    /// notifications remain (API v0.8.10 § Mark All as Read), so this calls the
     /// endpoint again until the server says it is done. Doing that here rather
     /// than in each caller is what makes the name true: a single call leaves an
     /// inbox over 5,000 partly unread, and "mark all as read" that quietly
@@ -564,13 +663,42 @@ mod tests {
     }
 
     #[test]
-    fn only_a_chat_mention_reports_a_room() {
-        // A stray roomSlug on another type is not a chat mention, and following
+    fn only_a_chat_type_reports_a_room() {
+        // A stray roomSlug on a non-chat type is not a deep link, and following
         // it would take the reader somewhere they did not ask to go.
         let n: Notification =
             serde_json::from_str(r#"{"id":"n1","type":"reply","metadata":{"roomSlug":"general"}}"#)
                 .unwrap();
         assert_eq!(n.chat_room_slug(), None);
+    }
+
+    #[test]
+    fn a_guild_chat_message_deep_links_like_a_chat_mention() {
+        // v0.8.10 § Notification object gives the chat types the same metadata
+        // keys, so the guild room has to be as navigable as the cIRC one.
+        let n: Notification = serde_json::from_str(
+            r#"{"id":"n1","type":"guild_chat_message","actorUsername":"trinity",
+                "metadata":{"roomSlug":"night-owls","roomName":"Night Owls",
+                            "messageContent":"  anyone up?  "}}"#,
+        )
+        .unwrap();
+        assert_eq!(n.kind, NotificationType::GuildChatMessage);
+        assert_eq!(n.chat_room_slug(), Some("night-owls"));
+        assert_eq!(n.metadata.room_name.as_deref(), Some("Night Owls"));
+        assert_eq!(n.message_preview(), Some("anyone up?"), "trimmed");
+        assert_eq!(n.actor_profile(), Some("trinity"));
+    }
+
+    #[test]
+    fn a_blank_message_preview_reads_as_absent() {
+        for raw in [
+            r#"{"id":"n1","type":"chat_mention"}"#,
+            r#"{"id":"n1","type":"chat_mention","metadata":{"messageContent":null}}"#,
+            r#"{"id":"n1","type":"chat_mention","metadata":{"messageContent":"   "}}"#,
+        ] {
+            let n: Notification = serde_json::from_str(raw).unwrap();
+            assert_eq!(n.message_preview(), None, "{raw}");
+        }
     }
 
     #[test]
@@ -593,6 +721,125 @@ mod tests {
             assert_eq!(t, expected, "decoding {s}");
         }
     }
+
+    #[test]
+    fn the_v0810_notification_types_decode_as_themselves() {
+        // Six more in § List Notifications. Until they were modelled each one
+        // decoded as `Unknown` and was summarised as a bare "notice about your
+        // account", which is wrong for a gift and wrong for a guild chat
+        // message.
+        let kinds = [
+            ("guild_chat_message", NotificationType::GuildChatMessage),
+            (
+                "moderator_permissions_changed",
+                NotificationType::ModeratorPermissionsChanged,
+            ),
+            ("edit_access_granted", NotificationType::EditAccessGranted),
+            ("edit_access_removed", NotificationType::EditAccessRemoved),
+            ("gift_received", NotificationType::GiftReceived),
+            ("gift_sent", NotificationType::GiftSent),
+        ];
+        for (s, expected) in kinds {
+            let t: NotificationType =
+                serde_json::from_str(&format!("\"{s}\"")).expect("must decode");
+            assert_eq!(t, expected, "decoding {s}");
+            assert_eq!(t.wire(), s, "wire form of {s}");
+        }
+    }
+
+    #[test]
+    fn a_role_change_names_the_staff_member_who_made_it() {
+        // v0.8.10 § How notifications are generated: the role and permission
+        // changes "do carry actorId / actorUsername". Treating them as
+        // senderless would strand the reader with no way to see who did it.
+        let n: Notification = serde_json::from_str(
+            r#"{"id":"n1","type":"moderator_permissions_changed",
+                "actorId":"u9","actorUsername":"morpheus","reason":"scope widened"}"#,
+        )
+        .unwrap();
+        assert_eq!(n.actor_profile(), Some("morpheus"));
+        assert!(!n.is_from_system());
+        assert_eq!(n.reason.as_deref(), Some("scope widened"));
+    }
+
+    #[test]
+    fn the_type_filter_is_deduplicated_capped_and_free_of_unknown() {
+        use NotificationType::{Bookmark, GiftSent, Reply, Unknown};
+
+        // Repeats spend room against the cap for nothing (§ List Notifications
+        // ignores them), and `Unknown` is this client's own placeholder — its
+        // "unknown" wire form would turn the whole filter into a 400.
+        let picked = filter_type_values(&[Reply, Bookmark, Reply, Unknown, GiftSent]);
+        assert_eq!(
+            picked,
+            vec!["reply", "bookmark", "gift_sent"],
+            "caller order is kept"
+        );
+
+        assert!(filter_type_values(&[]).is_empty());
+        assert!(
+            filter_type_values(&[Unknown]).is_empty(),
+            "a filter of nothing but Unknown must omit `type=` rather than send an empty one"
+        );
+
+        // Thirty-one distinct types truncate to the documented ceiling.
+        let many: Vec<NotificationType> = ALL_KNOWN_TYPES.to_vec();
+        assert!(
+            many.len() > MAX_NOTIFICATION_TYPE_FILTERS,
+            "the type list has outgrown the filter, which is exactly why the cap exists"
+        );
+        let picked = filter_type_values(&many);
+        assert_eq!(picked.len(), MAX_NOTIFICATION_TYPE_FILTERS);
+        assert_eq!(
+            picked[0],
+            many[0].wire(),
+            "truncation keeps the types asked for first"
+        );
+    }
+
+    /// Every type this build models, `Unknown` aside. Used to prove the filter
+    /// cap actually bites.
+    const ALL_KNOWN_TYPES: &[NotificationType] = {
+        use NotificationType::*;
+        &[
+            Bookmark,
+            Reply,
+            ThreadReply,
+            NewFollower,
+            Unfollowed,
+            NewPostFollowing,
+            NewPostFriend,
+            Poke,
+            ChatMention,
+            PostMention,
+            ReplyMention,
+            GraffitiMention,
+            DmMessage,
+            GuildNewThread,
+            GuildChatMessage,
+            SupporterGranted,
+            SupporterRemoved,
+            HackerGranted,
+            HackerRemoved,
+            ModeratorGranted,
+            ModeratorRemoved,
+            ModeratorPermissionsChanged,
+            ApiAccessGranted,
+            ApiAccessRemoved,
+            EditAccessGranted,
+            EditAccessRemoved,
+            ImagePermissionGranted,
+            ImagePermissionRemoved,
+            AttachmentPermissionGranted,
+            AttachmentPermissionRemoved,
+            SystemBan,
+            SystemBanLifted,
+            PostCooldown,
+            RateLimitWarning,
+            GiftReceived,
+            GiftSent,
+        ]
+    };
 
     #[test]
     fn the_v086_notification_types_decode_as_themselves() {

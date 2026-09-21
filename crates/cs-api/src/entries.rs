@@ -1,16 +1,24 @@
-//! Entry (post) read and write endpoints (`/v1/posts`, API v0.8.4).
+//! Entry (post) read and write endpoints (`/v1/posts`, API v0.8.10).
 //!
 //! Covers the feed, single-entry reads, slug resolution, create, edit, delete
 //! and reporting. Editing (§ Edit Entry) is limited to supporters, within 5
 //! minutes of publishing, on their own entries. The server owns both rules, so
 //! this module sends the request and lets the `403` surface.
+//!
+//! Attachments on the write path are audio only since v0.8.10 (§ Create Entry).
+//! Images travel as inline markdown in `content`, pointing at a URL the website
+//! already hosts, and are uploaded there; sending `"type": "image"` here is a
+//! `400`. [`validate_write_attachments`] refuses one locally so it costs no
+//! rate-limit token.
 use reqwest::Method;
 use serde::{Deserialize, Serialize, Serializer};
 
 use crate::client::Client;
 use crate::endpoint::EndpointKey;
 use crate::error::{ApiError, Result};
-use crate::types::{validate_flag_reason, Attachment, Entry, FlagBody, FlagResponse};
+use crate::types::{
+    validate_flag_reason, validate_write_attachments, Attachment, Entry, FlagBody, FlagResponse,
+};
 
 const MAX_CONTENT_LEN: usize = 32_768;
 const MAX_TOPICS: usize = 3;
@@ -29,6 +37,14 @@ impl Client {
     /// `GET /v1/posts` — the home feed. Pass `None` for the first page; thread
     /// the returned cursor for subsequent pages. `limit` is clamped to 1–50
     /// (spec ceiling) with a default of 20.
+    ///
+    /// Since v0.8.10 the feed also carries guild forum threads, but only from
+    /// guilds the caller belongs to and only while `showGuildPostsInFeed` is on
+    /// (§ List Entries, § Settings). The server filters *after* taking the page,
+    /// so a page can come back shorter than `limit`, or empty, with more entries
+    /// waiting behind it. Keep paging while the returned cursor is `Some`;
+    /// treating a short page as the end of the feed truncates it at the first
+    /// filtered thread.
     pub async fn list_entries(
         &self,
         cursor: Option<&str>,
@@ -53,7 +69,12 @@ impl Client {
     /// `POST /v1/posts` — create a new entry. Returns the created entry's id,
     /// final slug (server may suffix on collision), and any echo-back title.
     ///
-    /// Rate limit: 2/min, 10/day.
+    /// `attachments` takes at most one, and audio only (§ Create Entry). Build
+    /// one with [`Attachment::audio`]; pass an empty slice for an entry with no
+    /// track, which omits the field rather than sending `[]`.
+    ///
+    /// Rate limit: 2/min, 24/day.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_entry(
         &self,
         content: &str,
@@ -62,6 +83,7 @@ impl Client {
         topics: &[String],
         is_public: bool,
         is_nsfw: bool,
+        attachments: &[Attachment],
     ) -> Result<CreatedEntry> {
         validate_content_topics(content, topics)?;
         if let Some(t) = title {
@@ -70,6 +92,7 @@ impl Client {
         if let Some(s) = slug {
             validate_slug(s)?;
         }
+        validate_write_attachments(attachments)?;
         let body = CreateEntryBody {
             content,
             title,
@@ -77,6 +100,7 @@ impl Client {
             topics,
             is_public,
             is_nsfw,
+            attachments,
         };
         let r: CreateEntryResponse = self
             .request(
@@ -124,6 +148,9 @@ impl Client {
         }
         if let Some(topics) = &edit.topics {
             validate_topics(topics)?;
+        }
+        if let Some(attachments) = &edit.attachments {
+            validate_write_attachments(attachments)?;
         }
         let path = format!("/v1/posts/{post_id}");
         let r: EditEntryResponse = self
@@ -243,7 +270,10 @@ impl Serialize for TitleEdit {
 /// - `title`: `None` keeps the current title, `Some(TitleEdit::Remove)` sends
 ///   `""` and removes it.
 /// - `attachments`: `None` keeps the current attachments, `Some(Vec::new())`
-///   sends `[]` and removes them. A non-empty list replaces the whole set.
+///   sends `[]` and removes them. A non-empty list replaces the whole set, and
+///   since v0.8.10 may hold only one, audio (§ Edit Entry). An entry that
+///   already carries an image keeps it as long as `attachments` is left `None`:
+///   sending the image back is what draws the `400`.
 ///
 /// `topics` likewise replaces the existing list wholesale.
 ///
@@ -274,7 +304,8 @@ pub struct EntryEdit {
     #[serde(rename = "isNSFW", skip_serializing_if = "Option::is_none")]
     pub is_nsfw: Option<bool>,
 
-    /// Replacement attachment list. `Some(Vec::new())` removes them all.
+    /// Replacement attachment list. `Some(Vec::new())` removes them all. Audio
+    /// only, max one; see the type docs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attachments: Option<Vec<Attachment>>,
 }
@@ -388,6 +419,11 @@ struct CreateEntryBody<'a> {
     is_public: bool,
     #[serde(rename = "isNSFW")]
     is_nsfw: bool,
+    /// Omitted rather than sent as `[]` when there is no track: § Create Entry
+    /// calls the field optional, and an entry with no attachments has nothing
+    /// to say about them.
+    #[serde(skip_serializing_if = "<[Attachment]>::is_empty")]
+    attachments: &'a [Attachment],
 }
 
 #[derive(Debug, Deserialize)]
@@ -445,6 +481,7 @@ mod tests {
             topics: &topics,
             is_public: true,
             is_nsfw: true,
+            attachments: &[],
         };
         let s = serde_json::to_string(&body).unwrap();
         assert!(s.contains(r#""content":"hi""#));
@@ -454,6 +491,29 @@ mod tests {
         // Optional fields omitted when None.
         assert!(!s.contains(r#""title""#));
         assert!(!s.contains(r#""slug""#));
+        assert!(
+            !s.contains(r#""attachments""#),
+            "an entry with no track says nothing about attachments"
+        );
+    }
+
+    #[test]
+    fn create_entry_body_carries_an_audio_attachment() {
+        let track = Attachment::audio("https://youtu.be/abc", "Artist", "Title", "synthwave");
+        let body = CreateEntryBody {
+            content: "hi",
+            title: None,
+            slug: None,
+            topics: &[],
+            is_public: false,
+            is_nsfw: false,
+            attachments: std::slice::from_ref(&track),
+        };
+        let v: serde_json::Value = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["attachments"][0]["type"], "audio");
+        assert_eq!(v["attachments"][0]["src"], "https://youtu.be/abc");
+        assert_eq!(v["attachments"][0]["origin"], "youtube");
+        assert_eq!(v["attachments"][0]["genre"], "synthwave");
     }
 
     #[test]
@@ -465,6 +525,7 @@ mod tests {
             topics: &[],
             is_public: false,
             is_nsfw: false,
+            attachments: &[],
         };
         let s = serde_json::to_string(&body).unwrap();
         assert!(s.contains(r#""title":"My Title""#));

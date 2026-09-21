@@ -1,6 +1,6 @@
 # cs-tui
 
-A terminal client for [cyberspace.online](https://cyberspace.online), targeting the v0.8.6 API.
+A terminal client for [cyberspace.online](https://cyberspace.online), targeting the v0.8.10 API.
 
 ![cs-tui screenshot](docs/screenshot.png)
 
@@ -8,17 +8,18 @@ A terminal client for [cyberspace.online](https://cyberspace.online), targeting 
 
 ## Status
 
-Early development. Most of the documented v0.8.6 REST surface is implemented, including private C-Mail and multi-user cIRC chat (REST + live Firebase RTDB streaming) and full-text search; live testing against the API is ongoing.
+Early development. Most of the documented v0.8.10 REST surface is implemented, including private C-Mail and multi-user cIRC chat (REST + live Firebase RTDB streaming), full-text search, and the program registry; live testing against the API is ongoing.
 
 ## Features
 
 - **Feed** with cursor-based infinite scroll and entry titles
 - **Post detail** with threaded replies
-- **Notifications** with read/unread filtering and an unread badge that reads `99+` once the count passes 100 (past that the server counts only the 100 most recent), covering the full v0.8.6 type list: graffiti mentions, moderator and API-access changes, ban lifts, post cooldowns and rate-limit warnings alongside the older replies, mentions, follows and pokes. Several of those are about your own account rather than someone else's action, and arrive with no sender at all
+- **Notifications** with read/unread filtering and an unread badge that reads `99+` once the count passes 100 (past that the server counts only the 100 most recent), covering the full v0.8.10 type list: guild chat messages (with a preview of what was said), gifts sent and received, edit-access and moderator-permission changes, graffiti mentions, ban lifts, post cooldowns and rate-limit warnings alongside the older replies, mentions, follows and pokes. A few are about your own account rather than someone else's action and arrive with no sender at all; the role changes do name the staff member who made them
 - **Thread watching**: `w` in post detail watches/unwatches a thread for `thread_reply` notifications; replying or being `@mentioned` auto-watches (toggle with `autoWatchOnReply` in Settings)
 - **Bookmarks**, **Topics**, and per-topic feeds
 - **Profiles** (info / posts / replies / followers / following / guilds) with follow & unfollow, and `P` to poke someone. The guilds tab lists every guild they belong to with the role held in each, the one on their profile badge first and any apprenticeships after it; `Enter` opens one
 - **Compose** posts and replies in the built-in editor (soft-wrapping, multi-line paste, no external editor required); delete your own entries
+- **Attach a jukebox track** to a post or a reply, typed as `youtube url | artist | title | genre` on the options screen — the same shape as `/song` in chat. Clearing the field on an edit removes the track. Images are uploaded on the website and travel inline in the body as markdown, which is what the API now takes
 - **Edit** your own entry or reply with `e` (`E` on your profile's Posts tab). The API allows this on supporter accounts for 5 minutes after posting, and says so when it doesn't
 - **Flag** an entry, a reply, or a cIRC message for review with `F`, with an optional reason. Reporting is idempotent and can't be withdrawn
 - **cIRC** chat rooms with live streaming: a room roster (`Ctrl+U`) showing who's there and who's idle, presence published on your behalf, and an action menu (`Ctrl+A`) to delete your own message, flag one, open an attachment, reveal a spoiler, or mute the author
@@ -27,6 +28,7 @@ Early development. Most of the documented v0.8.6 REST surface is implemented, in
 - **Text styles and ASCII art**: `/art` is decoded and drawn as sent, `/rainbow` colors per character, `/quiet` dims, `/spoiler` stays masked until you press `v`, and `/blink`, `/wave`, `/slow` and `/glitch` get a static stand-in. Nothing animates. `/l33t`, `/flip`, `/comic`, `/cursive` and `/times` rewrite the text rather than style it, so cs-tui shows exactly what the server sent and adds nothing of its own
 - **Muted users**: `/mute` and `/unmute` in a room (or `m` in the `Ctrl+A` action menu) hide that person's messages for you; it's the same mute list the website uses
 - **Guilds**: browse member groups, view threads/members, join, leave, move your profile badge between guilds, and post threads. v0.8.6's apprenticeships are modelled throughout: the guild you are a member or founder of is the badge on your profile, joining another while you have one makes you an apprentice there (five at most), and promoting an apprenticeship moves the badge to it while the guild it replaces becomes an apprenticeship, so you stay in both
+- **Programs**: a section for the program registry — browse the gallery of programs members have published, filter by runtime, read any release's source (releases are immutable, so an old one is exactly what went out) and save it to a file, publish your own from a file, and recall or delete them. cs-tui does not run programs — `web` ones belong to the website's terminal and `term`/`wasm` to the terminal machine — so it is a place to read one before you do
 - **Journal** (private notes) with revision history
 - **Settings** round-trip that preserves fields the client doesn't model
 - Markdown rendering with `@mention` highlighting
@@ -129,8 +131,11 @@ On first launch you log in with your cyberspace.online email and password. The
 session is saved (see [Files](#files)) and reused on the next launch until you
 log out.
 
-cs-tui is keyboard-driven. Each screen shows its own context keys in the status
-bar, and `?` opens a help overlay anywhere you aren't typing into a field. The
+cs-tui is keyboard-driven. The left and right arrows move between sections
+(Feed, Notifications, C-Mail, cIRC, Bookmarks, Topics, Profile, Journal,
+Guilds, Programs, Settings); there are no number-key jumps, so digits reach the
+screen you are on. Each screen shows its own context keys in the status bar,
+and `?` opens a help overlay anywhere you aren't typing into a field. The
 overlay lists every key grouped by screen and is longer than a terminal, so it
 scrolls with `j`/`k`, the arrows and PgUp/PgDn (`g`/`G` jump to the ends); any
 other key closes it.
@@ -162,6 +167,14 @@ composes):
 | cIRC action menu | `Esc` | Close the menu, back to the composer |
 | C-Mail conversation | `o` | Open the attachment, or play the track |
 | C-Mail conversation | `v` | Reveal a spoiler |
+| Program gallery | `m` / `t` | Switch between the gallery and your own programs / cycle the runtime filter |
+| Program gallery | `P` | Publish a program from a local file |
+| Program gallery | `d` then `y` | Recall your own program (in the `m` listing; reversible, the release history stays) |
+| Program gallery | `D` then `y` | Delete the record, which frees the slot it holds against your program count |
+| Program publish form | `Tab` / `Space` / `Ctrl+D` | Move between fields / cycle the runtime / publish |
+| Program source | `,` / `.` | Walk the release history (`[` / `]` are the jukebox volume) |
+| Program source | `j`/`k`, `PgUp`/`PgDn`, `g`/`G` | Scroll the source |
+| Program source | `w` | Write the source to a file (it will not overwrite one) |
 
 In a cIRC room the composer always has focus, so every letter you type goes
 into the message. That is why the room's own actions are chords, and why
@@ -247,7 +260,7 @@ location is auto-created).
 
 | Option | Default | Notes |
 |---|---|---|
-| `start_section` | `feed` | Section opened on launch: `feed`, `notifications`, `c-mail`, `circ`, `bookmarks`, `topics`, `profile`, `journal`, `guilds`, `settings`. |
+| `start_section` | `feed` | Section opened on launch: `feed`, `notifications`, `c-mail`, `circ`, `bookmarks`, `topics`, `profile`, `journal`, `guilds`, `programs`, `settings`. |
 | `nsfw` | `false` | Show NSFW posts by default (otherwise hidden until toggled). |
 | `confirm_deletes` | `true` | Require the two-step `d` then `y` confirmation before deleting a post or note. |
 | `feed_autorefresh` | `true` | Auto-refresh the feed in the background: new entries are prepended at the top without moving your scroll position (only while the feed is on screen). |
@@ -299,7 +312,7 @@ Cyberspace, and publishes nothing to anyone you talk to.
 | `crates/cs-api/` | HTTP client + types for the Cyberspace REST API |
 | `crates/cs-tui/` | Ratatui application (binary) |
 
-The client targets **Cyberspace API v0.8.6**. The specification itself is not
+The client targets **Cyberspace API v0.8.10**. The specification itself is not
 redistributed here; obtain it from the service. Code comments cite it by section
 name (for example, § Join a Guild) so they stay readable without it.
 

@@ -100,8 +100,8 @@ impl TopicFeedScreen {
     }
 
     /// Whether a field is capturing text, so the shell's global single-letter
-    /// shortcuts (section jumps, `i`, `S`, the player keys) must not swallow the
-    /// keystroke. True only while the flag-reason prompt is open.
+    /// shortcuts (`i`, `S`, the player keys) must not swallow the keystroke.
+    /// True only while the flag-reason prompt is open.
     #[must_use]
     pub fn is_text_input(&self) -> bool {
         self.flag_prompt.is_some()
@@ -446,6 +446,7 @@ mod tests {
             created_at: None,
             edited_at: None,
             deleted: false,
+            ..Default::default()
         }
     }
 

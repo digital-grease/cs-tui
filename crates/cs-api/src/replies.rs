@@ -1,15 +1,22 @@
-//! Reply read and write endpoints (`/v1/replies`, API v0.8.4).
+//! Reply read and write endpoints (`/v1/replies`, API v0.8.10).
 //!
 //! Replies hang off an entry and can be threaded under another reply. Editing
 //! (§ Edit Reply) is limited to supporters, within 5 minutes of posting, on
 //! their own replies, and never bumps the thread.
+//!
+//! v0.8.10 gave replies the same `attachments` field entries have: at most one,
+//! audio only, same image rule (§ Create Reply). Editing a reply still touches
+//! nothing but `content`, so an attachment posted with a reply cannot be
+//! changed afterwards, only deleted with the reply.
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 
 use crate::client::Client;
 use crate::endpoint::EndpointKey;
 use crate::error::{ApiError, Result};
-use crate::types::{validate_flag_reason, FlagBody, FlagResponse, Reply};
+use crate::types::{
+    validate_flag_reason, validate_write_attachments, Attachment, FlagBody, FlagResponse, Reply,
+};
 
 const DEFAULT_PAGE_LIMIT: u32 = 20;
 const MAX_PAGE_LIMIT: u32 = 50;
@@ -42,18 +49,30 @@ impl Client {
 
     /// `POST /v1/replies` — create a new reply on `post_id`. Pass
     /// `parent_reply_id = Some(...)` for nested replies, `None` for top-level.
-    /// Returns the new `replyId`. Rate limit: 3/min, 10/day.
+    /// Returns the new `replyId`.
+    ///
+    /// `attachments` takes at most one, and audio only, on the same terms as
+    /// [`create_entry`](Client::create_entry) (§ Create Reply). Pass an empty
+    /// slice for a plain reply, which omits the field rather than sending `[]`.
+    ///
+    /// Posting a reply auto-watches the thread unless `autoWatchOnReply` is off
+    /// in Settings.
+    ///
+    /// Rate limit: 3/min, 48/day.
     pub async fn create_reply(
         &self,
         post_id: &str,
         content: &str,
         parent_reply_id: Option<&str>,
+        attachments: &[Attachment],
     ) -> Result<String> {
         validate_reply_content(content)?;
+        validate_write_attachments(attachments)?;
         let body = CreateReplyBody {
             post_id,
             content,
             parent_reply_id,
+            attachments,
         };
         let r: CreateReplyResponse = self
             .request(
@@ -145,6 +164,10 @@ struct CreateReplyBody<'a> {
     content: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_reply_id: Option<&'a str>,
+    /// Omitted rather than sent as `[]` for a plain reply, matching
+    /// `CreateEntryBody`.
+    #[serde(skip_serializing_if = "<[Attachment]>::is_empty")]
+    attachments: &'a [Attachment],
 }
 
 #[derive(Debug, Deserialize)]
@@ -178,11 +201,29 @@ mod tests {
             post_id: "p1",
             content: "hi",
             parent_reply_id: None,
+            attachments: &[],
         };
         let s = serde_json::to_string(&body).unwrap();
         assert!(s.contains(r#""postId":"p1""#));
         assert!(s.contains(r#""content":"hi""#));
         assert!(!s.contains("parentReplyId"));
+        assert!(!s.contains("attachments"), "a plain reply omits the field");
+    }
+
+    #[test]
+    fn create_body_carries_the_v0810_reply_attachment() {
+        // New in v0.8.10 § Create Reply: a reply may carry a track, on the same
+        // terms an entry does.
+        let track = Attachment::audio("https://youtu.be/abc", "Artist", "Title", "ambient");
+        let body = CreateReplyBody {
+            post_id: "p1",
+            content: "this one",
+            parent_reply_id: None,
+            attachments: std::slice::from_ref(&track),
+        };
+        let v: serde_json::Value = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["attachments"][0]["type"], "audio");
+        assert_eq!(v["attachments"][0]["artist"], "Artist");
     }
 
     #[test]
@@ -191,6 +232,7 @@ mod tests {
             post_id: "p1",
             content: "hi",
             parent_reply_id: Some("r0"),
+            attachments: &[],
         };
         let s = serde_json::to_string(&body).unwrap();
         assert!(s.contains(r#""parentReplyId":"r0""#));

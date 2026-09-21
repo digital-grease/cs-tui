@@ -980,14 +980,12 @@ mod tests {
             post_id: post_id.into(),
             author_username: "alice".into(),
             content: format!("thread {post_id}"),
-            ..Default::default()
-        };
-        GuildThread {
-            entry,
             guild_id: Some("g1".into()),
             guild_slug: Some("owls".into()),
             is_guild_thread: true,
-        }
+            ..Default::default()
+        };
+        GuildThread { entry }
     }
 
     #[test]

@@ -30,46 +30,12 @@ const CARD_WIDTH: u16 = 64;
 /// description rows are indented to the same place.
 const KEY_COL: usize = 14;
 
+/// The tab-bar sections. They carry no key of their own: the arrows cycle them,
+/// which is what the Global group says.
 const SECTIONS: &[Row] = &[
     Row {
-        keys: "1",
-        desc: "Feed",
-    },
-    Row {
-        keys: "2",
-        desc: "Notifications",
-    },
-    Row {
-        keys: "3",
-        desc: "C-Mail",
-    },
-    Row {
-        keys: "4",
-        desc: "cIRC",
-    },
-    Row {
-        keys: "5",
-        desc: "Bookmarks",
-    },
-    Row {
-        keys: "6",
-        desc: "Topics",
-    },
-    Row {
-        keys: "7",
-        desc: "Profile",
-    },
-    Row {
-        keys: "8",
-        desc: "Journal",
-    },
-    Row {
-        keys: "9",
-        desc: "Guilds",
-    },
-    Row {
-        keys: "0",
-        desc: "Settings",
+        keys: "← / →",
+        desc: "Feed · Notifications · C-Mail · cIRC · Bookmarks · Topics · Profile · Journal · Guilds · Programs · Settings",
     },
 ];
 
@@ -83,8 +49,8 @@ const GLOBAL: &[Row] = &[
         desc: "back",
     },
     Row {
-        keys: "1-0 / ← →",
-        desc: "jump to / cycle sections",
+        keys: "← / →",
+        desc: "cycle sections. There are no number keys: an eleventh section left the digits a key short, so they now reach the screen underneath instead",
     },
     Row {
         keys: "Tab / Shift+Tab",
@@ -240,6 +206,49 @@ const GUILDS: &[Row] = &[
     },
 ];
 
+const PROGRAMS: &[Row] = &[
+    Row {
+        keys: "Enter",
+        desc: "read the selected program's source. cs-tui cannot run a program — web ones belong to the website terminal, term and wasm to the terminal machine — so reading it and saving it is what it offers",
+    },
+    Row {
+        keys: "m",
+        desc: "switch between the public gallery and your own programs (drafts and recalled ones included)",
+    },
+    Row {
+        keys: "t",
+        desc: "cycle the runtime filter: all / web / term / wasm",
+    },
+    Row {
+        keys: "P",
+        desc: "publish a program from a local file. Publishing an existing name releases the next version; unchanged source is a no-op",
+    },
+    Row {
+        keys: "d",
+        desc: "recall your program — it leaves the gallery, its release history stays, and publishing again resumes from the next version. Only in your own listing (`m`); the public gallery is other people's",
+    },
+    Row {
+        keys: "D",
+        desc: "delete the record instead, which is what frees the slot it holds against your program count. Irreversible, and refused on a program a moderator took down",
+    },
+    Row {
+        keys: ", / .",
+        desc: "walk the release history while reading source. Releases are immutable, so an old version is exactly what went out. (Not `[` / `]` — those are the jukebox volume, globally)",
+    },
+    Row {
+        keys: "w",
+        desc: "write the open source to a file (a wasm binary is decoded first). It will not overwrite an existing file",
+    },
+    Row {
+        keys: "publish form",
+        desc: "Tab / Shift+Tab move between fields, Space cycles the runtime, Enter or Ctrl+D publishes, Esc cancels. The source comes from a file: a program is something you wrote in an editor, and a wasm binary cannot be typed",
+    },
+    Row {
+        keys: "save prompt",
+        desc: "Enter writes the file, Esc cancels. Both it and the publish form capture every printable key, so `?` cannot be opened from inside them — their keys are on the status bar",
+    },
+];
+
 const CIRC: &[Row] = &[
     Row {
         keys: "",
@@ -378,6 +387,10 @@ const EDITOR: &[Row] = &[
         desc: "save the body and continue to the post options",
     },
     Row {
+        keys: "track",
+        desc: "a post or reply may carry one jukebox track, typed on the options screen as `youtube url | artist | title | genre` — the same shape as /song in chat, except that a post needs all four parts. Clearing the field on an edit removes the track. Images are uploaded on the website and go inline in the body as markdown",
+    },
+    Row {
         keys: "Esc / Ctrl+C",
         desc: "cancel and discard",
     },
@@ -420,6 +433,7 @@ fn help_lines(theme: &Theme, desc_width: usize) -> Vec<Line<'static>> {
     group(&mut lines, "Posts & replies", POSTS);
     group(&mut lines, "Profile", PROFILE);
     group(&mut lines, "Guilds", GUILDS);
+    group(&mut lines, "Programs", PROGRAMS);
     group(&mut lines, "cIRC room", CIRC);
     group(&mut lines, "cIRC message actions (Ctrl+A)", CIRC_SELECT);
     group(&mut lines, "C-Mail conversation", CMAIL);

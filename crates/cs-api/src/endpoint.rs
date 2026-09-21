@@ -1,6 +1,6 @@
 //! Endpoint keys for rate-limiter accounting. One variant per documented endpoint.
 //!
-//! Rate-limit values come from the v0.8.6 spec (§ Rate Limits, plus each
+//! Rate-limit values come from the v0.8.10 spec (§ Rate Limits, plus each
 //! endpoint's own section). Where the consolidated table and the per-endpoint
 //! section disagree, the lower (more restrictive) value is used so the client
 //! cannot self-trigger 429s.
@@ -146,6 +146,19 @@ pub enum EndpointKey {
 
     // Search (v0.7)
     Search,
+
+    // Programs (v0.8.10 § Programs)
+    /// `GET /v1/programs` — the gallery, and its `?mine=1`, `?runtime=` and
+    /// `?author=&name=` forms. One key: they are the same read with different
+    /// query parameters.
+    ProgramsList,
+    /// `GET /v1/programs/:id/source`, current release or an earlier one.
+    ProgramsSource,
+    /// `POST /v1/programs` (§ Publish): 3/min, 40/day.
+    ProgramsPublish,
+    /// `DELETE /v1/programs/:id`, with or without `?purge=1` (§ Recall). Both
+    /// forms draw on the one "Program recalls" row, 5/min.
+    ProgramsRecall,
 }
 
 impl EndpointKey {
@@ -165,10 +178,11 @@ impl EndpointKey {
             GuildsThreadsCreate, GuildsThreadsList, NotesCreate, NotesDelete, NotesGet,
             NotesGetRevision, NotesList, NotesListRevisions, NotesUpdate, NotificationsList,
             NotificationsMarkAllRead, NotificationsMarkRead, NotificationsUnreadCount,
-            RepliesCreate, RepliesDelete, RepliesEdit, RepliesGet, RepliesList, Search,
-            SettingsGet, SettingsUpdate, TopicsList, TopicsListPosts, UsersGet, UsersGetMe,
-            UsersGetPostBySlug, UsersListGuilds, UsersListPosts, UsersListReplies, UsersPoke,
-            UsersUpdateMe, WatchCreate, WatchDelete, WatchStatus, WatchesList,
+            ProgramsList, ProgramsPublish, ProgramsRecall, ProgramsSource, RepliesCreate,
+            RepliesDelete, RepliesEdit, RepliesGet, RepliesList, Search, SettingsGet,
+            SettingsUpdate, TopicsList, TopicsListPosts, UsersGet, UsersGetMe, UsersGetPostBySlug,
+            UsersListGuilds, UsersListPosts, UsersListReplies, UsersPoke, UsersUpdateMe,
+            WatchCreate, WatchDelete, WatchStatus, WatchesList,
         };
 
         match self {
@@ -209,19 +223,26 @@ impl EndpointKey {
             EntriesGet | RepliesGet | UsersGetMe | NotesGet | NotesGetRevision
             | NotesListRevisions | SettingsGet => RateLimit::none(),
 
-            // Writes: lower of the (table, section) values in v0.8.4.
-            EntriesCreate | UsersUpdateMe | SettingsUpdate => RateLimit::with_day(2, 15),
-            RepliesCreate | FollowsCreate | FollowsDelete => RateLimit::with_day(3, 15),
+            // Writes: lower of the (table, section) values in v0.8.10.
+            //
+            // Entries and replies got roomier daily budgets in v0.8.10 (§ Rate
+            // Limits: entries 15 -> 24/day, replies 15 -> 48/day) while profile
+            // and settings updates kept the old 15, so the three no longer
+            // share an arm.
+            EntriesCreate => RateLimit::with_day(2, 24),
+            UsersUpdateMe | SettingsUpdate => RateLimit::with_day(2, 15),
+            RepliesCreate => RateLimit::with_day(3, 48),
+            FollowsCreate | FollowsDelete => RateLimit::with_day(3, 15),
             NotesCreate => RateLimit::with_day(3, 30),
             BookmarksCreate => RateLimit::with_day(5, 75),
             // Thread watching (v0.8.4 § Rate Limits, "Watch thread" 10/min, 100/day).
             WatchCreate => RateLimit::with_day(10, 100),
-            // C-Mail (v0.8.4). Start/send declare all three windows, and the hourly
-            // cap (30/hr start, 150/hr send) is stricter than per_minute * 60, so
-            // it has to be modelled explicitly or the client could self-inflict a
+            // C-Mail. Start/send declare all three windows, and the hourly cap
+            // (30/hr start, 150/hr send) is stricter than per_minute * 60, so it
+            // has to be modelled explicitly or the client could self-inflict a
             // 429. Mark-read has only a per-minute cap.
             CmailStart => RateLimit::full(5, 30, 50),
-            CmailSend => RateLimit::full(15, 150, 300),
+            CmailSend => RateLimit::full(15, 150, 1000),
             CmailMarkRead => RateLimit::per_minute(60),
             // C-Mail typing (v0.8.4 § Rate Limits, "C-Mail typing on/off",
             // 40 per conversation, 120 overall). This is the overall half; the
@@ -229,8 +250,11 @@ impl EndpointKey {
             // (clear) draws on the same budget as the POST, which is both what
             // the single table row says and the conservative reading.
             CmailTyping => RateLimit::per_minute(120),
-            // cIRC (v0.8.4): same message caps as C-Mail (15/min, 150/hr, 300/day).
-            CircSend => RateLimit::full(15, 150, 300),
+            // cIRC: same message caps as C-Mail. v0.8.10 raised both daily
+            // budgets from 300 to 1,000 (§ Rate Limits); the hourly cap the
+            // per-endpoint prose states is unchanged and still stricter than
+            // `per_minute * 60`, so it stays modelled explicitly.
+            CircSend => RateLimit::full(15, 150, 1000),
             CircMarkRead => RateLimit::per_minute(60),
             // cIRC presence (v0.8.4 § Rate Limits, "cIRC presence heartbeat /
             // leave", 15 per room, 90 overall). Overall half; see
@@ -274,10 +298,25 @@ impl EndpointKey {
             GuildsList | GuildsMembersList => RateLimit::per_minute(30),
             GuildsThreadsList => RateLimit::per_minute(45),
             GuildsGet => RateLimit::none(),
-            GuildsThreadsCreate => RateLimit::with_day(2, 15),
+            // § Create Guild Thread: 2/min, 24/day in v0.8.10 (was 15/day), the
+            // same daily budget an ordinary entry now carries — a guild thread
+            // is an ordinary entry.
+            GuildsThreadsCreate => RateLimit::with_day(2, 24),
             // § Rate Limits, Write Actions: "Guild promote | 3 | 15", matching
             // join and leave, and § Change Your Guild Badge repeats it.
             GuildsJoin | GuildsPromote | GuildsLeave => RateLimit::with_day(3, 15),
+
+            // Programs (v0.8.10 § Rate Limits, Write Actions): "Program
+            // publishes | 3 | 40" and "Program recalls | 5 | —", the recall row
+            // leaving the daily column blank for both the recall and the purge.
+            ProgramsPublish => RateLimit::with_day(3, 40),
+            ProgramsRecall => RateLimit::per_minute(5),
+            // The gallery and the source read carry no documented limit: § Read
+            // Actions (Anti-Scraping) has no program rows at all. Same treatment
+            // as every other undocumented read here — no client-side cap rather
+            // than an invented one, which would throttle below what the server
+            // allows.
+            ProgramsList | ProgramsSource => RateLimit::none(),
         }
     }
 
@@ -315,7 +354,7 @@ mod tests {
     fn write_endpoints_have_both_caps() {
         let rl = EndpointKey::EntriesCreate.rate_limit();
         assert_eq!(rl.per_minute, Some(2));
-        assert_eq!(rl.per_day, Some(15));
+        assert_eq!(rl.per_day, Some(24));
     }
 
     #[test]
@@ -356,7 +395,7 @@ mod tests {
     }
 
     #[test]
-    fn cmail_endpoints_use_v06_caps() {
+    fn cmail_endpoints_use_their_documented_caps() {
         let start = EndpointKey::CmailStart.rate_limit();
         assert_eq!(start.per_minute, Some(5));
         assert_eq!(start.per_hour, Some(30));
@@ -365,7 +404,7 @@ mod tests {
         let send = EndpointKey::CmailSend.rate_limit();
         assert_eq!(send.per_minute, Some(15));
         assert_eq!(send.per_hour, Some(150));
-        assert_eq!(send.per_day, Some(300));
+        assert_eq!(send.per_day, Some(1000));
 
         let read = EndpointKey::CmailRead.rate_limit();
         assert_eq!(read.per_minute, Some(45));
@@ -456,6 +495,71 @@ mod tests {
         // spent two of one 3/min budget instead of one of each.
         assert_ne!(EndpointKey::GuildsPromote, EndpointKey::GuildsJoin);
         assert_ne!(EndpointKey::GuildsPromote, EndpointKey::GuildsLeave);
+    }
+
+    #[test]
+    fn the_v0810_daily_budgets_are_the_raised_ones() {
+        // § Rate Limits, Write Actions. Leaving these at the v0.8.6 values would
+        // make the client refuse posts the server would still have accepted.
+        let entry = EndpointKey::EntriesCreate.rate_limit();
+        assert_eq!(entry.per_minute, Some(2));
+        assert_eq!(entry.per_day, Some(24));
+
+        let reply = EndpointKey::RepliesCreate.rate_limit();
+        assert_eq!(reply.per_minute, Some(3));
+        assert_eq!(reply.per_day, Some(48));
+
+        // A guild thread is an ordinary entry and carries the entry budget.
+        let thread = EndpointKey::GuildsThreadsCreate.rate_limit();
+        assert_eq!(thread.per_minute, Some(2));
+        assert_eq!(thread.per_day, Some(24));
+
+        for key in [EndpointKey::CmailSend, EndpointKey::CircSend] {
+            let rl = key.rate_limit();
+            assert_eq!(rl.per_minute, Some(15), "{key:?}");
+            assert_eq!(rl.per_hour, Some(150), "{key:?}");
+            assert_eq!(rl.per_day, Some(1000), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn the_raised_daily_budgets_did_not_move_the_ones_that_stayed() {
+        // v0.8.10 raised entries and replies but not the writes that used to
+        // share their arms, so splitting the arms must not have dragged these
+        // along.
+        for key in [EndpointKey::UsersUpdateMe, EndpointKey::SettingsUpdate] {
+            let rl = key.rate_limit();
+            assert_eq!(rl.per_minute, Some(2), "{key:?}");
+            assert_eq!(rl.per_day, Some(15), "{key:?}");
+        }
+        for key in [EndpointKey::FollowsCreate, EndpointKey::FollowsDelete] {
+            let rl = key.rate_limit();
+            assert_eq!(rl.per_minute, Some(3), "{key:?}");
+            assert_eq!(rl.per_day, Some(15), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn program_endpoints_carry_their_v0810_caps() {
+        // § Rate Limits, Write Actions: "Program publishes | 3 | 40".
+        let publish = EndpointKey::ProgramsPublish.rate_limit();
+        assert_eq!(publish.per_minute, Some(3));
+        assert_eq!(publish.per_day, Some(40));
+
+        // "Program recalls | 5 | —" — the daily column is blank.
+        let recall = EndpointKey::ProgramsRecall.rate_limit();
+        assert_eq!(recall.per_minute, Some(5));
+        assert_eq!(recall.per_day, None);
+
+        // The anti-scraping table has no program rows, so the reads take no
+        // invented cap.
+        for key in [EndpointKey::ProgramsList, EndpointKey::ProgramsSource] {
+            let rl = key.rate_limit();
+            assert!(rl.per_minute.is_none(), "{key:?}");
+            assert!(rl.per_hour.is_none(), "{key:?}");
+            assert!(rl.per_day.is_none(), "{key:?}");
+            assert!(key.scoped_rate_limit().is_none(), "{key:?}");
+        }
     }
 
     #[test]

@@ -32,6 +32,7 @@ pub mod open;
 pub mod player;
 pub mod post_detail;
 pub mod profile;
+pub mod programs;
 pub mod search;
 pub mod settings_screen;
 pub mod shuffle;

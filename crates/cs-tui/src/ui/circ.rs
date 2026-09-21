@@ -459,8 +459,8 @@ impl CircScreen {
     /// deliberately given up the keyboard so `j`, `k`, `d`, `y`, `F`, `o`, `v`
     /// and `m` can act on a message. Returning `false` there re-enables the
     /// shell's global single-letter interceptors: `?` help, `i` image toggle,
-    /// `S` shuffle, the digit section jumps, the left/right section cycle,
-    /// Backspace-as-back and the jukebox transport keys. None of those collide
+    /// `S` shuffle, the left/right section cycle, Backspace-as-back and the
+    /// jukebox transport keys. None of those collide
     /// with the select-mode bindings, which is why the mode is safe to unfocus.
     /// The flag-reason prompt is itself a text field, so it captures again while
     /// it is open.

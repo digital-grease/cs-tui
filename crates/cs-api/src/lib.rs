@@ -1,6 +1,6 @@
-//! Async Rust client for the cyberspace.online API (v0.8.6).
+//! Async Rust client for the cyberspace.online API (v0.8.10).
 //!
-//! Targets Cyberspace API v0.8.6. Comments cite that spec by section name;
+//! Targets Cyberspace API v0.8.10. Comments cite that spec by section name;
 //! the spec itself is not redistributed with this repository.
 #![deny(rust_2018_idioms)]
 
@@ -19,6 +19,7 @@ mod message;
 mod notes;
 mod notifications;
 mod profile_patch;
+mod programs;
 mod rate_limit;
 mod replies;
 pub mod rtdb;
@@ -53,20 +54,27 @@ pub use message::{AudioAttachment, MessageExtras, MessageStyle};
 pub use notes::{Note, NoteRevision};
 pub use notifications::{
     Notification, NotificationMetadata, NotificationType, NotificationsFilter, UnreadCount,
-    SYSTEM_ACTOR,
+    MAX_NOTIFICATION_TYPE_FILTERS, SYSTEM_ACTOR,
 };
 pub use profile_patch::{Patch, ProfileUpdate};
+pub use programs::{
+    NewProgram, Program, ProgramQuery, ProgramSource, PublishedProgram, RecalledProgram, Runtime,
+    MAX_PROGRAM_DESCRIPTION_LEN, MAX_PROGRAM_NAME_LEN,
+};
 pub use rate_limit::RateLimit;
 pub use search::{PostHit, ReplyHit, SearchHit, SearchPreview, SearchType, UserHit};
 pub use settings::{NotificationPrefs, Settings, SettingsUpdate};
 pub use tokens::Tokens;
 pub use topics::Topic;
-pub use types::{Attachment, Entry, FlagResponse, Reply};
+pub use types::{
+    validate_write_attachments, Attachment, Entry, FlagResponse, Reply, AUDIO_ORIGIN_YOUTUBE,
+    MAX_ATTACHMENTS, MAX_AUDIO_ARTIST_LEN, MAX_AUDIO_GENRE_LEN, MAX_AUDIO_TITLE_LEN,
+};
 pub use users::{PokeResponse, User, UserGuild};
 pub use watch::Watch;
 
 /// Spec version this client targets.
-pub const API_VERSION: &str = "v0.8.6";
+pub const API_VERSION: &str = "v0.8.10";
 /// Production API host, used unless [`ClientBuilder`] is given another.
 pub const DEFAULT_BASE_URL: &str = "https://api.cyberspace.online";
 
@@ -76,7 +84,7 @@ mod tests {
 
     #[test]
     fn constants_present() {
-        assert_eq!(API_VERSION, "v0.8.6");
+        assert_eq!(API_VERSION, "v0.8.10");
         assert!(DEFAULT_BASE_URL.starts_with("https://"));
     }
 

@@ -1005,11 +1005,14 @@ impl CmailScreen {
         };
         let other = &conversation.other_user;
         let name = display_name_of(other);
-        let title = if name != other.username {
+        let mut title = if name != other.username {
             format!(" cs-tui • c-mail • {name} (@{}) ", other.username)
         } else {
             format!(" cs-tui • c-mail • @{} ", other.username)
         };
+        if other.deleted {
+            title = format!("{}• deleted account ", title.trim_end());
+        }
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(theme.border_style())
@@ -1788,6 +1791,11 @@ fn conversation_item(c: &CmailConversation, theme: &Theme) -> ListItem<'static> 
             theme.muted_style(),
         ));
     }
+    // A deleted account (v0.8.10 § List Conversations). The thread survives and
+    // stays readable, so it is labelled rather than hidden.
+    if c.other_user.deleted {
+        header.push(Span::styled(" (deleted)", theme.muted_style()));
+    }
     header.push(Span::styled(
         format!(" · {when}{unread}"),
         theme.muted_style(),
@@ -2047,6 +2055,7 @@ mod tests {
             username: username.into(),
             display_name: None,
             profile_picture_url: None,
+            deleted: false,
         }
     }
 
@@ -2234,6 +2243,69 @@ mod tests {
         s.open_conversation("c1");
         s.apply_messages("c1", true, Ok((msgs, cursor)));
         s
+    }
+
+    /// The same fixture as `open_with_messages`, with the correspondent's
+    /// account deleted (v0.8.10 § List Conversations).
+    fn open_with_deleted_correspondent() -> CmailScreen {
+        let mut s = CmailScreen::new();
+        let mut c = convo("c1", "ghost");
+        c.other_user.deleted = true;
+        s.apply_conversations(Ok(vec![c]));
+        s.open_conversation("c1");
+        s.apply_messages("c1", true, Ok((Vec::new(), None)));
+        s
+    }
+
+    #[test]
+    fn a_thread_with_a_deleted_account_is_marked_but_not_restricted() {
+        // v0.8.10 § List Conversations gives `otherUser.deleted` and says
+        // nothing about what it does to sending; the only documented refusal on
+        // a send is a block, which answers 403. This client used to refuse the
+        // send itself, which invented a rule the API does not state — and the
+        // house convention everywhere else (editing, supporter features) is to
+        // send the request and let the server's answer surface.
+        let mut s = open_with_deleted_correspondent();
+        assert_eq!(s.open_conversation_id(), Some("c1"));
+
+        s.handle_key(key(KeyCode::Char('c')));
+        for c in "yo".chars() {
+            s.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            CmailIntent::SendMessage {
+                conversation_id: "c1".into(),
+                content: "yo".into(),
+            },
+            "the send goes out; the server decides"
+        );
+    }
+
+    #[test]
+    fn a_deleted_account_is_still_labelled_in_the_conversation_list() {
+        // The marking half is what the spec does document, and it stays.
+        let mut s = CmailScreen::new();
+        let mut c = convo("c1", "ghost");
+        c.other_user.deleted = true;
+        s.apply_conversations(Ok(vec![c]));
+        assert!(s.conversations.items[0].other_user.deleted);
+    }
+
+    #[test]
+    fn a_live_correspondent_is_unaffected_by_the_deleted_check() {
+        let mut s = open_with_messages(vec![], None);
+        s.handle_key(key(KeyCode::Char('c')));
+        for c in "yo".chars() {
+            s.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            CmailIntent::SendMessage {
+                conversation_id: "c1".into(),
+                content: "yo".into(),
+            }
+        );
     }
 
     #[test]

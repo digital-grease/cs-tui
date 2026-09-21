@@ -45,6 +45,7 @@ use super::nav::{render_tab_bar, RootKind, TabBarStatus};
 use super::notifications::{NotificationsIntent, NotificationsScreen};
 use super::post_detail::{PostDetailIntent, PostDetailScreen};
 use super::profile::{ProfileIntent, ProfileScreen, ProfileTab};
+use super::programs::{ProgramsIntent, ProgramsScreen};
 use super::search::{SearchIntent, SearchScreen};
 use super::settings_screen::{SettingsIntent, SettingsScreen};
 use super::shuffle::ShufflePool;
@@ -377,6 +378,27 @@ pub enum BgEvent {
         usernames: Vec<String>,
     },
     SearchResults(Result<cs_api::SearchPreview, String>),
+    /// The program gallery (v0.8.10 § Programs). `more` marks a follow-up page
+    /// so it appends rather than replacing.
+    ProgramsListed {
+        epoch: u64,
+        more: bool,
+        result: Result<(Vec<cs_api::Program>, Option<String>), String>,
+    },
+    /// A fetched source, tagged with the program it was asked for: a slow
+    /// response must not be painted into whatever program happens to be open
+    /// when it lands.
+    ProgramSourceLoaded {
+        program_id: String,
+        result: Result<cs_api::ProgramSource, String>,
+    },
+    /// A finished publish, already reduced to the line to show the reader —
+    /// the three outcomes (§ Publish) read differently and only the spawn has
+    /// the response to tell them apart.
+    ProgramPublished(Result<String, String>),
+    ProgramRecalled(Result<String, String>),
+    /// A source written to disk, or why it could not be.
+    ProgramSourceSaved(Result<String, String>),
     /// Result of a background C-Mail unread poll: the total unread count and,
     /// when any conversation is unread, the display name of the most recently
     /// active unread sender (drives the "new mail" toast).
@@ -633,6 +655,8 @@ pub enum Screen {
     Guilds(GuildsScreen),
     Guild(GuildScreen),
     Search(SearchScreen),
+    /// The program registry (v0.8.10 § Programs), a tab-bar root of its own.
+    Programs(ProgramsScreen),
 }
 
 impl Screen {
@@ -650,6 +674,8 @@ impl Screen {
             Screen::Cmail(s) => s.is_text_input(),
             Screen::Circ(s) => s.is_text_input(),
             Screen::Search(s) => s.is_editing(),
+            // The publish form and the save-path prompt capture printable keys.
+            Screen::Programs(s) => s.is_text_input(),
             // The flag-reason prompts (`F`) are single-line fields, so while one
             // is open every printable key belongs to it, not to a global.
             Screen::Feed(s) => s.is_text_input(),
@@ -658,7 +684,7 @@ impl Screen {
             // The topics search box captures printable keys while open.
             Screen::Topics(s) => s.is_filtering(),
             // Settings has only toggles, cyclable choices, and read-only fields —
-            // no free text — so global nav (1-8 / ←→) always stays active there.
+            // no free text — so the section arrows always stay active there.
             _ => false,
         }
     }
@@ -783,6 +809,37 @@ enum Action {
     },
     SearchRun {
         query: String,
+    },
+    /// (Re)load the program gallery from the top (v0.8.10 § Browse the Gallery).
+    ProgramsReload {
+        query: Box<cs_api::ProgramQuery>,
+    },
+    ProgramsMore {
+        query: Box<cs_api::ProgramQuery>,
+        before: String,
+    },
+    ProgramSourceLoad {
+        program_id: String,
+        release: Option<u32>,
+    },
+    /// Read `source_path` off disk, then publish it (§ Publish). The read
+    /// happens in the background task, not on the UI thread: the ceilings run
+    /// to megabytes.
+    ProgramPublish {
+        name: String,
+        description: String,
+        runtime: cs_api::Runtime,
+        note: Option<String>,
+        source_path: String,
+    },
+    ProgramRecall {
+        program_id: String,
+        purge: bool,
+    },
+    /// Write the open program source to a local file.
+    ProgramSourceSave {
+        path: String,
+        bytes: Vec<u8>,
     },
     BookmarksRefresh,
     BookmarksMore {
@@ -1141,6 +1198,12 @@ pub struct App {
     /// epoch lets a late page from the old query be dropped instead of appended
     /// under the new filter's heading, taking the old cursor with it.
     notifications_epoch: Arc<AtomicU64>,
+    /// Generation for program-gallery queries, for the same reason
+    /// `notifications_epoch` exists: `m`, `t` and `r` each start a new query
+    /// while the previous one may still be in flight, and a superseded page
+    /// would otherwise be appended to the new query's list and hand it the old
+    /// query's cursor.
+    programs_epoch: Arc<AtomicU64>,
     /// Generation counter for the unread-notification count.
     ///
     /// Bumped whenever the count is changed locally (an optimistic
@@ -1280,6 +1343,7 @@ impl App {
             topics_complete: false,
             topics_epoch: Arc::new(AtomicU64::new(0)),
             notifications_epoch: Arc::new(AtomicU64::new(0)),
+            programs_epoch: Arc::new(AtomicU64::new(0)),
             unread_epoch: Arc::new(AtomicU64::new(0)),
             update_available: None,
             topic_follows: Vec::new(),
@@ -1679,6 +1743,7 @@ impl App {
                     self.picker.as_ref().filter(|_| self.images_on),
                 ),
                 Screen::Search(s) => s.render(frame, screen_area, &self.theme),
+                Screen::Programs(s) => s.render(frame, screen_area, &self.theme),
                 Screen::Bookmarks(s) => s.render(frame, screen_area, &self.theme),
                 Screen::Topics(s) => s.render(frame, screen_area, &self.theme),
                 Screen::TopicFeed(s) => s.render(frame, screen_area, &self.theme),
@@ -2307,6 +2372,41 @@ impl App {
                 SearchIntent::OpenUser { username } => Action::ProfileOpenUser { username },
                 SearchIntent::None => Action::None,
             },
+            Screen::Programs(s) => match s.handle_key(key) {
+                ProgramsIntent::Quit => Action::Quit,
+                ProgramsIntent::Warn(msg) => Action::Warn(msg),
+                ProgramsIntent::Reload { query } => Action::ProgramsReload { query },
+                ProgramsIntent::LoadMore { query, before } => {
+                    Action::ProgramsMore { query, before }
+                }
+                ProgramsIntent::LoadSource {
+                    program_id,
+                    release,
+                } => Action::ProgramSourceLoad {
+                    program_id,
+                    release,
+                },
+                ProgramsIntent::Publish {
+                    name,
+                    description,
+                    runtime,
+                    note,
+                    source_path,
+                } => Action::ProgramPublish {
+                    name,
+                    description,
+                    runtime,
+                    note,
+                    source_path,
+                },
+                ProgramsIntent::Recall { program_id, purge } => {
+                    Action::ProgramRecall { program_id, purge }
+                }
+                ProgramsIntent::SaveSource { path, bytes } => {
+                    Action::ProgramSourceSave { path, bytes }
+                }
+                ProgramsIntent::None => Action::None,
+            },
         }
     }
 
@@ -2337,6 +2437,7 @@ impl App {
                 }
                 Screen::Circ(s) => s.paste_text(&data),
                 Screen::Search(s) => s.paste_text(&data),
+                Screen::Programs(s) => s.paste_text(&data),
                 // No-ops unless a flag-reason prompt is open, so they are safe
                 // to route unconditionally.
                 Screen::Feed(s) => s.paste_text(&data),
@@ -2398,8 +2499,8 @@ impl App {
         // A modal picture swallows the next key, whatever it is.
         //
         // This must be the FIRST handler. It used to sit far below, after Esc,
-        // after the 1-8 and arrow section navigation, after Ctrl+F and after the
-        // player keys, so "any key closes" was simply false: Esc with a picture
+        // after the arrow section navigation, after Ctrl+F and after the player
+        // keys, so "any key closes" was simply false: Esc with a picture
         // open left the cIRC room, wiped the composer draft and the queued
         // failed sends, and left the picture painted over the room list. A
         // reader dismissing a photo means "close this", never "quit", "delete"
@@ -2517,6 +2618,15 @@ impl App {
                     return;
                 }
             }
+            // A sub-mode of Programs (source view, publish form, save prompt,
+            // delete confirm) owns Esc: closing one must not also leave the
+            // section, which is what the root-level "Esc opens the menu" below
+            // would otherwise do.
+            if let Screen::Programs(s) = &mut self.screen {
+                if s.handle_escape() {
+                    return;
+                }
+            }
             if let Screen::Circ(s) = &mut self.screen {
                 // Read the room before `handle_escape` unwinds it, so leaving
                 // still knows which room's presence to withdraw.
@@ -2589,11 +2699,12 @@ impl App {
             return;
         }
 
-        // Section nav: ←/→ cycle and 1-8 jump, but only on screens that don't
-        // capture text (a digit typed into a compose title must reach the field,
-        // not navigate). Tab is deliberately NOT a section key — it's reserved
-        // for switching sub-tabs within a screen (profile tabs, guild tabs,
-        // settings fields).
+        // Section nav: ←/→ cycle, on screens that don't capture text. The `1`-`0`
+        // jump keys are gone — an eleventh section (Programs) left the digits a
+        // key short, and a partial set would have been worse than none. Digits
+        // now reach the screen underneath like any other character. Tab is
+        // deliberately NOT a section key either: it switches sub-tabs within a
+        // screen (profile tabs, guild tabs, settings fields).
         if !self.screen.accepts_text_input() {
             match key.code {
                 KeyCode::Right => {
@@ -2605,14 +2716,6 @@ impl App {
                     let prev = self.current_root.unwrap_or(RootKind::Feed).prev();
                     self.goto_root(prev);
                     return;
-                }
-                KeyCode::Char(c) => {
-                    if let Some(target) = RootKind::from_shortcut(c) {
-                        if self.current_root != Some(target) {
-                            self.goto_root(target);
-                            return;
-                        }
-                    }
                 }
                 _ => {}
             }
@@ -2882,6 +2985,45 @@ impl App {
                 self.spawn_circ_mute_user(room_id, username);
             }
             Action::SearchRun { query } => self.spawn_search(query),
+            Action::ProgramsReload { query } => self.spawn_programs(*query, None),
+            Action::ProgramsMore { query, before } => {
+                self.spawn_programs(*query, Some(before));
+            }
+            Action::ProgramSourceLoad {
+                program_id,
+                release,
+            } => self.spawn_program_source(program_id, release),
+            Action::ProgramPublish {
+                name,
+                description,
+                runtime,
+                note,
+                source_path,
+            } => {
+                if self.block_write_if_offline() {
+                    if let Screen::Programs(s) = &mut self.screen {
+                        s.apply_published(Err("you're offline".into()));
+                    }
+                    return;
+                }
+                self.spawn_program_publish(name, description, runtime, note, source_path);
+            }
+            Action::ProgramRecall { program_id, purge } => {
+                if self.block_write_if_offline() {
+                    // The confirm set the list loading before the intent left
+                    // the screen. Nothing is going to answer, and a stuck
+                    // `loading` also suppresses every later load-more error
+                    // (`list::load_more_error` returns None while it is set).
+                    if let Screen::Programs(s) = &mut self.screen {
+                        s.list.loading = false;
+                    }
+                    return;
+                }
+                self.spawn_program_recall(program_id, purge);
+            }
+            Action::ProgramSourceSave { path, bytes } => {
+                self.spawn_program_source_save(path, bytes);
+            }
             Action::BookmarksRefresh => self.spawn_bookmarks_initial(),
             Action::BookmarksMore { cursor } => self.spawn_bookmarks_more(cursor),
             Action::BookmarkRemove { bookmark_id } => {
@@ -3688,6 +3830,93 @@ impl App {
                     s.apply_results(result);
                 }
             }
+            BgEvent::ProgramsListed {
+                epoch,
+                more,
+                result,
+            } => {
+                if result.is_ok() {
+                    self.offline = false;
+                }
+                // A page from a superseded query would put rows the current
+                // scope or filter excludes under the current header, and hand
+                // the list the old query's cursor, sending every later page
+                // down the wrong query.
+                if epoch != self.programs_epoch.load(Ordering::SeqCst) {
+                    return;
+                }
+                let mut chase = None;
+                let mut query = None;
+                if let Screen::Programs(s) = &mut self.screen {
+                    chase = if more {
+                        s.apply_more(result)
+                    } else {
+                        s.apply_initial(result)
+                    };
+                    query = Some(s.query());
+                }
+                // § Browse the Gallery: a filtered page can be empty and still
+                // carry a cursor, so an empty listing is not an empty gallery
+                // until the cursor runs out.
+                if let (Some(before), Some(query)) = (chase, query) {
+                    self.spawn_programs(query, Some(before));
+                }
+            }
+            BgEvent::ProgramSourceLoaded { program_id, result } => {
+                if result.is_ok() {
+                    self.offline = false;
+                }
+                if let Screen::Programs(s) = &mut self.screen {
+                    s.apply_source(&program_id, result);
+                }
+            }
+            // A publish or a recall is a write the reader is waiting on, and an
+            // irreversible one in the purge case. It is announced whether or not
+            // they are still on the screen that started it: gating the toast on
+            // the screen meant that stepping to another section during the round
+            // trip lost both the confirmation and, worse, the failure — which
+            // `note_api_err` does not toast on its own for an ordinary API
+            // error. Only the form bookkeeping and the re-read are screen-local.
+            BgEvent::ProgramPublished(result) => {
+                let announced = match &result {
+                    Ok(message) => Toast::info(message.clone()),
+                    Err(msg) => Toast::warning(msg.clone()),
+                };
+                let mut refresh = None;
+                if let Screen::Programs(s) = &mut self.screen {
+                    if s.apply_published(result).is_some() {
+                        refresh = Some(s.query());
+                    }
+                }
+                self.toast = Some(announced);
+                // The listing underneath now has a new release in it.
+                if let Some(query) = refresh {
+                    self.spawn_programs(query, None);
+                }
+            }
+            BgEvent::ProgramRecalled(result) => {
+                let announced = match &result {
+                    Ok(message) => Toast::info(message.clone()),
+                    Err(msg) => Toast::warning(msg.clone()),
+                };
+                let mut refresh = None;
+                if let Screen::Programs(s) = &mut self.screen {
+                    match &result {
+                        Ok(_) => refresh = Some(s.query()),
+                        // The confirm step set the list loading in advance;
+                        // nothing changed, so let it settle back.
+                        Err(_) => s.list.loading = false,
+                    }
+                }
+                self.toast = Some(announced);
+                if let Some(query) = refresh {
+                    self.spawn_programs(query, None);
+                }
+            }
+            BgEvent::ProgramSourceSaved(result) => match result {
+                Ok(path) => self.toast = Some(Toast::info(format!("saved to {path}"))),
+                Err(msg) => self.toast = Some(Toast::warning(msg)),
+            },
             BgEvent::CmailUnread { count, latest_from } => {
                 // A successful poll doubles as an online heartbeat, same as the
                 // notifications unread poller.
@@ -5309,6 +5538,12 @@ impl App {
                 self.screen = Screen::Guilds(GuildsScreen::new());
                 self.spawn_guilds_initial();
             }
+            RootKind::Programs => {
+                let s = ProgramsScreen::new();
+                let query = s.query();
+                self.screen = Screen::Programs(s);
+                self.spawn_programs(query, None);
+            }
         }
     }
 
@@ -5897,6 +6132,138 @@ impl App {
                 .await
                 .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::SearchResults(result));
+        });
+    }
+
+    /// `GET /v1/programs` (§ Browse the Gallery). `before` is the previous
+    /// page's cursor; `None` reloads from the top.
+    fn spawn_programs(&self, query: cs_api::ProgramQuery, before: Option<String>) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        let more = before.is_some();
+        // A fresh query advances the generation; a follow-up page rides the one
+        // its list already belongs to, so it is dropped if the query moved on
+        // under it.
+        let epoch = if more {
+            self.programs_epoch.load(Ordering::SeqCst)
+        } else {
+            self.programs_epoch.fetch_add(1, Ordering::SeqCst) + 1
+        };
+        tokio::spawn(async move {
+            let result = client
+                .list_programs(&query, before.as_deref(), None)
+                .await
+                .map_err(|e| note_api_err(&tx, e));
+            let _ = tx.send(BgEvent::ProgramsListed {
+                epoch,
+                more,
+                result,
+            });
+        });
+    }
+
+    fn spawn_program_source(&self, program_id: String, release: Option<u32>) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = client
+                .get_program_source(&program_id, release)
+                .await
+                .map_err(|e| note_api_err(&tx, e));
+            let _ = tx.send(BgEvent::ProgramSourceLoaded { program_id, result });
+        });
+    }
+
+    /// Read the file, then publish it (§ Publish).
+    ///
+    /// The read is here rather than on the UI thread because the ceilings run to
+    /// megabytes, and it is the step most likely to fail — a mistyped path — so
+    /// its error has to read as a file problem rather than as an API one.
+    fn spawn_program_publish(
+        &self,
+        name: String,
+        description: String,
+        runtime: cs_api::Runtime,
+        note: Option<String>,
+        source_path: String,
+    ) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let source = match tokio::fs::read(&source_path).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    let _ = tx.send(BgEvent::ProgramPublished(Err(format!(
+                        "could not read {source_path}: {e}"
+                    ))));
+                    return;
+                }
+            };
+            let mut program = cs_api::NewProgram::new(name, description, source, runtime);
+            if let Some(note) = note {
+                program = program.with_note(note);
+            }
+            let result = client
+                .publish_program(&program)
+                .await
+                .map_err(|e| note_api_err(&tx, e))
+                .map(|published| {
+                    // The three outcomes read differently and only a caller
+                    // that saw the response can tell them apart.
+                    let release = published.release;
+                    if published.is_new_release() {
+                        format!("published {} v{release}", published.name)
+                    } else if published.restored {
+                        format!("{} is back in the gallery at v{release}", published.name)
+                    } else {
+                        format!(
+                            "{} is already at v{release} — nothing to publish",
+                            published.name
+                        )
+                    }
+                });
+            let _ = tx.send(BgEvent::ProgramPublished(result));
+        });
+    }
+
+    fn spawn_program_recall(&self, program_id: String, purge: bool) {
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let call = if purge {
+                client.purge_program(&program_id).await
+            } else {
+                client.recall_program(&program_id).await
+            };
+            let result = call.map_err(|e| note_api_err(&tx, e)).map(|recalled| {
+                let name = recalled.name;
+                if recalled.deleted {
+                    format!("deleted {name}")
+                } else {
+                    format!("{name} is out of the gallery")
+                }
+            });
+            let _ = tx.send(BgEvent::ProgramRecalled(result));
+        });
+    }
+
+    /// Write a fetched program source to a local file.
+    ///
+    /// Refuses to overwrite: this writes a file the user named by hand into a
+    /// directory the client knows nothing about, and clobbering a working copy
+    /// they had been editing is not something a save prompt should be able to
+    /// do by accident.
+    fn spawn_program_source_save(&self, path: String, bytes: Vec<u8>) {
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            let result = match tokio::fs::try_exists(&path).await {
+                Ok(true) => Err(format!("{path} already exists")),
+                Ok(false) | Err(_) => tokio::fs::write(&path, &bytes)
+                    .await
+                    .map(|()| path.clone())
+                    .map_err(|e| format!("could not write {path}: {e}")),
+            };
+            let _ = tx.send(BgEvent::ProgramSourceSaved(result));
         });
     }
 
@@ -7078,7 +7445,7 @@ impl App {
     }
 
     fn spawn_compose_submit(&self) {
-        let (kind, content, title, slug, topics, is_public, is_nsfw, entry_edit) =
+        let (kind, content, title, slug, topics, attachments, is_public, is_nsfw, entry_edit) =
             match &self.screen {
                 Screen::Compose(s) => (
                     s.kind.clone(),
@@ -7086,6 +7453,9 @@ impl App {
                     s.title_to_send(),
                     s.slug_to_send(),
                     s.parse_topics(),
+                    // Already validated by `try_submit`, which refuses to submit
+                    // a track it could not parse.
+                    s.attachments_to_send(),
                     s.is_public,
                     s.is_nsfw,
                     // The only correct source for an entry edit: it diffs against
@@ -7108,6 +7478,7 @@ impl App {
                             &topics,
                             is_public,
                             is_nsfw,
+                            &attachments,
                         )
                         .await
                         .map(|created| (created.post_id, created.slug))
@@ -7119,7 +7490,7 @@ impl App {
                     parent_reply_id,
                 } => {
                     let result = client
-                        .create_reply(&post_id, &content, parent_reply_id.as_deref())
+                        .create_reply(&post_id, &content, parent_reply_id.as_deref(), &attachments)
                         .await
                         .map_err(|e| note_api_err(&tx, e));
                     let _ = tx.send(BgEvent::ReplyCreated(result));
@@ -8700,6 +9071,27 @@ mod tests {
     }
 
     #[test]
+    fn the_tab_bar_draws_section_names_and_no_key_prefixes() {
+        // The rendered token, not just `label()`: the bar used to prefix each
+        // one with its number key ("1·Feed"), and that prefix would now be
+        // advertising a key that does nothing.
+        let mut app = test_app();
+        app.screen = Screen::Feed(FeedScreen::new());
+        app.current_root = Some(RootKind::Feed);
+        let bar = render_to_string(&app)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+
+        assert!(bar.contains("Feed"), "{bar}");
+        assert!(
+            !bar.contains("1·") && !bar.contains("2·"),
+            "the bar still shows number keys: {bar}"
+        );
+    }
+
+    #[test]
     fn menu_overlay_is_drawn_over_the_login_screen() {
         // Regression: opening the Esc menu on the login screen used to be
         // skipped by an early return in render(), so keystrokes routed to an
@@ -8748,6 +9140,7 @@ mod tests {
             created_at: None,
             edited_at: None,
             deleted: false,
+            ..Default::default()
         }
     }
 
@@ -8960,6 +9353,7 @@ mod tests {
                 username: "alice".into(),
                 display_name: None,
                 profile_picture_url: None,
+                deleted: false,
             },
             last_message: None,
             last_message_at: None,
@@ -9288,31 +9682,78 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn digit_keys_navigate_from_read_screens() {
+    async fn the_arrows_move_between_sections_from_a_read_screen() {
         let mut app = test_app();
         app.screen = Screen::Feed(FeedScreen::new());
         app.current_root = Some(RootKind::Feed);
-        app.handle_terminal_event(key_event(KeyCode::Char('2')))
-            .await;
+        app.handle_terminal_event(key_event(KeyCode::Right)).await;
         assert!(
             matches!(app.screen, Screen::Notifications(_)),
-            "2 should switch to notifications from a read screen"
+            "Right should move to the next section"
+        );
+        app.handle_terminal_event(key_event(KeyCode::Left)).await;
+        assert!(
+            matches!(app.screen, Screen::Feed(_)),
+            "Left should move back"
         );
     }
 
     #[tokio::test]
-    async fn digit_keys_do_not_navigate_away_from_text_input_screens() {
-        // Compose is unconditionally text-input: a digit must reach the editor,
-        // not navigate.
+    async fn a_digit_no_longer_navigates_anywhere() {
+        // The `1`-`0` jump keys went when Programs made an eleventh section.
+        // A digit is now an ordinary character: it reaches the screen, which on
+        // the feed means it does nothing at all.
+        for digit in ['1', '2', '9', '0'] {
+            let mut app = test_app();
+            app.screen = Screen::Feed(FeedScreen::new());
+            app.current_root = Some(RootKind::Feed);
+            app.handle_terminal_event(key_event(KeyCode::Char(digit)))
+                .await;
+            assert!(
+                matches!(app.screen, Screen::Feed(_)),
+                "{digit} must not navigate"
+            );
+            assert_eq!(app.current_root, Some(RootKind::Feed));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_programs_section_is_reachable_by_cycling_to_it() {
         let mut app = test_app();
-        app.screen = Screen::Compose(ComposeScreen::new(ComposeKind::NewEntry, String::new()));
-        app.current_root = Some(RootKind::Feed);
-        app.handle_terminal_event(key_event(KeyCode::Char('2')))
-            .await;
+        app.screen = Screen::Guilds(GuildsScreen::new());
+        app.current_root = Some(RootKind::Guilds);
+        app.handle_terminal_event(key_event(KeyCode::Right)).await;
         assert!(
-            matches!(app.screen, Screen::Compose(_)),
-            "a digit on a text-input screen must reach the screen, not navigate"
+            matches!(app.screen, Screen::Programs(_)),
+            "Programs sits after Guilds"
         );
+        assert_eq!(app.current_root, Some(RootKind::Programs));
+    }
+
+    #[tokio::test]
+    async fn esc_in_a_programs_sub_mode_closes_it_without_leaving_the_section() {
+        // Programs is a root, so Esc at its top level opens the overlay menu.
+        // A form open over it has to get Esc first, or cancelling one would
+        // drop the reader out of the section.
+        let mut app = test_app();
+        let mut screen = ProgramsScreen::new();
+        screen.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Char('P'),
+            KeyModifiers::SHIFT,
+        ));
+        app.screen = Screen::Programs(screen);
+        app.current_root = Some(RootKind::Programs);
+
+        app.handle_terminal_event(key_event(KeyCode::Esc)).await;
+        assert!(
+            matches!(app.screen, Screen::Programs(_)),
+            "Esc closed the form, not the section"
+        );
+        assert!(app.menu.is_none(), "and did not open the menu");
+
+        // A second Esc, now at the gallery, does open the menu.
+        app.handle_terminal_event(key_event(KeyCode::Esc)).await;
+        assert!(app.menu.is_some());
     }
 
     /// Build a loaded Settings screen focused on the field at `idx`.
@@ -9324,42 +9765,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn settings_toggle_lets_section_keys_through() {
-        // On a toggle field (the default), header nav must leave Settings like
-        // any read screen — both digits and ←/→.
-        let mut app = test_app();
-        app.screen = settings_focused(0); // filterNSFW — a Bool field
-        app.current_root = Some(RootKind::Settings);
-        app.handle_terminal_event(key_event(KeyCode::Char('2')))
-            .await;
-        assert!(
-            matches!(app.screen, Screen::Notifications(_)),
-            "a digit on a settings toggle should jump to that section"
-        );
-
-        let mut app = test_app();
-        app.screen = settings_focused(0);
-        app.current_root = Some(RootKind::Settings);
-        app.handle_terminal_event(key_event(KeyCode::Left)).await;
-        assert!(
-            matches!(app.screen, Screen::Guilds(_)),
-            "Left on a settings toggle should cycle to the previous section"
-        );
-    }
-
-    #[tokio::test]
-    async fn settings_choice_field_lets_section_keys_through() {
-        // Settings has no free-text fields, so a digit always navigates — even
-        // when a cyclable choice field is focused (space cycles it, not digits).
-        let mut app = test_app();
-        app.screen = settings_focused(12); // timeDisplayFormat — a Choice field
-        app.current_root = Some(RootKind::Settings);
-        app.handle_terminal_event(key_event(KeyCode::Char('2')))
-            .await;
-        assert!(
-            matches!(app.screen, Screen::Notifications(_)),
-            "a digit on a settings choice field should jump to that section"
-        );
+    async fn settings_lets_the_section_arrows_through() {
+        // Settings captures no free text, so header nav must leave it like any
+        // read screen — on a toggle field and on a cyclable choice field alike
+        // (space cycles a choice, the arrows never do).
+        for idx in [0, 13] {
+            let mut app = test_app();
+            app.screen = settings_focused(idx);
+            app.current_root = Some(RootKind::Settings);
+            app.handle_terminal_event(key_event(KeyCode::Left)).await;
+            assert!(
+                matches!(app.screen, Screen::Programs(_)),
+                "Left from Settings reaches the section before it (field {idx})"
+            );
+        }
     }
 
     // --- Phase 7.3: reliability signals -------------------------------------
@@ -10764,13 +11183,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_digit_does_not_change_tab_underneath_the_image_modal() {
-        // The same ordering bug via the 1-8 section navigation.
+    async fn an_arrow_does_not_change_tab_underneath_the_image_modal() {
+        // The same ordering bug via the section navigation.
         let mut app = app_in_a_room();
         app.current_root = Some(RootKind::Circ);
         app.image_modal = Some(("u".into(), vec![1]));
 
-        app.handle_terminal_event(Event::Key(event::KeyEvent::from(KeyCode::Char('2'))))
+        app.handle_terminal_event(Event::Key(event::KeyEvent::from(KeyCode::Right)))
             .await;
 
         assert!(app.image_modal.is_none());

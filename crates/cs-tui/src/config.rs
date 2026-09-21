@@ -437,7 +437,7 @@ const TEMPLATE: &str = r##"# cs-tui configuration. Edit and restart cs-tui.
 # ── Behavior ─────────────────────────────────────────────────────────────────
 
 # Section to open on launch: feed | notifications | c-mail | circ |
-# bookmarks | topics | profile | journal | guilds | settings
+# bookmarks | topics | profile | journal | guilds | programs | settings
 #start_section = "feed"
 
 # Show NSFW posts by default (otherwise they're hidden until toggled).
@@ -831,6 +831,7 @@ fn parse_section(s: &str) -> Option<RootKind> {
         "journal" => RootKind::Journal,
         "settings" => RootKind::Settings,
         "guilds" => RootKind::Guilds,
+        "programs" | "gallery" => RootKind::Programs,
         _ => return None,
     })
 }

@@ -129,19 +129,19 @@ pub struct GuildMembership {
     pub profile_picture_url: Option<String>,
 }
 
-/// A guild forum thread: an ordinary [`Entry`] plus its guild context. The
-/// server returns entry fields and the guild fields in one flat object.
+/// A guild forum thread: an ordinary [`Entry`], which since v0.8.10 carries the
+/// guild context itself. The server returns entry fields and guild fields in
+/// one flat object.
+///
+/// The three guild fields used to be declared here. They moved onto [`Entry`]
+/// when § List Entries started putting threads in the main feed, where there is
+/// no `GuildThread` to hold them; duplicating them here as well would give
+/// serde two claims on the same keys. Read them through `entry`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GuildThread {
     #[serde(flatten)]
     pub entry: Entry,
-    #[serde(default)]
-    pub guild_id: Option<String>,
-    #[serde(default)]
-    pub guild_slug: Option<String>,
-    #[serde(default)]
-    pub is_guild_thread: bool,
 }
 
 /// Result of [`Client::join_guild`].
@@ -538,9 +538,13 @@ mod tests {
         assert_eq!(t.entry.post_id, "p1");
         assert_eq!(t.entry.content, "thread body");
         assert_eq!(t.entry.title.as_deref(), Some("Hello"));
-        assert_eq!(t.guild_id.as_deref(), Some("g1"));
-        assert_eq!(t.guild_slug.as_deref(), Some("night-owls"));
-        assert!(t.is_guild_thread);
+        // The guild fields live on the flattened `Entry` since v0.8.10, so a
+        // thread decodes identically whether it arrives from the guild forum or
+        // from the main feed.
+        assert_eq!(t.entry.guild_id.as_deref(), Some("g1"));
+        assert_eq!(t.entry.guild_slug.as_deref(), Some("night-owls"));
+        assert!(t.entry.is_guild_thread);
+        assert_eq!(t.entry.guild_thread_of(), Some("night-owls"));
     }
 
     #[test]

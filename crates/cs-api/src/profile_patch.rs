@@ -49,6 +49,13 @@ impl<T: Serialize> Serialize for Patch<T> {
 }
 
 /// Body for `PATCH /v1/users/me`. Only non-`Skip` fields are sent.
+///
+/// There is deliberately no `websiteImageUrl`. v0.8.10 took the 88x31 button
+/// off this endpoint (§ Update Own Profile: it "is set on the website, which
+/// uploads the image for you... It's returned on profiles here but can't be set
+/// here"), because the site now hosts the image rather than linking one. It is
+/// still read back on [`User`](crate::User); modelling it here would only let a
+/// caller spend a 2/min budget on a certain `400`.
 #[derive(Debug, Default, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfileUpdate {
@@ -66,9 +73,6 @@ pub struct ProfileUpdate {
 
     #[serde(skip_serializing_if = "Patch::is_skip")]
     pub website_name: Patch<String>,
-
-    #[serde(skip_serializing_if = "Patch::is_skip")]
-    pub website_image_url: Patch<String>,
 
     #[serde(skip_serializing_if = "Patch::is_skip")]
     pub location_latitude: Patch<f64>,
@@ -89,7 +93,6 @@ impl ProfileUpdate {
             && self.pinned_post_id.is_skip()
             && self.website_url.is_skip()
             && self.website_name.is_skip()
-            && self.website_image_url.is_skip()
             && self.location_latitude.is_skip()
             && self.location_longitude.is_skip()
             && self.location_name.is_skip()
@@ -112,21 +115,17 @@ impl ProfileUpdate {
             if !(s.starts_with("http://") || s.starts_with("https://")) {
                 return Err("websiteUrl must start with http:// or https://".into());
             }
-            if s.len() > 2048 {
+            // Characters, not bytes: § Content Limits says "2,048 chars", and
+            // every other length check in this file counts the same way. A URL
+            // with a non-ASCII path was refused locally while being inside the
+            // documented limit.
+            if s.chars().count() > 2048 {
                 return Err("websiteUrl must be ≤2048 characters".into());
             }
         }
         if let Patch::Set(s) = &self.website_name {
             if s.chars().count() > 64 {
                 return Err("websiteName must be ≤64 characters".into());
-            }
-        }
-        if let Patch::Set(s) = &self.website_image_url {
-            if !(s.starts_with("http://") || s.starts_with("https://")) {
-                return Err("websiteImageUrl must start with http:// or https://".into());
-            }
-            if s.len() > 2048 {
-                return Err("websiteImageUrl must be ≤2048 characters".into());
             }
         }
         if let Patch::Set(s) = &self.location_name {

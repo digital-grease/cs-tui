@@ -1,6 +1,12 @@
-//! Top-level navigation: a tab bar and number-key shortcuts for switching between
-//! root screens (Feed / Notifications / Bookmarks / Topics; Profile / Journal /
-//! Settings join when their phases land).
+//! Top-level navigation: the tab bar and the keys that move between root
+//! screens.
+//!
+//! Sections are cycled with the left and right arrows, and nothing else. They
+//! used to carry number keys too, `1`-`0` for ten sections, which stopped
+//! scaling the moment there were eleven: the digits ran out, and picking which
+//! section went without one would have been arbitrary. Dropping them altogether
+//! keeps one way to move rather than one-and-a-partial, and hands every digit
+//! back to the screens, where they can mean something local.
 use cs_api::UnreadCount;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
@@ -20,6 +26,8 @@ pub enum RootKind {
     Profile,
     Journal,
     Guilds,
+    /// The program registry (v0.8.10 § Programs).
+    Programs,
     Settings,
 }
 
@@ -36,6 +44,7 @@ impl RootKind {
             Self::Profile,
             Self::Journal,
             Self::Guilds,
+            Self::Programs,
             Self::Settings,
         ]
     }
@@ -52,6 +61,7 @@ impl RootKind {
             Self::Profile => "Profile",
             Self::Journal => "Journal",
             Self::Guilds => "Guilds",
+            Self::Programs => "Programs",
             Self::Settings => "Settings",
         }
     }
@@ -70,40 +80,6 @@ impl RootKind {
         let all = Self::all();
         let i = all.iter().position(|k| *k == self).unwrap_or(0);
         all[(i + all.len() - 1) % all.len()]
-    }
-
-    #[must_use]
-    pub fn shortcut(self) -> char {
-        match self {
-            Self::Feed => '1',
-            Self::Notifications => '2',
-            Self::Cmail => '3',
-            Self::Circ => '4',
-            Self::Bookmarks => '5',
-            Self::Topics => '6',
-            Self::Profile => '7',
-            Self::Journal => '8',
-            Self::Guilds => '9',
-            // Tenth section takes the '0' key.
-            Self::Settings => '0',
-        }
-    }
-
-    #[must_use]
-    pub fn from_shortcut(c: char) -> Option<Self> {
-        match c {
-            '1' => Some(Self::Feed),
-            '2' => Some(Self::Notifications),
-            '3' => Some(Self::Cmail),
-            '4' => Some(Self::Circ),
-            '5' => Some(Self::Bookmarks),
-            '6' => Some(Self::Topics),
-            '7' => Some(Self::Profile),
-            '8' => Some(Self::Journal),
-            '9' => Some(Self::Guilds),
-            '0' => Some(Self::Settings),
-            _ => None,
-        }
     }
 }
 
@@ -204,7 +180,7 @@ pub fn render_tab_bar(frame: &mut Frame<'_>, area: Rect, status: TabBarStatus, t
                 ),
                 _ => String::new(),
             };
-            format!("{}·{}{}", k.shortcut(), k.label(), badge)
+            format!("{}{}", k.label(), badge)
         })
         .collect();
     let widths: Vec<usize> = tokens.iter().map(|t| t.chars().count()).collect();
@@ -264,18 +240,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shortcut_round_trips_for_all_kinds() {
-        for kind in RootKind::all() {
-            let c = kind.shortcut();
-            assert_eq!(RootKind::from_shortcut(c), Some(*kind));
+    fn every_section_is_reachable_by_cycling() {
+        // The arrows are the only way between sections now, so `next` has to
+        // visit every one of them before coming back round. A section left out
+        // of `all()` would be unreachable rather than merely unlabelled.
+        let mut seen = vec![RootKind::Feed];
+        let mut kind = RootKind::Feed;
+        for _ in 0..RootKind::all().len() {
+            kind = kind.next();
+            if kind == RootKind::Feed {
+                break;
+            }
+            seen.push(kind);
         }
+        assert_eq!(
+            seen.len(),
+            RootKind::all().len(),
+            "cycling visited {seen:?}, which is not every section"
+        );
+        assert_eq!(kind, RootKind::Feed, "the cycle has to close");
     }
 
     #[test]
-    fn unknown_shortcut_returns_none() {
-        assert_eq!(RootKind::from_shortcut('x'), None);
-        assert_eq!(RootKind::from_shortcut('0'), Some(RootKind::Settings));
-        assert_eq!(RootKind::from_shortcut('a'), None);
+    fn no_section_label_carries_a_key_prefix() {
+        // The rendered bar is asserted in app.rs
+        // (`the_tab_bar_draws_section_names_and_no_key_prefixes`), which is
+        // where the `N·` prefix actually lived. This only pins the labels.
+        for kind in RootKind::all() {
+            assert!(
+                !kind.label().contains('·'),
+                "{kind:?} still carries a key prefix"
+            );
+            assert!(
+                !kind.label().chars().any(|c| c.is_ascii_digit()),
+                "{kind:?} still carries a digit"
+            );
+        }
     }
 
     #[test]
@@ -315,6 +315,9 @@ mod tests {
         assert_eq!(RootKind::Settings.next(), RootKind::Feed); // wraps
         assert_eq!(RootKind::Feed.prev(), RootKind::Settings); // wraps
         assert_eq!(RootKind::Notifications.prev(), RootKind::Feed);
+        // Programs sits between Guilds and Settings.
+        assert_eq!(RootKind::Guilds.next(), RootKind::Programs);
+        assert_eq!(RootKind::Settings.prev(), RootKind::Programs);
     }
 
     #[test]

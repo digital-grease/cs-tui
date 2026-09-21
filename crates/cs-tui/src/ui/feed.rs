@@ -124,8 +124,8 @@ impl FeedScreen {
     }
 
     /// Whether a field is capturing text, so the shell's global single-letter
-    /// shortcuts (section jumps, `i`, `S`, the player keys) must not swallow the
-    /// keystroke. True only while the flag-reason prompt is open.
+    /// shortcuts (`i`, `S`, the player keys) must not swallow the keystroke.
+    /// True only while the flag-reason prompt is open.
     #[must_use]
     pub fn is_text_input(&self) -> bool {
         self.flag_prompt.is_some()
@@ -665,6 +665,14 @@ fn entry_item(entry: &Entry, width: u16, theme: &Theme, image_rows: u16) -> List
     } else {
         format!(" · #{}", entry.topics.join(" #"))
     };
+    // v0.8.10 § List Entries puts guild forum threads in the main feed, for the
+    // guilds you belong to. Without a marker a thread is indistinguishable from
+    // a personal post, and the reader has no way to see which guild it came
+    // from — the one piece of context that makes a thread make sense.
+    let guild = entry
+        .guild_thread_of()
+        .map(|slug| format!(" · guild:{slug}"))
+        .unwrap_or_default();
     let counts = format!(
         " · {} replies · {} bookmarks",
         entry.replies_count, entry.bookmarks_count
@@ -677,7 +685,7 @@ fn entry_item(entry: &Entry, width: u16, theme: &Theme, image_rows: u16) -> List
     let mut header_spans = vec![
         Span::styled(format!("@{}", entry.author_username), theme.accent_style()),
         Span::styled(
-            format!(" · {when}{edited}{topics}{counts}"),
+            format!(" · {when}{edited}{guild}{topics}{counts}"),
             theme.muted_style(),
         ),
     ];
@@ -769,6 +777,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_short_feed_page_is_not_the_end_of_the_feed() {
+        // v0.8.10 § List Entries: guild forum threads are filtered out of the
+        // feed *after* the page is taken, so a page can come back shorter than
+        // `limit`, or empty, with more entries behind it. The end of the feed is
+        // a null cursor and nothing else — reading it off the page size would
+        // truncate the feed at the first filtered thread.
+        let mut s = FeedScreen::new();
+        s.apply_initial(Ok((
+            vec![entry("p1", "trinity", false)],
+            Some("cursor-1".into()),
+        )));
+        assert_eq!(s.list.items.len(), 1, "a page far shorter than the limit");
+        assert!(s.list.next_cursor.is_some());
+
+        // Even an empty page keeps the feed going.
+        let mut s = FeedScreen::new();
+        s.apply_initial(Ok((Vec::new(), Some("cursor-1".into()))));
+        assert!(s.list.items.is_empty());
+        assert!(
+            s.list.next_cursor.is_some(),
+            "the cursor is what says whether there is more"
+        );
+        // And scrolling off the (empty) end asks for the next page rather than
+        // stopping dead.
+        assert!(matches!(
+            s.handle_key(key(KeyCode::Char('n'))),
+            FeedIntent::LoadMore
+        ));
+    }
+
     fn entry(id: &str, author: &str, nsfw: bool) -> Entry {
         Entry {
             post_id: id.into(),
@@ -786,6 +825,7 @@ mod tests {
             created_at: None,
             edited_at: None,
             deleted: false,
+            ..Default::default()
         }
     }
 

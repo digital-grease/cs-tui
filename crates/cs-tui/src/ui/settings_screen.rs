@@ -11,7 +11,14 @@ use super::theme::Theme;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FieldKind {
-    Bool,
+    /// A toggle, carrying what the server does when it has never been set.
+    ///
+    /// `GET /v1/settings` omits a field the account has never changed, and
+    /// cs-api keeps that absence distinct from `false` on purpose. Rendering
+    /// the absence as `[ ]` was a lie for the two fields the spec documents as
+    /// "default on": the row said guild threads were out of the feed while they
+    /// were in it.
+    Bool { default_on: bool },
     /// A fixed set of allowed values, cycled in place with space.
     Choice(&'static [&'static str]),
     /// A server-managed value shown for reference but not editable here: the API
@@ -35,52 +42,59 @@ const FIELDS: &[FieldSpec] = &[
     FieldSpec {
         key: "filterNSFW",
         label: "filter NSFW posts",
-        kind: FieldKind::Bool,
+        kind: FieldKind::Bool { default_on: false },
     },
     FieldSpec {
         key: "showFollowerCount",
         label: "show follower count on profile",
-        kind: FieldKind::Bool,
+        kind: FieldKind::Bool { default_on: false },
     },
     FieldSpec {
         key: "hideImagesInFeed",
         label: "hide images in feed",
-        kind: FieldKind::Bool,
+        kind: FieldKind::Bool { default_on: false },
     },
     FieldSpec {
         key: "hideAudioInFeed",
         label: "hide audio in feed",
-        kind: FieldKind::Bool,
+        kind: FieldKind::Bool { default_on: false },
     },
     FieldSpec {
         key: "autoWatchOnReply",
         label: "auto-watch threads I reply to",
-        kind: FieldKind::Bool,
+        // § Settings: "autoWatchOnReply (default on)".
+        kind: FieldKind::Bool { default_on: true },
+    },
+    FieldSpec {
+        key: "showGuildPostsInFeed",
+        label: "show guild threads in the feed",
+        // § Settings: "showGuildPostsInFeed (default on)".
+        kind: FieldKind::Bool { default_on: true },
     },
     FieldSpec {
         key: "useLegacyMenuOrder",
         label: "use legacy menu order",
-        kind: FieldKind::Bool,
+        kind: FieldKind::Bool { default_on: false },
     },
     FieldSpec {
         key: "defaultPublicPost",
         label: "default new posts to public",
-        kind: FieldKind::Bool,
+        kind: FieldKind::Bool { default_on: false },
     },
     FieldSpec {
         key: "notif.bookmark",
         label: "notify on bookmark",
-        kind: FieldKind::Bool,
+        kind: FieldKind::Bool { default_on: false },
     },
     FieldSpec {
         key: "notif.reply",
         label: "notify on reply",
-        kind: FieldKind::Bool,
+        kind: FieldKind::Bool { default_on: false },
     },
     FieldSpec {
         key: "notif.poke",
         label: "notify on poke",
-        kind: FieldKind::Bool,
+        kind: FieldKind::Bool { default_on: false },
     },
     FieldSpec {
         key: "iconTheme",
@@ -104,6 +118,12 @@ const FIELDS: &[FieldSpec] = &[
     },
 ];
 
+/// The three parallel arrays are sized to `FIELDS`, and `focused` cycles
+/// `% FIELDS.len()` before indexing them. Adding a row without growing them
+/// would panic on the last field at runtime, which no test would catch unless
+/// it happened to focus that row — so the sizes are pinned here instead.
+const _: () = assert!(FIELDS.len() == 15);
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SettingsIntent {
     Cancel,
@@ -120,9 +140,9 @@ pub struct SettingsScreen {
     pub submitting: bool,
     pub focused: usize,
     /// Values keyed by FIELDS index.
-    pub bools: [Option<bool>; 14],
-    pub texts: [String; 14],
-    pub dirty: [bool; 14],
+    pub bools: [Option<bool>; 15],
+    pub texts: [String; 15],
+    pub dirty: [bool; 15],
 }
 
 impl SettingsScreen {
@@ -133,9 +153,9 @@ impl SettingsScreen {
             error: None,
             submitting: false,
             focused: 0,
-            bools: [None; 14],
+            bools: [None; 15],
             texts: std::array::from_fn(|_| String::new()),
-            dirty: [false; 14],
+            dirty: [false; 15],
         }
     }
 
@@ -149,16 +169,17 @@ impl SettingsScreen {
                 self.bools[2] = s.hide_images_in_feed;
                 self.bools[3] = s.hide_audio_in_feed;
                 self.bools[4] = s.auto_watch_on_reply;
-                self.bools[5] = s.use_legacy_menu_order;
-                self.bools[6] = s.default_public_post;
-                self.bools[7] = s.notifications.bookmark;
-                self.bools[8] = s.notifications.reply;
-                self.bools[9] = s.notifications.poke;
-                self.texts[10] = s.icon_theme.unwrap_or_default();
-                self.texts[11] = s.image_pixel_size.unwrap_or_default();
-                self.texts[12] = s.time_display_format.unwrap_or_default();
-                self.texts[13] = s.keyboard_preset.unwrap_or_default();
-                self.dirty = [false; 14];
+                self.bools[5] = s.show_guild_posts_in_feed;
+                self.bools[6] = s.use_legacy_menu_order;
+                self.bools[7] = s.default_public_post;
+                self.bools[8] = s.notifications.bookmark;
+                self.bools[9] = s.notifications.reply;
+                self.bools[10] = s.notifications.poke;
+                self.texts[11] = s.icon_theme.unwrap_or_default();
+                self.texts[12] = s.image_pixel_size.unwrap_or_default();
+                self.texts[13] = s.time_display_format.unwrap_or_default();
+                self.texts[14] = s.keyboard_preset.unwrap_or_default();
+                self.dirty = [false; 15];
                 self.error = None;
             }
             Err(msg) => self.error = Some(msg),
@@ -189,8 +210,10 @@ impl SettingsScreen {
             }
             KeyCode::Enter => return self.try_submit(),
             KeyCode::Char(' ') => match FIELDS[self.focused].kind {
-                FieldKind::Bool => {
-                    let prev = self.bools[self.focused].unwrap_or(false);
+                FieldKind::Bool { default_on } => {
+                    // Toggle against what is actually in effect, which for an
+                    // unset field is the documented default, not `false`.
+                    let prev = self.bools[self.focused].unwrap_or(default_on);
                     self.bools[self.focused] = Some(!prev);
                     self.dirty[self.focused] = true;
                 }
@@ -226,7 +249,7 @@ impl SettingsScreen {
         if let Err(msg) = result {
             self.error = Some(msg);
         } else {
-            self.dirty = [false; 14];
+            self.dirty = [false; 15];
         }
     }
 
@@ -244,6 +267,7 @@ impl SettingsScreen {
                 "hideImagesInFeed" => u.hide_images_in_feed = self.bools[i],
                 "hideAudioInFeed" => u.hide_audio_in_feed = self.bools[i],
                 "autoWatchOnReply" => u.auto_watch_on_reply = self.bools[i],
+                "showGuildPostsInFeed" => u.show_guild_posts_in_feed = self.bools[i],
                 "useLegacyMenuOrder" => u.use_legacy_menu_order = self.bools[i],
                 "defaultPublicPost" => u.default_public_post = self.bools[i],
                 "notif.bookmark" => {
@@ -326,8 +350,8 @@ impl SettingsScreen {
             .map(|(i, f)| {
                 let dirty_marker = if self.dirty[i] { "*" } else { " " };
                 let value = match f.kind {
-                    FieldKind::Bool => {
-                        if self.bools[i].unwrap_or(false) {
+                    FieldKind::Bool { default_on } => {
+                        if self.bools[i].unwrap_or(default_on) {
                             "[x]".to_string()
                         } else {
                             "[ ]".to_string()
@@ -367,7 +391,7 @@ impl SettingsScreen {
             format!("error: {msg} · esc to cancel")
         } else {
             format!(
-                "{dirty_count} unsaved · space toggle/cycle · 1-8/←→ section · enter/ctrl+d save · esc menu"
+                "{dirty_count} unsaved · space toggle/cycle · ←→ section · enter/ctrl+d save · esc menu"
             )
         };
         frame.render_widget(
@@ -397,6 +421,19 @@ mod tests {
         }
     }
 
+    /// The row index for a settings key.
+    ///
+    /// Tests used to hard-code these, which meant adding one field in the
+    /// middle of `FIELDS` quietly repointed five assertions at their
+    /// neighbours. Looking the index up keeps a test pinned to the field it
+    /// names.
+    fn idx(key: &str) -> usize {
+        FIELDS
+            .iter()
+            .position(|f| f.key == key)
+            .unwrap_or_else(|| panic!("no settings field {key:?}"))
+    }
+
     #[test]
     fn keys_ignored_before_load() {
         let mut s = SettingsScreen::new();
@@ -419,9 +456,26 @@ mod tests {
         };
         s.apply_loaded(Ok(settings));
         assert!(s.loaded);
-        assert_eq!(s.bools[0], Some(true)); // filterNSFW
-        assert_eq!(s.bools[7], Some(false)); // notif.bookmark
-        assert_eq!(s.texts[10], "cyber");
+        assert_eq!(s.bools[idx("filterNSFW")], Some(true));
+        assert_eq!(s.bools[idx("notif.bookmark")], Some(false));
+        assert_eq!(s.texts[idx("iconTheme")], "cyber");
+    }
+
+    #[test]
+    fn the_v0810_guild_feed_toggle_round_trips() {
+        let mut s = SettingsScreen::new();
+        s.apply_loaded(Ok(Settings {
+            show_guild_posts_in_feed: Some(true),
+            ..Default::default()
+        }));
+        let i = idx("showGuildPostsInFeed");
+        assert_eq!(s.bools[i], Some(true));
+
+        s.focused = i;
+        s.handle_key(key(KeyCode::Char(' '), KeyModifiers::empty()));
+        assert_eq!(s.bools[i], Some(false));
+        assert!(s.dirty[i]);
+        assert_eq!(s.build_update().show_guild_posts_in_feed, Some(false));
     }
 
     #[test]
@@ -444,10 +498,11 @@ mod tests {
             time_display_format: Some("datetime".into()),
             ..Default::default()
         }));
-        s.focused = 12; // timeDisplayFormat — a Choice field
+        let i = idx("timeDisplayFormat"); // a Choice field
+        s.focused = i;
         s.handle_key(key(KeyCode::Char(' '), KeyModifiers::empty()));
-        assert_eq!(s.texts[12], "relative"); // datetime → relative
-        assert!(s.dirty[12]);
+        assert_eq!(s.texts[i], "relative"); // datetime → relative
+        assert!(s.dirty[i]);
         let update = s.build_update();
         assert_eq!(update.time_display_format.as_deref(), Some("relative"));
     }
@@ -460,9 +515,10 @@ mod tests {
             time_display_format: Some("weird".into()),
             ..Default::default()
         }));
-        s.focused = 12;
+        let i = idx("timeDisplayFormat");
+        s.focused = i;
         s.handle_key(key(KeyCode::Char(' '), KeyModifiers::empty()));
-        assert_eq!(s.texts[12], "datetime");
+        assert_eq!(s.texts[i], "datetime");
     }
 
     #[test]
@@ -472,11 +528,12 @@ mod tests {
             icon_theme: Some("pixel".into()),
             ..Default::default()
         }));
-        s.focused = 10; // iconTheme — read-only
+        let i = idx("iconTheme"); // read-only
+        s.focused = i;
         s.handle_key(key(KeyCode::Char(' '), KeyModifiers::empty()));
         s.handle_key(key(KeyCode::Char('x'), KeyModifiers::empty()));
-        assert_eq!(s.texts[10], "pixel"); // unchanged, still shown
-        assert!(!s.dirty[10]);
+        assert_eq!(s.texts[i], "pixel"); // unchanged, still shown
+        assert!(!s.dirty[i]);
         assert!(s.build_update().is_empty());
     }
 
@@ -507,7 +564,7 @@ mod tests {
     fn notification_toggles_grouped_into_subobject() {
         let mut s = SettingsScreen::new();
         s.apply_loaded(Ok(Settings::default()));
-        s.focused = 7; // notif.bookmark
+        s.focused = idx("notif.bookmark");
         s.handle_key(key(KeyCode::Char(' '), KeyModifiers::empty()));
         let update = s.build_update();
         assert!(update.notifications.is_some());

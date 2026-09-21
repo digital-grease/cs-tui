@@ -1,5 +1,11 @@
 //! Edit-profile form — fields for bio, displayName, website*, location*,
 //! pinnedPostId. Tab cycles focus; Enter or Ctrl+D submits; Esc cancels.
+//!
+//! `websiteImageUrl`, the 88x31 button, is deliberately not a field here.
+//! v0.8.10 took it off `PATCH /v1/users/me` (§ Update Own Profile) because the
+//! site now uploads and hosts the image rather than linking one, so the form
+//! says where it is set instead of offering an input that could only ever draw
+//! a `400`. It is still shown on the profile screen, which reads it back.
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use cs_api::{Patch, ProfileUpdate, User};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -15,7 +21,6 @@ pub enum Field {
     Bio,
     WebsiteUrl,
     WebsiteName,
-    WebsiteImageUrl,
     LocationName,
     LocationLatitude,
     LocationLongitude,
@@ -23,12 +28,11 @@ pub enum Field {
 }
 
 impl Field {
-    const ALL: [Field; 9] = [
+    const ALL: [Field; 8] = [
         Self::DisplayName,
         Self::Bio,
         Self::WebsiteUrl,
         Self::WebsiteName,
-        Self::WebsiteImageUrl,
         Self::LocationName,
         Self::LocationLatitude,
         Self::LocationLongitude,
@@ -41,7 +45,6 @@ impl Field {
             Self::Bio => "bio",
             Self::WebsiteUrl => "websiteUrl",
             Self::WebsiteName => "websiteName",
-            Self::WebsiteImageUrl => "websiteImageUrl",
             Self::LocationName => "locationName",
             Self::LocationLatitude => "locationLatitude",
             Self::LocationLongitude => "locationLongitude",
@@ -60,11 +63,11 @@ pub enum EditProfileIntent {
 
 #[derive(Debug)]
 pub struct EditProfileScreen {
-    pub fields: [String; 9],
+    pub fields: [String; 8],
     /// `true` for fields the user explicitly cleared (will be sent as `null`).
-    pub cleared: [bool; 9],
+    pub cleared: [bool; 8],
     /// Initial values to detect unchanged fields (sent as `Skip`).
-    pub initial: [Option<String>; 9],
+    pub initial: [Option<String>; 8],
     pub focused: usize,
     /// Cursor position (char index) within the focused field's text.
     pub cursor: usize,
@@ -74,12 +77,11 @@ pub struct EditProfileScreen {
 
 impl EditProfileScreen {
     pub fn from_user(u: &User) -> Self {
-        let initial: [Option<String>; 9] = [
+        let initial: [Option<String>; 8] = [
             u.display_name.clone(),
             u.bio.clone(),
             u.website_url.clone(),
             u.website_name.clone(),
-            u.website_image_url.clone(),
             u.location_name.clone(),
             u.location_latitude.map(|v| v.to_string()),
             u.location_longitude.map(|v| v.to_string()),
@@ -89,7 +91,7 @@ impl EditProfileScreen {
         let cursor = fields[0].chars().count();
         Self {
             fields,
-            cleared: [false; 9],
+            cleared: [false; 8],
             initial,
             focused: 0,
             cursor,
@@ -241,7 +243,6 @@ impl EditProfileScreen {
                 Field::Bio => u.bio = patch_str,
                 Field::WebsiteUrl => u.website_url = patch_str,
                 Field::WebsiteName => u.website_name = patch_str,
-                Field::WebsiteImageUrl => u.website_image_url = patch_str,
                 Field::LocationName => u.location_name = patch_str,
                 Field::PinnedPostId => u.pinned_post_id = patch_str,
                 Field::LocationLatitude | Field::LocationLongitude => {
@@ -280,7 +281,7 @@ impl EditProfileScreen {
             .iter()
             .flat_map(|_| [Constraint::Length(1), Constraint::Length(1)])
             .collect();
-        constraints.push(Constraint::Length(1)); // spacer
+        constraints.push(Constraint::Length(1)); // note about the fields set elsewhere
         constraints.push(Constraint::Length(1)); // status / error
 
         let layout = Layout::default()
@@ -320,6 +321,18 @@ impl EditProfileScreen {
             };
             frame.render_widget(Paragraph::new(input_line), layout[input_idx]);
         }
+
+        // Say where the fields this form cannot set actually live, so the
+        // absence reads as a fact about the API rather than a missing feature
+        // (§ Update Own Profile).
+        let note_idx = layout.len() - 2;
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "the 88x31 website button is set on cyberspace.online, not here",
+                theme.muted_style(),
+            ))),
+            layout[note_idx],
+        );
 
         let status_idx = layout.len() - 1;
         let status: Line<'_> = if self.submitting {
@@ -365,6 +378,7 @@ mod tests {
             website_url: None,
             website_name: None,
             website_image_url: None,
+            is_supporter: None,
             location_latitude: None,
             location_longitude: None,
             location_name: None,

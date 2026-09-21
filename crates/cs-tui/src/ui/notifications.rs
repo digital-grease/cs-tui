@@ -105,9 +105,11 @@ impl NotifTypeFilter {
 
     /// The notification types this bucket selects (empty = no type filter).
     ///
-    /// § List Notifications caps the `type` query at 20 values, so a bucket has
-    /// to stay inside that; `System` is the one that grew in v0.8.6 and it sits
-    /// at 16.
+    /// § List Notifications caps the `type` query at 30 distinct values (raised
+    /// from 20 in v0.8.10), so a bucket has to stay inside that. `System` is the
+    /// one that keeps growing and sits at 19; the cap is also enforced in
+    /// [`cs_api::MAX_NOTIFICATION_TYPE_FILTERS`], so a bucket that outgrew it
+    /// would be truncated rather than answered with a `400`.
     fn types(self) -> Vec<NotificationType> {
         use NotificationType::*;
         match self {
@@ -118,6 +120,10 @@ impl NotifTypeFilter {
                 ChatMention,
                 GraffitiMention,
                 DmMessage,
+                // A guild chat message is somebody talking to you in a room,
+                // which is what the rest of this bucket is; the guild *thread*
+                // notification is a post and stays under Social.
+                GuildChatMessage,
             ],
             Self::Replies => vec![Reply, ThreadReply],
             Self::Social => vec![
@@ -128,10 +134,14 @@ impl NotifTypeFilter {
                 NewPostFriend,
                 Bookmark,
                 GuildNewThread,
+                GiftReceived,
+                GiftSent,
             ],
             // Everything the platform says about the reader's own account:
-            // roles, permissions, restrictions, and (new in v0.8.6) the two
-            // posting-limit notices. None of them has a sender.
+            // roles, permissions, restrictions, and the two posting-limit
+            // notices. Most now name the staff member behind the change
+            // (v0.8.10 § How notifications are generated); the four genuinely
+            // senderless ones are the restriction and posting notices.
             Self::System => vec![
                 SupporterGranted,
                 SupporterRemoved,
@@ -139,8 +149,11 @@ impl NotifTypeFilter {
                 HackerRemoved,
                 ModeratorGranted,
                 ModeratorRemoved,
+                ModeratorPermissionsChanged,
                 ApiAccessGranted,
                 ApiAccessRemoved,
+                EditAccessGranted,
+                EditAccessRemoved,
                 ImagePermissionGranted,
                 ImagePermissionRemoved,
                 AttachmentPermissionGranted,
@@ -271,9 +284,12 @@ impl NotificationsScreen {
                         }
                     }
                     // Nothing to read, but somebody to look at: a new follower,
-                    // a poke, a graffiti mention (which v0.8.6 gives no target of
-                    // its own). The account notifications stop here with nothing
-                    // to open, which is the point of them.
+                    // a poke, a graffiti mention (which v0.8.6 gives no target
+                    // of its own), and since v0.8.10 the role and permission
+                    // changes, whose actor is the staff member who made them.
+                    // The four genuinely senderless notices — the ban pair, the
+                    // post cooldown and the rate-limit warning — stop here with
+                    // nothing to open, which is the point of them.
                     if let Some(username) = actor {
                         return NotificationsIntent::OpenUser { username };
                     }
@@ -545,18 +561,58 @@ fn reason_text(n: &Notification) -> Option<&str> {
 fn summary_style(n: &Notification, theme: &Theme) -> Style {
     use NotificationType::*;
     match n.kind {
-        SystemBan | PostCooldown | RateLimitWarning | ApiAccessRemoved => theme.warning_style(),
+        SystemBan | PostCooldown | RateLimitWarning | ApiAccessRemoved | EditAccessRemoved => {
+            theme.warning_style()
+        }
         _ => theme.base(),
+    }
+}
+
+/// Name the staff member behind a role or permission change, when the server
+/// named one (v0.8.10 § How notifications are generated).
+///
+/// Falls back to the bare sentence otherwise, which is what an older server
+/// sends and what [`Notification::actor_profile`] answers for the `"system"`
+/// sentinel.
+fn by_staff(summary: &str, n: &Notification) -> String {
+    match n.actor_profile() {
+        Some(actor) => format!("{summary} · by @{actor}"),
+        None => summary.to_string(),
+    }
+}
+
+/// How much of a chat message fits on a notification row beside its summary.
+const MESSAGE_PREVIEW_CHARS: usize = 48;
+
+/// Append what was actually said, when v0.8.10 § Notification object sent it as
+/// `messageContent`.
+///
+/// Worth the room: "@trinity mentioned you in chat" tells the reader nothing
+/// about whether it needs answering now, and the preview is the difference
+/// between opening the room and deciding not to. Absent on an older server, in
+/// which case the summary reads exactly as it used to.
+fn with_message_preview(summary: String, n: &Notification) -> String {
+    match n.message_preview() {
+        Some(text) => format!(
+            "{summary}: {}",
+            super::cmail::one_line_preview(text, MESSAGE_PREVIEW_CHARS)
+        ),
+        None => summary,
     }
 }
 
 /// One line describing a notification.
 ///
-/// The account notifications (API v0.8.6 § How notifications are generated:
-/// `post_cooldown`, `rate_limit_warning`, `system_ban` / `system_ban_lifted`,
-/// the role and permission changes) have no sender, so they are phrased about
-/// the reader and never name an actor. `actor` is only ever interpolated for
-/// the types that genuinely have one.
+/// Four types genuinely have no sender (API v0.8.10 § How notifications are
+/// generated: `post_cooldown`, `rate_limit_warning`, `system_ban` and
+/// `system_ban_lifted`), and those are phrased about the reader alone.
+///
+/// The role and permission changes are *not* among them, whatever the
+/// pre-v0.8.10 reading said: they "do carry `actorId` / `actorUsername` — the
+/// staff member who made the change". They are still phrased about the reader,
+/// because that is what they are about, but they name who did it when the
+/// server says — which is also what makes opening their profile from the row
+/// make sense.
 fn summarize(n: &Notification, actor: &str) -> String {
     use NotificationType::*;
     match n.kind {
@@ -568,7 +624,7 @@ fn summarize(n: &Notification, actor: &str) -> String {
         }
         ReplyMention => format!("@{actor} mentioned you in a reply"),
         PostMention => format!("@{actor} mentioned you in a post"),
-        ChatMention => format!("@{actor} mentioned you in chat"),
+        ChatMention => with_message_preview(format!("@{actor} mentioned you in chat"), n),
         GraffitiMention => format!("@{actor} mentioned you in graffiti"),
         DmMessage => format!("@{actor} sent you a DM"),
         NewFollower => format!("@{actor} followed you"),
@@ -580,22 +636,36 @@ fn summarize(n: &Notification, actor: &str) -> String {
             let guild = n.guild_display_name().unwrap_or("a guild");
             format!("new thread in {guild} by @{actor}")
         }
-        SupporterGranted => "supporter status granted".to_string(),
-        SupporterRemoved => "supporter status removed".to_string(),
-        HackerGranted => "hacker status granted".to_string(),
-        HackerRemoved => "hacker status removed".to_string(),
-        ModeratorGranted => "you are now a moderator".to_string(),
-        ModeratorRemoved => "your moderator role was removed".to_string(),
-        ApiAccessGranted => "API access granted".to_string(),
-        ApiAccessRemoved => "API access removed".to_string(),
-        ImagePermissionGranted => "image-upload permission granted".to_string(),
-        ImagePermissionRemoved => "image-upload permission removed".to_string(),
-        AttachmentPermissionGranted => "attachment permission granted".to_string(),
-        AttachmentPermissionRemoved => "attachment permission removed".to_string(),
+        GuildChatMessage => {
+            let room = n
+                .metadata
+                .room_name
+                .as_deref()
+                .or(n.metadata.room_slug.as_deref())
+                .unwrap_or("guild chat");
+            with_message_preview(format!("@{actor} posted in {room}"), n)
+        }
+        SupporterGranted => by_staff("supporter status granted", n),
+        SupporterRemoved => by_staff("supporter status removed", n),
+        HackerGranted => by_staff("hacker status granted", n),
+        HackerRemoved => by_staff("hacker status removed", n),
+        ModeratorGranted => by_staff("you are now a moderator", n),
+        ModeratorRemoved => by_staff("your moderator role was removed", n),
+        ModeratorPermissionsChanged => by_staff("your moderator permissions changed", n),
+        ApiAccessGranted => by_staff("API access granted", n),
+        ApiAccessRemoved => by_staff("API access removed", n),
+        EditAccessGranted => by_staff("edit access granted", n),
+        EditAccessRemoved => by_staff("edit access removed", n),
+        ImagePermissionGranted => by_staff("image-upload permission granted", n),
+        ImagePermissionRemoved => by_staff("image-upload permission removed", n),
+        AttachmentPermissionGranted => by_staff("attachment permission granted", n),
+        AttachmentPermissionRemoved => by_staff("attachment permission removed", n),
         SystemBan => "your account has been banned".to_string(),
         SystemBanLifted => "the restriction on your account was lifted".to_string(),
         PostCooldown => "your entry was held back and saved as a note".to_string(),
         RateLimitWarning => "you're approaching a posting limit".to_string(),
+        GiftReceived => format!("@{actor} sent you a gift"),
+        GiftSent => format!("your gift reached @{actor}"),
         // A type this build has never heard of. If it arrives without an actor,
         // or with the "system" sentinel, it is about the reader's own account
         // (§ Notification object) and must not be dressed up as somebody's
@@ -693,6 +763,144 @@ mod tests {
         n.actor_username = Some("system".into());
         n.reason = Some(reason.into());
         n
+    }
+
+    // ---- the v0.8.10 types (§ List Notifications) -------------------------
+
+    #[test]
+    fn a_guild_chat_message_reads_as_somebody_talking_in_a_room() {
+        let mut n = notif("n1", NotificationType::GuildChatMessage, None, None);
+        n.actor_username = Some("trinity".into());
+        n.metadata.room_name = Some("Night Owls".into());
+        n.metadata.room_slug = Some("night-owls".into());
+        n.metadata.message_content = Some("anyone up?".into());
+
+        assert_eq!(
+            summarize(&n, n.actor_name()),
+            "@trinity posted in Night Owls: anyone up?"
+        );
+    }
+
+    #[test]
+    fn a_long_chat_preview_is_cut_rather_than_pushed_off_the_row() {
+        let mut n = notif("n1", NotificationType::ChatMention, None, None);
+        n.actor_username = Some("trinity".into());
+        n.metadata.message_content = Some("x".repeat(200));
+        let line = summarize(&n, n.actor_name());
+        assert!(line.ends_with('…'), "{line}");
+        assert!(line.chars().count() < 100, "{line}");
+    }
+
+    #[test]
+    fn a_chat_notification_without_a_preview_reads_as_it_always_did() {
+        let mut n = notif("n1", NotificationType::ChatMention, None, None);
+        n.actor_username = Some("trinity".into());
+        assert_eq!(
+            summarize(&n, n.actor_name()),
+            "@trinity mentioned you in chat"
+        );
+    }
+
+    #[test]
+    fn a_guild_chat_message_opens_its_room() {
+        // § Notification object gives the chat types the same metadata keys, so
+        // Enter has to follow the guild room exactly as it follows a cIRC one.
+        let mut n = notif("n1", NotificationType::GuildChatMessage, None, None);
+        n.actor_username = Some("trinity".into());
+        n.metadata.room_slug = Some("night-owls".into());
+
+        let mut s = NotificationsScreen::new();
+        seed(&mut s, vec![n], None);
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            NotificationsIntent::OpenCircRoom {
+                room_slug: "night-owls".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_gift_names_the_other_person_in_each_direction() {
+        let mut received = notif("n1", NotificationType::GiftReceived, None, None);
+        received.actor_username = Some("trinity".into());
+        assert_eq!(
+            summarize(&received, received.actor_name()),
+            "@trinity sent you a gift"
+        );
+
+        let mut sent = notif("n2", NotificationType::GiftSent, None, None);
+        sent.actor_username = Some("neo".into());
+        assert_eq!(
+            summarize(&sent, sent.actor_name()),
+            "your gift reached @neo"
+        );
+    }
+
+    #[test]
+    fn the_v0810_account_notices_read_as_being_about_the_reader() {
+        for (kind, expected) in [
+            (
+                NotificationType::ModeratorPermissionsChanged,
+                "your moderator permissions changed",
+            ),
+            (NotificationType::EditAccessGranted, "edit access granted"),
+            (NotificationType::EditAccessRemoved, "edit access removed"),
+        ] {
+            let n = account_notif("n1", kind, "a staff member changed it");
+            assert_eq!(summarize(&n, n.actor_name()), expected);
+        }
+    }
+
+    #[test]
+    fn every_type_filter_bucket_stays_inside_the_servers_ceiling() {
+        // § List Notifications takes 1-30 distinct values, and the System bucket
+        // grows every time the platform adds a role. Past the cap the server
+        // answers 400 and the reader sees nothing at all.
+        for filter in [
+            NotifTypeFilter::All,
+            NotifTypeFilter::Mentions,
+            NotifTypeFilter::Replies,
+            NotifTypeFilter::Social,
+            NotifTypeFilter::System,
+        ] {
+            let types = filter.types();
+            assert!(
+                types.len() <= cs_api::MAX_NOTIFICATION_TYPE_FILTERS,
+                "{filter:?} asks for {} types",
+                types.len()
+            );
+            let mut sorted: Vec<&str> = types.iter().map(|t| t.wire()).collect();
+            sorted.sort_unstable();
+            let before = sorted.len();
+            sorted.dedup();
+            assert_eq!(before, sorted.len(), "{filter:?} repeats a type");
+        }
+    }
+
+    #[test]
+    fn the_v0810_types_are_each_in_exactly_one_bucket() {
+        // A type in no bucket is unreachable by any filter but "all"; a type in
+        // two is counted twice against the cap.
+        use NotificationType::*;
+        for kind in [
+            GuildChatMessage,
+            ModeratorPermissionsChanged,
+            EditAccessGranted,
+            EditAccessRemoved,
+            GiftReceived,
+            GiftSent,
+        ] {
+            let found: Vec<NotifTypeFilter> = [
+                NotifTypeFilter::Mentions,
+                NotifTypeFilter::Replies,
+                NotifTypeFilter::Social,
+                NotifTypeFilter::System,
+            ]
+            .into_iter()
+            .filter(|f| f.types().contains(&kind))
+            .collect();
+            assert_eq!(found.len(), 1, "{kind:?} is in {found:?}");
+        }
     }
 
     /// Load a page into the screen, checking it needs no follow-up fetch (the

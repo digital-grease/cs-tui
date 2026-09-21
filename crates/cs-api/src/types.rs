@@ -12,6 +12,34 @@ use crate::error::{ApiError, Result};
 /// (v0.8.4 § Content Limits).
 pub(crate) const MAX_FLAG_REASON_LEN: usize = 500;
 
+/// How many attachments an entry or reply may carry (v0.8.10 § Create Entry:
+/// "optional, max 1").
+pub const MAX_ATTACHMENTS: usize = 1;
+
+/// Field ceilings on an audio attachment (v0.8.10 § Create Entry): `artist` max
+/// 100, `title` max 150, `genre` max 50 and lowercase. All three are required.
+pub const MAX_AUDIO_ARTIST_LEN: usize = 100;
+/// See [`MAX_AUDIO_ARTIST_LEN`].
+pub const MAX_AUDIO_TITLE_LEN: usize = 150;
+/// See [`MAX_AUDIO_ARTIST_LEN`].
+pub const MAX_AUDIO_GENRE_LEN: usize = 50;
+
+/// The `origin` every audio attachment carries (v0.8.10 § Create Entry). The
+/// only source the API takes is YouTube.
+pub const AUDIO_ORIGIN_YOUTUBE: &str = "youtube";
+
+/// Hosts a jukebox `src` may name. `youtube.com` covers the `watch?v=` and
+/// `/shorts/` forms, `youtu.be` the short links, and the `m.` / `music.`
+/// subdomains are what a phone and the music app hand out.
+const YOUTUBE_HOSTS: &[&str] = &[
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtu.be",
+    "www.youtu.be",
+];
+
 /// Decode a field that has a `Default`, treating an explicit JSON `null` as
 /// that default.
 ///
@@ -93,6 +121,26 @@ pub struct Entry {
     #[serde(default, deserialize_with = "null_as_default")]
     pub attachments: Vec<Attachment>,
 
+    /// Guild context, present only on a guild forum thread.
+    ///
+    /// These used to live on [`GuildThread`](crate::GuildThread) alone, because
+    /// `GET /v1/guilds/:slug/posts` was the only place a thread could arrive.
+    /// v0.8.10 § List Entries puts threads in the main feed too — "Guild forum
+    /// threads appear here only for guilds you belong to" — so an ordinary
+    /// `Entry` has to be able to carry them, or the feed cannot tell a forum
+    /// thread from a personal post.
+    ///
+    /// All three are absent on a normal entry, which is what
+    /// [`Entry::guild_thread_of`] reads.
+    #[serde(default)]
+    pub guild_id: Option<String>,
+    /// See [`Entry::guild_id`].
+    #[serde(default)]
+    pub guild_slug: Option<String>,
+    /// See [`Entry::guild_id`].
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub is_guild_thread: bool,
+
     /// RFC 3339. Some entries may be missing this in degenerate responses; we
     /// accept `None` rather than refusing to decode.
     #[serde(default, with = "time::serde::rfc3339::option")]
@@ -106,6 +154,25 @@ pub struct Entry {
 
     #[serde(default, deserialize_with = "null_as_default")]
     pub deleted: bool,
+}
+
+impl Entry {
+    /// The guild slug this entry is a forum thread in, or `None` for an
+    /// ordinary entry.
+    ///
+    /// Requires the slug, not just the `isGuildThread` flag: a marker with no
+    /// guild to name is not something a reader can act on, and the flag alone
+    /// would leave the feed printing "guild thread" with no guild.
+    #[must_use]
+    pub fn guild_thread_of(&self) -> Option<&str> {
+        if !self.is_guild_thread {
+            return None;
+        }
+        self.guild_slug
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
 }
 
 /// A reply on a post. The spec doesn't publish the full response shape; this
@@ -155,6 +222,14 @@ pub struct Reply {
 /// so is the `type` tag itself: anything that is not one of the two known
 /// shapes decodes to [`Attachment::Unknown`] instead of failing, which would
 /// otherwise sink every entry on the page it arrived with.
+///
+/// **Reading and writing are not symmetric.** v0.8.10 § Create Entry made the
+/// write path audio-only: an `"type": "image"` attachment is a `400`, and an
+/// image now travels as inline markdown in `content` pointing at a URL the
+/// website is already hosting. Existing entries keep and still return the image
+/// attachments they have, so [`Attachment::Image`] stays a first-class read
+/// shape; it is only sending one that is refused, by
+/// [`validate_write_attachments`] before it can cost a rate-limit token.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Attachment {
     /// An image, with its dimensions when the server reports them.
@@ -180,6 +255,143 @@ pub enum Attachment {
     /// API after this client shipped therefore survives an edit rather than
     /// being silently rewritten or dropped.
     Unknown(serde_json::Value),
+}
+
+impl Attachment {
+    /// A jukebox track to post with an entry or reply (v0.8.10 § Create Entry).
+    ///
+    /// Fills in the one `origin` the API takes, so a caller cannot get it
+    /// wrong. The fields are not checked here — build the attachment, then let
+    /// [`Client::create_entry`](crate::Client::create_entry) or
+    /// [`Client::create_reply`](crate::Client::create_reply) validate it, which
+    /// is the same path an attachment from any other source takes.
+    #[must_use]
+    pub fn audio(
+        src: impl Into<String>,
+        artist: impl Into<String>,
+        title: impl Into<String>,
+        genre: impl Into<String>,
+    ) -> Self {
+        Self::Audio {
+            src: src.into(),
+            origin: AUDIO_ORIGIN_YOUTUBE.to_string(),
+            artist: artist.into(),
+            title: title.into(),
+            genre: genre.into(),
+        }
+    }
+}
+
+/// Whether `url` names a YouTube video, the one source a jukebox track may come
+/// from (v0.8.10 § Create Entry).
+///
+/// Deliberately a host check and nothing more. The server owns the real rule and
+/// answers `400 VALIDATION_ERROR` for "a `/song` that isn't a YouTube link"
+/// (§ Commands); this is only here to catch the obvious paste before it spends
+/// one of the two entries a user gets per minute.
+fn is_youtube_url(url: &str) -> bool {
+    let rest = match url.split_once("://") {
+        Some(("http" | "https", rest)) => rest,
+        _ => return false,
+    };
+    // Authority runs up to the first `/`, `?` or `#`; strip any userinfo and
+    // port so `youtu.be:443` and a look-alike like `youtube.com.evil.test` are
+    // told apart.
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    let host = authority.split(':').next().unwrap_or_default();
+    YOUTUBE_HOSTS
+        .iter()
+        .any(|known| host.eq_ignore_ascii_case(known))
+}
+
+/// Check an attachment list on its way to `POST`/`PATCH` for an entry or reply
+/// (v0.8.10 § Create Entry, § Edit Entry, § Create Reply).
+///
+/// Enforces the three things the spec states and the server would otherwise
+/// answer `400` for: at most [`MAX_ATTACHMENTS`], audio only, and the three
+/// required audio fields within their ceilings.
+///
+/// [`Attachment::Unknown`] passes. It is how this client preserves an
+/// attachment shape it has never seen — § Edit Entry replaces the whole list, so
+/// an unknown attachment has to be re-sendable or an edit would silently drop
+/// it — and refusing one here would break that the day the API adds a third
+/// kind. An image is the opposite case: the spec names it as a `400` outright,
+/// so it is worth failing on locally with an explanation the server will not
+/// give.
+pub fn validate_write_attachments(attachments: &[Attachment]) -> Result<()> {
+    if attachments.len() > MAX_ATTACHMENTS {
+        return Err(ApiError::Config(format!(
+            "at most {MAX_ATTACHMENTS} attachment allowed, got {}",
+            attachments.len()
+        )));
+    }
+    for attachment in attachments {
+        match attachment {
+            Attachment::Image { .. } => {
+                return Err(ApiError::Config(
+                    "images are posted on the website, not attached here: put the hosted                      image in the content as markdown instead"
+                        .into(),
+                ));
+            }
+            Attachment::Audio {
+                src,
+                origin,
+                artist,
+                title,
+                genre,
+            } => validate_audio_attachment(src, origin, artist, title, genre)?,
+            Attachment::Unknown(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// The field rules for one audio attachment (v0.8.10 § Create Entry).
+fn validate_audio_attachment(
+    src: &str,
+    origin: &str,
+    artist: &str,
+    title: &str,
+    genre: &str,
+) -> Result<()> {
+    if !is_youtube_url(src.trim()) {
+        return Err(ApiError::Config(
+            "an audio attachment's src must be a YouTube URL".into(),
+        ));
+    }
+    if !origin.trim().is_empty() && !origin.eq_ignore_ascii_case(AUDIO_ORIGIN_YOUTUBE) {
+        return Err(ApiError::Config(format!(
+            "an audio attachment's origin must be {AUDIO_ORIGIN_YOUTUBE:?}"
+        )));
+    }
+    // artist, title and genre are all required (§ Create Entry), so an empty
+    // one is a 400 rather than an omission the server fills in.
+    for (label, value, max) in [
+        ("artist", artist, MAX_AUDIO_ARTIST_LEN),
+        ("title", title, MAX_AUDIO_TITLE_LEN),
+        ("genre", genre, MAX_AUDIO_GENRE_LEN),
+    ] {
+        if value.trim().is_empty() {
+            return Err(ApiError::Config(format!(
+                "an audio attachment needs a {label}"
+            )));
+        }
+        if value.chars().count() > max {
+            return Err(ApiError::Config(format!(
+                "audio {label} exceeds {max} characters"
+            )));
+        }
+    }
+    if genre.chars().any(char::is_uppercase) {
+        return Err(ApiError::Config("audio genre must be lowercase".into()));
+    }
+    Ok(())
 }
 
 /// Compared by value, including the preserved JSON of an
@@ -368,6 +580,104 @@ pub(crate) fn validate_flag_reason(reason: Option<&str>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_image_attachment_is_refused_on_the_write_path() {
+        // v0.8.10 § Create Entry: `"type": "image"` in attachments returns 400.
+        // Images go inline in the content, pointing at a URL the site hosts.
+        let image = Attachment::Image {
+            src: "https://bunker.cyberspace.online/x.png".into(),
+            width: 10,
+            height: 10,
+        };
+        let err = validate_write_attachments(&[image]).expect_err("must refuse");
+        assert!(
+            err.to_string().contains("website"),
+            "the message has to say where images do go: {err}"
+        );
+    }
+
+    #[test]
+    fn an_audio_attachment_passes_when_it_is_complete() {
+        let ok = Attachment::audio("https://youtu.be/abc", "Artist", "Title", "synthwave");
+        assert!(validate_write_attachments(std::slice::from_ref(&ok)).is_ok());
+        assert!(validate_write_attachments(&[]).is_ok());
+    }
+
+    #[test]
+    fn an_audio_attachment_needs_all_three_fields_within_their_ceilings() {
+        // § Create Entry: artist (max 100), title (max 150) and genre (max 50,
+        // lowercase) "are all required".
+        for missing in [
+            Attachment::audio("https://youtu.be/abc", "", "Title", "synthwave"),
+            Attachment::audio("https://youtu.be/abc", "Artist", "  ", "synthwave"),
+            Attachment::audio("https://youtu.be/abc", "Artist", "Title", ""),
+        ] {
+            assert!(
+                validate_write_attachments(&[missing]).is_err(),
+                "a blank required field is a 400"
+            );
+        }
+
+        let long_artist = Attachment::audio("https://youtu.be/abc", "a".repeat(101), "T", "g");
+        assert!(validate_write_attachments(&[long_artist]).is_err());
+        let at_limit = Attachment::audio("https://youtu.be/abc", "a".repeat(100), "T", "g");
+        assert!(validate_write_attachments(&[at_limit]).is_ok());
+
+        let long_title = Attachment::audio("https://youtu.be/abc", "A", "t".repeat(151), "g");
+        assert!(validate_write_attachments(&[long_title]).is_err());
+        let long_genre = Attachment::audio("https://youtu.be/abc", "A", "T", "g".repeat(51));
+        assert!(validate_write_attachments(&[long_genre]).is_err());
+
+        let shouty = Attachment::audio("https://youtu.be/abc", "A", "T", "Synthwave");
+        assert!(
+            validate_write_attachments(&[shouty]).is_err(),
+            "genre must be lowercase"
+        );
+    }
+
+    #[test]
+    fn an_audio_src_has_to_be_a_youtube_url() {
+        for good in [
+            "https://youtu.be/abc",
+            "https://www.youtube.com/watch?v=abc",
+            "http://m.youtube.com/watch?v=abc",
+            "https://music.youtube.com/watch?v=abc",
+            "https://YouTube.com/watch?v=abc",
+            "https://youtu.be:443/abc",
+        ] {
+            assert!(is_youtube_url(good), "{good} is a YouTube link");
+        }
+        for bad in [
+            "",
+            "youtu.be/abc",
+            "ftp://youtu.be/abc",
+            "https://youtube.com.evil.test/abc",
+            "https://evil.test/?u=https://youtu.be/abc",
+            "https://vimeo.com/123",
+        ] {
+            assert!(!is_youtube_url(bad), "{bad} is not a YouTube link");
+        }
+    }
+
+    #[test]
+    fn at_most_one_attachment_goes_on_the_wire() {
+        let a = Attachment::audio("https://youtu.be/a", "A", "T", "g");
+        let b = Attachment::audio("https://youtu.be/b", "B", "U", "g");
+        assert!(
+            validate_write_attachments(&[a, b]).is_err(),
+            "§ Create Entry caps the list at one"
+        );
+    }
+
+    #[test]
+    fn an_unknown_attachment_still_round_trips_through_an_edit() {
+        // § Edit Entry replaces the whole list, so a shape this build has never
+        // seen has to be re-sendable or an edit would silently drop it. Only an
+        // image is named as a 400, so only an image is refused here.
+        let future = Attachment::Unknown(serde_json::json!({"type": "video", "src": "x"}));
+        assert!(validate_write_attachments(std::slice::from_ref(&future)).is_ok());
+    }
 
     #[test]
     fn entry_decodes_full_example_from_spec() {

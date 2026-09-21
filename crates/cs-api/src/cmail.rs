@@ -75,6 +75,17 @@ pub struct CmailUser {
     pub display_name: Option<String>,
     #[serde(default)]
     pub profile_picture_url: Option<String>,
+
+    /// Set when the account behind this conversation has been deleted
+    /// (API v0.8.10 § List Conversations: "`deleted: true` when the account has
+    /// been deleted"). Absent otherwise, which is why it decodes as a plain
+    /// `bool` rather than an `Option`.
+    ///
+    /// The conversation and its history survive the deletion, so this is a
+    /// rendering hint, not a reason to hide the thread: mark the correspondent
+    /// as gone, and do not offer a profile to open or a message to send.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub deleted: bool,
 }
 
 /// A C-Mail message as returned by history/list responses and RTDB events.
@@ -816,6 +827,26 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_deleted_correspondent_is_marked_and_has_no_profile_to_open() {
+        // v0.8.10 § List Conversations. The thread and its history survive the
+        // deletion, so this is a rendering hint, not a reason to hide it.
+        let gone: CmailUser =
+            serde_json::from_str(r#"{"userId":"u2","username":"ghost","deleted":true}"#)
+                .expect("must decode");
+        assert!(gone.deleted);
+        assert_eq!(gone.username, "ghost", "the handle is still shown");
+
+        let live: CmailUser =
+            serde_json::from_str(r#"{"userId":"u2","username":"alice"}"#).unwrap();
+        assert!(!live.deleted, "absent means the account is still there");
+
+        // An explicit null must not sink the page it arrived on.
+        let nulled: CmailUser =
+            serde_json::from_str(r#"{"userId":"u2","username":"alice","deleted":null}"#).unwrap();
+        assert!(!nulled.deleted);
+    }
 
     #[test]
     fn start_request_by_user_id_serializes() {

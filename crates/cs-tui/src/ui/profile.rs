@@ -595,10 +595,24 @@ impl ProfileScreen {
         if let Some(dn) = &u.display_name {
             lines.push(Line::from(Span::styled(dn.clone(), theme.accent_style())));
         }
-        lines.push(Line::from(Span::styled(
-            format!("@{}", u.username),
-            theme.muted_style(),
-        )));
+        // v0.8.10 § Get User Profile: `isSupporter` is true for a supporter and
+        // absent otherwise. It is worth showing next to the handle because it is
+        // what decides whether editing a post and `/song` will work at all — on
+        // your own profile it answers "why was that refused", and on someone
+        // else's it explains the track under their post.
+        let handle = Line::from(if u.supporter() {
+            vec![
+                Span::styled(format!("@{}", u.username), theme.muted_style()),
+                Span::raw(" "),
+                Span::styled("★ supporter", theme.accent_style()),
+            ]
+        } else {
+            vec![Span::styled(
+                format!("@{}", u.username),
+                theme.muted_style(),
+            )]
+        });
+        lines.push(handle);
         if let Some(bio) = &u.bio {
             lines.push(Line::from(""));
             for line in bio.lines() {
@@ -636,6 +650,19 @@ impl ProfileScreen {
             let label = u.website_name.as_deref().unwrap_or(url.as_str());
             lines.push(Line::from(Span::styled(
                 format!("🔗 {label} ({url})"),
+                theme.muted_style(),
+            )));
+        }
+        // The 88x31 webring button. Read-only everywhere in this client: v0.8.10
+        // took it off `PATCH /v1/users/me` (§ Update Own Profile), so the edit
+        // form does not offer it and this is the only place it appears.
+        if let Some(button) = u
+            .website_image_url
+            .as_deref()
+            .filter(|url| !url.trim().is_empty())
+        {
+            lines.push(Line::from(Span::styled(
+                format!("🔲 button: {button}"),
                 theme.muted_style(),
             )));
         }
@@ -946,6 +973,7 @@ mod tests {
             website_url: None,
             website_name: None,
             website_image_url: None,
+            is_supporter: None,
             location_latitude: None,
             location_longitude: None,
             location_name: None,
@@ -975,6 +1003,7 @@ mod tests {
             created_at: None,
             edited_at: None,
             deleted: false,
+            ..Default::default()
         }
     }
 
@@ -1235,6 +1264,7 @@ mod tests {
             created_at: None,
             edited_at: None,
             deleted: false,
+            ..Default::default()
         }];
         s.posts.loading = false;
         s.posts.loaded = true;

@@ -1,9 +1,10 @@
-//! User profile types and endpoints (`/v1/users/*`, API v0.8.6 § Users).
+//! User profile types and endpoints (`/v1/users/*`, API v0.8.10 § Users).
 //!
 //! `User` models the `/v1/users/me` and `/v1/users/:username` response shapes.
 //! Because the spec still only enumerates fields under PATCH input (§ Update
 //! Own Profile), several optional response fields (followers/following/posts
-//! counts, supporter flags) are inferred and decoded leniently.
+//! counts) are inferred and decoded leniently. `isSupporter` is the exception:
+//! v0.8.10 documents it outright on both endpoints.
 //!
 //! The guild fields on a profile describe one guild, the badge. Since v0.8.6 a
 //! user can also hold up to five apprenticeships alongside it, and
@@ -45,6 +46,14 @@ pub struct User {
     pub website_url: Option<String>,
     #[serde(default)]
     pub website_name: Option<String>,
+
+    /// The 88x31 button shown on the profile and in the webring.
+    ///
+    /// Read-only from here: v0.8.10 took `websiteImageUrl` off `PATCH
+    /// /v1/users/me` (§ Update Own Profile: "is set on the website, which
+    /// uploads the image for you... It's returned on profiles here but can't be
+    /// set here"), so there is deliberately no matching field on
+    /// [`ProfileUpdate`](crate::ProfileUpdate).
     #[serde(default)]
     pub website_image_url: Option<String>,
 
@@ -61,6 +70,17 @@ pub struct User {
     pub following_count: Option<u32>,
     #[serde(default)]
     pub posts_count: Option<u32>,
+
+    /// Whether this account holds supporter status (API v0.8.10 § Get User
+    /// Profile: "`isSupporter` is `true` for any account with supporter status,
+    /// and absent otherwise. Both endpoints return it").
+    ///
+    /// Absent decodes as `None` rather than `Some(false)`: on `/v1/users/me` it
+    /// is what gates the supporter-only features (editing an entry, `/song`),
+    /// and "the server did not say" is not the same answer as "no". Call
+    /// [`User::supporter`] when only the yes/no matters.
+    #[serde(default)]
+    pub is_supporter: Option<bool>,
 
     /// Whether the *viewing* user currently follows this user. May be absent.
     #[serde(default)]
@@ -88,6 +108,20 @@ pub struct User {
 
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub created_at: Option<OffsetDateTime>,
+}
+
+impl User {
+    /// Whether this account holds supporter status, treating an absent
+    /// `isSupporter` as "no".
+    ///
+    /// § Get User Profile only ever sets the field to `true`, so absence is the
+    /// documented way of saying no. Use this where the answer drives what is
+    /// drawn; read the `is_supporter` field directly where "the server did not
+    /// say" needs telling apart from a plain no.
+    #[must_use]
+    pub fn supporter(&self) -> bool {
+        self.is_supporter.unwrap_or(false)
+    }
 }
 
 /// One guild a user is in, from `GET /v1/users/:username/guilds` (API v0.8.6

@@ -1,4 +1,4 @@
-//! User settings (`/v1/settings`, API v0.8.4 § Settings).
+//! User settings (`/v1/settings`, API v0.8.10 § Settings).
 //!
 //! The spec lists known fields, but some (`keyboardBindings`,
 //! `mutedUsersByRoom`) are opaque JSON. `Settings` decodes everything verbatim
@@ -53,6 +53,16 @@ pub struct Settings {
     pub hide_audio_in_feed: Option<bool>,
     #[serde(default)]
     pub auto_watch_on_reply: Option<bool>,
+
+    /// Whether guild forum threads from the guilds you belong to appear in the
+    /// main feed (API v0.8.10 § Settings, § List Entries). Default on.
+    ///
+    /// Switching it off is what makes `GET /v1/posts` hand back pages shorter
+    /// than `limit`, so a client that reads this still has to page on a short
+    /// page rather than treating one as the end of the feed.
+    #[serde(default)]
+    pub show_guild_posts_in_feed: Option<bool>,
+
     #[serde(default)]
     pub use_legacy_menu_order: Option<bool>,
     #[serde(default)]
@@ -215,6 +225,8 @@ pub struct SettingsUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_watch_on_reply: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub show_guild_posts_in_feed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub use_legacy_menu_order: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_public_post: Option<bool>,
@@ -244,6 +256,7 @@ impl SettingsUpdate {
             && self.hide_images_in_feed.is_none()
             && self.hide_audio_in_feed.is_none()
             && self.auto_watch_on_reply.is_none()
+            && self.show_guild_posts_in_feed.is_none()
             && self.use_legacy_menu_order.is_none()
             && self.default_public_post.is_none()
             && self.icon_theme.is_none()
@@ -329,6 +342,27 @@ mod tests {
         // None fields must not appear.
         assert!(!obj.contains_key("showFollowerCount"));
         assert!(!obj.contains_key("notifications"));
+    }
+
+    #[test]
+    fn the_v0810_guild_feed_toggle_round_trips() {
+        let s: Settings =
+            serde_json::from_str(r#"{"showGuildPostsInFeed": false}"#).expect("must decode");
+        assert_eq!(s.show_guild_posts_in_feed, Some(false));
+
+        // Absent stays absent rather than defaulting to the server's "on", so a
+        // PATCH built from a read never asserts a value the server never sent.
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.show_guild_posts_in_feed, None);
+
+        let u = SettingsUpdate {
+            show_guild_posts_in_feed: Some(true),
+            ..Default::default()
+        };
+        assert!(!u.is_empty());
+        let v: serde_json::Value = serde_json::to_value(&u).unwrap();
+        assert_eq!(v["showGuildPostsInFeed"], true);
+        assert_eq!(v.as_object().unwrap().len(), 1, "no other field is sent");
     }
 
     #[test]

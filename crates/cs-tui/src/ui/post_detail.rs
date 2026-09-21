@@ -1162,6 +1162,7 @@ mod tests {
             created_at: None,
             edited_at: None,
             deleted: false,
+            ..Default::default()
         }
     }
 

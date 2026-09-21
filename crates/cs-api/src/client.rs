@@ -431,6 +431,14 @@ impl Client {
             // would answer "writable now" straight into another 429. Parse the
             // hint before `bytes()` consumes the response.
             let retry_after = if status == StatusCode::TOO_MANY_REQUESTS {
+                // Whatever else the server sends on a 429 is the only evidence
+                // available for the questions the spec leaves open — chiefly
+                // whether the grouped rows in § Read Actions are one shared
+                // budget or one each. Logged rather than probed for: finding out
+                // by hammering an endpoint is exactly the automated traffic
+                // § Terms forbids, so the answer has to come from a limit hit in
+                // ordinary use. Values only, no request body and no token.
+                log_rate_limit_headers(key, &resp);
                 let wait = parse_retry_after(&resp).unwrap_or_else(|| backoff_delay(attempt));
                 self.inner.limiter.penalise(key, wait);
                 Some(wait)
@@ -541,6 +549,28 @@ fn is_cyberspace_url(url: &str) -> bool {
         .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
         .map(|h| h == "cyberspace.online" || h.ends_with(".cyberspace.online"))
         .unwrap_or(false)
+}
+
+/// Record any rate-limit metadata a `429` carried, at debug level.
+///
+/// Skips `authorization` and `cookie` outright; those cannot appear on a
+/// response, and naming them here is what keeps that true if this is ever
+/// pointed at a request.
+fn log_rate_limit_headers(key: EndpointKey, resp: &reqwest::Response) {
+    let interesting: Vec<String> = resp
+        .headers()
+        .iter()
+        .filter(|(name, _)| {
+            let n = name.as_str().to_ascii_lowercase();
+            n != "authorization"
+                && n != "cookie"
+                && (n.contains("ratelimit") || n.contains("retry"))
+        })
+        .map(|(name, value)| format!("{name}: {}", value.to_str().unwrap_or("<non-ascii>")))
+        .collect();
+    if !interesting.is_empty() {
+        tracing::debug!(endpoint = ?key, headers = ?interesting, "429 rate-limit headers");
+    }
 }
 
 fn parse_retry_after(resp: &reqwest::Response) -> Option<Duration> {
