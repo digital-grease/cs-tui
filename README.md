@@ -4,51 +4,48 @@ A terminal client for [cyberspace.online](https://cyberspace.online), targeting 
 
 ![cs-tui screenshot](docs/screenshot.png)
 
-*The feed in the `vapor` theme (one of seven built-in themes; see [Configuration](#configuration)).*
+*The feed in the `vapor` theme, one of seven built in.*
 
 ## Status
 
-Early development. Most of the documented v0.8.10 REST surface is implemented, including private C-Mail and multi-user cIRC chat (REST + live Firebase RTDB streaming), full-text search, and the program registry; live testing against the API is ongoing.
+Early development. Most of the documented v0.8.10 REST surface is implemented,
+including private C-Mail and multi-user cIRC chat (REST plus live streaming),
+full-text search and the program registry. Live testing against the API is
+ongoing.
 
 ## Features
 
-- **Feed** with cursor-based infinite scroll and entry titles
-- **Post detail** with threaded replies
-- **Notifications** with read/unread filtering and an unread badge that reads `99+` once the count passes 100 (past that the server counts only the 100 most recent), covering the full v0.8.10 type list: guild chat messages (with a preview of what was said), gifts sent and received, edit-access and moderator-permission changes, graffiti mentions, ban lifts, post cooldowns and rate-limit warnings alongside the older replies, mentions, follows and pokes. A few are about your own account rather than someone else's action and arrive with no sender at all; the role changes do name the staff member who made them
-- **Thread watching**: `w` in post detail watches/unwatches a thread for `thread_reply` notifications; replying or being `@mentioned` auto-watches (toggle with `autoWatchOnReply` in Settings)
-- **Bookmarks**, **Topics**, and per-topic feeds
-- **Profiles** (info / posts / replies / followers / following / guilds) with follow & unfollow, and `P` to poke someone. The guilds tab lists every guild they belong to with the role held in each, the one on their profile badge first and any apprenticeships after it; `Enter` opens one
-- **Compose** posts and replies in the built-in editor (soft-wrapping, multi-line paste, no external editor required); delete your own entries
-- **Attach a jukebox track** to a post or a reply, typed as `youtube url | artist | title | genre` on the options screen — the same shape as `/song` in chat. Clearing the field on an edit removes the track. Images are uploaded on the website and travel inline in the body as markdown, which is what the API now takes
-- **Edit** your own entry or reply with `e` (`E` on your profile's Posts tab). The API allows this on supporter accounts for 5 minutes after posting, and says so when it doesn't
-- **Flag** an entry, a reply, or a cIRC message for review with `F`, with an optional reason. Reporting is idempotent and can't be withdrawn
-- **cIRC** chat rooms with live streaming: a room roster (`Ctrl+U`) showing who's there and who's idle, presence published on your behalf, and an action menu (`Ctrl+A`) to delete your own message, flag one, open an attachment, reveal a spoiler, or mute the author
-- **C-Mail** private conversations with live streaming, an unread badge, and a typing indicator in both directions
-- **Chat attachments** as compact chips: `[image]`, `[gif]` and `[♪ artist - title]`, clickable via OSC 8 when `hyperlinks` is on, with `o` to open the link or play the track in the jukebox
-- **Text styles and ASCII art**: `/art` is decoded and drawn as sent, `/rainbow` colors per character, `/quiet` dims, `/spoiler` stays masked until you press `v`, and `/blink`, `/wave`, `/slow` and `/glitch` get a static stand-in. Nothing animates. `/l33t`, `/flip`, `/comic`, `/cursive` and `/times` rewrite the text rather than style it, so cs-tui shows exactly what the server sent and adds nothing of its own
-- **Muted users**: `/mute` and `/unmute` in a room (or `m` in the `Ctrl+A` action menu) hide that person's messages for you; it's the same mute list the website uses
-- **Guilds**: browse member groups, view threads/members, join, leave, move your profile badge between guilds, and post threads. v0.8.6's apprenticeships are modelled throughout: the guild you are a member or founder of is the badge on your profile, joining another while you have one makes you an apprentice there (five at most), and promoting an apprenticeship moves the badge to it while the guild it replaces becomes an apprenticeship, so you stay in both
-- **Programs**: a section for the program registry — browse the gallery of programs members have published, filter by runtime, read any release's source (releases are immutable, so an old one is exactly what went out) and save it to a file, publish your own from a file, and recall or delete them. cs-tui does not run programs — `web` ones belong to the website's terminal and `term`/`wasm` to the terminal machine — so it is a place to read one before you do
-- **Journal** (private notes) with revision history
-- **Settings** round-trip that preserves fields the client doesn't model
-- Markdown rendering with `@mention` highlighting
-- Inline image rendering in post detail on graphics-capable terminals (Kitty/iTerm2/Sixel); `[image] url` placeholder elsewhere
-- Seven built-in themes (`cyber`, `c64`, `vt320`, `dark`, `vapor`, `paper` (light), `gruvbox`), switchable at runtime, plus a `custom` palette defined in `config.toml`
-- Per-endpoint rate limiting and one-shot token refresh on 401
+- **Feed, topic feeds and post detail**: infinite scroll, threaded replies, markdown and `@mention` highlighting
+- **Compose** posts and replies in a built-in editor, edit and delete your own, and attach a jukebox track
+- **Notifications** across the full v0.8.10 type list, with read/unread filtering and an unread badge
+- **Thread watching** for reply notifications, armed automatically on anything you reply to or are named in
+- **cIRC** chat rooms with live streaming: a roster of who is present and idle, per-room mutes, and an action menu for the message under the cursor
+- **C-Mail** private conversations with live streaming, an unread badge and typing indicators both ways
+- **Chat text styles**: `/art` is decoded and drawn, `/spoiler` masks until you reveal it, and the rest render as close as a terminal gets. The animated ones are static unless you ask for animation
+- **Guilds**: browse, join, leave, post threads, and move your profile badge between them, apprenticeships included
+- **Programs**: browse the registry, read and save any release's source, publish and recall your own. cs-tui does not run programs, it is a place to read one
+- **Profiles**, **Bookmarks**, **Topics**, **Journal** (private notes with revision history) and **Settings**
+- **Jukebox playback** of the tracks posts carry, shuffle included, when `mpv` and `yt-dlp` are installed
+- **Inline images** in post detail on Kitty, iTerm2 and Sixel terminals
+- **Seven themes** plus a custom palette, switchable at runtime
 
 ## Install
 
-cs-tui is one ready-to-run program file. There is nothing to install, and no Rust toolchain or other software to set up first.
+cs-tui is one ready-to-run program file. There is nothing to install, and no
+Rust toolchain or other software to set up first.
 
-It runs *inside* a terminal window, so double-clicking it won't get you far. You will need a terminal open: **Terminal** on macOS (Applications → Utilities), **Windows Terminal** or **PowerShell** on Windows (search the Start menu), or whichever terminal app your Linux desktop ships with.
+It runs *inside* a terminal window, so double-clicking it will not get you far.
+You will need a terminal open: **Terminal** on macOS (Applications → Utilities),
+**Windows Terminal** or **PowerShell** on Windows, or whichever terminal app
+your Linux desktop ships with.
 
-Every download below is on the [latest release page](https://github.com/digital-grease/cs-tui/releases/latest).
+Every download is on the [latest release page](https://github.com/digital-grease/cs-tui/releases/latest).
 
 ### macOS
 
-1. Download the file ending in **`aarch64-apple-darwin.tar.gz`** for an Apple Silicon Mac (M1 and newer), or **`x86_64-apple-darwin.tar.gz`** for an older Intel one. Not sure which you have? Apple menu → About This Mac.
-2. Double-click the downloaded file in Finder. It unpacks into a program called `cs-tui`.
-3. Open Terminal and run these one line at a time:
+Download **`aarch64-apple-darwin.tar.gz`** for an Apple Silicon Mac (M1 and
+newer) or **`x86_64-apple-darwin.tar.gz`** for an Intel one (Apple menu → About
+This Mac). Double-click it in Finder to unpack, then in Terminal:
 
 ```sh
 cd ~/Downloads
@@ -56,24 +53,27 @@ xattr -d com.apple.quarantine cs-tui
 ./cs-tui
 ```
 
-The `xattr` line tells macOS you trust the program. Without it, macOS refuses to open it, because these builds aren't signed with a paid Apple developer certificate.
+The `xattr` line tells macOS you trust the program. Without it macOS refuses to
+open it, because these builds are not signed with a paid Apple certificate.
 
 ### Windows
 
-1. Download the file ending in **`x86_64-pc-windows-msvc.zip`**. Windows 10 or newer; nothing else needs installing.
-2. Right-click it in File Explorer, choose **Extract All**, then **Extract**. That gives you a folder containing `cs-tui.exe`.
-3. Open that folder, right-click an empty spot inside it, and choose **Open in Terminal** (on Windows 10: hold Shift while right-clicking, then **Open PowerShell window here**). Then run:
+Download **`x86_64-pc-windows-msvc.zip`** (Windows 10 or newer). Right-click it
+in File Explorer, **Extract All**, then **Extract**. Open the resulting folder,
+right-click an empty spot inside it, choose **Open in Terminal**, and run:
 
 ```powershell
 .\cs-tui.exe
 ```
 
-If Windows shows a blue "Windows protected your PC" box, choose **More info**, then **Run anyway**. That appears because the program isn't signed with a paid certificate, not because anything is wrong with it.
+If Windows shows a blue "Windows protected your PC" box, choose **More info**,
+then **Run anyway**. That appears because the program is not signed with a paid
+certificate, not because anything is wrong with it.
 
 ### Linux
 
-1. Download the file ending in **`x86_64-unknown-linux-musl.tar.gz`**. That build works on any distribution.
-2. In a terminal:
+Download **`x86_64-unknown-linux-musl.tar.gz`**, which works on any
+distribution. Then:
 
 ```sh
 cd ~/Downloads
@@ -81,18 +81,13 @@ tar xzf cs-tui-*-x86_64-unknown-linux-musl.tar.gz
 ./cs-tui
 ```
 
-### Running it from anywhere
-
-The steps above run cs-tui out of your Downloads folder. To launch it by just typing `cs-tui` from any folder, move it somewhere your shell looks for programs. On macOS and Linux:
-
-```sh
-install -m 755 cs-tui ~/.local/bin/
-```
-
-If typing `cs-tui` still doesn't find it, `~/.local/bin` isn't on your `PATH` yet. On Windows, put `cs-tui.exe` wherever you like and run it from that folder, or add that folder to your `PATH` in the Start menu's "Edit environment variables for your account".
-
 <details>
-<summary>Full list of downloads</summary>
+<summary>Running it from anywhere, all downloads, building from source</summary>
+
+To launch it by typing `cs-tui` from any folder, move it somewhere your shell
+looks for programs. On macOS and Linux, `install -m 755 cs-tui ~/.local/bin/`
+(if that still does not find it, `~/.local/bin` is not on your `PATH` yet). On
+Windows, put `cs-tui.exe` wherever you like and add that folder to your `PATH`.
 
 | Platform | Asset | Notes |
 |---|---|---|
@@ -102,219 +97,60 @@ If typing `cs-tui` still doesn't find it, `~/.local/bin` isn't on your `PATH` ye
 | macOS (Intel) | `cs-tui-<ver>-x86_64-apple-darwin.tar.gz` | |
 | Windows | `cs-tui-<ver>-x86_64-pc-windows-msvc.zip` | Windows 10 or newer. |
 
-Every archive has a matching `.sha256` file next to it if you want to verify the download.
+Every archive has a matching `.sha256` file next to it if you want to verify the
+download.
 
-</details>
-
-### Build from source
-
-Only needed if you want changes that aren't in a release yet.
+To build from source, which is only needed for changes that are not in a release
+yet, requires Rust 1.81+ (stable; see `rust-toolchain.toml`):
 
 ```sh
 cargo build --release
 ./target/release/cs-tui --help
 ```
 
-Requires Rust 1.81+ (stable channel; see `rust-toolchain.toml`).
+</details>
 
 ## Usage
 
 ```sh
-# Launch
-cs-tui
-
-# Verbose logging (written to the log file, not the terminal)
-cs-tui --debug
+cs-tui           # launch
+cs-tui --debug   # verbose logging, written to the log file
 ```
 
 On first launch you log in with your cyberspace.online email and password. The
-session is saved (see [Files](#files)) and reused on the next launch until you
-log out.
+session is saved and reused on the next launch until you log out.
 
-cs-tui is keyboard-driven. The left and right arrows move between sections
-(Feed, Notifications, C-Mail, cIRC, Bookmarks, Topics, Profile, Journal,
-Guilds, Programs, Settings); there are no number-key jumps, so digits reach the
-screen you are on. Each screen shows its own context keys in the status bar,
-and `?` opens a help overlay anywhere you aren't typing into a field. The
-overlay lists every key grouped by screen and is longer than a terminal, so it
-scrolls with `j`/`k`, the arrows and PgUp/PgDn (`g`/`G` jump to the ends); any
-other key closes it.
+cs-tui is keyboard-driven: the left and right arrows move between sections, each
+screen shows its own keys in the status bar, and `?` opens a help overlay
+anywhere you are not typing into a field.
 
-### Keys by screen
+## Reference
 
-Beyond the shared list keys (`j`/`k` move, `Enter` opens, `r` refreshes, `c`
-composes):
-
-| Screen | Key | Action |
-|---|---|---|
-| Feed, topic feed, post detail | `e` | Edit your own entry (on post detail, the selected reply) |
-| Feed, topic feed, post detail | `F` | Flag an entry or reply for review, with an optional reason |
-| Someone else's profile | `P` | Poke them |
-| Your own profile, Posts tab | `E` | Edit the selected post (`e` edits your profile, `P` pins a post) |
-| Guild | `J` then `y` | Join (member if you are not in a guild yet, apprentice otherwise) |
-| Guild | `P` then `y` | Make this guild your profile badge |
-| Guild | `L` then `y` | Leave, an apprenticeship included (founders leave on the web) |
-| cIRC room | `Ctrl+U` | Show / hide the room roster |
-| cIRC room | `Ctrl+A` | Open the action menu for the message under the cursor |
-| cIRC room | `↑` / `↓` | Move through the room history (`PgUp` / `PgDn` too) |
-| cIRC action menu | `j` / `k` | Pick a message |
-| cIRC action menu | `Home` / `End` | Jump to the oldest / newest message held |
-| cIRC action menu | `d` then `y` | Delete your own message |
-| cIRC action menu | `F` | Flag the message |
-| cIRC action menu | `o` | Open the image or GIF, or play the track |
-| cIRC action menu | `v` | Reveal a spoiler |
-| cIRC action menu | `m` | Mute the author in this room |
-| cIRC action menu | `Esc` | Close the menu, back to the composer |
-| C-Mail conversation | `o` | Open the attachment, or play the track |
-| C-Mail conversation | `v` | Reveal a spoiler |
-| Program gallery | `m` / `t` | Switch between the gallery and your own programs / cycle the runtime filter |
-| Program gallery | `P` | Publish a program from a local file |
-| Program gallery | `d` then `y` | Recall your own program (in the `m` listing; reversible, the release history stays) |
-| Program gallery | `D` then `y` | Delete the record, which frees the slot it holds against your program count |
-| Program publish form | `Tab` / `Space` / `Ctrl+D` | Move between fields / cycle the runtime / publish |
-| Program source | `,` / `.` | Walk the release history (`[` / `]` are the jukebox volume) |
-| Program source | `j`/`k`, `PgUp`/`PgDn`, `g`/`G` | Scroll the source |
-| Program source | `w` | Write the source to a file (it will not overwrite one) |
-
-In a cIRC room the composer always has focus, so every letter you type goes
-into the message. That is why the room's own actions are chords, and why
-deleting or flagging a message goes through the `Ctrl+A` menu: while the menu is
-up it owns the keyboard, and `Ctrl+A` is the only key in a room that is not
-typed.
-
-### Themes
-
-Cycle palettes at runtime via **Esc → Theme**; the selection is remembered
-between runs. Set a default (or define a `custom` palette) in `config.toml`.
-
-### Jukebox playback (optional)
-
-Posts can carry a "jukebox" track (a YouTube link). cs-tui shows the track card
-and cover art inline, and can stream the audio in the background when
-[`mpv`](https://mpv.io) and [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) are
-installed and on your `PATH`. Without them the card and link still render, and
-`o` opens the link in your browser instead.
-
-| Key | Action |
+| | |
 |---|---|
-| `p` | play / pause the focused track (feed, post, topics, bookmarks) |
-| `o` | open the jukebox link in your browser |
-| `s` | stop playback (also turns shuffle off) |
-| `S` | toggle shuffle mode |
-| `<` / `>` | previous / next track |
-| `[` / `]` | volume down / up |
-
-A now-playing bar shows at the bottom while audio plays. Set the starting volume
-with `audio_volume` (0-130, default 50) in `config.toml`.
-
-With **shuffle** on, a track that plays to its end chains into a random jukebox
-post instead of stopping, indefinitely. Candidates come from the posts you've
-already browsed, topped up now and then from the public feed. Pressing `S` with
-nothing playing starts a random track right away; `s` stops the music and the
-mode together. Picking a different track by hand keeps shuffle armed, and it
-chains onward from whatever ends next. Set `shuffle = true` in `config.toml`
-to start every session with the mode armed (playback still begins by hand).
-
-`<` and `>` step through the play history, mpv-style: `<` replays earlier
-tracks, `>` moves forward again, and at the newest entry `>` skips to a fresh
-random pick from the same pool shuffle uses.
+| [KEYS.md](KEYS.md) | Every key by screen, and the jukebox controls |
+| [CONFIG.md](CONFIG.md) | Every `config.toml` option |
 
 ## Files
 
 | Path | Purpose |
 |---|---|
-| `~/.config/cs-tui/config.toml` | User configuration (see [Configuration](#configuration)) |
+| `~/.config/cs-tui/config.toml` | User configuration |
 | `~/.config/cs-tui/session.json` | Saved login session (mode `0600` on Unix) |
 | `~/.config/cs-tui/prefs.json` | UI preferences (e.g. selected theme) |
 | `~/.local/state/cs-tui/cs-tui.log` | Log output (`--debug` / `RUST_LOG` raise verbosity) |
 
-(Paths follow the XDG base directory spec; locations differ on macOS/Windows.)
-
-## Configuration
-
-On first run, cs-tui writes a commented `config.toml` to
-`~/.config/cs-tui/config.toml`, listing every option at its default. It is never
-overwritten, so your edits and comments are safe. Every option is optional;
-restart to apply changes. Point at a different file with `--config <path>` or
-`$CS_TUI_CONFIG`; an explicit path must already exist (only the default
-location is auto-created).
-
-### Appearance
-
-| Option | Default | Notes |
-|---|---|---|
-| `theme` | `cyber` | One of `cyber`, `c64`, `vt320`, `dark`, `vapor`, `paper` (light), `gruvbox`, `custom`. The in-app Esc → Theme menu overrides this and is remembered separately. |
-| `[colors]` | built-in | Custom palette, used when `theme = "custom"`. Keys: `background`, `foreground`, `muted`, `accent`, `heading` (panel titles; defaults to `accent`), `success`, `error`, `warning`, `border`, `selection`. Each is a hex (`"#1e1e2e"`), `"reset"`, or an ANSI index (`"0"` to `"255"`); omitted keys keep the default. |
-| `selection` | `fill` | Selected-row emphasis: `fill` (a full-row background fill, the `selection` color) or `bar` (just the `▌` bar + bold-accent text). |
-| `background_mode` | `theme` | Screen background / terminal transparency. `theme` uses the palette's own background (`cyber`/`vt320`/`dark` are transparent, `c64`/`vapor`/`paper`/`gruvbox` solid); `transparent` never paints a backdrop so the terminal's transparency shows through on any theme; `opaque` always paints a solid backdrop (black for the transparent themes). |
-| `compact` | `false` | Drop the blank-line / rule separators between list items for a denser feed. |
-
-### Time
-
-| Option | Default | Notes |
-|---|---|---|
-| `time_format` | `relative` | `relative` ("2h ago") or `absolute` ("2026-05-31 14:30"). |
-| `timezone` | `utc` | For absolute timestamps: `utc`, or a fixed offset like `-05:00`, `+02:00`, `+0530`. |
-
-### Behavior
-
-| Option | Default | Notes |
-|---|---|---|
-| `start_section` | `feed` | Section opened on launch: `feed`, `notifications`, `c-mail`, `circ`, `bookmarks`, `topics`, `profile`, `journal`, `guilds`, `programs`, `settings`. |
-| `nsfw` | `false` | Show NSFW posts by default (otherwise hidden until toggled). |
-| `confirm_deletes` | `true` | Require the two-step `d` then `y` confirmation before deleting a post or note. |
-| `feed_autorefresh` | `true` | Auto-refresh the feed in the background: new entries are prepended at the top without moving your scroll position (only while the feed is on screen). |
-| `feed_refresh_secs` | `30` | Seconds between background feed polls. Minimum 10; lower values use more of the read rate limit. |
-| `notifications_refresh_secs` | `20` | Seconds between background polls of the unread-notification count (the header badge). Minimum 5; lower values surface new notifications sooner but use more of the read rate limit. |
-| `cmail_refresh_secs` | `20` | Seconds between background polls of the unread C-Mail count (the header badge). Minimum 5; lower values surface new mail sooner but use more of the read rate limit. |
-| `cmail_bell` | `false` | Ring the terminal bell when new C-Mail arrives while you are on another screen. |
-| `audio_volume` | `50` | Starting jukebox volume for a fresh session (0 to 130; above 100 is soft amplification). Adjust live with `[` / `]`. |
-| `shuffle` | `false` | Start each session with shuffle mode armed (playback still begins by hand). See [Jukebox playback](#jukebox-playback-optional). |
-| `editor` | _(unset, uses the built-in editor)_ | Set to an external editor command (e.g. `nvim`) to compose in it instead of the built-in editor. GUI editors must block until the file is closed, so use a wait flag: `code --wait`, `subl -w`, `gnome-text-editor --standalone`. Leave unset to use the built-in editor. `$VISUAL`/`$EDITOR` are no longer consulted (an environment editor that forks or is missing was silently aborting composes). |
-| `browser` | _(unset, uses the OS default handler)_ | Command used to open a link, instead of `xdg-open` / `open` / `cmd /C start`. Split on spaces and run directly, with no shell, so quotes and globs are not interpreted. `%s` in an argument is replaced by the URL; without one it is appended (`firefox --new-tab`, `qutebrowser %s --target tab`). Only http and https links are ever opened, whatever this is set to. |
-| `preview_length` | `200` | Characters of post content shown in list previews (clamped 20 to 2000). |
-| `image_height` | `20` | Max rows for the inline image strip in post detail (clamped 1 to 60). |
-| `image_sharpness` | `crisp` | How an image is resampled when it is scaled to fit: `crisp` (nearest neighbour, cheapest, keeps hard edges on pixel art), `smooth`, `medium`, or `sharp` (best on downscaled photographs, slowest). The cost is paid once per picture per size, when it is first drawn, and not again while you scroll. |
-| `graphics_protocol` | _(unset, probes)_ | Force a terminal graphics protocol instead of probing for one: `kitty`, `iterm2`, `sixel`, or `halfblocks`. Leave unset unless the probe gets it wrong, which shows up as no images in a terminal that supports them, or a screenful of escape bytes in one that does not. |
-
-### What other people can see
-
-Two settings publish your activity to other people on Cyberspace. Both are on by
-default, because that is what the website does and what people in a room expect.
-Set either to `false` in `config.toml` and cs-tui never makes the call at all.
-
-| Option | Default | Notes |
-|---|---|---|
-| `circ_presence` | `true` | Announce your presence while a cIRC room is open, so your name appears in that room's user list for everyone in the room, including people reading on the website. cs-tui refreshes it on the cadence the server asks for, and removes you when you leave the room or quit. Set to `false` to stay out of the user list entirely; you can still read the room and post in it. |
-| `cmail_typing` | `true` | Publish a typing indicator while a C-Mail conversation is open, so the other participant sees the same "…is typing" the website shows. It is refreshed while you type and cleared when you stop, close the conversation, or quit. Set to `false` to publish nothing; you still see their indicator either way. |
-
-One further setting makes a request on your behalf, but to GitHub rather than to
-Cyberspace, and publishes nothing to anyone you talk to.
-
-| Option | Default | Notes |
-|---|---|---|
-| `update_check` | `true` | Ask GitHub, at most once a day and in the background, whether a newer cs-tui release exists, and mention it once if so. The release then stays listed in the Esc menu, which opens its page. The request tells GitHub your address and that you run cs-tui; it never touches the Cyberspace API, carries no session token, and nothing is ever downloaded or installed. Set to `false` to make no such request. |
-
-### Input and rendering
-
-| Option | Default | Notes |
-|---|---|---|
-| `mouse` | `false` | Capture the scroll wheel for in-app scrolling. Off keeps native terminal select/copy. `--mouse` forces it on. |
-| `images` | `true` | Render inline images on graphics-capable terminals. `--no-images` forces it off. |
-| `animate_styles` | `false` | Animate the `blink`, `wave` and `glitch` text styles instead of drawing static approximations of them. This redraws the chat pane several times a second for as long as an animated message is on screen, whether or not you are looking at it, which is real battery on a laptop. Off by default for that reason. |
-| `hyperlinks` | `true` | Make links clickable via OSC 8 terminal hyperlinks (Ghostty, kitty, WezTerm, iTerm2, foot, recent VTE terminals, Windows Terminal, tmux ≥ 3.4). Off surfaces the bare URL for the terminal's own URL detection instead. |
-| `api_base` | `https://api.cyberspace.online` | Override the API base URL. |
+Paths follow the XDG base directory spec; locations differ on macOS and Windows.
 
 ## Layout
 
 | Path | Purpose |
 |---|---|
-| `crates/cs-api/` | HTTP client + types for the Cyberspace REST API |
+| `crates/cs-api/` | HTTP client and types for the Cyberspace REST API |
 | `crates/cs-tui/` | Ratatui application (binary) |
 
-The client targets **Cyberspace API v0.8.10**. The specification itself is not
-redistributed here; obtain it from the service. Code comments cite it by section
-name (for example, § Join a Guild) so they stay readable without it.
+Code comments cite the Cyberspace API specification by section name (for
+example, § Join a Guild) so they stay readable without it to hand.
 
 ## License
 
