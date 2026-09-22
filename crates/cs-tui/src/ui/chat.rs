@@ -56,6 +56,21 @@ pub const INDENT: &str = "  ";
 /// other field is stripped, so there is nothing to render but a marker.
 pub const TOMBSTONE: &str = "⌫ message deleted";
 
+/// The inline marker drawn where an unrevealed `spoiler` body ends.
+///
+/// A masked message is otherwise a wall of [`super::styles::SPOILER_GLYPH`]
+/// blocks with nothing on screen saying what it is or that there is a key to
+/// read it, and the footer only names the key once the reader has opened
+/// cIRC's action menu, which is exactly the step someone who does not know the
+/// blocks are a spoiler will not take. So the body names itself.
+pub const SPOILER_MARK: &str = "[spoiler]";
+
+/// Columns [`SPOILER_MARK`] occupies, the space in front of it included.
+///
+/// Held out of the text's wrap budget for every `spoiler` message, revealed or
+/// not. See [`body_rows`].
+const SPOILER_MARK_COLS: usize = SPOILER_MARK.len() + 1;
+
 /// The chip label for an attached image.
 const IMAGE_CHIP: &str = "[image]";
 
@@ -316,9 +331,11 @@ pub fn body_lines(
     let text_styles = TextStyles::from_message(msg.extras.style.as_ref());
     let base = theme.base();
     let action = action_style(msg.extras, theme);
-    body_rows(msg, layout)
-        .into_iter()
-        .flat_map(|row| {
+    let rows = body_rows(msg, layout);
+    let mark_at = spoiler_mark_row(&rows, msg, layout);
+    rows.into_iter()
+        .enumerate()
+        .flat_map(|(i, row)| {
             let mut spans = vec![Span::styled(layout.indent.to_string(), base)];
             match row {
                 // Blank rows, because the screen paints the picture over them
@@ -364,9 +381,45 @@ pub fn body_lines(
                     theme.muted_style().add_modifier(Modifier::ITALIC),
                 )),
             }
+            if Some(i) == mark_at {
+                // Accent, not the mask's muted grey, or the marker disappears
+                // into the very blocks it is there to explain. Italic rather
+                // than `accent_style`'s bold, for two reasons: it carries the
+                // marker under `NO_COLOR`, where there is no accent to see, and
+                // accent-plus-bold is what a `@mention` is drawn in, which a
+                // masked spoiler deliberately never contains. See `text_spans`.
+                spans.push(Span::styled(
+                    format!(" {SPOILER_MARK}"),
+                    Style::default()
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::ITALIC),
+                ));
+            }
             vec![Line::from(spans)]
         })
         .collect()
+}
+
+/// Which row [`SPOILER_MARK`] attaches to, if any.
+///
+/// The last masked row, so the marker sits where the blocks end rather than
+/// floating past an attachment chip, which is not masked and is not a spoiler.
+/// `None` once the reader has revealed the message: the text is its own label
+/// then, and the footer hint carries the key to hide it again.
+fn spoiler_mark_row(
+    rows: &[BodyRow],
+    msg: ChatMessage<'_>,
+    layout: BodyLayout<'_>,
+) -> Option<usize> {
+    if layout.revealed || !has_spoiler(msg.extras) {
+        return None;
+    }
+    rows.iter().rposition(|row| {
+        matches!(
+            row,
+            BodyRow::Text(..) | BodyRow::Action(..) | BodyRow::Art(_)
+        )
+    })
 }
 
 /// How many rows [`body_lines`] will produce for the same arguments.
@@ -1116,6 +1169,16 @@ fn body_rows(msg: ChatMessage<'_>, layout: BodyLayout<'_>) -> Vec<BodyRow> {
     }
     let width = layout.width.max(1);
     let text_styles = TextStyles::from_message(msg.extras.style.as_ref());
+    // The marker is held out of the text's budget whether or not the spoiler is
+    // revealed, so both states wrap identically and revealing swaps blocks for
+    // text without moving anything below the message. Only the text pays: a
+    // highlight or a chip is never masked, so the marker cannot land on one and
+    // they keep the full width.
+    let text_width = if text_styles.spoiler {
+        width.saturating_sub(SPOILER_MARK_COLS).max(1)
+    } else {
+        width
+    };
     let mut rows = Vec::new();
 
     // `display_content` carries the spec's two content rules: the text may be
@@ -1124,7 +1187,7 @@ fn body_rows(msg: ChatMessage<'_>, layout: BodyLayout<'_>) -> Vec<BodyRow> {
     if let Some(text) = msg.extras.display_content(msg.content) {
         if text_styles.art {
             rows.extend(
-                hard_wrap(&art::decode_art(text), width)
+                hard_wrap(&art::decode_art(text), text_width)
                     .into_iter()
                     .map(BodyRow::Art),
             );
@@ -1145,7 +1208,7 @@ fn body_rows(msg: ChatMessage<'_>, layout: BodyLayout<'_>) -> Vec<BodyRow> {
             marks.extend(body_marks);
             let line = format!("{prefix}{plain}");
             rows.extend(
-                word_wrap_marked(&line, &marks, width)
+                word_wrap_marked(&line, &marks, text_width)
                     .into_iter()
                     .map(|(t, m)| BodyRow::Action(t, m)),
             );
@@ -1169,7 +1232,7 @@ fn body_rows(msg: ChatMessage<'_>, layout: BodyLayout<'_>) -> Vec<BodyRow> {
             // columns.
             let (plain, marks) = super::markdown::inline_marks(&text);
             rows.extend(
-                word_wrap_marked(&plain, &marks, width)
+                word_wrap_marked(&plain, &marks, text_width)
                     .into_iter()
                     .map(|(t, m)| BodyRow::Text(t, m)),
             );
@@ -2219,6 +2282,117 @@ mod tests {
             body_height(msg, layout(12)),
             body_height(msg, layout(12).with_revealed(true)),
         );
+    }
+
+    #[test]
+    fn a_hidden_spoiler_names_itself_where_the_blocks_end() {
+        let e = styled("spoiler");
+        let msg = ChatMessage::new("neo", "the butler did it", &e);
+
+        let hidden = rows(msg, 40);
+        assert_eq!(hidden.len(), 1, "{hidden:?}");
+        assert!(
+            hidden[0].ends_with(SPOILER_MARK),
+            "the mask is labelled, so a wall of blocks is not a mystery: {hidden:?}",
+        );
+
+        // Revealed, the text is its own label and the marker would just be
+        // noise on a message the reader is already reading.
+        let shown: String = body_lines(msg, layout(40).with_revealed(true), &Theme::cyber())
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(!shown.contains(SPOILER_MARK), "{shown:?}");
+    }
+
+    #[test]
+    fn the_spoiler_marker_is_told_apart_from_the_mask_it_labels() {
+        let theme = Theme::cyber();
+        let e = styled("spoiler");
+        let msg = ChatMessage::new("neo", "the butler did it", &e);
+        let lines = body_lines(msg, layout(40), &theme);
+        let mark = lines[0]
+            .spans
+            .iter()
+            .find(|s| s.content.contains(SPOILER_MARK))
+            .expect("the marker is drawn");
+        // Muted is the mask's own colour: a muted marker would vanish into the
+        // blocks, and italic carries it where there is no colour at all. Not
+        // bold, which is the mention style a masked spoiler must never show.
+        assert_eq!(mark.style.fg, Some(theme.accent));
+        assert!(mark.style.add_modifier.contains(Modifier::ITALIC));
+        assert!(!mark.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn the_spoiler_marker_never_overruns_the_pane() {
+        let e = styled("spoiler");
+        // Long enough to fill several rows at this width, so the last row is a
+        // short one and the earlier ones are packed as tight as the wrap goes.
+        let msg = ChatMessage::new(
+            "neo",
+            "the butler did it in the library with the candlestick and he is sorry",
+            &e,
+        );
+        for width in [12usize, 20, 33, 40] {
+            for row in rows(msg, width) {
+                let cells: usize = row
+                    .chars()
+                    .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+                    .sum();
+                assert!(
+                    cells <= INDENT.len() + width,
+                    "a {width}-column body overflowed to {cells}: {row:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_spoiler_marker_does_not_rewrap_the_body_when_it_goes() {
+        let e = styled("spoiler");
+        let msg = ChatMessage::new(
+            "neo",
+            "the butler did it in the library with the candlestick",
+            &e,
+        );
+        // Same rows, and the same text on each of them: the marker's columns are
+        // reserved in both states, so revealing cannot reflow the pane.
+        let masked = body_rows(msg, layout(24));
+        let shown = body_rows(msg, layout(24).with_revealed(true));
+        assert_eq!(masked.len(), shown.len());
+        let widths = |rs: &[BodyRow]| -> Vec<usize> {
+            rs.iter()
+                .map(|r| match r {
+                    BodyRow::Text(t, _) | BodyRow::Action(t, _) => t.chars().count(),
+                    _ => 0,
+                })
+                .collect()
+        };
+        assert_eq!(widths(&masked), widths(&shown));
+    }
+
+    #[test]
+    fn the_spoiler_marker_labels_the_text_not_the_attachment_chip() {
+        let e = MessageExtras {
+            style: Some(MessageStyle::One("spoiler".into())),
+            image_url: Some("https://cdn.example/pic.png".into()),
+            ..MessageExtras::default()
+        };
+        let msg = ChatMessage::new("neo", "the butler did it", &e);
+        let drawn = rows(msg, 40);
+        assert_eq!(drawn.len(), 2, "{drawn:?}");
+        assert!(drawn[0].ends_with(SPOILER_MARK), "{drawn:?}");
+        // The chip is not masked and is not the secret, so it keeps its own row
+        // intact and the chip-link overlay still finds the label it expects.
+        assert_eq!(drawn[1].trim(), IMAGE_CHIP);
+    }
+
+    #[test]
+    fn an_ordinary_message_is_never_marked_as_a_spoiler() {
+        let e = extras();
+        let msg = ChatMessage::new("neo", "the butler did it", &e);
+        assert!(!rows(msg, 40).concat().contains(SPOILER_MARK));
     }
 
     #[test]
