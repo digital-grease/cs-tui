@@ -1,15 +1,22 @@
 //! Minimal markdown → ratatui Lines renderer.
 //!
 //! Handles the subset of GitHub-flavored markdown that appears in cyberspace.online
-//! posts: headings, bold/italic, inline code, code blocks, unordered lists,
+//! posts: headings, bold/italic, strikethrough, inline code, code blocks, unordered lists,
 //! blockquotes, links (the visible text, then the bare URL on its own line),
 //! soft/hard breaks, and `@mention` highlighting. Tables, footnotes, and other
 //! advanced features are rendered as plain text.
-use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
+use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::theme::Theme;
+
+/// A parser with the one GitHub extension Cyberspace text actually uses:
+/// `~strikethrough~` (single or double tildes). Without it the markers render
+/// literally, which is how a struck-out word ended up drawn as `~word~`.
+fn parser(input: &str) -> Parser<'_> {
+    Parser::new_ext(input, Options::ENABLE_STRIKETHROUGH)
+}
 
 /// Whether [`render_markdown`] surfaces an image's destination URL below the
 /// `[image]` placeholder. Contexts that draw the image as terminal graphics (the
@@ -42,6 +49,8 @@ pub struct InlineMark {
     pub strong: bool,
     /// `*emphasis*` or `_emphasis_`.
     pub emphasis: bool,
+    /// `~strikethrough~` or `~~strikethrough~~`.
+    pub strikethrough: bool,
     /// `` `code` ``.
     pub code: bool,
     /// Inside a `[link](url)` or a bare URL.
@@ -110,7 +119,7 @@ fn push_line(line: &str, text: &mut String, marks: &mut Vec<InlineMark>) {
     let mut out = String::new();
     let mut out_marks: Vec<InlineMark> = Vec::new();
     let mut depth_paragraph = 0usize;
-    for ev in Parser::new(line) {
+    for ev in parser(line) {
         match ev {
             Event::Start(Tag::Paragraph) => depth_paragraph += 1,
             Event::End(TagEnd::Paragraph) => {}
@@ -118,6 +127,8 @@ fn push_line(line: &str, text: &mut String, marks: &mut Vec<InlineMark>) {
             Event::End(TagEnd::Strong) => cur.strong = false,
             Event::Start(Tag::Emphasis) => cur.emphasis = true,
             Event::End(TagEnd::Emphasis) => cur.emphasis = false,
+            Event::Start(Tag::Strikethrough) => cur.strikethrough = true,
+            Event::End(TagEnd::Strikethrough) => cur.strikethrough = false,
             Event::Start(Tag::Link { .. }) => cur.link = true,
             Event::End(TagEnd::Link) => cur.link = false,
             Event::Text(t) => {
@@ -181,8 +192,7 @@ pub fn render_markdown_with(
     let mut link_url: Option<String> = None;
     let mut link_text = String::new();
 
-    let parser = Parser::new(input);
-    for event in parser {
+    for event in parser(input) {
         match event {
             Event::Start(Tag::Image { dest_url, .. }) => {
                 // Capture the alt text and URL; the placeholder is emitted at End.
@@ -300,7 +310,7 @@ pub fn render_markdown_with(
 pub fn content_preview(content: &str, max: usize) -> String {
     let mut text = String::new();
     let mut in_image = false;
-    for ev in Parser::new(content) {
+    for ev in parser(content) {
         match ev {
             Event::Start(Tag::Image { .. }) => in_image = true,
             Event::End(TagEnd::Image) => in_image = false,
@@ -353,6 +363,9 @@ fn handle_start(
         }
         Tag::Emphasis => stack.push(current_style(stack, theme).add_modifier(Modifier::ITALIC)),
         Tag::Strong => stack.push(current_style(stack, theme).add_modifier(Modifier::BOLD)),
+        Tag::Strikethrough => {
+            stack.push(current_style(stack, theme).add_modifier(Modifier::CROSSED_OUT));
+        }
         Tag::CodeBlock(_) => {
             flush(line, out, *blockquote_depth, theme);
             stack.push(Style::default().fg(theme.accent));
@@ -429,7 +442,7 @@ fn handle_end(
             stack.pop();
             out.push(Line::from(""));
         }
-        TagEnd::Emphasis | TagEnd::Strong => {
+        TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
             stack.pop();
         }
         TagEnd::List(_) => {
@@ -546,6 +559,20 @@ mod tests {
     }
 
     #[test]
+    fn strikethrough_is_honoured_with_one_tilde_or_two() {
+        for (input, struck) in [("a ~gone~ word", "gone"), ("a ~~gone~~ word", "gone")] {
+            let (text, marks) = inline_marks(input);
+            assert_eq!(text, "a gone word", "{input:?} keeps no tildes");
+            assert!(marks[text.find(struck).unwrap()].strikethrough, "{input:?}");
+            assert!(marks[text.find("word").unwrap()].is_plain(), "{input:?}");
+        }
+        // A lone tilde is just a tilde.
+        let (text, marks) = inline_marks("~5 minutes");
+        assert_eq!(text, "~5 minutes");
+        assert!(marks.iter().all(|m| m.is_plain()));
+    }
+
+    #[test]
     fn a_line_that_looks_like_a_block_renders_as_typed() {
         // The whole reason this is inline-only: a chat message beginning with
         // one of these is a message, not a document.
@@ -654,6 +681,18 @@ mod tests {
             })
         });
         assert!(has_italic);
+    }
+
+    #[test]
+    fn strikethrough_runs_apply_crossed_out_modifier() {
+        let lines = render_markdown("a ~~gone~~ word", &Theme::dark());
+        assert_eq!(flat_text(&lines).trim(), "a gone word");
+        let struck = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains("gone"))
+            .unwrap();
+        assert!(struck.style.add_modifier.contains(Modifier::CROSSED_OUT));
     }
 
     #[test]

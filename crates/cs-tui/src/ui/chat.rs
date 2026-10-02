@@ -1052,6 +1052,9 @@ fn decorate_mark(base: Style, mark: InlineMark, theme: &Theme) -> Style {
     if mark.emphasis {
         style = style.add_modifier(Modifier::ITALIC);
     }
+    if mark.strikethrough {
+        style = style.add_modifier(Modifier::CROSSED_OUT);
+    }
     if mark.code {
         // A colour rather than a background: a background would fight the
         // selected-row highlight, and chat rows are already dense.
@@ -1757,6 +1760,20 @@ mod tests {
             "a bold word",
             "the markers are consumed, not printed",
         );
+    }
+
+    #[test]
+    fn strikethrough_is_drawn_crossed_out_rather_than_as_tildes() {
+        let extras = MessageExtras::default();
+        let msg = ChatMessage::new("neo", "a ~gone~ word", &extras);
+        assert_eq!(body_text(msg, 40).trim(), "a gone word");
+        let lines = body_lines(msg, layout(40), &Theme::cyber());
+        let struck = lines[0]
+            .spans
+            .iter()
+            .find(|s| s.content.contains("gone"))
+            .expect("the struck word is drawn");
+        assert!(struck.style.add_modifier.contains(Modifier::CROSSED_OUT));
     }
 
     #[test]
