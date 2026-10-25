@@ -23,7 +23,7 @@ explicit path must already exist; only the default location is auto-created.
 | Option | Default | Notes |
 |---|---|---|
 | `time_format` | `relative` | `relative` ("2h ago") or `absolute` ("2026-05-31 14:30"). |
-| `timezone` | `utc` | For absolute timestamps: `utc`, or a fixed offset like `-05:00`, `+02:00`, `+0530`. |
+| `timezone` | `utc` | For absolute timestamps: `utc`, or a fixed offset like `-05:00`, `+02:00`, `+0530`. Setting it also lets a bare `/localtime` in cIRC fill in your time. |
 
 ## Behavior
 

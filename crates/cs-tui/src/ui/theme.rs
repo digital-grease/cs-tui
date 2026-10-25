@@ -318,6 +318,129 @@ fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
     (16 + 36 * q(r) + 6 * q(g) + q(b)) as u8
 }
 
+/// A username colour at `hue` degrees, for cIRC's `colorNicknames` setting
+/// (v0.9.0 § Settings): the website takes the hue from the name and leaves the
+/// lightness "to suit your background", so this picks a light tone on a dark
+/// background and a dark one on a light background, then fits the result to
+/// what the terminal can show.
+#[must_use]
+pub fn hue_color(hue: u16, theme: &Theme, mode: ColorMode) -> Color {
+    let lightness = if has_light_background(theme) {
+        0.36
+    } else {
+        0.66
+    };
+    let (r, g, b) = hsl_to_rgb(f32::from(hue % 360), 0.75, lightness);
+    match mode {
+        ColorMode::Full => Color::Rgb(r, g, b),
+        ColorMode::Indexed256 => Color::Indexed(rgb_to_ansi256(r, g, b)),
+        ColorMode::Monochrome => Color::Reset,
+    }
+}
+
+/// Whether `theme` draws on a light background.
+///
+/// A transparent background (`Reset`, from `background_mode = "transparent"`)
+/// says nothing by itself, so it is judged from the foreground the palette was
+/// designed to put on it: `paper`'s dark ink means a light page even when the
+/// terminal supplies the page. With both unknown, dark is the guess, since most
+/// terminals are.
+fn has_light_background(theme: &Theme) -> bool {
+    if theme.background != Color::Reset {
+        return is_light(theme.background);
+    }
+    match theme.foreground {
+        Color::Reset => false,
+        fg => !is_light(fg),
+    }
+}
+
+/// The 16 ANSI colours, at xterm's default values.
+const ANSI_16: [(u8, u8, u8); 16] = [
+    (0, 0, 0),
+    (205, 0, 0),
+    (0, 205, 0),
+    (205, 205, 0),
+    (0, 0, 238),
+    (205, 0, 205),
+    (0, 205, 205),
+    (229, 229, 229),
+    (127, 127, 127),
+    (255, 0, 0),
+    (0, 255, 0),
+    (255, 255, 0),
+    (92, 92, 255),
+    (255, 0, 255),
+    (0, 255, 255),
+    (255, 255, 255),
+];
+
+/// Whether `color` is a light colour. Anything this cannot place counts as
+/// dark: every built-in palette but `paper` is dark, and so are most terminals.
+fn is_light(color: Color) -> bool {
+    let ansi = |i: usize| Some(ANSI_16[i]);
+    let rgb = match color {
+        Color::Rgb(r, g, b) => Some((r, g, b)),
+        Color::Black => ansi(0),
+        Color::Red => ansi(1),
+        Color::Green => ansi(2),
+        Color::Yellow => ansi(3),
+        Color::Blue => ansi(4),
+        Color::Magenta => ansi(5),
+        Color::Cyan => ansi(6),
+        Color::Gray => ansi(7),
+        Color::DarkGray => ansi(8),
+        Color::LightRed => ansi(9),
+        Color::LightGreen => ansi(10),
+        Color::LightYellow => ansi(11),
+        Color::LightBlue => ansi(12),
+        Color::LightMagenta => ansi(13),
+        Color::LightCyan => ansi(14),
+        Color::White => ansi(15),
+        Color::Indexed(i) => match i {
+            0..=15 => ansi(usize::from(i)),
+            16..=231 => {
+                let level = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+                let i = i - 16;
+                Some((level(i / 36), level((i / 6) % 6), level(i % 6)))
+            }
+            232..=255 => {
+                let v = 8 + (i - 232) * 10;
+                Some((v, v, v))
+            }
+        },
+        Color::Reset => None,
+    };
+    let Some((r, g, b)) = rgb else {
+        return false;
+    };
+    // Rec. 601 luma, which is plenty to tell a cream page from a black one.
+    let luma = 0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b);
+    luma > 140.0
+}
+
+/// HSL (hue in degrees, saturation and lightness in `0..=1`) to 8-bit RGB.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::many_single_char_names
+)]
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r, g, b) = match h {
+        h if h < 60.0 => (c, x, 0.0),
+        h if h < 120.0 => (x, c, 0.0),
+        h if h < 180.0 => (0.0, c, x),
+        h if h < 240.0 => (0.0, x, c),
+        h if h < 300.0 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let to_u8 = |v: f32| ((v + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    (to_u8(r), to_u8(g), to_u8(b))
+}
+
 impl Default for Theme {
     fn default() -> Self {
         Self::cyber()
@@ -449,6 +572,80 @@ mod tests {
         // cyber uses named/indexed colors → unchanged by the downsample.
         let c = Theme::cyber();
         assert_eq!(c.adapt(ColorMode::Indexed256).accent, c.accent);
+    }
+
+    #[test]
+    fn hsl_to_rgb_hits_the_primaries() {
+        assert_eq!(hsl_to_rgb(0.0, 1.0, 0.5), (255, 0, 0));
+        assert_eq!(hsl_to_rgb(120.0, 1.0, 0.5), (0, 255, 0));
+        assert_eq!(hsl_to_rgb(240.0, 1.0, 0.5), (0, 0, 255));
+        assert_eq!(hsl_to_rgb(0.0, 0.0, 1.0), (255, 255, 255));
+    }
+
+    #[test]
+    fn hue_color_suits_the_background() {
+        let luma = |c: Color| match c {
+            Color::Rgb(r, g, b) => {
+                0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b)
+            }
+            other => panic!("expected Rgb, got {other:?}"),
+        };
+        let on_dark = hue_color(200, &Theme::cyber(), ColorMode::Full);
+        let on_paper = hue_color(200, &Theme::paper(), ColorMode::Full);
+        assert!(
+            luma(on_dark) > luma(on_paper),
+            "{on_dark:?} vs {on_paper:?}"
+        );
+        // Transparent: judged from the ink the palette puts on the page.
+        let clear = Some(Color::Reset);
+        assert_eq!(
+            hue_color(200, &Theme::cyber().with_background(clear), ColorMode::Full),
+            on_dark
+        );
+        assert_eq!(
+            hue_color(200, &Theme::paper().with_background(clear), ColorMode::Full),
+            on_paper,
+            "paper's dark ink means a light page"
+        );
+        // Every built-in palette but paper is dark, in both colour modes that
+        // keep colour.
+        for kind in ThemeKind::ALL {
+            for mode in [ColorMode::Full, ColorMode::Indexed256] {
+                let theme = kind.theme().adapt(mode);
+                assert_eq!(
+                    has_light_background(&theme),
+                    kind == ThemeKind::Paper,
+                    "{kind:?} in {mode:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hue_color_follows_the_color_mode() {
+        let theme = Theme::cyber();
+        assert!(matches!(
+            hue_color(10, &theme, ColorMode::Indexed256),
+            Color::Indexed(_)
+        ));
+        assert_eq!(hue_color(10, &theme, ColorMode::Monochrome), Color::Reset);
+    }
+
+    #[test]
+    fn indexed_backgrounds_are_classified() {
+        assert!(is_light(Color::Indexed(255)), "top of the grey ramp");
+        assert!(!is_light(Color::Indexed(232)), "bottom of the grey ramp");
+        assert!(is_light(Color::Indexed(231)), "cube white");
+        assert!(!is_light(Color::Indexed(16)), "cube black");
+        // The bright ANSI colours a custom theme can name by number or name.
+        for light in [10u8, 11, 14, 15] {
+            assert!(is_light(Color::Indexed(light)), "ANSI {light}");
+        }
+        for dark in [0u8, 1, 4, 8] {
+            assert!(!is_light(Color::Indexed(dark)), "ANSI {dark}");
+        }
+        assert!(is_light(Color::LightYellow));
+        assert!(!is_light(Color::Blue));
     }
 
     #[test]

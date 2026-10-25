@@ -1,4 +1,4 @@
-//! Entry (post) read and write endpoints (`/v1/posts`, API v0.8.10).
+//! Entry (post) read and write endpoints (`/v1/posts`, API v0.9.0).
 //!
 //! Covers the feed, single-entry reads, slug resolution, create, edit, delete
 //! and reporting. Editing (§ Edit Entry) is limited to supporters, within 5
@@ -10,6 +10,11 @@
 //! already hosts, and are uploaded there; sending `"type": "image"` here is a
 //! `400`. [`validate_write_attachments`] refuses one locally so it costs no
 //! rate-limit token.
+//!
+//! v0.9.0 adds an optional `contentWarning` (max 60 characters) on create and
+//! edit. Readers see `CW: <warning>` in place of the entry and reveal the title,
+//! body and attachments only on request; that masking is the UI's job, this
+//! module only carries and checks the field.
 use reqwest::Method;
 use serde::{Deserialize, Serialize, Serializer};
 
@@ -24,6 +29,8 @@ const MAX_CONTENT_LEN: usize = 32_768;
 const MAX_TOPICS: usize = 3;
 const MAX_TITLE_LEN: usize = 100;
 const MAX_SLUG_LEN: usize = 60;
+/// Ceiling on an entry's `contentWarning` (v0.9.0 § Create Entry).
+pub const MAX_CONTENT_WARNING_LEN: usize = 60;
 
 /// Slugs the server reserves and will reject if submitted.
 const RESERVED_SLUGS: &[&str] = &[
@@ -73,6 +80,10 @@ impl Client {
     /// one with [`Attachment::audio`]; pass an empty slice for an entry with no
     /// track, which omits the field rather than sending `[]`.
     ///
+    /// `content_warning` is the short phrase readers see before the entry
+    /// (v0.9.0 § Create Entry), max 60 characters. `None` or a blank string
+    /// sends no warning.
+    ///
     /// Rate limit: 2/min, 24/day.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_entry(
@@ -83,9 +94,14 @@ impl Client {
         topics: &[String],
         is_public: bool,
         is_nsfw: bool,
+        content_warning: Option<&str>,
         attachments: &[Attachment],
     ) -> Result<CreatedEntry> {
         validate_content_topics(content, topics)?;
+        let content_warning = content_warning.map(str::trim).filter(|cw| !cw.is_empty());
+        if let Some(cw) = content_warning {
+            validate_content_warning(cw)?;
+        }
         if let Some(t) = title {
             validate_title(t)?;
         }
@@ -100,6 +116,7 @@ impl Client {
             topics,
             is_public,
             is_nsfw,
+            content_warning,
             attachments,
         };
         let r: CreateEntryResponse = self
@@ -148,6 +165,9 @@ impl Client {
         }
         if let Some(topics) = &edit.topics {
             validate_topics(topics)?;
+        }
+        if let Some(cw) = &edit.content_warning {
+            validate_content_warning(cw)?;
         }
         if let Some(attachments) = &edit.attachments {
             validate_write_attachments(attachments)?;
@@ -269,6 +289,8 @@ impl Serialize for TitleEdit {
 /// Two fields separate "leave it" from "clear it":
 /// - `title`: `None` keeps the current title, `Some(TitleEdit::Remove)` sends
 ///   `""` and removes it.
+/// - `content_warning`: `None` keeps the current warning, `Some(String::new())`
+///   sends `""` and removes it (v0.9.0 § Edit Entry).
 /// - `attachments`: `None` keeps the current attachments, `Some(Vec::new())`
 ///   sends `[]` and removes them. A non-empty list replaces the whole set, and
 ///   since v0.8.10 may hold only one, audio (§ Edit Entry). An entry that
@@ -299,10 +321,17 @@ pub struct EntryEdit {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_public: Option<bool>,
 
-    /// Content-warning flag. The spec field is literally `isNSFW`, unlike every
-    /// other camelCase field.
+    /// NSFW flag. The spec field is literally `isNSFW`, unlike every other
+    /// camelCase field. Not the same thing as
+    /// [`content_warning`](Self::content_warning).
     #[serde(rename = "isNSFW", skip_serializing_if = "Option::is_none")]
     pub is_nsfw: Option<bool>,
+
+    /// Replacement content warning, max 60 characters (v0.9.0 § Edit Entry).
+    /// `Some(String::new())` puts `""` on the wire, which removes the warning;
+    /// `None` leaves the current one alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_warning: Option<String>,
 
     /// Replacement attachment list. `Some(Vec::new())` removes them all. Audio
     /// only, max one; see the type docs.
@@ -321,6 +350,7 @@ impl EntryEdit {
             && self.topics.is_none()
             && self.is_public.is_none()
             && self.is_nsfw.is_none()
+            && self.content_warning.is_none()
             && self.attachments.is_none()
     }
 }
@@ -400,6 +430,23 @@ pub(crate) fn validate_topics(topics: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Content-warning length check (v0.9.0 § Create Entry, § Edit Entry). An
+/// empty warning passes: on an edit it is how the warning is removed.
+///
+/// Counted in UTF-16 code units, the `.length` a JavaScript server sees, rather
+/// than in Unicode scalars. The two agree except for characters outside the
+/// Basic Multilingual Plane (most emoji), which are one scalar but two units;
+/// the unit count is never the smaller, so this cannot pass a warning the
+/// server's own count would refuse.
+pub fn validate_content_warning(cw: &str) -> Result<()> {
+    if cw.encode_utf16().count() > MAX_CONTENT_WARNING_LEN {
+        return Err(ApiError::Config(format!(
+            "content warning exceeds {MAX_CONTENT_WARNING_LEN} characters"
+        )));
+    }
+    Ok(())
+}
+
 /// Both checks together, for the create paths that always send content and
 /// topics as a pair.
 pub(crate) fn validate_content_topics(content: &str, topics: &[String]) -> Result<()> {
@@ -419,6 +466,8 @@ struct CreateEntryBody<'a> {
     is_public: bool,
     #[serde(rename = "isNSFW")]
     is_nsfw: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content_warning: Option<&'a str>,
     /// Omitted rather than sent as `[]` when there is no track: § Create Entry
     /// calls the field optional, and an entry with no attachments has nothing
     /// to say about them.
@@ -481,6 +530,7 @@ mod tests {
             topics: &topics,
             is_public: true,
             is_nsfw: true,
+            content_warning: None,
             attachments: &[],
         };
         let s = serde_json::to_string(&body).unwrap();
@@ -507,6 +557,7 @@ mod tests {
             topics: &[],
             is_public: false,
             is_nsfw: false,
+            content_warning: None,
             attachments: std::slice::from_ref(&track),
         };
         let v: serde_json::Value = serde_json::to_value(&body).unwrap();
@@ -525,6 +576,7 @@ mod tests {
             topics: &[],
             is_public: false,
             is_nsfw: false,
+            content_warning: None,
             attachments: &[],
         };
         let s = serde_json::to_string(&body).unwrap();
@@ -685,6 +737,7 @@ mod tests {
             topics: Some(vec!["music".into()]),
             is_public: Some(true),
             is_nsfw: Some(false),
+            content_warning: Some("spiders".into()),
             attachments: Some(vec![Attachment::Image {
                 src: "https://x/y.png".into(),
                 width: 640,
@@ -697,6 +750,7 @@ mod tests {
         assert_eq!(v["topics"][0], "music");
         assert_eq!(v["isPublic"], true);
         assert_eq!(v["isNSFW"], false);
+        assert_eq!(v["contentWarning"], "spiders");
         assert_eq!(v["attachments"][0]["type"], "image");
         assert_eq!(v["attachments"][0]["src"], "https://x/y.png");
     }
@@ -749,10 +803,67 @@ mod tests {
             topics: Some(vec!["music".into()]),
             is_public: Some(true),
             is_nsfw: Some(true),
+            content_warning: Some(String::new()),
             attachments: Some(Vec::new()),
         };
         let v: serde_json::Value = serde_json::to_value(&edit).unwrap();
         assert!(!v.as_object().unwrap().contains_key("slug"));
+    }
+
+    #[test]
+    fn create_entry_body_sends_a_content_warning_only_when_set() {
+        let body = CreateEntryBody {
+            content: "hi",
+            title: None,
+            slug: None,
+            topics: &[],
+            is_public: false,
+            is_nsfw: false,
+            content_warning: Some("spiders"),
+            attachments: &[],
+        };
+        let v: serde_json::Value = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["contentWarning"], "spiders");
+
+        let none = CreateEntryBody {
+            content_warning: None,
+            ..body
+        };
+        let v: serde_json::Value = serde_json::to_value(&none).unwrap();
+        assert!(!v.as_object().unwrap().contains_key("contentWarning"));
+    }
+
+    #[test]
+    fn entry_edit_distinguishes_removing_a_content_warning_from_leaving_it() {
+        let remove = EntryEdit {
+            content_warning: Some(String::new()),
+            ..Default::default()
+        };
+        assert!(!remove.is_empty());
+        assert_eq!(
+            serde_json::to_string(&remove).unwrap(),
+            r#"{"contentWarning":""}"#
+        );
+
+        let leave_alone = EntryEdit {
+            content: Some("c".into()),
+            ..Default::default()
+        };
+        let v: serde_json::Value = serde_json::to_value(&leave_alone).unwrap();
+        assert!(!v.as_object().unwrap().contains_key("contentWarning"));
+    }
+
+    #[test]
+    fn content_warning_is_capped_at_sixty_characters() {
+        assert!(validate_content_warning("").is_ok());
+        assert!(validate_content_warning(&"w".repeat(MAX_CONTENT_WARNING_LEN)).is_ok());
+        assert!(validate_content_warning(&"w".repeat(MAX_CONTENT_WARNING_LEN + 1)).is_err());
+        // Counted in UTF-16 units, not bytes: `é` is one unit.
+        assert!(validate_content_warning(&"é".repeat(MAX_CONTENT_WARNING_LEN)).is_ok());
+        // An emoji outside the BMP is two units, as JavaScript's `.length`
+        // counts it, so 31 of them are over the 60 limit.
+        assert!(validate_content_warning(&"🕷".repeat(30)).is_ok());
+        assert!(validate_content_warning(&"🕷".repeat(31)).is_err());
     }
 
     #[test]

@@ -141,6 +141,7 @@ impl TopicFeedScreen {
         };
         item.content = fresh.content.clone();
         item.title = fresh.title.clone();
+        item.content_warning = fresh.content_warning.clone();
         item.topics = fresh.topics.clone();
         item.attachments = fresh.attachments.clone();
         item.is_public = fresh.is_public;
@@ -257,21 +258,22 @@ impl TopicFeedScreen {
                 let track = visible
                     .get(self.list.selected)
                     .and_then(|idx| self.list.items.get(*idx))
-                    .and_then(|e| super::audio::jukebox_track(&e.attachments));
+                    .and_then(|e| super::audio::jukebox_track(super::cw::listed_attachments(e)));
                 return TopicFeedIntent::PlayJukebox(track);
             }
             KeyCode::Char('o') => {
                 if let Some(url) = visible
                     .get(self.list.selected)
                     .and_then(|idx| self.list.items.get(*idx))
-                    .and_then(|e| super::audio::jukebox_url(&e.attachments))
+                    .and_then(|e| super::audio::jukebox_url(super::cw::listed_attachments(e)))
                 {
                     return TopicFeedIntent::OpenJukebox(url);
                 }
             }
             KeyCode::Char('e') => {
                 if let Some(idx) = visible.get(self.list.selected) {
-                    if let Some(e) = self.list.items.get(*idx) {
+                    // Not on a post behind a content warning; see the feed.
+                    if let Some(e) = self.list.items.get(*idx).filter(|e| !super::cw::masked(e)) {
                         return TopicFeedIntent::EditEntry {
                             post_id: e.post_id.clone(),
                             content: e.content.clone(),
@@ -356,14 +358,22 @@ impl TopicFeedScreen {
                 ""
             };
             // Surface the jukebox keys only when the highlighted post has a track.
-            let media = if self.selected_entry().is_some_and(super::audio::has_audio) {
+            let media = if self.selected_entry().is_some_and(|e| {
+                super::audio::jukebox_url(super::cw::listed_attachments(e)).is_some()
+            }) {
                 " · p play · o open"
             } else {
                 ""
             };
+            // `e` is not offered on a post behind a content warning.
+            let edit = if self.selected_entry().is_some_and(super::cw::masked) {
+                ""
+            } else {
+                " · e edit"
+            };
             (
                 format!(
-                    "{} entries · {more}enter open{media} · e edit · F flag · f {follow} · m {mute} · r refresh · esc back",
+                    "{} entries · {more}enter open{media}{edit} · F flag · f {follow} · m {mute} · r refresh · esc back",
                     self.list.items.len()
                 ),
                 theme.muted_style(),
@@ -397,17 +407,23 @@ fn entry_item(entry: &Entry, theme: &Theme) -> ListItem<'static> {
         Span::styled(format!("@{}", entry.author_username), theme.accent_style()),
         Span::styled(format!(" · {when}{edited}{counts}"), theme.muted_style()),
     ];
-    if super::images::has_image(entry) {
+    let masked = super::cw::masked(entry);
+    if !masked && super::images::has_image(entry) {
         header_spans.push(Span::styled(" · [image]", theme.accent_style()));
     }
-    if super::audio::has_audio(entry) {
+    if !masked && super::audio::has_audio(entry) {
         header_spans.push(Span::styled(" · [jukebox]", theme.accent_style()));
     }
     let mut lines = vec![Line::from(header_spans)];
-    let snippet =
-        super::markdown::content_preview(&entry.content, crate::config::get().preview_length);
-    if !snippet.is_empty() {
-        lines.push(Line::from(Span::styled(snippet, theme.base())));
+    if let Some(cw) = entry.cw() {
+        // v0.9.0: the warning in place of the snippet.
+        lines.push(super::cw::cw_line(cw, 200, theme));
+    } else {
+        let snippet =
+            super::markdown::content_preview(&entry.content, crate::config::get().preview_length);
+        if !snippet.is_empty() {
+            lines.push(Line::from(Span::styled(snippet, theme.base())));
+        }
     }
     if !crate::config::get().compact {
         lines.push(Line::from(""));
@@ -485,6 +501,7 @@ mod tests {
             artist: "Art of Noise".into(),
             title: "Paranoimia".into(),
             genre: "electronic".into(),
+            cover: None,
         }];
         s.apply_initial(Ok((vec![e], None)));
         match s.handle_key(key(KeyCode::Char('p'))) {
@@ -516,12 +533,50 @@ mod tests {
             artist: "Art of Noise".into(),
             title: "Paranoimia".into(),
             genre: "electronic".into(),
+            cover: None,
         }];
         s.apply_initial(Ok((vec![e], None)));
         assert_eq!(
             s.handle_key(key(KeyCode::Char('o'))),
             TopicFeedIntent::OpenJukebox("https://youtu.be/abc".into())
         );
+    }
+
+    #[test]
+    fn a_warned_entry_masks_its_snippet_and_track() {
+        let mut e = entry("p1");
+        e.content_warning = Some("spiders".into());
+        e.attachments = vec![cs_api::Attachment::audio(
+            "https://youtu.be/abc",
+            "Art of Noise",
+            "Paranoimia",
+            "electronic",
+        )];
+        let item = entry_item(&e, &Theme::cyber());
+        let backend = ratatui::backend::TestBackend::new(80, 3);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| f.render_widget(ratatui::widgets::List::new(vec![item]), f.area()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("CW: spiders"), "{text}");
+        assert!(!text.contains("entry p1"), "snippet masked: {text}");
+        assert!(!text.contains("[jukebox]"), "track masked: {text}");
+
+        let mut s = TopicFeedScreen::new("music".into());
+        s.apply_initial(Ok((vec![e], None)));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('p'))),
+            TopicFeedIntent::PlayJukebox(None)
+        );
+        assert_eq!(s.handle_key(key(KeyCode::Char('o'))), TopicFeedIntent::None);
+        assert_eq!(s.handle_key(key(KeyCode::Char('e'))), TopicFeedIntent::None);
     }
 
     #[test]

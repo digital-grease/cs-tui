@@ -1,7 +1,8 @@
 //! Jukebox (audio) attachment surfacing for posts and replies.
 //!
 //! On cyberspace.online a "jukebox" track is modeled as an [`Attachment::Audio`]
-//! (almost always a YouTube link, `origin: "youtube"`) carrying the track's
+//! (a YouTube link, `origin: "youtube"`, or since v0.9.0 a direct MP3 uploaded on
+//! the website, `origin: "latex"`, with its own `cover`) carrying the track's
 //! `artist`, `title`, and `genre` alongside the `src` URL. The TUI can't stream
 //! audio inline, but the link and its metadata are worth keeping: previously the
 //! whole attachment was dropped, leaving only the post's text. Here we detect
@@ -181,15 +182,21 @@ pub fn is_youtube(url: &str) -> bool {
     youtube_id(url).is_some()
 }
 
-/// The cover-art image URL for an audio attachment: the YouTube thumbnail
-/// derived from the track's `src`. Returns `None` for non-YouTube sources or
-/// when the video ID can't be parsed. Uses `hqdefault.jpg`, which always exists
-/// for a valid video (unlike `maxresdefault.jpg`).
+/// The cover-art image URL for an audio attachment.
+///
+/// The track's own `cover` when it has one: a website upload (`origin:
+/// "latex"`, v0.9.0) carries a cover image URL next to its direct MP3 `src`.
+/// Otherwise the YouTube thumbnail derived from `src`, using `hqdefault.jpg`,
+/// which always exists for a valid video (unlike `maxresdefault.jpg`). `None`
+/// for a source that is neither.
 #[must_use]
 pub fn cover_art_url(att: &Attachment) -> Option<String> {
-    let Attachment::Audio { src, .. } = att else {
+    let Attachment::Audio { src, cover, .. } = att else {
         return None;
     };
+    if let Some(cover) = cover.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        return Some(cover.to_string());
+    }
     let id = youtube_id(src)?;
     Some(format!("https://img.youtube.com/vi/{id}/hqdefault.jpg"))
 }
@@ -213,6 +220,7 @@ mod tests {
             artist: artist.into(),
             title: title.into(),
             genre: genre.into(),
+            cover: None,
         }
     }
 
@@ -352,6 +360,43 @@ mod tests {
                 height: 0,
             }),
             None
+        );
+    }
+
+    #[test]
+    fn a_latex_track_uses_its_own_cover() {
+        // v0.9.0: a website upload has a direct MP3 `src` (no derivable
+        // thumbnail) and names its cover outright.
+        let att = Attachment::Audio {
+            src: "https://bunker.cyberspace.online/a.mp3".into(),
+            origin: cs_api::AUDIO_ORIGIN_LATEX.into(),
+            artist: "A".into(),
+            title: "T".into(),
+            genre: "ambient".into(),
+            cover: Some("https://bunker.cyberspace.online/a.jpg".into()),
+        };
+        assert_eq!(
+            cover_art_url(&att).as_deref(),
+            Some("https://bunker.cyberspace.online/a.jpg")
+        );
+        let track = jukebox_track(std::slice::from_ref(&att)).expect("playable");
+        assert_eq!(track.url, "https://bunker.cyberspace.online/a.mp3");
+        assert!(!is_youtube(&track.url), "so playback needs no yt-dlp");
+    }
+
+    #[test]
+    fn a_blank_cover_falls_back_to_the_youtube_thumbnail() {
+        let att = Attachment::Audio {
+            src: "https://youtu.be/dQw4w9WgXcQ".into(),
+            origin: "youtube".into(),
+            artist: "A".into(),
+            title: "T".into(),
+            genre: "g".into(),
+            cover: Some("  ".into()),
+        };
+        assert_eq!(
+            cover_art_url(&att).as_deref(),
+            Some("https://img.youtube.com/vi/dQw4w9WgXcQ/hqdefault.jpg")
         );
     }
 

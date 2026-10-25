@@ -1,6 +1,6 @@
-//! Async Rust client for the cyberspace.online API (v0.8.10).
+//! Async Rust client for the cyberspace.online API (v0.9.0).
 //!
-//! Targets Cyberspace API v0.8.10. Comments cite that spec by section name;
+//! Targets Cyberspace API v0.9.0. Comments cite that spec by section name;
 //! the spec itself is not redistributed with this repository.
 #![deny(rust_2018_idioms)]
 
@@ -46,7 +46,9 @@ pub use cmail::{
     CmailStartRequest, CmailTypingResponse, CmailTypingStatus, CmailUser,
 };
 pub use endpoint::EndpointKey;
-pub use entries::{CreatedEntry, EntryEdit, TitleEdit};
+pub use entries::{
+    validate_content_warning, CreatedEntry, EntryEdit, TitleEdit, MAX_CONTENT_WARNING_LEN,
+};
 pub use error::{ApiError, ErrorCode, Result};
 pub use follows::{Follow, FollowsDirection};
 pub use guilds::{Guild, GuildMembership, GuildRole, GuildThread, JoinedGuild, PromotedGuild};
@@ -63,12 +65,13 @@ pub use programs::{
 };
 pub use rate_limit::RateLimit;
 pub use search::{PostHit, ReplyHit, SearchHit, SearchPreview, SearchType, UserHit};
-pub use settings::{NotificationPrefs, Settings, SettingsUpdate};
+pub use settings::{nickname_hue, NotificationPrefs, Settings, SettingsUpdate, IMAGE_PIXEL_SIZES};
 pub use tokens::Tokens;
 pub use topics::Topic;
 pub use types::{
-    validate_write_attachments, Attachment, Entry, FlagResponse, Reply, AUDIO_ORIGIN_YOUTUBE,
-    MAX_ATTACHMENTS, MAX_AUDIO_ARTIST_LEN, MAX_AUDIO_GENRE_LEN, MAX_AUDIO_TITLE_LEN,
+    validate_write_attachments, Attachment, Entry, FlagResponse, Reply, AUDIO_ORIGIN_LATEX,
+    AUDIO_ORIGIN_YOUTUBE, MAX_ATTACHMENTS, MAX_AUDIO_ARTIST_LEN, MAX_AUDIO_GENRE_LEN,
+    MAX_AUDIO_TITLE_LEN,
 };
 pub use users::{PokeResponse, User, UserGuild};
 pub use watch::Watch;

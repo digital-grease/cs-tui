@@ -1,6 +1,6 @@
 # cs-tui
 
-A terminal client for [cyberspace.online](https://cyberspace.online), targeting the v0.8.10 API.
+A terminal client for [cyberspace.online](https://cyberspace.online), targeting the v0.9.0 API.
 
 ![cs-tui screenshot](docs/screenshot.png)
 
@@ -8,7 +8,7 @@ A terminal client for [cyberspace.online](https://cyberspace.online), targeting 
 
 ## Status
 
-Early development. Most of the documented v0.8.10 REST surface is implemented,
+Early development. Most of the documented v0.9.0 REST surface is implemented,
 including private C-Mail and multi-user cIRC chat (REST plus live streaming),
 full-text search and the program registry. Live testing against the API is
 ongoing.
@@ -16,8 +16,9 @@ ongoing.
 ## Features
 
 - **Feed, topic feeds and post detail**: infinite scroll, threaded replies, markdown and `@mention` highlighting
-- **Compose** posts and replies in a built-in editor, edit and delete your own, and attach a jukebox track
-- **Notifications** across the full v0.8.10 type list, with read/unread filtering and an unread badge
+- **Compose** posts and replies in a built-in editor, edit and delete your own, and attach a jukebox track or a content warning
+- **Content warnings**: a warned post shows only `CW: <warning>` in every list, and its title, body and attachments wait on post detail until you press `v`
+- **Notifications** across the full v0.9.0 type list, with read/unread filtering and an unread badge
 - **Thread watching** for reply notifications, armed automatically on anything you reply to or are named in
 - **cIRC** chat rooms with live streaming: a roster of who is present and idle, per-room mutes, and an action menu for the message under the cursor
 - **C-Mail** private conversations with live streaming, an unread badge and typing indicators both ways
@@ -25,7 +26,7 @@ ongoing.
 - **Guilds**: browse, join, leave, post threads, and move your profile badge between them, apprenticeships included
 - **Programs**: browse the registry, read and save any release's source, publish and recall your own. cs-tui does not run programs, it is a place to read one
 - **Profiles**, **Bookmarks**, **Topics**, **Journal** (private notes with revision history) and **Settings**
-- **Jukebox playback** of the tracks posts carry, shuffle included, when `mpv` and `yt-dlp` are installed
+- **Jukebox playback** of the tracks posts carry, shuffle included, when `mpv` is installed (plus `yt-dlp` for YouTube tracks)
 - **Inline images** in post detail on Kitty, iTerm2 and Sixel terminals
 - **Seven themes** plus a custom palette, switchable at runtime
 

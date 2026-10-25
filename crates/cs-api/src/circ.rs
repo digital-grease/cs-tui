@@ -31,6 +31,7 @@ use serde_json::Value;
 
 use crate::client::Client;
 use crate::endpoint::EndpointKey;
+use crate::envelope::Cursor;
 use crate::error::{ApiError, Result};
 use crate::message::{AudioAttachment, MessageExtras, MessageStyle};
 use crate::rtdb::SseEventKind;
@@ -674,6 +675,19 @@ impl Client {
 
     /// `GET /v1/circ/:roomId`: load message history, oldest first. Pass `before`
     /// (the previous cursor timestamp) to page older messages.
+    ///
+    /// History is limited (v0.9.0 § Read a Room): scrollback stops at the
+    /// room's newest 1000 messages or at messages 180 days old, whichever comes
+    /// first. The first page always returns the latest messages however old, so
+    /// a quiet room never loads empty. A `before` past the limit returns an
+    /// empty page. The server's own last page inside the limit carries an
+    /// explicit `null` cursor, which is honoured as the end rather than
+    /// overridden by the derived cursor, so reaching the limit costs no extra
+    /// request. See [`room_cursor`].
+    ///
+    /// This is the only way to page history. RTDB denies `endAt` and
+    /// `endBefore` on `chat_messages` since v0.9.0, so scrollback can never move
+    /// to the realtime stream.
     pub async fn read_circ_room(
         &self,
         room_id: &str,
@@ -688,10 +702,10 @@ impl Client {
             query.push(("before", before.to_string()));
         }
         let path = format!("/v1/circ/{room_id}");
-        let (messages, cursor): (Vec<CircMessage>, Option<String>) = self
-            .request_page(EndpointKey::CircRead, Method::GET, &path, &query)
+        let (messages, cursor): (Vec<CircMessage>, Cursor) = self
+            .request_page_cursor(EndpointKey::CircRead, Method::GET, &path, &query)
             .await?;
-        let cursor = cursor.or_else(|| next_cursor_fallback(&messages, limit));
+        let cursor = room_cursor(cursor, &messages, limit);
         Ok((messages, cursor))
     }
 
@@ -861,9 +875,14 @@ impl Client {
 }
 
 /// The RTDB path carrying a room's live messages. Subscribe with
-/// `orderBy="timestamp"` and a `limitToLast` of 100 or fewer, as the spec
-/// requires (§ Reading a room in real time), and decode each event with
+/// `orderBy="timestamp"` and a `limitToLast` of 1000 or fewer, as the spec
+/// requires (v0.9.0 § Reading a room in real time; reads without both are
+/// denied), and decode each event with
 /// [`circ_message_updates_from_rtdb_event`].
+///
+/// `endAt` and `endBefore` are denied, so older history is paged over REST with
+/// [`Client::read_circ_room`]. `startAt` / `startAfter` are allowed, for
+/// resuming a stream after the last message already held.
 #[must_use]
 pub fn circ_messages_path(room_id: &str) -> String {
     format!("/chat_messages/{room_id}")
@@ -1137,6 +1156,20 @@ fn default_stale_after_ms() -> i64 {
 
 fn default_idle_after_ms() -> i64 {
     DEFAULT_IDLE_AFTER_MS
+}
+
+/// The next-page cursor for a room read.
+///
+/// The server's cursor when it sends one. An explicit `null` is the end of the
+/// history the server will serve (v0.9.0 § Read a Room), even on a full page,
+/// so it is never second-guessed. Only a missing cursor falls back to deriving
+/// one from the page; see [`next_cursor_fallback`].
+fn room_cursor(cursor: Cursor, messages: &[CircMessage], limit: u32) -> Option<String> {
+    match cursor {
+        Cursor::Next(c) => Some(c),
+        Cursor::Null => None,
+        Cursor::Absent => next_cursor_fallback(messages, limit),
+    }
 }
 
 /// Derive a next-page cursor when the server didn't send one (see
@@ -2073,6 +2106,30 @@ mod tests {
             validate_circ_content(&long),
             Err(ApiError::Config(_))
         ));
+    }
+
+    #[test]
+    fn an_explicit_null_cursor_ends_room_history_even_on_a_full_page() {
+        let full = vec![
+            CircMessage {
+                timestamp: 1_000,
+                ..CircMessage::default()
+            },
+            CircMessage {
+                timestamp: 2_000,
+                ..CircMessage::default()
+            },
+        ];
+        assert_eq!(room_cursor(Cursor::Null, &full, 2), None);
+        assert_eq!(
+            room_cursor(Cursor::Absent, &full, 2).as_deref(),
+            Some("1000"),
+            "only a missing cursor is derived"
+        );
+        assert_eq!(
+            room_cursor(Cursor::Next("900".into()), &full, 2).as_deref(),
+            Some("900")
+        );
     }
 
     #[test]

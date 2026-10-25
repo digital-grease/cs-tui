@@ -70,6 +70,10 @@ pub enum PostDetailIntent {
     PlayJukebox(Option<super::audio::JukeboxTrack>),
     /// User confirmed deletion of the entry.
     DeleteEntryConfirmed,
+    /// `v` revealed or re-hid the post behind its content warning. The app
+    /// fetches the post's image now: nothing behind a warning is fetched until
+    /// the reader asks, so a reveal is the first moment it is wanted.
+    ContentWarningToggled,
     /// Edit this entry (`e` with the post focused). Carries the current values
     /// of every field `PATCH /v1/posts/:id` accepts (v0.8.4 § Edit Entry) so the
     /// app can prefill an edit flow without re-fetching. The slug is absent on
@@ -202,6 +206,11 @@ pub struct PostDetailScreen {
     /// line where its reserved blank-row gap starts), consumed by `render` to
     /// overlay each image onto its gap. Recomputed every frame.
     image_slots: RefCell<Vec<ImageSlot>>,
+    /// Whether the reader has asked to see past the entry's content warning
+    /// (`v`). v0.9.0 § Create Entry: clients show `CW: <warning>` and reveal the
+    /// title, body and attachments only on request, so this starts false and
+    /// nothing behind the warning is drawn or fetched until it flips.
+    cw_revealed: bool,
 }
 
 impl PostDetailScreen {
@@ -225,6 +234,30 @@ impl PostDetailScreen {
             image_bytes: RefCell::new(HashMap::new()),
             requested: RefCell::new(HashSet::new()),
             image_slots: RefCell::new(Vec::new()),
+            cw_revealed: false,
+        }
+    }
+
+    /// The warning the entry is currently masked behind, or `None` when it has
+    /// none or the reader has revealed it.
+    fn masking_cw(&self) -> Option<&str> {
+        self.entry.cw().filter(|_| !self.cw_revealed)
+    }
+
+    /// What `Q` quotes from the post: its first line, or while it is masked
+    /// only its warning, so a quote-reply cannot republish what the reader has
+    /// not chosen to see.
+    #[must_use]
+    pub fn quote_text(&self) -> String {
+        match self.masking_cw() {
+            Some(cw) => format!("CW: {cw}"),
+            None => self
+                .entry
+                .content
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string(),
         }
     }
 
@@ -284,6 +317,11 @@ impl PostDetailScreen {
         if let Some(is_nsfw) = edit.is_nsfw {
             self.entry.is_nsfw = is_nsfw;
         }
+        if let Some(cw) = &edit.content_warning {
+            // `""` is the removal (v0.9.0 § Edit Entry); `Entry::cw` already
+            // reads a blank warning as none, so storing it as sent is enough.
+            self.entry.content_warning = Some(cw.clone());
+        }
         if let Some(attachments) = &edit.attachments {
             self.entry.attachments = attachments.clone();
         }
@@ -328,7 +366,13 @@ impl PostDetailScreen {
 
     /// The post's own inline image: its first markdown/attachment image, or — for
     /// a jukebox post that carries no image — the track's cover-art thumbnail.
+    ///
+    /// `None` while a content warning masks the post, so the image is neither
+    /// drawn nor fetched before the reader asks for it.
     fn post_image_url(&self) -> Option<String> {
+        if self.masking_cw().is_some() {
+            return None;
+        }
         entry_image_urls(&self.entry)
             .into_iter()
             .next()
@@ -398,6 +442,12 @@ impl PostDetailScreen {
             // window, none of which the client knows for certain, so the
             // server's 403 surfaces like any other error, exactly as `d` already
             // behaves here (v0.8.4 § Edit Entry, § Edit Reply).
+            // Not while the post is masked: the edit flow opens on the body, and
+            // `e` is offered on every post, the reader's own or not, so it
+            // would show what the warning is holding back. `v` first.
+            KeyCode::Char('e') if self.selected_reply.is_none() && self.masking_cw().is_some() => {
+                PostDetailIntent::None
+            }
             KeyCode::Char('e') => self.edit_intent(),
             // `F` reports whatever is focused, after an optional reason.
             KeyCode::Char('F') => {
@@ -406,6 +456,11 @@ impl PostDetailScreen {
             }
             // `w` watches / unwatches the thread (post-level, ignores reply selection).
             KeyCode::Char('w') => PostDetailIntent::ToggleWatch,
+            // Reveal the post behind its content warning, or hide it again.
+            KeyCode::Char('v') if self.entry.cw().is_some() => {
+                self.cw_revealed = !self.cw_revealed;
+                PostDetailIntent::ContentWarningToggled
+            }
             // `l` copies the entry's permalink. Only when it has a slug: a
             // link built from a missing half would 404, which is worse than
             // the key doing nothing.
@@ -570,6 +625,9 @@ impl PostDetailScreen {
                 return Some(url);
             }
         }
+        if self.masking_cw().is_some() {
+            return None;
+        }
         super::audio::jukebox_url(&self.entry.attachments)
     }
 
@@ -580,6 +638,9 @@ impl PostDetailScreen {
             if let Some(track) = super::audio::jukebox_track(&reply.attachments) {
                 return Some(track);
             }
+        }
+        if self.masking_cw().is_some() {
+            return None;
         }
         super::audio::jukebox_track(&self.entry.attachments)
     }
@@ -901,6 +962,11 @@ impl PostDetailScreen {
         } else {
             ""
         };
+        let cw_hint = match (self.entry.cw(), self.cw_revealed) {
+            (None, _) => "",
+            (Some(_), false) => " · v show post",
+            (Some(_), true) => " · v hide post",
+        };
         let watch_hint = if self.watching == Some(true) {
             " · w unwatch"
         } else {
@@ -909,7 +975,9 @@ impl PostDetailScreen {
         // A soft hint, never a gate: it says when the focused item is certainly
         // past the server's 5-minute edit window, but the key stays on offer and
         // a missing `created_at` reads as "still open".
-        let edit_hint = if within_edit_window(self.focused_created_at()) {
+        let edit_hint = if self.selected_reply.is_none() && self.masking_cw().is_some() {
+            " · e edit (v first)"
+        } else if within_edit_window(self.focused_created_at()) {
             " · e edit"
         } else {
             " · e edit (5m passed)"
@@ -928,12 +996,12 @@ impl PostDetailScreen {
             format!("error: {msg} · esc back · r retry")
         } else if self.next_replies_cursor.is_some() {
             format!(
-                "{} replies · scroll down for more · esc back · J/K or ↑↓ select reply · R reply · Q quote · b bookmark{open_hint}{watch_hint}{edit_hint} · F flag · d delete · r refresh",
+                "{} replies · scroll down for more · esc back · J/K or ↑↓ select reply · R reply · Q quote · b bookmark{cw_hint}{open_hint}{watch_hint}{edit_hint} · F flag · d delete · r refresh",
                 self.replies.len()
             )
         } else {
             format!(
-                "{} replies · end · esc back · J/K or ↑↓ select reply · R reply · Q quote · b bookmark{open_hint}{watch_hint}{edit_hint} · F flag · d delete · r refresh",
+                "{} replies · end · esc back · J/K or ↑↓ select reply · R reply · Q quote · b bookmark{cw_hint}{open_hint}{watch_hint}{edit_hint} · F flag · d delete · r refresh",
                 self.replies.len()
             )
         };
@@ -967,9 +1035,11 @@ impl PostDetailScreen {
         } else {
             format!(" · #{}", self.entry.topics.join(" #"))
         };
+        let masked = self.masking_cw();
         // v0.3.7: lead with the entry title (when set) as a headline above the
-        // author/metadata line. Skipped for None/whitespace-only titles.
-        if let Some(title) = self.entry.title.as_deref() {
+        // author/metadata line. Skipped for None/whitespace-only titles, and
+        // behind a content warning, which hides the title too (v0.9.0).
+        if let Some(title) = self.entry.title.as_deref().filter(|_| masked.is_none()) {
             let title = title.trim();
             if !title.is_empty() {
                 lines.push(Line::from(Span::styled(
@@ -1004,35 +1074,57 @@ impl PostDetailScreen {
         )));
         lines.push(Line::from(""));
 
-        // Body — rendered with pulldown-cmark (markdown + @mention highlighting).
-        // When images are drawn inline, the image URL is hidden here (the graphic
-        // appears in the reserved gap below); otherwise it's surfaced as text.
-        // Links always surface their URL.
-        for md_line in render_markdown_with(&self.entry.content, theme, image_urls) {
-            lines.push(md_line);
-        }
+        // v0.9.0: behind a content warning only the warning shows. The title,
+        // body, image and track stay out of the body until `v`; the replies
+        // below are their own posts and are not masked.
+        if let Some(cw) = masked {
+            lines.push(Line::from(vec![
+                Span::styled("CW: ", theme.warning_style().add_modifier(Modifier::BOLD)),
+                Span::styled(cw.to_string(), theme.warning_style()),
+            ]));
+            lines.push(Line::from(Span::styled(
+                "v to show the post",
+                theme.muted_style(),
+            )));
+        } else {
+            if let Some(cw) = self.entry.cw() {
+                lines.push(Line::from(Span::styled(
+                    format!("CW: {cw} · v to hide"),
+                    theme.muted_style(),
+                )));
+                lines.push(Line::from(""));
+            }
 
-        // The post's own image (or, for a jukebox post, its cover art) drawn
-        // inline right after the body it belongs to.
-        if inline_images {
-            if let Some(url) = self.post_image_url() {
-                slots.push(ImageSlot {
-                    url,
-                    start_line: lines.len(),
-                });
-                for _ in 0..img_rows {
-                    lines.push(Line::from(""));
+            // Body — rendered with pulldown-cmark (markdown + @mention highlighting).
+            // When images are drawn inline, the image URL is hidden here (the graphic
+            // appears in the reserved gap below); otherwise it's surfaced as text.
+            // Links always surface their URL.
+            for md_line in render_markdown_with(&self.entry.content, theme, image_urls) {
+                lines.push(md_line);
+            }
+
+            // The post's own image (or, for a jukebox post, its cover art) drawn
+            // inline right after the body it belongs to.
+            if inline_images {
+                if let Some(url) = self.post_image_url() {
+                    slots.push(ImageSlot {
+                        url,
+                        start_line: lines.len(),
+                    });
+                    for _ in 0..img_rows {
+                        lines.push(Line::from(""));
+                    }
                 }
             }
-        }
 
-        // Jukebox (audio) attachment — usually a YouTube link. We can't stream it
-        // inline, but keep the track card and link visible rather than dropping
-        // the whole attachment with the rest of the non-text content.
-        let audio = super::audio::audio_lines(&self.entry.attachments, theme);
-        if !audio.is_empty() {
-            lines.push(Line::from(""));
-            lines.extend(audio);
+            // Jukebox (audio) attachment — usually a YouTube link. We can't stream it
+            // inline, but keep the track card and link visible rather than dropping
+            // the whole attachment with the rest of the non-text content.
+            let audio = super::audio::audio_lines(&self.entry.attachments, theme);
+            if !audio.is_empty() {
+                lines.push(Line::from(""));
+                lines.extend(audio);
+            }
         }
 
         // Replies separator
@@ -1550,6 +1642,7 @@ mod tests {
             artist: "Art of Noise".into(),
             title: "Paranoimia".into(),
             genre: "electronic".into(),
+            cover: None,
         }];
         let lines = body_text(&PostDetailScreen::new(e)).join("\n");
         assert!(lines.contains("♪ Paranoimia"), "track title: {lines:?}");
@@ -1558,6 +1651,117 @@ mod tests {
             lines.contains("https://www.youtube.com/watch?v=abc"),
             "the jukebox link must be retained in the post body: {lines:?}"
         );
+    }
+
+    fn warned_entry() -> Entry {
+        let mut e = entry("p1");
+        e.title = Some("Headline Here".into());
+        e.content = "the hidden body".into();
+        e.content_warning = Some("spiders".into());
+        e.attachments = vec![jukebox("https://youtu.be/abc")];
+        e
+    }
+
+    #[test]
+    fn a_content_warning_masks_the_title_body_and_track() {
+        let s = PostDetailScreen::new(warned_entry());
+        let body = body_text(&s).join("\n");
+        assert!(body.contains("CW: spiders"), "{body}");
+        assert!(body.contains("v to show the post"), "{body}");
+        assert!(!body.contains("Headline Here"), "title hidden: {body}");
+        assert!(!body.contains("the hidden body"), "body hidden: {body}");
+        assert!(!body.contains("Paranoimia"), "track hidden: {body}");
+        assert!(!body.contains("youtu.be"), "track link hidden: {body}");
+        // The author line still says whose post it is.
+        assert!(body.contains("@alice"), "{body}");
+    }
+
+    #[test]
+    fn a_masked_post_neither_fetches_its_image_nor_offers_its_track() {
+        let mut e = warned_entry();
+        e.attachments = vec![image_attachment("https://x/post.png")];
+        let mut s = PostDetailScreen::new(e);
+        assert!(s.all_image_urls().is_empty(), "nothing fetched behind a CW");
+
+        let mut s2 = PostDetailScreen::new(warned_entry());
+        assert_eq!(
+            s2.handle_key(key(KeyCode::Char('o'))),
+            PostDetailIntent::None
+        );
+        assert_eq!(
+            s2.handle_key(key(KeyCode::Char('p'))),
+            PostDetailIntent::PlayJukebox(None)
+        );
+
+        s.handle_key(key(KeyCode::Char('v')));
+        assert_eq!(s.all_image_urls(), vec!["https://x/post.png".to_string()]);
+    }
+
+    #[test]
+    fn v_reveals_a_warned_post_and_hides_it_again() {
+        let mut s = PostDetailScreen::new(warned_entry());
+        // The intent is what makes the app fetch the image nothing fetched
+        // while the post was masked.
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('v'))),
+            PostDetailIntent::ContentWarningToggled
+        );
+        let body = body_text(&s).join("\n");
+        assert!(body.contains("Headline Here"), "{body}");
+        assert!(body.contains("the hidden body"), "{body}");
+        assert!(body.contains("Paranoimia"), "{body}");
+        assert!(body.contains("CW: spiders · v to hide"), "{body}");
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('o'))),
+            PostDetailIntent::OpenUrl("https://youtu.be/abc".into())
+        );
+
+        s.handle_key(key(KeyCode::Char('v')));
+        assert!(!body_text(&s).join("\n").contains("the hidden body"));
+    }
+
+    #[test]
+    fn e_waits_for_a_reveal_and_q_quotes_only_the_warning() {
+        let mut s = PostDetailScreen::new(warned_entry());
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('e'))),
+            PostDetailIntent::None,
+            "the edit flow would open on the hidden body"
+        );
+        assert_eq!(s.quote_text(), "CW: spiders");
+
+        s.handle_key(key(KeyCode::Char('v')));
+        assert!(matches!(
+            s.handle_key(key(KeyCode::Char('e'))),
+            PostDetailIntent::EditEntry { .. }
+        ));
+        assert_eq!(s.quote_text(), "the hidden body");
+    }
+
+    #[test]
+    fn a_post_without_a_warning_shows_no_cw_line() {
+        let mut s = PostDetailScreen::new(entry("p1"));
+        assert!(!body_text(&s).join("\n").contains("CW:"));
+        // `v` is not bound without a warning, so it does nothing.
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('v'))),
+            PostDetailIntent::None
+        );
+    }
+
+    #[test]
+    fn an_edit_that_adds_or_removes_a_warning_lands_on_screen() {
+        let mut s = PostDetailScreen::new(entry("p1"));
+        s.apply_entry_edit(&EntryEdit {
+            content_warning: Some("eye strain".into()),
+            ..Default::default()
+        });
+        assert_eq!(s.entry.cw(), Some("eye strain"));
+        s.apply_entry_edit(&EntryEdit {
+            content_warning: Some(String::new()),
+            ..Default::default()
+        });
+        assert_eq!(s.entry.cw(), None, "the removal clears the mask");
     }
 
     #[test]
@@ -1607,6 +1811,7 @@ mod tests {
             artist: "Art of Noise".into(),
             title: "Paranoimia".into(),
             genre: "electronic".into(),
+            cover: None,
         }
     }
 

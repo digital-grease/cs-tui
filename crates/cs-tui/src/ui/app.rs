@@ -29,7 +29,7 @@ use tokio::sync::{mpsc, Notify};
 use tokio::time::MissedTickBehavior;
 
 use super::bookmarks::{BookmarksIntent, BookmarksScreen};
-use super::circ::{CircIntent, CircScreen, CircStreamState};
+use super::circ::{CircIntent, CircScreen, CircStreamState, NickColors};
 use super::cmail::{CmailIntent, CmailScreen};
 use super::compose::{launch_editor, ComposeIntent, ComposeKind, ComposeScreen};
 use super::edit_profile::{EditProfileIntent, EditProfileScreen};
@@ -377,7 +377,17 @@ pub enum BgEvent {
         room_id: String,
         usernames: Vec<String>,
     },
+    /// The `colorNicknames` setting (v0.9.0 § Settings), read by the same
+    /// settings fetch that loads a room's mute list, so opening a room picks up
+    /// the reader's choice at no extra request.
+    CircNickColors(bool),
     SearchResults(Result<cs_api::SearchPreview, String>),
+    /// What reading one search post hit's entry said about its content
+    /// warning (see [`super::search`]).
+    SearchPostChecked {
+        post_id: String,
+        check: super::search::PostCheck,
+    },
     /// The program gallery (v0.8.10 § Programs). `more` marks a follow-up page
     /// so it appends rather than replacing.
     ProgramsListed {
@@ -868,6 +878,9 @@ enum Action {
     PostDetailRefreshReplies {
         post_id: String,
     },
+    /// Fetch whatever images the open post now shows: after `v` reveals a post
+    /// behind its content warning, nothing of which was fetched while masked.
+    PostDetailFetchImages,
     PostDetailMoreReplies {
         post_id: String,
         cursor: Option<String>,
@@ -2127,9 +2140,10 @@ impl App {
                     prefill: format!(
                         "> @{}: {}\n\n",
                         s.entry.author_username,
-                        first_line(&s.entry.content)
+                        first_line(&s.quote_text())
                     ),
                 },
+                PostDetailIntent::ContentWarningToggled => Action::PostDetailFetchImages,
                 PostDetailIntent::DeleteEntryConfirmed => Action::DeleteEntry {
                     post_id: s.entry.post_id.clone(),
                 },
@@ -2825,9 +2839,13 @@ impl App {
                 if let Screen::Notifications(s) = &mut self.screen {
                     s.mark_local(&notification_id);
                 }
-                // Only the number moves: whether the server's figure was capped
-                // is its answer to give, and clearing one row cannot un-cap it.
-                self.unread_count.count = self.unread_count.count.saturating_sub(1);
+                // Only an exact figure moves. A capped one (`exact: false`) is a
+                // lower bound, and v0.9.0 shows "99+" only while it sits at 100:
+                // knocking it to 99 would claim 99 unread over an inbox that may
+                // hold hundreds. The resync after the mark brings the real figure.
+                if self.unread_count.exact {
+                    self.unread_count.count = self.unread_count.count.saturating_sub(1);
+                }
                 self.spawn_mark_notification_read(notification_id);
             }
             Action::NotificationsMarkAll => {
@@ -3097,6 +3115,7 @@ impl App {
             }
             Action::TopicFeedRefresh { slug } => self.spawn_topic_feed_initial(&slug),
             Action::TopicFeedMore { slug, cursor } => self.spawn_topic_feed_more(&slug, cursor),
+            Action::PostDetailFetchImages => self.ensure_detail_images_fetched(),
             Action::PostDetailRefreshReplies { post_id } => {
                 self.spawn_detail_replies_initial(&post_id);
             }
@@ -3784,6 +3803,7 @@ impl App {
                     s.set_muted_users(&room_id, &usernames);
                 }
             }
+            BgEvent::CircNickColors(on) => self.apply_nick_colors(on),
             BgEvent::CircSent {
                 room_id,
                 content,
@@ -3828,6 +3848,13 @@ impl App {
                 }
                 if let Screen::Search(s) = &mut self.screen {
                     s.apply_results(result);
+                    let to_check = s.posts_to_check();
+                    self.spawn_search_post_checks(to_check);
+                }
+            }
+            BgEvent::SearchPostChecked { post_id, check } => {
+                if let Screen::Search(s) = &mut self.screen {
+                    s.apply_post_check(post_id, check);
                 }
             }
             BgEvent::ProgramsListed {
@@ -3956,7 +3983,11 @@ impl App {
                 if let Screen::Notifications(s) = &mut self.screen {
                     s.unmark_local(&notification_id);
                 }
-                self.unread_count.count = self.unread_count.count.saturating_add(1);
+                // The mirror of the optimistic mark, which left a capped figure
+                // alone.
+                if self.unread_count.exact {
+                    self.unread_count.count = self.unread_count.count.saturating_add(1);
+                }
                 self.warn_toast_unless_signalled("couldn't mark as read");
             }
             BgEvent::AllNotificationsMarkFailed => {
@@ -4413,6 +4444,10 @@ impl App {
                             s.apply_entry_edit(&edit);
                         }
                     }
+                    // An edit can lift a content warning or change the image,
+                    // and either way the picture now on show may never have
+                    // been fetched.
+                    self.ensure_detail_images_fetched();
                     self.spawn_entry_refresh(post_id);
                     self.toast = Some(Toast::confirmation("saved"));
                 }
@@ -4551,6 +4586,14 @@ impl App {
             }
             BgEvent::SettingsSaved(result) => match result {
                 Ok(s) => {
+                    // A room parked behind the settings screen should show the
+                    // new choice the moment the reader goes back to it. Only when
+                    // the response names the field: § Settings does not document
+                    // the PATCH reply, and reading an absent field as "off" would
+                    // turn website colours off over an unrelated save.
+                    if let Some(on) = s.color_nicknames {
+                        self.apply_nick_colors(on);
+                    }
                     if let Screen::Settings(screen) = &mut self.screen {
                         screen.apply_loaded(Ok(s));
                         screen.finish_submit(Ok(()));
@@ -5155,6 +5198,9 @@ impl App {
             }
             _ => {}
         }
+        // The fresh copy may show an image the old one did not, a lifted
+        // content warning included. A no-op off post detail.
+        self.ensure_detail_images_fetched();
     }
 
     /// Open the edit flow for an already-published entry (§ Edit Entry): the
@@ -5357,6 +5403,20 @@ impl App {
             kinds.push(ThemeKind::Custom);
         }
         kinds
+    }
+
+    /// Apply the `colorNicknames` setting to the open room, wherever it is
+    /// (see [`Self::circ_mut`]). On means the website's hue per name, fitted to
+    /// this terminal's colour mode; off keeps cs-tui's own palette.
+    fn apply_nick_colors(&mut self, on: bool) {
+        let nick_colors = if on {
+            NickColors::Website(self.color_mode)
+        } else {
+            NickColors::Palette
+        };
+        if let Some(s) = self.circ_mut() {
+            s.set_nick_colors(nick_colors);
+        }
     }
 
     /// Resolve a kind to its concrete palette (`Custom` comes from `config.toml`),
@@ -5919,6 +5979,10 @@ impl App {
                         .map(str::to_string)
                         .collect();
                     let _ = tx.send(BgEvent::CircMutedUsers { room_id, usernames });
+                    // § Settings: "colorNicknames (default off)".
+                    let _ = tx.send(BgEvent::CircNickColors(
+                        settings.color_nicknames.unwrap_or(false),
+                    ));
                 }
                 Err(e) => {
                     let msg = note_api_err(&tx, e);
@@ -6132,6 +6196,39 @@ impl App {
                 .await
                 .map_err(|e| note_api_err(&tx, e));
             let _ = tx.send(BgEvent::SearchResults(result));
+        });
+    }
+
+    /// Read each search post hit's entry for its content warning, one at a
+    /// time (see [`super::search`]). At most eight, and only ever right after a
+    /// search the reader ran. A failure leaves that hit's text hidden rather
+    /// than guessing it is clear.
+    fn spawn_search_post_checks(&self, post_ids: Vec<String>) {
+        if post_ids.is_empty() {
+            return;
+        }
+        let client = self.client.clone();
+        let tx = self.bg_tx.clone();
+        tokio::spawn(async move {
+            for post_id in post_ids {
+                let check = match client.get_entry(&post_id).await {
+                    Ok(entry) => match entry.cw() {
+                        Some(cw) => super::search::PostCheck::Warned(cw.to_string()),
+                        None => super::search::PostCheck::Clear,
+                    },
+                    Err(e) => {
+                        let msg = note_api_err(&tx, e);
+                        tracing::debug!(error = %msg, post_id, "search hit check failed");
+                        super::search::PostCheck::Unavailable
+                    }
+                };
+                if tx
+                    .send(BgEvent::SearchPostChecked { post_id, check })
+                    .is_err()
+                {
+                    return;
+                }
+            }
         });
     }
 
@@ -6867,7 +6964,7 @@ impl App {
     fn start_playback_at(&mut self, track: super::audio::JukeboxTrack, push_history: bool) {
         if !self.mpv_available() {
             self.toast = Some(Toast::warning(
-                "install mpv + yt-dlp to play audio · o opens it in your browser",
+                "install mpv to play audio · o opens it in your browser",
             ));
             return;
         }
@@ -6952,6 +7049,8 @@ impl App {
         } else {
             // One-shot random pick; with no material, point at shuffle rather
             // than silently spinning up its refill walk for a single skip.
+            let youtube = self.ytdlp_available();
+            self.shuffle_pool.set_youtube_playable(youtube);
             match self.shuffle_pool.pick(current.as_deref()) {
                 Some(track) => self.start_playback(track),
                 None => {
@@ -6999,11 +7098,12 @@ impl App {
             self.toast = Some(Toast::confirmation("shuffle off"));
             return;
         }
-        // Without mpv (and yt-dlp — jukebox tracks are nearly always YouTube
-        // links) shuffle could never play anything; say so instead of turning
-        // on a mode that silently does nothing.
-        if !self.mpv_available() || !self.ytdlp_available() {
-            self.toast = Some(Toast::warning("install mpv + yt-dlp to use shuffle"));
+        // Without mpv shuffle could never play anything; say so instead of
+        // turning on a mode that silently does nothing. yt-dlp is only needed
+        // for YouTube tracks: a website upload (v0.9.0 `latex`) is a direct
+        // MP3, so without it shuffle plays those and skips the rest.
+        if !self.mpv_available() {
+            self.toast = Some(Toast::warning("install mpv to use shuffle"));
             return;
         }
         self.shuffle = true;
@@ -7027,6 +7127,8 @@ impl App {
     /// handle is already taken out of `now_playing` by then). With an empty
     /// pool, latch `pending_play` so the refill's arrival starts playback.
     fn shuffle_advance(&mut self, just_ended: Option<&str>) {
+        let youtube = self.ytdlp_available();
+        self.shuffle_pool.set_youtube_playable(youtube);
         match self.shuffle_pool.pick(just_ended) {
             Some(track) => {
                 self.start_playback(track);
@@ -7055,7 +7157,11 @@ impl App {
                 // jukebox posts to offer. Turn the mode back off rather than
                 // leaving it armed and silent.
                 self.shuffle = false;
-                self.toast = Some(Toast::warning("shuffle off: no jukebox posts found"));
+                self.toast = Some(Toast::warning(if youtube {
+                    "shuffle off: no jukebox posts found"
+                } else {
+                    "shuffle off: no tracks found that play without yt-dlp"
+                }));
             }
         }
     }
@@ -7079,6 +7185,9 @@ impl App {
         // handler instead of repopulating a cleared pool.
         let epoch_ref = Arc::clone(&self.shuffle_epoch);
         let epoch = epoch_ref.load(Ordering::SeqCst);
+        // Without yt-dlp, a walk counts only tracks that can play, or it would
+        // stop at its target on YouTube links shuffle will never pick.
+        let youtube = self.shuffle_pool.youtube_playable();
         tokio::spawn(async move {
             let mut found: Vec<super::audio::JukeboxTrack> = Vec::new();
             for page in 0..super::shuffle::REFILL_MAX_PAGES {
@@ -7093,7 +7202,11 @@ impl App {
                         found.extend(
                             entries
                                 .iter()
-                                .filter_map(|e| super::audio::jukebox_track(&e.attachments)),
+                                // Never a track behind a content warning.
+                                .filter_map(|e| {
+                                    super::audio::jukebox_track(super::cw::listed_attachments(e))
+                                })
+                                .filter(|t| youtube || !super::audio::is_youtube(&t.url)),
                         );
                         cursor = next;
                         if cursor.is_none() || found.len() >= super::shuffle::REFILL_TARGET {
@@ -7445,26 +7558,37 @@ impl App {
     }
 
     fn spawn_compose_submit(&self) {
-        let (kind, content, title, slug, topics, attachments, is_public, is_nsfw, entry_edit) =
-            match &self.screen {
-                Screen::Compose(s) => (
-                    s.kind.clone(),
-                    s.content.clone(),
-                    s.title_to_send(),
-                    s.slug_to_send(),
-                    s.parse_topics(),
-                    // Already validated by `try_submit`, which refuses to submit
-                    // a track it could not parse.
-                    s.attachments_to_send(),
-                    s.is_public,
-                    s.is_nsfw,
-                    // The only correct source for an entry edit: it diffs against
-                    // the snapshot the kind carries, so untouched fields are
-                    // omitted and the server leaves them alone (§ Edit Entry).
-                    s.entry_edit(),
-                ),
-                _ => return,
-            };
+        let (
+            kind,
+            content,
+            title,
+            slug,
+            topics,
+            attachments,
+            is_public,
+            is_nsfw,
+            content_warning,
+            entry_edit,
+        ) = match &self.screen {
+            Screen::Compose(s) => (
+                s.kind.clone(),
+                s.content.clone(),
+                s.title_to_send(),
+                s.slug_to_send(),
+                s.parse_topics(),
+                // Already validated by `try_submit`, which refuses to submit
+                // a track it could not parse.
+                s.attachments_to_send(),
+                s.is_public,
+                s.is_nsfw,
+                s.content_warning_to_send(),
+                // The only correct source for an entry edit: it diffs against
+                // the snapshot the kind carries, so untouched fields are
+                // omitted and the server leaves them alone (§ Edit Entry).
+                s.entry_edit(),
+            ),
+            _ => return,
+        };
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
@@ -7478,6 +7602,7 @@ impl App {
                             &topics,
                             is_public,
                             is_nsfw,
+                            content_warning.as_deref(),
                             &attachments,
                         )
                         .await
@@ -10051,6 +10176,7 @@ mod tests {
             artist: "a".into(),
             title: "t".into(),
             genre: String::new(),
+            cover: None,
         }];
         e
     }
@@ -10145,7 +10271,9 @@ mod tests {
         // proof the chain reached the play step without spawning a real
         // process, and exercising the no-dead-armed-mode guard in one go.
         app.mpv_available = Some(false);
-        app.ytdlp_available = Some(false);
+        // yt-dlp present: these tracks are YouTube links, which shuffle
+        // only picks when they can play. mpv stubbed off is what stops it.
+        app.ytdlp_available = Some(true);
         app.shuffle = true;
         app.shuffle_pool
             .add_tracks(vec![jukebox_track("https://youtu.be/next")]);
@@ -10214,7 +10342,9 @@ mod tests {
         app.screen = Screen::Feed(FeedScreen::new());
         app.current_root = Some(RootKind::Feed);
         app.mpv_available = Some(false);
-        app.ytdlp_available = Some(false);
+        // yt-dlp present: these tracks are YouTube links, which shuffle
+        // only picks when they can play. mpv stubbed off is what stops it.
+        app.ytdlp_available = Some(true);
         app.shuffle = true;
         app.shuffle_pool.fetch_inflight = true;
         app.shuffle_pool.pending_play = true;
@@ -10331,7 +10461,9 @@ mod tests {
         app.screen = Screen::Feed(FeedScreen::new());
         app.current_root = Some(RootKind::Feed);
         app.mpv_available = Some(false);
-        app.ytdlp_available = Some(false);
+        // yt-dlp present: these tracks are YouTube links, which shuffle
+        // only picks when they can play. mpv stubbed off is what stops it.
+        app.ytdlp_available = Some(true);
         app.shuffle_pool
             .add_tracks(vec![jukebox_track("https://youtu.be/other")]);
         app.now_playing = Some(super::super::player::test_handle("https://youtu.be/cur", 1));
@@ -10600,6 +10732,29 @@ mod tests {
             text.contains(super::super::chat::TOMBSTONE),
             "a tombstone replaces it: {text:?}"
         );
+    }
+
+    #[test]
+    fn the_color_nicknames_setting_reaches_the_open_room() {
+        let mut app = test_app();
+        app.screen = Screen::Circ(circ_room_screen("general", Vec::new()));
+        app.current_root = Some(RootKind::Circ);
+        let Screen::Circ(s) = &app.screen else {
+            unreachable!()
+        };
+        assert_eq!(s.nick_colors(), NickColors::Palette, "off by default");
+
+        app.handle_bg_event(BgEvent::CircNickColors(true));
+        let Screen::Circ(s) = &app.screen else {
+            unreachable!()
+        };
+        assert_eq!(s.nick_colors(), NickColors::Website(app.color_mode));
+
+        app.handle_bg_event(BgEvent::CircNickColors(false));
+        let Screen::Circ(s) = &app.screen else {
+            unreachable!()
+        };
+        assert_eq!(s.nick_colors(), NickColors::Palette);
     }
 
     #[test]
@@ -11060,6 +11215,34 @@ mod tests {
         app.handle_bg_event(BgEvent::VerificationResent(Err("nope".into())));
         let text = render_to_string(&app);
         assert!(text.contains("resend failed"), "{text:?}");
+    }
+
+    #[test]
+    fn a_search_post_check_reaches_the_open_search() {
+        // Routed straight to the screen: delivering `SearchResults` here would
+        // start the background reads, and the test client points at the real
+        // API, which no test may reach.
+        let mut app = test_app();
+        let mut screen = SearchScreen::new();
+        screen.apply_results(Ok(cs_api::SearchPreview {
+            posts: vec![cs_api::PostHit {
+                post_id: "p1".into(),
+                author_username: "trinity".into(),
+                content: "the hidden body".into(),
+                ..cs_api::PostHit::default()
+            }],
+            ..cs_api::SearchPreview::default()
+        }));
+        app.push_screen(Screen::Search(screen));
+        assert!(!render_to_string(&app).contains("the hidden body"));
+
+        app.handle_bg_event(BgEvent::SearchPostChecked {
+            post_id: "p1".into(),
+            check: super::super::search::PostCheck::Warned("spiders".into()),
+        });
+        let text = render_to_string(&app);
+        assert!(text.contains("CW: spiders"), "{text}");
+        assert!(!text.contains("the hidden body"), "{text}");
     }
 
     #[test]

@@ -216,6 +216,10 @@ pub struct Runtime {
     /// choice; see [`Runtime::chat_time_format`].
     pub explicit_time_format: Option<TimeFormat>,
     pub tz_offset: UtcOffset,
+    /// Whether `tz_offset` came from a `timezone` the config actually set,
+    /// rather than the UTC default. Only then is it the reader's own clock,
+    /// which is what cIRC's `/localtime` needs to fill in their time.
+    pub tz_configured: bool,
     pub compact: bool,
     pub preview_length: usize,
     pub image_height: u16,
@@ -312,6 +316,7 @@ impl Default for Runtime {
             time_format: TimeFormat::Relative,
             explicit_time_format: None,
             tz_offset: UtcOffset::UTC,
+            tz_configured: false,
             compact: false,
             preview_length: 200,
             image_height: 20,
@@ -431,7 +436,8 @@ const TEMPLATE: &str = r##"# cs-tui configuration. Edit and restart cs-tui.
 
 # Timezone for absolute timestamps: "utc" or a fixed UTC offset like
 # "-05:00" / "+02:00" / "+0530". (Auto-detecting the local zone isn't reliable
-# in a threaded app, so set your offset explicitly.)
+# in a threaded app, so set your offset explicitly.) Setting it also lets a bare
+# /localtime in cIRC fill in your time.
 #timezone = "utc"
 
 # ── Behavior ─────────────────────────────────────────────────────────────────
@@ -638,6 +644,7 @@ impl Config {
                 }),
                 None => d.tz_offset,
             },
+            tz_configured: self.timezone.as_deref().and_then(parse_tz).is_some(),
             compact: self.compact.unwrap_or(d.compact),
             preview_length: self
                 .preview_length

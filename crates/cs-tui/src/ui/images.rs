@@ -212,6 +212,7 @@ mod tests {
                 artist: String::new(),
                 title: String::new(),
                 genre: String::new(),
+                cover: None,
             }],
         );
         assert!(entry_image_urls(&e).is_empty());

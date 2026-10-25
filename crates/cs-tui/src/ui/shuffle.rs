@@ -63,6 +63,12 @@ pub struct ShufflePool {
     /// The last refill walk added nothing new; suppress further refills until
     /// browsing harvests a fresh track or shuffle is toggled back on.
     refill_dry: bool,
+    /// Whether YouTube tracks can play here, which needs yt-dlp beside mpv. A
+    /// website upload (`origin: "latex"`, v0.9.0) is a direct MP3 that mpv
+    /// plays alone, so without yt-dlp shuffle still has those. Tracks it cannot
+    /// play stay in the pool, just never picked, so installing yt-dlp
+    /// mid-session would bring them back.
+    youtube_playable: bool,
 }
 
 impl ShufflePool {
@@ -76,7 +82,30 @@ impl ShufflePool {
             fetch_inflight: false,
             pending_play: false,
             refill_dry: false,
+            youtube_playable: true,
         }
+    }
+
+    /// Record whether YouTube tracks can play (see the field).
+    pub fn set_youtube_playable(&mut self, playable: bool) {
+        self.youtube_playable = playable;
+    }
+
+    /// Whether YouTube tracks can play, for a refill walk to filter on.
+    #[must_use]
+    pub fn youtube_playable(&self) -> bool {
+        self.youtube_playable
+    }
+
+    /// Whether `track` can play on this machine right now.
+    #[must_use]
+    pub fn can_play(&self, track: &JukeboxTrack) -> bool {
+        self.youtube_playable || !super::audio::is_youtube(&track.url)
+    }
+
+    /// How many tracks shuffle could actually pick.
+    fn playable_len(&self) -> usize {
+        self.tracks.iter().filter(|t| self.can_play(t)).count()
     }
 
     /// Pool size, for test assertions. The app itself never needs the count —
@@ -97,10 +126,13 @@ impl ShufflePool {
     /// from the feed/topic/profile page handlers as pages arrive — harvesting
     /// what the user already fetched costs no extra API calls. Returns how many
     /// tracks were new.
+    ///
+    /// A track behind a content warning is never harvested: shuffle would
+    /// otherwise play what the reader has not chosen to see.
     pub fn harvest(&mut self, entries: &[Entry]) -> usize {
         let tracks: Vec<_> = entries
             .iter()
-            .filter_map(|e| jukebox_track(&e.attachments))
+            .filter_map(|e| jukebox_track(super::cw::listed_attachments(e)))
             .collect();
         self.add_tracks(tracks)
     }
@@ -128,7 +160,7 @@ impl ShufflePool {
     /// low, nothing is already fetching, and the last walk wasn't dry.
     #[must_use]
     pub fn needs_refill(&self) -> bool {
-        self.tracks.len() < REFILL_BELOW && !self.fetch_inflight && !self.refill_dry
+        self.playable_len() < REFILL_BELOW && !self.fetch_inflight && !self.refill_dry
     }
 
     /// Record a finished refill walk: where to resume next time, and whether it
@@ -163,11 +195,18 @@ impl ShufflePool {
     /// current track and weren't played recently. Falls back to ignoring the
     /// recency filter, then the current-track filter, so a pool of any size
     /// always yields something. Records the pick in the recent list.
+    ///
+    /// Only tracks that [`Self::can_play`] are candidates at all.
     pub fn pick_seeded(&mut self, current_url: Option<&str>, seed: u64) -> Option<JukeboxTrack> {
-        if self.tracks.is_empty() {
+        let playable: Vec<usize> = (0..self.tracks.len())
+            .filter(|&i| self.can_play(&self.tracks[i]))
+            .collect();
+        if playable.is_empty() {
             return None;
         }
-        let not_current: Vec<usize> = (0..self.tracks.len())
+        let not_current: Vec<usize> = playable
+            .iter()
+            .copied()
             .filter(|&i| current_url != Some(self.tracks[i].url.as_str()))
             .collect();
         let fresh: Vec<usize> = not_current
@@ -182,7 +221,7 @@ impl ShufflePool {
         } else {
             // Pool of one and it's the current track: repeat it rather than
             // going silent — the refill machinery is busy widening the pool.
-            (0..self.tracks.len()).collect()
+            playable
         };
         let idx = candidates[(seed % candidates.len() as u64) as usize];
         let track = self.tracks[idx].clone();
@@ -230,6 +269,7 @@ mod tests {
                 artist: "a".into(),
                 title: "t".into(),
                 genre: String::new(),
+                cover: None,
             }],
             ..Default::default()
         }
@@ -248,6 +288,42 @@ mod tests {
         // A second pass over the same page adds nothing.
         assert_eq!(pool.harvest(&entries), 0);
         assert_eq!(pool.len(), 2);
+    }
+
+    #[test]
+    fn without_yt_dlp_only_direct_tracks_are_picked() {
+        let mut pool = ShufflePool::new();
+        pool.add_tracks(vec![
+            track("https://youtu.be/abc"),
+            track("https://bunker.cyberspace.online/a.mp3"),
+        ]);
+        pool.set_youtube_playable(false);
+        for seed in 0..10 {
+            assert_eq!(
+                pool.pick_seeded(None, seed).unwrap().url,
+                "https://bunker.cyberspace.online/a.mp3"
+            );
+        }
+        // Only YouTube left: nothing to pick, rather than a track that fails.
+        pool.remove("https://bunker.cyberspace.online/a.mp3");
+        assert!(pool.pick_seeded(None, 0).is_none());
+        // A pool of unplayable tracks still needs refilling.
+        assert!(pool.needs_refill());
+        // With yt-dlp the YouTube track is back.
+        pool.set_youtube_playable(true);
+        assert_eq!(
+            pool.pick_seeded(None, 0).unwrap().url,
+            "https://youtu.be/abc"
+        );
+    }
+
+    #[test]
+    fn harvest_skips_a_track_behind_a_content_warning() {
+        let mut pool = ShufflePool::new();
+        let mut warned = audio_entry("https://youtu.be/hidden");
+        warned.content_warning = Some("spiders".into());
+        assert_eq!(pool.harvest(&[warned]), 0);
+        assert_eq!(pool.len(), 0);
     }
 
     #[test]

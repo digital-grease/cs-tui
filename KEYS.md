@@ -30,6 +30,7 @@ digits reach the screen you are on.
 | Feed, topic feed, post detail | `e` | Edit your own entry (on post detail, the selected reply) |
 | Feed, topic feed, post detail | `F` | Flag an entry or reply for review, with an optional reason |
 | Post detail | `w` | Watch / unwatch the thread for reply notifications |
+| Post detail | `v` | Show / hide a post behind its content warning |
 | Someone else's profile | `P` | Poke them |
 | Your own profile, Posts tab | `E` | Edit the selected post (`e` edits your profile, `P` pins a post) |
 | Guild | `J` then `y` | Join (member if you are not in a guild yet, apprentice otherwise) |
@@ -73,11 +74,13 @@ sends those raw.
 
 ## Jukebox
 
-Posts can carry a "jukebox" track (a YouTube link). cs-tui shows the track card
-and cover art inline, and can stream the audio in the background when
-[`mpv`](https://mpv.io) and [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) are
-installed and on your `PATH`. Without them the card and link still render, and
-`o` opens the link in your browser instead.
+Posts and chat messages can carry a "jukebox" track: a YouTube link, or an MP3
+uploaded on the website. cs-tui shows the track card and cover art inline, and
+can stream the audio in the background when [`mpv`](https://mpv.io) is
+installed and on your `PATH`. YouTube tracks also need
+[`yt-dlp`](https://github.com/yt-dlp/yt-dlp); without it, shuffle plays only the
+uploaded tracks. Without mpv the card and link still render, and `o` opens the
+link in your browser instead.
 
 | Key | Action |
 |---|---|

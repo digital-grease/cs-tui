@@ -238,21 +238,25 @@ impl FeedScreen {
                 let track = visible
                     .get(self.list.selected)
                     .and_then(|idx| self.list.items.get(*idx))
-                    .and_then(|e| super::audio::jukebox_track(&e.attachments));
+                    .and_then(|e| super::audio::jukebox_track(super::cw::listed_attachments(e)));
                 return FeedIntent::PlayJukebox(track);
             }
             KeyCode::Char('o') => {
                 if let Some(url) = visible
                     .get(self.list.selected)
                     .and_then(|idx| self.list.items.get(*idx))
-                    .and_then(|e| super::audio::jukebox_url(&e.attachments))
+                    .and_then(|e| super::audio::jukebox_url(super::cw::listed_attachments(e)))
                 {
                     return FeedIntent::OpenJukebox(url);
                 }
             }
             KeyCode::Char('e') => {
                 if let Some(idx) = visible.get(self.list.selected) {
-                    if let Some(entry) = self.list.items.get(*idx) {
+                    // Not on a post behind a content warning: the edit flow
+                    // opens on its body, and `e` is offered on every post, the
+                    // reader's own or not. Open it and reveal it first.
+                    if let Some(entry) = self.list.items.get(*idx).filter(|e| !super::cw::masked(e))
+                    {
                         return FeedIntent::EditEntry {
                             post_id: entry.post_id.clone(),
                             content: entry.content.clone(),
@@ -374,6 +378,9 @@ impl FeedScreen {
                 item.bookmarks_count = f.bookmarks_count;
                 item.content = f.content.clone();
                 item.title = f.title.clone();
+                // Travels with the content it guards: merging a body without
+                // the warning the author just added would show it unmasked.
+                item.content_warning = f.content_warning.clone();
                 item.topics = f.topics.clone();
                 item.edited_at = f.edited_at;
             }
@@ -401,6 +408,7 @@ impl FeedScreen {
         };
         item.content = fresh.content.clone();
         item.title = fresh.title.clone();
+        item.content_warning = fresh.content_warning.clone();
         item.topics = fresh.topics.clone();
         item.attachments = fresh.attachments.clone();
         item.is_public = fresh.is_public;
@@ -449,6 +457,8 @@ impl FeedScreen {
         self.list
             .items
             .iter()
+            // Nothing behind a content warning is fetched from a list.
+            .filter(|e| !super::cw::masked(e))
             .filter_map(|e| super::images::entry_image_urls(e).into_iter().next())
             // Three steps, and the order of all three matters. Skip what is
             // already held or already asked for, *then* cap the batch, and only
@@ -591,6 +601,9 @@ impl FeedScreen {
         let cols = width.saturating_sub(2).max(1);
         let rows_for = |e: &Entry| -> u16 {
             let Some(cap) = band_cap else { return 0 };
+            if super::cw::masked(e) {
+                return 0;
+            }
             let Some(url) = super::images::entry_image_urls(e).into_iter().next() else {
                 return 0;
             };
@@ -640,13 +653,18 @@ impl Default for FeedScreen {
 /// wrong place. `entry_height_matches_entry_item` pins it.
 fn entry_height(entry: &Entry, image_rows: u16) -> u16 {
     let mut rows = 1u16; // header
-    if entry.title.as_deref().is_some_and(|t| !t.trim().is_empty()) {
+    if super::cw::masked(entry) {
+        // The CW row stands in for the title and the snippet.
         rows += 1;
-    }
-    if !super::markdown::content_preview(&entry.content, crate::config::get().preview_length)
-        .is_empty()
-    {
-        rows += 1;
+    } else {
+        if entry.title.as_deref().is_some_and(|t| !t.trim().is_empty()) {
+            rows += 1;
+        }
+        if !super::markdown::content_preview(&entry.content, crate::config::get().preview_length)
+            .is_empty()
+        {
+            rows += 1;
+        }
     }
     rows += image_rows;
     if !crate::config::get().compact {
@@ -689,34 +707,42 @@ fn entry_item(entry: &Entry, width: u16, theme: &Theme, image_rows: u16) -> List
             theme.muted_style(),
         ),
     ];
+    let masked = super::cw::masked(entry);
     // Flag any image (markdown link OR attachment) — the snippet only sees
     // markdown, so attachment-only posts would otherwise look image-less.
-    if super::images::has_image(entry) {
+    // Neither marker shows behind a content warning, which hides the
+    // attachments along with everything else.
+    if !masked && super::images::has_image(entry) {
         header_spans.push(Span::styled(" · [image]", theme.accent_style()));
     }
     // Likewise flag a jukebox (audio) attachment so it's visible from the list.
-    if super::audio::has_audio(entry) {
+    if !masked && super::audio::has_audio(entry) {
         header_spans.push(Span::styled(" · [jukebox]", theme.accent_style()));
     }
 
     let mut lines = vec![Line::from(header_spans)];
 
-    // v0.3.7: surface the entry title (when set) on its own line above the
-    // content snippet. Skipped for None/whitespace-only titles.
-    if let Some(title) = entry.title.as_deref() {
-        let title = title.trim();
-        if !title.is_empty() {
-            lines.push(Line::from(Span::styled(
-                super::text::first_line_truncated(title, 200),
-                theme.accent_style(),
-            )));
+    if let Some(cw) = entry.cw() {
+        // v0.9.0: the warning in place of the title and the snippet.
+        lines.push(super::cw::cw_line(cw, 200, theme));
+    } else {
+        // v0.3.7: surface the entry title (when set) on its own line above the
+        // content snippet. Skipped for None/whitespace-only titles.
+        if let Some(title) = entry.title.as_deref() {
+            let title = title.trim();
+            if !title.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    super::text::first_line_truncated(title, 200),
+                    theme.accent_style(),
+                )));
+            }
         }
-    }
 
-    let snippet =
-        super::markdown::content_preview(&entry.content, crate::config::get().preview_length);
-    if !snippet.is_empty() {
-        lines.push(Line::from(Span::styled(snippet, theme.base())));
+        let snippet =
+            super::markdown::content_preview(&entry.content, crate::config::get().preview_length);
+        if !snippet.is_empty() {
+            lines.push(Line::from(Span::styled(snippet, theme.base())));
+        }
     }
 
     // Blank rows the screen paints the picture onto after the list is drawn.
@@ -741,21 +767,30 @@ fn status_line<'a>(s: &'a FeedScreen, theme: &Theme) -> Paragraph<'a> {
         return Paragraph::new(Line::from(Span::styled(msg, theme.error_style())));
     }
     // Surface the jukebox keys only when the highlighted post has a track.
-    let media = if s.selected_entry().is_some_and(super::audio::has_audio) {
+    let media = if s
+        .selected_entry()
+        .is_some_and(|e| super::audio::jukebox_url(super::cw::listed_attachments(e)).is_some())
+    {
         " · p play · o open"
     } else {
         ""
+    };
+    // `e` is not offered on a post behind a content warning (see `handle_key`).
+    let edit = if s.selected_entry().is_some_and(super::cw::masked) {
+        ""
+    } else {
+        " · e edit"
     };
     let text = if s.list.loading {
         "loading… · c new post · enter open · b bookmark · r refresh · esc menu".to_string()
     } else if s.list.next_cursor.is_some() {
         format!(
-            "{} entries · scroll down for more · c new post · enter open · b bookmark{media} · e edit · F flag · r refresh · esc menu",
+            "{} entries · scroll down for more · c new post · enter open · b bookmark{media}{edit} · F flag · r refresh · esc menu",
             s.list.items.len()
         )
     } else {
         format!(
-            "{} entries · end of feed · c new post · enter open · b bookmark{media} · e edit · F flag · r refresh · esc menu",
+            "{} entries · end of feed · c new post · enter open · b bookmark{media}{edit} · F flag · r refresh · esc menu",
             s.list.items.len()
         )
     };
@@ -896,8 +931,11 @@ mod tests {
         let mut titled = entry("e2", "with a title", false);
         titled.title = Some("A Title".into());
         let empty = entry("e3", "", false);
+        let mut warned = entry("e4", "alice", false);
+        warned.title = Some("Hidden Title".into());
+        warned.content_warning = Some("spiders".into());
 
-        for e in [&plain, &titled, &empty] {
+        for e in [&plain, &titled, &empty, &warned] {
             for rows in [0u16, 1, 7] {
                 let item = entry_item(e, 80, &theme, rows);
                 assert_eq!(
@@ -966,6 +1004,7 @@ mod tests {
             artist: "Art of Noise".into(),
             title: "Paranoimia".into(),
             genre: "electronic".into(),
+            cover: None,
         }];
         s.apply_initial(Ok((vec![e], None)));
         match s.handle_key(key(KeyCode::Char('p'))) {
@@ -997,6 +1036,7 @@ mod tests {
             artist: "Art of Noise".into(),
             title: "Paranoimia".into(),
             genre: "electronic".into(),
+            cover: None,
         }];
         s.apply_initial(Ok((vec![e], None)));
         assert_eq!(
@@ -1021,6 +1061,7 @@ mod tests {
             artist: "Art of Noise".into(),
             title: "Paranoimia".into(),
             genre: "electronic".into(),
+            cover: None,
         }];
         let text = render_entry_item(&e);
         assert!(
@@ -1028,6 +1069,79 @@ mod tests {
             "audio attachment must be flagged: {text:?}"
         );
         assert!(text.contains("content of a"), "text snippet still renders");
+    }
+
+    fn warned_jukebox_entry() -> Entry {
+        let mut e = entry("a", "alice", false); // content "content of a"
+        e.title = Some("Hidden Title".into());
+        e.content_warning = Some("spiders".into());
+        e.attachments = vec![cs_api::Attachment::audio(
+            "https://youtu.be/abc",
+            "Art of Noise",
+            "Paranoimia",
+            "electronic",
+        )];
+        e
+    }
+
+    #[test]
+    fn a_warned_entry_shows_only_its_warning() {
+        let text = render_entry_item(&warned_jukebox_entry());
+        assert!(text.contains("CW: spiders"), "{text:?}");
+        assert!(!text.contains("Hidden Title"), "title masked: {text:?}");
+        assert!(!text.contains("content of a"), "snippet masked: {text:?}");
+        assert!(!text.contains("[jukebox]"), "attachments masked: {text:?}");
+        assert!(text.contains("@alice"), "whose post it is still shows");
+    }
+
+    #[test]
+    fn a_warned_entrys_track_is_not_playable_from_the_list() {
+        let mut s = FeedScreen::new();
+        s.apply_initial(Ok((vec![warned_jukebox_entry()], None)));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('p'))),
+            FeedIntent::PlayJukebox(None)
+        );
+        assert_eq!(s.handle_key(key(KeyCode::Char('o'))), FeedIntent::None);
+    }
+
+    #[test]
+    fn e_is_not_offered_on_a_warned_entry() {
+        let mut s = FeedScreen::new();
+        s.apply_initial(Ok((vec![warned_jukebox_entry()], None)));
+        assert_eq!(s.handle_key(key(KeyCode::Char('e'))), FeedIntent::None);
+        let hint = |s: &FeedScreen| -> String {
+            let backend = ratatui::backend::TestBackend::new(240, 1);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| f.render_widget(status_line(s, &Theme::cyber()), f.area()))
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect()
+        };
+        assert!(!hint(&s).contains("e edit"), "{}", hint(&s));
+
+        let mut plain = FeedScreen::new();
+        plain.apply_initial(Ok((vec![entry("b", "alice", false)], None)));
+        assert!(hint(&plain).contains("e edit"), "{}", hint(&plain));
+    }
+
+    #[test]
+    fn a_warned_entrys_image_is_not_fetched_from_the_list() {
+        let mut s = FeedScreen::new();
+        let mut e = warned_jukebox_entry();
+        e.attachments = vec![cs_api::Attachment::Image {
+            src: "https://x/a.png".into(),
+            width: 0,
+            height: 0,
+        }];
+        s.apply_initial(Ok((vec![e], None)));
+        assert!(s.image_urls_to_fetch(10).is_empty());
     }
 
     #[test]

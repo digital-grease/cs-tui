@@ -20,7 +20,7 @@ use crossterm::terminal::{
 };
 use cs_api::{
     Attachment, Entry, EntryEdit, Reply, TitleEdit, MAX_AUDIO_ARTIST_LEN, MAX_AUDIO_GENRE_LEN,
-    MAX_AUDIO_TITLE_LEN,
+    MAX_AUDIO_TITLE_LEN, MAX_CONTENT_WARNING_LEN,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
@@ -46,8 +46,10 @@ pub struct EntrySnapshot {
     pub topics: Vec<String>,
     /// Whether the entry is readable without logging in.
     pub is_public: bool,
-    /// Content-warning flag.
+    /// NSFW flag.
     pub is_nsfw: bool,
+    /// Content warning as published, trimmed (v0.9.0). `None` means none.
+    pub content_warning: Option<String>,
     /// The entry's URL slug. Frozen once published so share links keep working,
     /// so this is shown read-only and never sent.
     pub slug: Option<String>,
@@ -66,6 +68,7 @@ impl EntrySnapshot {
             topics: entry.topics.clone(),
             is_public: entry.is_public,
             is_nsfw: entry.is_nsfw,
+            content_warning: entry.cw().map(str::to_string),
             slug: entry.slug.clone(),
             attachments: entry.attachments.clone(),
         }
@@ -186,6 +189,12 @@ impl ComposeKind {
         matches!(self, Self::NewEntry | Self::EditEntry { .. })
     }
 
+    /// A content warning (v0.9.0 § Create Entry, § Edit Entry) goes on
+    /// top-level entries only, the same set that carries the NSFW flag.
+    fn has_content_warning(&self) -> bool {
+        self.has_visibility_toggles()
+    }
+
     /// Titles are valid on top-level entries, guild threads, and entry edits.
     fn has_title(&self) -> bool {
         matches!(
@@ -225,6 +234,7 @@ impl ComposeKind {
                 ConfirmField::Slug,
                 ConfirmField::Topics,
                 ConfirmField::Track,
+                ConfirmField::Warning,
                 ConfirmField::Public,
                 ConfirmField::Nsfw,
             ],
@@ -241,12 +251,14 @@ impl ComposeKind {
                 ConfirmField::Title,
                 ConfirmField::Topics,
                 ConfirmField::Track,
+                ConfirmField::Warning,
                 ConfirmField::Public,
                 ConfirmField::Nsfw,
             ],
             Self::EditEntry { .. } => &[
                 ConfirmField::Title,
                 ConfirmField::Topics,
+                ConfirmField::Warning,
                 ConfirmField::Public,
                 ConfirmField::Nsfw,
             ],
@@ -323,6 +335,8 @@ pub enum ConfirmField {
     Topics,
     /// The one jukebox track an entry or reply may carry (§ Create Entry).
     Track,
+    /// The entry's content warning (v0.9.0 § Create Entry).
+    Warning,
     Public,
     Nsfw,
 }
@@ -347,6 +361,9 @@ pub struct ComposeScreen {
     /// The jukebox track as one `url | artist | title | genre` line. Blank means
     /// no track; on an edit, blank where there was one removes it.
     pub track_input: String,
+    /// The content warning readers see before the entry. Blank means none; on
+    /// an edit, blank where there was one removes it.
+    pub warning_input: String,
     pub is_public: bool,
     pub is_nsfw: bool,
     pub focused: ConfirmField,
@@ -369,17 +386,19 @@ impl ComposeScreen {
             .first()
             .copied()
             .unwrap_or(ConfirmField::Topics);
-        let (title_input, slug_input, topics_input, track_input, is_public, is_nsfw) =
+        let (title_input, slug_input, topics_input, track_input, warning_input, is_public, is_nsfw) =
             match kind.entry_original() {
                 Some(original) => (
                     original.title.clone().unwrap_or_default(),
                     original.slug.clone().unwrap_or_default(),
                     original.topics.join(", "),
                     original.track_line(),
+                    original.content_warning.clone().unwrap_or_default(),
                     original.is_public,
                     original.is_nsfw,
                 ),
                 None => (
+                    String::new(),
                     String::new(),
                     String::new(),
                     String::new(),
@@ -395,6 +414,7 @@ impl ComposeScreen {
             slug_input,
             topics_input,
             track_input,
+            warning_input,
             is_public,
             is_nsfw,
             focused,
@@ -480,7 +500,11 @@ impl ComposeScreen {
     fn focused_is_text(&self) -> bool {
         matches!(
             self.focused,
-            ConfirmField::Title | ConfirmField::Slug | ConfirmField::Topics | ConfirmField::Track
+            ConfirmField::Title
+                | ConfirmField::Slug
+                | ConfirmField::Topics
+                | ConfirmField::Track
+                | ConfirmField::Warning
         )
     }
 
@@ -491,6 +515,7 @@ impl ComposeScreen {
             ConfirmField::Slug => Some(&mut self.slug_input),
             ConfirmField::Topics => Some(&mut self.topics_input),
             ConfirmField::Track => Some(&mut self.track_input),
+            ConfirmField::Warning => Some(&mut self.warning_input),
             ConfirmField::Public | ConfirmField::Nsfw => None,
         }
     }
@@ -517,7 +542,8 @@ impl ComposeScreen {
             ConfirmField::Title
             | ConfirmField::Slug
             | ConfirmField::Topics
-            | ConfirmField::Track => {}
+            | ConfirmField::Track
+            | ConfirmField::Warning => {}
         }
     }
 
@@ -577,6 +603,12 @@ impl ComposeScreen {
         }
         if self.is_nsfw != original.is_nsfw {
             edit.is_nsfw = Some(self.is_nsfw);
+        }
+        // Same shape as the title: clearing a warning that was set sends `""`,
+        // which § Edit Entry reads as a removal.
+        let warning = self.warning_input.trim();
+        if original.content_warning.as_deref().unwrap_or_default() != warning {
+            edit.content_warning = Some(warning.to_string());
         }
         // Attachments are sent only when this screen can express what the entry
         // carries *and* the user changed it. Leaving the field out is what keeps
@@ -673,6 +705,16 @@ impl ComposeScreen {
                 }
             }
         }
+        // The crate owns the counting rule (UTF-16 units), so the form and the
+        // request cannot disagree about what fits.
+        if self.kind.has_content_warning()
+            && cs_api::validate_content_warning(self.warning_input.trim()).is_err()
+        {
+            self.error = Some(format!(
+                "content warning must be ≤{MAX_CONTENT_WARNING_LEN} characters"
+            ));
+            return ComposeIntent::None;
+        }
         if let Err(msg) = self.parse_track() {
             self.error = Some(msg);
             return ComposeIntent::None;
@@ -697,6 +739,16 @@ impl ComposeScreen {
         } else {
             Some(t.to_string())
         }
+    }
+
+    /// Trimmed content warning to post with a new entry, or `None` when blank
+    /// or not applicable.
+    pub fn content_warning_to_send(&self) -> Option<String> {
+        if !self.kind.has_content_warning() {
+            return None;
+        }
+        let w = self.warning_input.trim();
+        (!w.is_empty()).then(|| w.to_string())
     }
 
     /// The jukebox track this screen would post, or `None` for no track.
@@ -787,6 +839,14 @@ impl ComposeScreen {
         {
             let idx = constraints.len();
             constraints.push(Constraint::Length(1));
+            Some(idx)
+        } else {
+            None
+        };
+        let warning_idx = if self.kind.has_content_warning() {
+            let idx = constraints.len();
+            constraints.push(Constraint::Length(1)); // warning label
+            constraints.push(Constraint::Length(1)); // warning input
             Some(idx)
         } else {
             None
@@ -959,6 +1019,41 @@ impl ComposeScreen {
                 Paragraph::new(Line::from(Span::styled(note, theme.muted_style()))),
                 layout[idx],
             );
+        }
+
+        // Content warning (entries only)
+        if let Some(idx) = warning_idx {
+            let focused = self.focused == ConfirmField::Warning;
+            let style = if focused {
+                theme.accent_style()
+            } else {
+                theme.muted_style()
+            };
+            let label = if self
+                .kind
+                .entry_original()
+                .is_some_and(|original| original.content_warning.is_some())
+            {
+                "content warning (max 60 chars · clearing it removes the warning)"
+            } else {
+                "content warning (optional, max 60 chars · readers see CW: <this> first)"
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(label, style))),
+                layout[idx],
+            );
+            let warning_area = layout[idx + 1];
+            let warning_line = if focused {
+                super::input::windowed_line(
+                    &self.warning_input,
+                    self.warning_input.chars().count(),
+                    warning_area.width as usize,
+                    theme,
+                )
+            } else {
+                Line::from(Span::styled(self.warning_input.clone(), theme.base()))
+            };
+            frame.render_widget(Paragraph::new(warning_line), warning_area);
         }
 
         // Toggles (entries only)
@@ -1222,6 +1317,8 @@ mod tests {
         assert_eq!(s.focused, ConfirmField::Topics);
         s.handle_key(key(KeyCode::Tab, KeyModifiers::empty()));
         assert_eq!(s.focused, ConfirmField::Track, "v0.8.10 § Create Entry");
+        s.handle_key(key(KeyCode::Tab, KeyModifiers::empty()));
+        assert_eq!(s.focused, ConfirmField::Warning, "v0.9.0 § Create Entry");
         s.handle_key(key(KeyCode::Tab, KeyModifiers::empty()));
         assert_eq!(s.focused, ConfirmField::Public);
         s.handle_key(key(KeyCode::Tab, KeyModifiers::empty()));
@@ -1828,11 +1925,128 @@ mod tests {
         s.handle_key(key(KeyCode::Tab, KeyModifiers::empty()));
         assert_eq!(s.focused, ConfirmField::Track);
         s.handle_key(key(KeyCode::Tab, KeyModifiers::empty()));
+        assert_eq!(s.focused, ConfirmField::Warning);
+        s.handle_key(key(KeyCode::Tab, KeyModifiers::empty()));
         assert_eq!(s.focused, ConfirmField::Public);
         s.handle_key(key(KeyCode::Tab, KeyModifiers::empty()));
         assert_eq!(s.focused, ConfirmField::Nsfw);
         s.handle_key(key(KeyCode::Tab, KeyModifiers::empty()));
         assert_eq!(s.focused, ConfirmField::Title);
+    }
+
+    #[test]
+    fn a_new_entry_sends_a_trimmed_content_warning_only_when_set() {
+        let mut s = ComposeScreen::new(ComposeKind::NewEntry, "hi".into());
+        assert_eq!(s.content_warning_to_send(), None);
+        s.focused = ConfirmField::Warning;
+        for c in "  spiders ".chars() {
+            s.handle_key(key(KeyCode::Char(c), KeyModifiers::empty()));
+        }
+        assert_eq!(s.warning_input, "  spiders ");
+        assert_eq!(s.content_warning_to_send().as_deref(), Some("spiders"));
+    }
+
+    #[test]
+    fn space_types_into_the_content_warning_rather_than_toggling() {
+        let mut s = ComposeScreen::new(ComposeKind::NewEntry, "hi".into());
+        s.focused = ConfirmField::Warning;
+        s.handle_key(key(KeyCode::Char('a'), KeyModifiers::empty()));
+        s.handle_key(key(KeyCode::Char(' '), KeyModifiers::empty()));
+        s.handle_key(key(KeyCode::Char('b'), KeyModifiers::empty()));
+        assert_eq!(s.warning_input, "a b");
+        assert!(!s.is_public && !s.is_nsfw);
+    }
+
+    #[test]
+    fn an_overlong_content_warning_is_refused_before_it_leaves() {
+        let mut s = ComposeScreen::new(ComposeKind::NewEntry, "hi".into());
+        s.warning_input = "w".repeat(MAX_CONTENT_WARNING_LEN + 1);
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter, KeyModifiers::empty())),
+            ComposeIntent::None
+        );
+        assert!(s.error.as_deref().unwrap().contains("content warning"));
+        assert!(!s.submitting);
+
+        s.warning_input = "w".repeat(MAX_CONTENT_WARNING_LEN);
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter, KeyModifiers::empty())),
+            ComposeIntent::Submit
+        );
+    }
+
+    #[test]
+    fn only_entries_carry_a_content_warning() {
+        for kind in [
+            ComposeKind::Reply {
+                post_id: "p".into(),
+                parent_reply_id: None,
+            },
+            ComposeKind::NewNote,
+            ComposeKind::GuildThread {
+                guild_slug: "g".into(),
+            },
+        ] {
+            assert!(
+                !kind.focus_order().contains(&ConfirmField::Warning),
+                "{kind:?}"
+            );
+            let mut s = ComposeScreen::new(kind, "hi".into());
+            s.warning_input = "spiders".into();
+            assert_eq!(s.content_warning_to_send(), None);
+        }
+    }
+
+    fn entry_with_warning(cw: Option<&str>) -> ComposeScreen {
+        let mut entry = published_entry(Some("Old Title"));
+        entry.content_warning = cw.map(str::to_string);
+        let content = entry.content.clone();
+        ComposeScreen::from_entry(&entry, content)
+    }
+
+    #[test]
+    fn an_edit_prefills_the_warning_and_leaves_it_alone_when_untouched() {
+        let mut s = entry_with_warning(Some("spiders"));
+        assert_eq!(s.warning_input, "spiders");
+        s.title_input = "New Title".into();
+        let edit = s.entry_edit().unwrap();
+        assert!(edit.content_warning.is_none(), "untouched is not sent");
+    }
+
+    #[test]
+    fn clearing_a_warning_on_an_edit_sends_the_removal() {
+        let mut s = entry_with_warning(Some("spiders"));
+        s.warning_input = "   ".into();
+        let edit = s.entry_edit().unwrap();
+        assert_eq!(edit.content_warning.as_deref(), Some(""));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter, KeyModifiers::empty())),
+            ComposeIntent::Submit,
+            "a removal alone is a change worth sending"
+        );
+    }
+
+    #[test]
+    fn adding_or_changing_a_warning_on_an_edit_sends_it_trimmed() {
+        let mut s = entry_with_warning(None);
+        s.warning_input = " eye strain ".into();
+        assert_eq!(
+            s.entry_edit().unwrap().content_warning.as_deref(),
+            Some("eye strain")
+        );
+
+        let mut s = entry_with_warning(Some("spiders"));
+        s.warning_input = "spiders, lots".into();
+        assert_eq!(
+            s.entry_edit().unwrap().content_warning.as_deref(),
+            Some("spiders, lots")
+        );
+    }
+
+    #[test]
+    fn an_edit_with_no_warning_and_a_blank_field_sends_nothing() {
+        let s = entry_with_warning(None);
+        assert!(s.entry_edit().unwrap().content_warning.is_none());
     }
 
     #[test]
@@ -1855,7 +2069,7 @@ mod tests {
 
     fn render_to_string(s: &ComposeScreen) -> String {
         let theme = Theme::cyber();
-        let backend = ratatui::backend::TestBackend::new(70, 16);
+        let backend = ratatui::backend::TestBackend::new(80, 20);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|f| s.render(f, f.area(), &theme)).unwrap();
         terminal
@@ -1877,6 +2091,14 @@ mod tests {
         assert!(out.contains("music, linux"), "the topic prefill is visible");
         assert!(out.contains("[x] public"), "the flags round-trip");
         assert!(out.contains("[x] NSFW"));
+        assert!(out.contains("content warning (optional"));
+    }
+
+    #[test]
+    fn an_edit_of_a_warned_entry_explains_clearing_the_warning() {
+        let out = render_to_string(&entry_with_warning(Some("spiders")));
+        assert!(out.contains("spiders"), "the warning prefill is visible");
+        assert!(out.contains("clearing it removes the warning"), "{out}");
     }
 
     #[test]

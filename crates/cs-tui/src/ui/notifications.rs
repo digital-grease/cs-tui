@@ -405,9 +405,11 @@ impl NotificationsScreen {
     pub fn mark_local(&mut self, notification_id: &str) {
         for n in &mut self.list.items {
             if n.notification_id == notification_id {
-                if !n.read {
-                    // Keep the unread figure in step until the next poll, so the
-                    // status line doesn't count a row the reader just cleared.
+                // Keep an exact unread figure in step until the next poll, so
+                // the status line doesn't count a row the reader just cleared.
+                // A capped one is a lower bound and stays put, or "99+" would
+                // drop to "99" (v0.9.0 § Unread Count).
+                if !n.read && self.unread.exact {
                     self.unread.count = self.unread.count.saturating_sub(1);
                 }
                 n.read = true;
@@ -420,7 +422,7 @@ impl NotificationsScreen {
     pub fn unmark_local(&mut self, notification_id: &str) {
         for n in &mut self.list.items {
             if n.notification_id == notification_id {
-                if n.read {
+                if n.read && self.unread.exact {
                     self.unread.count = self.unread.count.saturating_add(1);
                 }
                 n.read = false;
@@ -1410,6 +1412,26 @@ mod tests {
         s.mark_local("a");
         s.mark_local("a");
         assert!(status_text(&s).contains("1 unread"));
+    }
+
+    #[test]
+    fn marking_a_row_read_leaves_a_capped_count_at_99_plus() {
+        // v0.9.0 shows "99+" only while an inexact count sits at 100, so the
+        // optimistic decrement must not knock it to "99".
+        let mut s = NotificationsScreen::new();
+        seed(
+            &mut s,
+            vec![notif("a", NotificationType::Poke, None, None)],
+            None,
+        );
+        s.set_unread_count(UnreadCount {
+            count: 100,
+            exact: false,
+        });
+        s.mark_local("a");
+        assert!(status_text(&s).contains("99+"), "{}", status_text(&s));
+        s.unmark_local("a");
+        assert!(status_text(&s).contains("99+"), "{}", status_text(&s));
     }
 
     #[test]

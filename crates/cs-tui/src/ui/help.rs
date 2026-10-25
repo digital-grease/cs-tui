@@ -143,6 +143,10 @@ const POSTS: &[Row] = &[
         desc: "flag an entry or reply for review, with an optional reason",
     },
     Row {
+        keys: "v",
+        desc: "show / hide a post behind its content warning (post detail)",
+    },
+    Row {
         keys: "",
         desc: "the server allows an edit for 5 minutes after posting, on supporter accounts",
     },
@@ -369,7 +373,7 @@ const JUKEBOX: &[Row] = &[
     },
     Row {
         keys: "[ / ]",
-        desc: "volume down / up (needs mpv + yt-dlp)",
+        desc: "volume down / up (playback needs mpv, and yt-dlp for YouTube)",
     },
 ];
 

@@ -730,14 +730,16 @@ impl ProfileScreen {
                 if pinned.as_deref() == Some(e.post_id.as_str()) {
                     header.push(Span::styled(" · 📌 pinned", theme.warning_style()));
                 }
-                vec![
-                    Line::from(header),
-                    Line::from(Span::styled(
+                // v0.9.0: a warned post shows its warning in place of the
+                // body, the same as every other list.
+                let preview = match e.cw() {
+                    Some(cw) => super::cw::cw_line(cw, 160, theme),
+                    None => Line::from(Span::styled(
                         super::text::first_line_truncated(&e.content, 160),
                         theme.base(),
                     )),
-                    Line::from(""),
-                ]
+                };
+                vec![Line::from(header), preview, Line::from("")]
             },
         );
     }

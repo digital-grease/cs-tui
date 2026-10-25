@@ -1250,8 +1250,8 @@ fn body_rows(msg: ChatMessage<'_>, layout: BodyLayout<'_>) -> Vec<BodyRow> {
         );
     }
     // A still image becomes a reserved gap when the screen can paint one, and
-    // an `[image]` chip otherwise. Only the still image: a GIF cannot be
-    // animated here and a song is not a picture, so both keep their chips.
+    // an `[image]` chip otherwise. Only a still image, a track's cover included:
+    // a GIF cannot be animated here, and a track keeps its chip either way.
     let inline_url = layout.image_rows.and_then(|_| inline_image_url(msg.extras));
     if let (Some(rows_reserved), Some(url)) = (layout.image_rows, inline_url.as_deref()) {
         rows.push(BodyRow::ImageGap {
@@ -1384,17 +1384,30 @@ pub fn fitted_image_rows(img: (u32, u32), cols: u16, font: (u16, u16), max: u16)
 
 /// The still image a screen could paint inline for this message, if any.
 ///
-/// Only `imageUrl`. A GIF is animated and this pipeline draws one static frame,
-/// so showing it inline would silently misrepresent it; a song has no picture at
-/// all. Both keep their chips and open in a real viewer.
+/// `imageUrl`, or failing that a track's `cover`: a website upload (`origin:
+/// "latex"`, v0.9.0 § Message fields) names its cover art, which is drawn under
+/// the track's chip the way post detail draws an entry's. Never a GIF, which is
+/// animated while this pipeline draws one static frame, so showing it inline
+/// would silently misrepresent it; it keeps its chip and opens in a real
+/// viewer. A YouTube track carries no cover and gets none here.
+///
+/// Every chat screen fetches, reserves rows for and paints exactly this URL,
+/// so the cover needs nothing beyond being returned.
 #[must_use]
 pub fn inline_image_url(extras: &MessageExtras) -> Option<String> {
-    extras
-        .image_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|u| !u.is_empty())
-        .map(str::to_string)
+    let clean = |u: Option<&str>| {
+        u.map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(str::to_string)
+    };
+    clean(extras.image_url.as_deref()).or_else(|| {
+        clean(
+            extras
+                .audio_attachment
+                .as_ref()
+                .and_then(|a| a.cover.as_deref()),
+        )
+    })
 }
 
 /// The attachment chips a message carries, already truncated to `width`.
@@ -1620,11 +1633,58 @@ mod tests {
             artist: artist.into(),
             title: title.into(),
             genre: genre.map(str::to_string),
+            cover: None,
         }
     }
 
     fn layout(width: usize) -> BodyLayout<'static> {
         BodyLayout::new(width)
+    }
+
+    #[test]
+    fn a_tracks_cover_is_the_inline_picture_when_there_is_no_image() {
+        let mut upload = track("A", "T", None);
+        upload.src = "https://bunker.cyberspace.online/a.mp3".into();
+        upload.origin = "latex".into();
+        upload.cover = Some(" https://bunker.cyberspace.online/a.jpg ".into());
+        let extras = MessageExtras {
+            audio_attachment: Some(upload),
+            ..MessageExtras::default()
+        };
+        assert_eq!(
+            inline_image_url(&extras).as_deref(),
+            Some("https://bunker.cyberspace.online/a.jpg")
+        );
+
+        // An attached image still wins, and a YouTube track has no cover.
+        let both = MessageExtras {
+            image_url: Some("https://cdn.example/pic.png".into()),
+            ..extras.clone()
+        };
+        assert_eq!(
+            inline_image_url(&both).as_deref(),
+            Some("https://cdn.example/pic.png")
+        );
+        let youtube = MessageExtras {
+            audio_attachment: Some(track("A", "T", None)),
+            ..MessageExtras::default()
+        };
+        assert_eq!(inline_image_url(&youtube), None);
+    }
+
+    #[test]
+    fn a_cover_drawn_inline_keeps_the_tracks_chip() {
+        let mut upload = track("A", "T", None);
+        upload.src = "https://bunker.cyberspace.online/a.mp3".into();
+        upload.cover = Some("https://bunker.cyberspace.online/a.jpg".into());
+        let extras = MessageExtras {
+            audio_attachment: Some(upload),
+            ..MessageExtras::default()
+        };
+        let drawn = inline_image_url(&extras);
+        let chips = chips_of(&extras, 80, drawn.as_deref());
+        assert_eq!(chips.len(), 1, "the track is still playable from its chip");
+        assert_eq!(chips[0].url, "https://bunker.cyberspace.online/a.mp3");
     }
 
     /// The rendered text of each body row, indent included.

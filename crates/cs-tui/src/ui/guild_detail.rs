@@ -913,22 +913,29 @@ fn thread_item<'a>(t: &'a GuildThread, theme: &Theme) -> ListItem<'a> {
             theme.muted_style(),
         ),
     ];
-    if super::images::has_image(e) {
+    if !super::cw::masked(e) && super::images::has_image(e) {
         header_spans.push(Span::styled(" · [image]", theme.accent_style()));
     }
     let mut lines = vec![Line::from(header_spans)];
-    if let Some(title) = e.title.as_deref() {
-        let title = title.trim();
-        if !title.is_empty() {
-            lines.push(Line::from(Span::styled(
-                super::text::first_line_truncated(title, 200),
-                theme.accent_style(),
-            )));
+    // A thread is an entry (§ Guilds), so a warned one is listed by its
+    // warning alone, as in every other list (v0.9.0).
+    if let Some(cw) = e.cw() {
+        lines.push(super::cw::cw_line(cw, 200, theme));
+    } else {
+        if let Some(title) = e.title.as_deref() {
+            let title = title.trim();
+            if !title.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    super::text::first_line_truncated(title, 200),
+                    theme.accent_style(),
+                )));
+            }
         }
-    }
-    let snippet = super::markdown::content_preview(&e.content, crate::config::get().preview_length);
-    if !snippet.is_empty() {
-        lines.push(Line::from(Span::styled(snippet, theme.base())));
+        let snippet =
+            super::markdown::content_preview(&e.content, crate::config::get().preview_length);
+        if !snippet.is_empty() {
+            lines.push(Line::from(Span::styled(snippet, theme.base())));
+        }
     }
     if !crate::config::get().compact {
         lines.push(Line::from(""));
@@ -986,6 +993,29 @@ mod tests {
             ..Default::default()
         };
         GuildThread { entry }
+    }
+
+    #[test]
+    fn a_warned_thread_is_listed_by_its_warning() {
+        let mut t = thread("p1");
+        t.entry.title = Some("Hidden Title".into());
+        t.entry.content_warning = Some("spiders".into());
+        let item = thread_item(&t, &Theme::cyber());
+        let backend = ratatui::backend::TestBackend::new(80, 3);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| f.render_widget(ratatui::widgets::List::new(vec![item]), f.area()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("CW: spiders"), "{text}");
+        assert!(!text.contains("Hidden Title"), "{text}");
+        assert!(!text.contains("thread p1"), "{text}");
     }
 
     #[test]

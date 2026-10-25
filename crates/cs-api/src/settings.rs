@@ -1,4 +1,4 @@
-//! User settings (`/v1/settings`, API v0.8.10 § Settings).
+//! User settings (`/v1/settings`, API v0.9.0 § Settings).
 //!
 //! The spec lists known fields, but some (`keyboardBindings`,
 //! `mutedUsersByRoom`) are opaque JSON. `Settings` decodes everything verbatim
@@ -19,6 +19,31 @@ use serde::{Deserialize, Serialize};
 use crate::client::Client;
 use crate::endpoint::EndpointKey;
 use crate::error::Result;
+
+/// The values `imagePixelSize` takes (v0.9.0 § Settings), coarsest first.
+pub const IMAGE_PIXEL_SIZES: &[&str] = &["rough", "medium", "sharp", "crisp"];
+
+/// The hue, in degrees, the website gives `username` when `colorNicknames` is
+/// on (v0.9.0 § Settings): a 32-bit FNV-1a hash of the lower-cased username,
+/// modulo 360. Lightness is left to the caller, to suit its background.
+///
+/// Hashed over UTF-16 code units, which is what a JavaScript FNV-1a over
+/// `charCodeAt` sees. For an ASCII handle that is the same as hashing bytes;
+/// for a name with any other letter in it, hashing UTF-8 bytes instead would
+/// give a different colour from the website's.
+#[must_use]
+pub fn nickname_hue(username: &str) -> u16 {
+    const FNV_OFFSET_BASIS: u32 = 0x811c_9dc5;
+    const FNV_PRIME: u32 = 0x0100_0193;
+    let hash = username
+        .to_lowercase()
+        .encode_utf16()
+        .fold(FNV_OFFSET_BASIS, |hash, unit| {
+            (hash ^ u32::from(unit)).wrapping_mul(FNV_PRIME)
+        });
+    // `hash % 360` is below 360, so it always fits.
+    u16::try_from(hash % 360).unwrap_or_default()
+}
 
 /// User-settable notification preferences (sub-object of `Settings`).
 ///
@@ -70,8 +95,19 @@ pub struct Settings {
 
     #[serde(default)]
     pub icon_theme: Option<String>,
+    /// One of `rough`, `medium`, `sharp`, `crisp` (v0.9.0 § Settings). See
+    /// [`IMAGE_PIXEL_SIZES`].
     #[serde(default)]
     pub image_pixel_size: Option<String>,
+    /// Render images in colour rather than the theme's foreground and
+    /// background (v0.9.0 § Settings). Default off. A website rendering
+    /// preference; this client already draws images in full colour.
+    #[serde(default)]
+    pub image_color: Option<bool>,
+    /// Colour usernames in cIRC message lines (v0.9.0 § Settings). Default
+    /// off. The website takes the hue from [`nickname_hue`].
+    #[serde(default)]
+    pub color_nicknames: Option<bool>,
     #[serde(default)]
     pub time_display_format: Option<String>,
     #[serde(default)]
@@ -236,6 +272,10 @@ pub struct SettingsUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_pixel_size: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_color: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color_nicknames: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub time_display_format: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keyboard_preset: Option<String>,
@@ -261,6 +301,8 @@ impl SettingsUpdate {
             && self.default_public_post.is_none()
             && self.icon_theme.is_none()
             && self.image_pixel_size.is_none()
+            && self.image_color.is_none()
+            && self.color_nicknames.is_none()
             && self.time_display_format.is_none()
             && self.keyboard_preset.is_none()
             && self.followed_topics.is_none()
@@ -363,6 +405,47 @@ mod tests {
         let v: serde_json::Value = serde_json::to_value(&u).unwrap();
         assert_eq!(v["showGuildPostsInFeed"], true);
         assert_eq!(v.as_object().unwrap().len(), 1, "no other field is sent");
+    }
+
+    #[test]
+    fn the_v090_image_and_nickname_fields_round_trip() {
+        let s: Settings = serde_json::from_str(
+            r#"{"imagePixelSize":"crisp","imageColor":true,"colorNicknames":false}"#,
+        )
+        .unwrap();
+        assert_eq!(s.image_pixel_size.as_deref(), Some("crisp"));
+        assert_eq!(s.image_color, Some(true));
+        assert_eq!(s.color_nicknames, Some(false));
+        assert!(s.extra.is_empty(), "both are modelled, not left in extra");
+
+        let u = SettingsUpdate {
+            image_color: Some(false),
+            color_nicknames: Some(true),
+            ..Default::default()
+        };
+        assert!(!u.is_empty());
+        assert_eq!(
+            serde_json::to_string(&u).unwrap(),
+            r#"{"imageColor":false,"colorNicknames":true}"#
+        );
+    }
+
+    #[test]
+    fn nickname_hue_is_fnv1a_of_the_lower_cased_name_mod_360() {
+        // FNV-1a 32-bit reference values: "" hashes to the offset basis
+        // 0x811c9dc5 and "a" to 0xe40c292c.
+        assert_eq!(nickname_hue(""), (0x811c_9dc5_u32 % 360) as u16);
+        assert_eq!(nickname_hue("a"), (0xe40c_292c_u32 % 360) as u16);
+        // "foobar" is the other classic test vector: 0xbf9cf968.
+        assert_eq!(nickname_hue("foobar"), (0xbf9c_f968_u32 % 360) as u16);
+        assert_eq!(nickname_hue("FooBar"), nickname_hue("foobar"));
+        // A non-ASCII letter goes in as one UTF-16 unit (U+00EB), not as its
+        // two UTF-8 bytes, matching `charCodeAt` on the website.
+        let utf16 = [0x7a_u32, 0x6f, 0xeb]
+            .iter()
+            .fold(0x811c_9dc5_u32, |h, u| (h ^ u).wrapping_mul(0x0100_0193));
+        assert_eq!(nickname_hue("zoë"), (utf16 % 360) as u16);
+        assert!(nickname_hue("trinity") < 360);
     }
 
     #[test]

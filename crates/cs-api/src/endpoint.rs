@@ -1,6 +1,6 @@
 //! Endpoint keys for rate-limiter accounting. One variant per documented endpoint.
 //!
-//! Rate-limit values come from the v0.8.10 spec (§ Rate Limits, plus each
+//! Rate-limit values come from the v0.9.0 spec (§ Rate Limits, plus each
 //! endpoint's own section). Where the consolidated table and the per-endpoint
 //! section disagree, the lower (more restrictive) value is used so the client
 //! cannot self-trigger 429s.
@@ -211,8 +211,11 @@ impl EndpointKey {
             | WatchStatus
             | WatchesList
             | CmailList
-            | CircList
-            | Search => RateLimit::per_minute(30),
+            | CircList => RateLimit::per_minute(30),
+            // § Search: "30/min, 60/hour, 200/day" since v0.9.0. Every search
+            // bills a monthly quota shared by the whole site, so the hour and
+            // day caps matter far more than the minute one.
+            Search => RateLimit::full(30, 60, 200),
             // Polling reads added in v0.8.4 (§ Rate Limits, Read Actions):
             // "Check C-Mail typing" and "List who's in a cIRC room". Neither row
             // carries a per-conversation or per-room qualifier, so both are
@@ -560,6 +563,15 @@ mod tests {
             assert!(rl.per_day.is_none(), "{key:?}");
             assert!(key.scoped_rate_limit().is_none(), "{key:?}");
         }
+    }
+
+    #[test]
+    fn search_carries_the_v090_hourly_and_daily_caps() {
+        // § Search: "Rate limit: 30/min, 60/hour, 200/day."
+        let rl = EndpointKey::Search.rate_limit();
+        assert_eq!(rl.per_minute, Some(30));
+        assert_eq!(rl.per_hour, Some(60));
+        assert_eq!(rl.per_day, Some(200));
     }
 
     #[test]

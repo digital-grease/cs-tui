@@ -1,4 +1,4 @@
-//! Which slash commands the server will recognize (API v0.8.6, § Commands).
+//! Which slash commands the server will recognize (API v0.9.0, § Commands).
 //!
 //! Both cIRC and C-Mail expand slash commands server-side, and anything that
 //! is not a command is posted as plain text. That is the problem this module
@@ -45,8 +45,8 @@ const BASE: [&str; 12] = [
     "img",
 ];
 
-/// Commands only a cIRC room accepts.
-const CIRC_ONLY: [&str; 5] = ["art", "mute", "unmute", "muted", "unmuteall"];
+/// Commands only a cIRC room accepts. `/localtime` arrived in v0.9.0.
+const CIRC_ONLY: [&str; 6] = ["art", "mute", "unmute", "muted", "unmuteall", "localtime"];
 
 /// The twelve text styles, each usable alone or chained with `+`.
 const STYLES: [&str; 12] = [
@@ -105,6 +105,48 @@ pub fn is_known(draft: &str, surface: Surface) -> bool {
         return true;
     }
     surface == Surface::Circ && CIRC_ONLY.contains(&name.as_str())
+}
+
+/// Fill in a bare `/localtime` (v0.9.0 § Commands).
+///
+/// The command posts "It's HH:MM o'clock where @you is", and the spec is plain
+/// that the time has to come from the client: "Pass your local time, 24h; the
+/// server can't see your clock." So `/localtime` on its own is completed here
+/// to `/localtime HH:MM` from `clock`, the reader's local hour and minute.
+///
+/// `clock` is `None` when this client does not know the reader's time, which
+/// is the case until they set `timezone` in config.toml: guessing UTC would
+/// announce the wrong time to the whole room, so a bare command is refused
+/// with the message to show instead. A `/localtime` that already carries an
+/// argument, and anything that is not `/localtime` at all, passes through
+/// untouched; checking the `HH:MM` is the server's job.
+pub fn complete_localtime(draft: &str, clock: Option<(u8, u8)>) -> Result<String, &'static str> {
+    let trimmed = draft.trim();
+    if !trimmed.eq_ignore_ascii_case("/localtime") {
+        return Ok(draft.to_string());
+    }
+    match clock {
+        Some((hour, minute)) => Ok(format!("/localtime {hour:02}:{minute:02}")),
+        None => Err("/localtime needs your time: /localtime HH:MM, or set timezone in config.toml"),
+    }
+}
+
+/// Restate a `/localtime HH:MM` with the time it is now, for a retry.
+///
+/// The command means "it is this time where I am", so a send that failed and
+/// is retried twenty minutes later must not announce the old time. Only the
+/// exact shape [`complete_localtime`] produces is touched, and only when the
+/// clock is known; anything else is resent as it was.
+#[must_use]
+pub fn refresh_localtime(content: &str, clock: Option<(u8, u8)>) -> String {
+    let is_filled = content.strip_prefix("/localtime ").is_some_and(|t| {
+        let b = t.as_bytes();
+        b.len() == 5 && b[2] == b':' && [b[0], b[1], b[3], b[4]].iter().all(u8::is_ascii_digit)
+    });
+    match clock {
+        Some((hour, minute)) if is_filled => format!("/localtime {hour:02}:{minute:02}"),
+        _ => content.to_string(),
+    }
 }
 
 /// Whether a `+`-joined name is a legal style chain.
@@ -187,6 +229,53 @@ mod tests {
                 !is_known(name, Surface::Cmail),
                 "{name} is cIRC-only per the spec, and is a 400 in C-Mail"
             );
+        }
+    }
+
+    #[test]
+    fn localtime_is_a_circ_only_command() {
+        assert!(is_known("/localtime 21:30", Surface::Circ));
+        assert!(is_known("/localtime", Surface::Circ));
+        assert!(!is_known("/localtime 21:30", Surface::Cmail));
+    }
+
+    #[test]
+    fn a_bare_localtime_is_filled_from_the_readers_clock() {
+        assert_eq!(
+            complete_localtime("/localtime", Some((9, 5))).as_deref(),
+            Ok("/localtime 09:05")
+        );
+        assert_eq!(
+            complete_localtime("  /LocalTime  ", Some((21, 30))).as_deref(),
+            Ok("/localtime 21:30")
+        );
+    }
+
+    #[test]
+    fn a_bare_localtime_without_a_known_clock_is_refused() {
+        assert!(complete_localtime("/localtime", None).is_err());
+    }
+
+    #[test]
+    fn localtime_with_an_argument_and_other_drafts_pass_through() {
+        for draft in ["/localtime 07:45", "hello", "/me waves", "/localtimes"] {
+            assert_eq!(complete_localtime(draft, None).as_deref(), Ok(draft));
+        }
+    }
+
+    #[test]
+    fn a_retried_localtime_states_the_time_it_is_now() {
+        assert_eq!(
+            refresh_localtime("/localtime 21:30", Some((21, 50))),
+            "/localtime 21:50"
+        );
+        // Without a clock there is nothing better to send.
+        assert_eq!(
+            refresh_localtime("/localtime 21:30", None),
+            "/localtime 21:30"
+        );
+        for other in ["/localtime", "/localtime 9:30", "/localtime soon", "hello"] {
+            assert_eq!(refresh_localtime(other, Some((1, 2))), other);
         }
     }
 

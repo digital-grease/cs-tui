@@ -3,6 +3,15 @@
 //! Opened globally with Ctrl+F and pushed like any transient screen. Shows the
 //! grouped preview (`type=all`): up to 8 hits per group, navigable as one
 //! flattened list, opening the selected hit into its post or profile.
+//!
+//! **Post hits are checked before they are previewed.** An entry can carry a
+//! content warning (v0.9.0), and the preview has to honour it like every other
+//! list, but § Search does not list `contentWarning` among a post hit's fields.
+//! So unless a hit carries the warning itself, its entry is read
+//! (`GET /v1/posts/:id`, the read opening it would make anyway) and the hit
+//! shows only its author until that answer arrives. See [`PostCheck`].
+use std::collections::HashMap;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use cs_api::{PostHit, ReplyHit, SearchPreview, UserHit};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -30,6 +39,18 @@ pub enum SearchIntent {
     None,
 }
 
+/// What reading a post hit's entry said about its content warning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostCheck {
+    /// No warning: the hit's title and text can be shown.
+    Clear,
+    /// Warned: the hit is listed by this warning alone.
+    Warned(String),
+    /// The read failed (a deleted post, a network error), so whether it is
+    /// warned is unknown and its text stays hidden.
+    Unavailable,
+}
+
 /// One navigable result row (borrowed from the preview groups).
 enum Row<'a> {
     User(&'a UserHit),
@@ -47,6 +68,9 @@ pub struct SearchScreen {
     error: Option<String>,
     /// Index into the flattened result rows.
     selected: usize,
+    /// Content-warning checks for the post hits, by post id. A hit with no
+    /// entry here is still being checked.
+    checked: HashMap<String, PostCheck>,
 }
 
 impl SearchScreen {
@@ -59,6 +83,45 @@ impl SearchScreen {
             loading: false,
             error: None,
             selected: 0,
+            checked: HashMap::new(),
+        }
+    }
+
+    /// The post hits whose entries still need reading for a content warning:
+    /// every one that neither carries a warning itself nor has been checked.
+    #[must_use]
+    pub fn posts_to_check(&self) -> Vec<String> {
+        self.results.as_ref().map_or_else(Vec::new, |r| {
+            r.posts
+                .iter()
+                .filter(|p| p.cw().is_none() && !self.checked.contains_key(&p.post_id))
+                .map(|p| p.post_id.clone())
+                .collect()
+        })
+    }
+
+    /// Record what reading `post_id`'s entry said.
+    pub fn apply_post_check(&mut self, post_id: String, check: PostCheck) {
+        self.checked.insert(post_id, check);
+    }
+
+    /// What a post hit is listed as: its warning, its title or text once known
+    /// to be clear, or only a placeholder until then.
+    fn post_label(&self, p: &PostHit) -> String {
+        let warning = |cw: &str| format!("CW: {}", one_line_preview(cw, 60));
+        if let Some(cw) = p.cw() {
+            return warning(cw);
+        }
+        match self.checked.get(&p.post_id) {
+            Some(PostCheck::Warned(cw)) => warning(cw),
+            Some(PostCheck::Clear) => p
+                .title
+                .as_deref()
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| one_line_preview(&p.content, 60)),
+            Some(PostCheck::Unavailable) => "(preview unavailable)".to_string(),
+            None => "checking…".to_string(),
         }
     }
 
@@ -160,6 +223,9 @@ impl SearchScreen {
                 self.results = Some(preview);
                 self.selected = 0;
                 self.error = None;
+                // A fresh search re-checks: a warning can be added or lifted
+                // in the meantime, and the next read is at most eight posts.
+                self.checked.clear();
             }
             Err(msg) => self.error = Some(msg),
         }
@@ -245,12 +311,9 @@ impl SearchScreen {
         if !r.posts.is_empty() {
             lines.push(section_header("Posts", theme));
             for p in &r.posts {
-                let title = p
-                    .title
-                    .as_deref()
-                    .filter(|t| !t.is_empty())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| one_line_preview(&p.content, 60));
+                // v0.9.0: a warned post is listed by its warning alone, and an
+                // unchecked one by nothing yet; see the module docs.
+                let title = self.post_label(p);
                 let label = format!("{title}  · @{}", p.author_username);
                 lines.push(result_line(&label, idx == sel, theme));
                 idx += 1;
@@ -323,6 +386,83 @@ mod tests {
                 ..ReplyHit::default()
             }],
         }
+    }
+
+    fn body_text(s: &SearchScreen) -> String {
+        s.body_lines(&Theme::cyber())
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|sp| sp.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_post_hit_shows_nothing_of_itself_until_checked() {
+        let mut s = SearchScreen::new();
+        s.apply_results(Ok(preview()));
+        assert_eq!(s.posts_to_check(), vec!["p1".to_string()]);
+        let text = body_text(&s);
+        assert!(text.contains("checking…"), "{text}");
+        assert!(!text.contains("hello"), "{text}");
+        assert!(text.contains("@trinity"), "the author still shows");
+
+        s.apply_post_check("p1".into(), PostCheck::Clear);
+        assert!(s.posts_to_check().is_empty());
+        assert!(body_text(&s).contains("hello"));
+    }
+
+    #[test]
+    fn a_post_hit_checked_as_warned_shows_only_the_warning() {
+        let mut s = SearchScreen::new();
+        s.apply_results(Ok(preview()));
+        s.apply_post_check("p1".into(), PostCheck::Warned("spiders".into()));
+        let text = body_text(&s);
+        assert!(text.contains("CW: spiders"), "{text}");
+        assert!(!text.contains("hello"), "{text}");
+    }
+
+    #[test]
+    fn a_failed_check_never_falls_back_to_the_text() {
+        let mut s = SearchScreen::new();
+        s.apply_results(Ok(preview()));
+        s.apply_post_check("p1".into(), PostCheck::Unavailable);
+        let text = body_text(&s);
+        assert!(text.contains("preview unavailable"), "{text}");
+        assert!(!text.contains("hello"), "{text}");
+    }
+
+    #[test]
+    fn a_new_search_checks_again() {
+        let mut s = SearchScreen::new();
+        s.apply_results(Ok(preview()));
+        s.apply_post_check("p1".into(), PostCheck::Clear);
+        s.apply_results(Ok(preview()));
+        assert_eq!(s.posts_to_check(), vec!["p1".to_string()]);
+    }
+
+    #[test]
+    fn a_warned_post_hit_is_listed_by_its_warning() {
+        let mut s = SearchScreen::new();
+        let mut results = preview();
+        results.posts[0].title = Some("Hidden Title".into());
+        results.posts[0].content_warning = Some("spiders".into());
+        s.results = Some(results);
+        // The hit says so itself, so there is nothing to read.
+        assert!(s.posts_to_check().is_empty());
+        let text: Vec<String> = s
+            .body_lines(&Theme::cyber())
+            .iter()
+            .map(|l| l.spans.iter().map(|sp| sp.content.as_ref()).collect())
+            .collect();
+        let text = text.join("\n");
+        assert!(text.contains("CW: spiders"), "{text}");
+        assert!(!text.contains("Hidden Title"), "{text}");
+        assert!(!text.contains("hello"), "{text}");
     }
 
     #[test]

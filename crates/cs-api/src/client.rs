@@ -8,7 +8,7 @@ use tokio::sync::RwLock;
 use url::Url;
 
 use crate::endpoint::EndpointKey;
-use crate::envelope::{Data, ErrorEnvelope, Page};
+use crate::envelope::{Cursor, Data, ErrorEnvelope, Page};
 use crate::error::{ApiError, ErrorCode, Result};
 use crate::rate_limit::EndpointLimiter;
 use crate::tokens::Tokens;
@@ -259,6 +259,25 @@ impl Client {
     {
         let raw = self
             .send_with_refresh::<()>(key, scope, method, path, query, None)
+            .await?;
+        let env: Page<T> = decode_body(key, &raw)?;
+        Ok((env.data, env.cursor.next()))
+    }
+
+    /// [`request_page`](Client::request_page), returning the raw [`Cursor`] so
+    /// a caller can tell an explicit `null` from a missing cursor.
+    pub(crate) async fn request_page_cursor<T>(
+        &self,
+        key: EndpointKey,
+        method: Method,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<(Vec<T>, Cursor)>
+    where
+        T: DeserializeOwned,
+    {
+        let raw = self
+            .send_with_refresh::<()>(key, None, method, path, query, None)
             .await?;
         let env: Page<T> = decode_body(key, &raw)?;
         Ok((env.data, env.cursor))

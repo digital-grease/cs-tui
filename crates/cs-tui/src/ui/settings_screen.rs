@@ -1,7 +1,7 @@
 //! Settings screen — boolean toggles + string preferences. Opaque fields are
 //! left untouched on PATCH.
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use cs_api::{NotificationPrefs, Settings, SettingsUpdate};
+use cs_api::{NotificationPrefs, Settings, SettingsUpdate, IMAGE_PIXEL_SIZES};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
@@ -27,8 +27,9 @@ enum FieldKind {
     ReadOnly,
 }
 
-/// Allowed values for `timeDisplayFormat` — the one string field with a known,
-/// applied value set. Order defines the space-cycle sequence.
+/// Allowed values for `timeDisplayFormat`. Order defines the space-cycle
+/// sequence. `imagePixelSize` is the other string field with a known value set
+/// (v0.9.0), cycled from [`IMAGE_PIXEL_SIZES`].
 const TIME_FORMATS: &[&str] = &["datetime", "relative", "unix", "swatch"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +83,13 @@ const FIELDS: &[FieldSpec] = &[
         kind: FieldKind::Bool { default_on: false },
     },
     FieldSpec {
+        key: "colorNicknames",
+        label: "colour nicknames in cIRC",
+        // § Settings (v0.9.0): "colorNicknames (default off)". Off, cs-tui
+        // keeps its own palette; on, it uses the website's hue per name.
+        kind: FieldKind::Bool { default_on: false },
+    },
+    FieldSpec {
         key: "notif.bookmark",
         label: "notify on bookmark",
         kind: FieldKind::Bool { default_on: false },
@@ -103,8 +111,16 @@ const FIELDS: &[FieldSpec] = &[
     },
     FieldSpec {
         key: "imagePixelSize",
-        label: "image pixel size",
-        kind: FieldKind::ReadOnly,
+        label: "image pixel size (website)",
+        // v0.9.0 enumerates the values, so this is no longer read-only.
+        kind: FieldKind::Choice(IMAGE_PIXEL_SIZES),
+    },
+    FieldSpec {
+        key: "imageColor",
+        label: "images in colour (website)",
+        // § Settings (v0.9.0): "imageColor (default off)". A website rendering
+        // preference; cs-tui always draws images in full colour.
+        kind: FieldKind::Bool { default_on: false },
     },
     FieldSpec {
         key: "timeDisplayFormat",
@@ -118,11 +134,9 @@ const FIELDS: &[FieldSpec] = &[
     },
 ];
 
-/// The three parallel arrays are sized to `FIELDS`, and `focused` cycles
-/// `% FIELDS.len()` before indexing them. Adding a row without growing them
-/// would panic on the last field at runtime, which no test would catch unless
-/// it happened to focus that row — so the sizes are pinned here instead.
-const _: () = assert!(FIELDS.len() == 15);
+/// The three parallel arrays are sized from `FIELDS` itself, so adding a row
+/// can never leave them short.
+const FIELD_COUNT: usize = FIELDS.len();
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SettingsIntent {
@@ -140,9 +154,9 @@ pub struct SettingsScreen {
     pub submitting: bool,
     pub focused: usize,
     /// Values keyed by FIELDS index.
-    pub bools: [Option<bool>; 15],
-    pub texts: [String; 15],
-    pub dirty: [bool; 15],
+    pub bools: [Option<bool>; FIELD_COUNT],
+    pub texts: [String; FIELD_COUNT],
+    pub dirty: [bool; FIELD_COUNT],
 }
 
 impl SettingsScreen {
@@ -153,9 +167,9 @@ impl SettingsScreen {
             error: None,
             submitting: false,
             focused: 0,
-            bools: [None; 15],
+            bools: [None; FIELD_COUNT],
             texts: std::array::from_fn(|_| String::new()),
-            dirty: [false; 15],
+            dirty: [false; FIELD_COUNT],
         }
     }
 
@@ -164,22 +178,39 @@ impl SettingsScreen {
         self.loaded = true;
         match result {
             Ok(s) => {
-                self.bools[0] = s.filter_nsfw;
-                self.bools[1] = s.show_follower_count;
-                self.bools[2] = s.hide_images_in_feed;
-                self.bools[3] = s.hide_audio_in_feed;
-                self.bools[4] = s.auto_watch_on_reply;
-                self.bools[5] = s.show_guild_posts_in_feed;
-                self.bools[6] = s.use_legacy_menu_order;
-                self.bools[7] = s.default_public_post;
-                self.bools[8] = s.notifications.bookmark;
-                self.bools[9] = s.notifications.reply;
-                self.bools[10] = s.notifications.poke;
-                self.texts[11] = s.icon_theme.unwrap_or_default();
-                self.texts[12] = s.image_pixel_size.unwrap_or_default();
-                self.texts[13] = s.time_display_format.unwrap_or_default();
-                self.texts[14] = s.keyboard_preset.unwrap_or_default();
-                self.dirty = [false; 15];
+                // Keyed rather than positional, so a row added to `FIELDS` can
+                // never shift a value onto its neighbour.
+                for (i, field) in FIELDS.iter().enumerate() {
+                    match field.key {
+                        "filterNSFW" => self.bools[i] = s.filter_nsfw,
+                        "showFollowerCount" => self.bools[i] = s.show_follower_count,
+                        "hideImagesInFeed" => self.bools[i] = s.hide_images_in_feed,
+                        "hideAudioInFeed" => self.bools[i] = s.hide_audio_in_feed,
+                        "autoWatchOnReply" => self.bools[i] = s.auto_watch_on_reply,
+                        "showGuildPostsInFeed" => self.bools[i] = s.show_guild_posts_in_feed,
+                        "useLegacyMenuOrder" => self.bools[i] = s.use_legacy_menu_order,
+                        "defaultPublicPost" => self.bools[i] = s.default_public_post,
+                        "colorNicknames" => self.bools[i] = s.color_nicknames,
+                        "imageColor" => self.bools[i] = s.image_color,
+                        "notif.bookmark" => self.bools[i] = s.notifications.bookmark,
+                        "notif.reply" => self.bools[i] = s.notifications.reply,
+                        "notif.poke" => self.bools[i] = s.notifications.poke,
+                        "iconTheme" => self.texts[i] = s.icon_theme.clone().unwrap_or_default(),
+                        "imagePixelSize" => {
+                            self.texts[i] = s.image_pixel_size.clone().unwrap_or_default();
+                        }
+                        "timeDisplayFormat" => {
+                            self.texts[i] = s.time_display_format.clone().unwrap_or_default();
+                        }
+                        "keyboardPreset" => {
+                            self.texts[i] = s.keyboard_preset.clone().unwrap_or_default();
+                        }
+                        // Every key above is in `FIELDS`;
+                        // `every_field_loads_from_the_server` pins that.
+                        _ => {}
+                    }
+                }
+                self.dirty = [false; FIELD_COUNT];
                 self.error = None;
             }
             Err(msg) => self.error = Some(msg),
@@ -249,7 +280,7 @@ impl SettingsScreen {
         if let Err(msg) = result {
             self.error = Some(msg);
         } else {
-            self.dirty = [false; 15];
+            self.dirty = [false; FIELD_COUNT];
         }
     }
 
@@ -270,6 +301,8 @@ impl SettingsScreen {
                 "showGuildPostsInFeed" => u.show_guild_posts_in_feed = self.bools[i],
                 "useLegacyMenuOrder" => u.use_legacy_menu_order = self.bools[i],
                 "defaultPublicPost" => u.default_public_post = self.bools[i],
+                "colorNicknames" => u.color_nicknames = self.bools[i],
+                "imageColor" => u.image_color = self.bools[i],
                 "notif.bookmark" => {
                     notif.bookmark = self.bools[i];
                     notif_dirty = true;
@@ -283,8 +316,9 @@ impl SettingsScreen {
                     notif_dirty = true;
                 }
                 "timeDisplayFormat" => u.time_display_format = Some(self.texts[i].clone()),
-                // iconTheme / imagePixelSize / keyboardPreset are read-only here
-                // (never dirty), so they're intentionally never PATCHed.
+                "imagePixelSize" => u.image_pixel_size = Some(self.texts[i].clone()),
+                // iconTheme / keyboardPreset are read-only here (never dirty),
+                // so they're intentionally never PATCHed.
                 _ => {}
             }
         }
@@ -432,6 +466,73 @@ mod tests {
             .iter()
             .position(|f| f.key == key)
             .unwrap_or_else(|| panic!("no settings field {key:?}"))
+    }
+
+    #[test]
+    fn every_field_loads_from_the_server() {
+        // A key missing from `apply_loaded` would silently show its default.
+        let mut s = SettingsScreen::new();
+        s.apply_loaded(Ok(Settings {
+            filter_nsfw: Some(true),
+            show_follower_count: Some(true),
+            hide_images_in_feed: Some(true),
+            hide_audio_in_feed: Some(true),
+            auto_watch_on_reply: Some(true),
+            show_guild_posts_in_feed: Some(true),
+            use_legacy_menu_order: Some(true),
+            default_public_post: Some(true),
+            color_nicknames: Some(true),
+            image_color: Some(true),
+            notifications: NotificationPrefs {
+                bookmark: Some(true),
+                reply: Some(true),
+                poke: Some(true),
+                ..Default::default()
+            },
+            icon_theme: Some("x".into()),
+            image_pixel_size: Some("x".into()),
+            time_display_format: Some("x".into()),
+            keyboard_preset: Some("x".into()),
+            ..Default::default()
+        }));
+        for (i, f) in FIELDS.iter().enumerate() {
+            match f.kind {
+                FieldKind::Bool { .. } => assert_eq!(s.bools[i], Some(true), "{}", f.key),
+                _ => assert_eq!(s.texts[i], "x", "{}", f.key),
+            }
+        }
+    }
+
+    #[test]
+    fn the_v090_toggles_round_trip() {
+        let mut s = SettingsScreen::new();
+        s.apply_loaded(Ok(Settings::default()));
+        for key_name in ["colorNicknames", "imageColor"] {
+            let i = idx(key_name);
+            assert_eq!(s.bools[i], None);
+            s.focused = i;
+            s.handle_key(key(KeyCode::Char(' '), KeyModifiers::empty()));
+            assert_eq!(s.bools[i], Some(true), "default off, so on: {key_name}");
+        }
+        let u = s.build_update();
+        assert_eq!(u.color_nicknames, Some(true));
+        assert_eq!(u.image_color, Some(true));
+    }
+
+    #[test]
+    fn image_pixel_size_cycles_the_v090_values() {
+        let mut s = SettingsScreen::new();
+        s.apply_loaded(Ok(Settings {
+            image_pixel_size: Some("sharp".into()),
+            ..Default::default()
+        }));
+        let i = idx("imagePixelSize");
+        s.focused = i;
+        s.handle_key(key(KeyCode::Char(' '), KeyModifiers::empty()));
+        assert_eq!(s.texts[i], "crisp");
+        s.handle_key(key(KeyCode::Char(' '), KeyModifiers::empty()));
+        assert_eq!(s.texts[i], "rough", "wraps to the coarsest");
+        assert_eq!(s.build_update().image_pixel_size.as_deref(), Some("rough"));
     }
 
     #[test]

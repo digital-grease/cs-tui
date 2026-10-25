@@ -1,4 +1,4 @@
-//! Optional message fields shared by cIRC and C-Mail (API v0.8.4, § Message
+//! Optional message fields shared by cIRC and C-Mail (API v0.9.0, § Message
 //! fields under Commands).
 //!
 //! Both chat systems expand the same slash commands server-side, so both come
@@ -23,12 +23,13 @@ use crate::types::null_as_default;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioAttachment {
-    /// The track URL, a YouTube link in practice.
+    /// The track URL: a YouTube link, or a direct MP3 for a `latex` track.
     #[serde(default, deserialize_with = "null_as_default")]
     pub src: String,
 
-    /// Documented as `"youtube"`. Kept a `String` rather than an enum so a new
-    /// origin cannot fail the decode of the whole message.
+    /// `"youtube"` or `"latex"` (v0.9.0 § Message fields). Kept a `String`
+    /// rather than an enum so a new origin cannot fail the decode of the whole
+    /// message.
     #[serde(default, deserialize_with = "null_as_default")]
     pub origin: String,
 
@@ -43,6 +44,10 @@ pub struct AudioAttachment {
     /// Optional: the `/song` syntax makes the trailing genre field optional.
     #[serde(default)]
     pub genre: Option<String>,
+
+    /// Cover art URL, carried by a `latex` track (v0.9.0 § Message fields).
+    #[serde(default)]
+    pub cover: Option<String>,
 }
 
 /// The `style` field, which is either one style name or an array of them.
@@ -303,6 +308,20 @@ mod tests {
         )
         .unwrap();
         assert!(no_genre.audio_attachment.unwrap().genre.is_none());
+    }
+
+    #[test]
+    fn a_latex_track_keeps_its_cover() {
+        let extras: MessageExtras = serde_json::from_str(
+            r#"{"audioAttachment":{"src":"https://bunker.cyberspace.online/a.mp3","origin":"latex","cover":"https://bunker.cyberspace.online/a.jpg","artist":"A","title":"T","genre":"ambient"}}"#,
+        )
+        .unwrap();
+        let audio = extras.audio_attachment.expect("audioAttachment");
+        assert_eq!(audio.origin, "latex");
+        assert_eq!(
+            audio.cover.as_deref(),
+            Some("https://bunker.cyberspace.online/a.jpg")
+        );
     }
 
     #[test]

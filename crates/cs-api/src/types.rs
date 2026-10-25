@@ -24,9 +24,15 @@ pub const MAX_AUDIO_TITLE_LEN: usize = 150;
 /// See [`MAX_AUDIO_ARTIST_LEN`].
 pub const MAX_AUDIO_GENRE_LEN: usize = 50;
 
-/// The `origin` every audio attachment carries (v0.8.10 § Create Entry). The
-/// only source the API takes is YouTube.
+/// The `origin` every audio attachment written through the API carries
+/// (v0.8.10 § Create Entry). The only source the API takes is YouTube.
 pub const AUDIO_ORIGIN_YOUTUBE: &str = "youtube";
+
+/// The other `origin` a track can arrive with (v0.9.0 § Create Entry,
+/// § Message fields): an upload made on the website, with a direct MP3 `src`
+/// and a `cover` image URL. Read-only for this client; the API accepts YouTube
+/// only on the write path.
+pub const AUDIO_ORIGIN_LATEX: &str = "latex";
 
 /// Hosts a jukebox `src` may name. `youtube.com` covers the `watch?v=` and
 /// `/shorts/` forms, `youtu.be` the short links, and the `m.` / `music.`
@@ -118,6 +124,13 @@ pub struct Entry {
     #[serde(default, rename = "isNSFW", deserialize_with = "null_as_default")]
     pub is_nsfw: bool,
 
+    /// A short phrase readers see before the entry (v0.9.0 § Create Entry, max
+    /// 60 characters). While it is set, the title, body and attachments stay
+    /// hidden behind `CW: <warning>` until the reader asks to see them; see
+    /// [`Entry::cw`], which is what a renderer should read.
+    #[serde(default)]
+    pub content_warning: Option<String>,
+
     #[serde(default, deserialize_with = "null_as_default")]
     pub attachments: Vec<Attachment>,
 
@@ -157,6 +170,19 @@ pub struct Entry {
 }
 
 impl Entry {
+    /// The entry's content warning, trimmed, or `None` when it has none.
+    ///
+    /// A blank warning is no warning: § Edit Entry removes one by sending `""`,
+    /// and a server that stores that literally must not leave the entry masked
+    /// behind an empty `CW:`.
+    #[must_use]
+    pub fn cw(&self) -> Option<&str> {
+        self.content_warning
+            .as_deref()
+            .map(str::trim)
+            .filter(|cw| !cw.is_empty())
+    }
+
     /// The guild slug this entry is a forum thread in, or `None` for an
     /// ordinary entry.
     ///
@@ -239,12 +265,19 @@ pub enum Attachment {
         height: u32,
     },
     /// A jukebox track, the same shape `/song` produces in chat.
+    ///
+    /// `origin` is `"youtube"` or, for a track uploaded on the website,
+    /// `"latex"` (v0.9.0), whose `src` is a direct MP3 and which carries a
+    /// `cover` image URL. Kept a `String` so a third origin still decodes.
     Audio {
         src: String,
         origin: String,
         artist: String,
         title: String,
         genre: String,
+        /// Cover art URL. Sent by the server for a `latex` track; a YouTube
+        /// track has none and its thumbnail is derived from `src` instead.
+        cover: Option<String>,
     },
     /// An attachment this client does not understand, held exactly as it
     /// arrived.
@@ -278,6 +311,7 @@ impl Attachment {
             artist: artist.into(),
             title: title.into(),
             genre: genre.into(),
+            cover: None,
         }
     }
 }
@@ -345,6 +379,7 @@ pub fn validate_write_attachments(attachments: &[Attachment]) -> Result<()> {
                 artist,
                 title,
                 genre,
+                ..
             } => validate_audio_attachment(src, origin, artist, title, genre)?,
             Attachment::Unknown(_) => {}
         }
@@ -429,6 +464,8 @@ enum KnownAttachment {
         title: String,
         #[serde(default, deserialize_with = "null_as_default")]
         genre: String,
+        #[serde(default)]
+        cover: Option<String>,
     },
 }
 
@@ -442,12 +479,14 @@ impl From<KnownAttachment> for Attachment {
                 artist,
                 title,
                 genre,
+                cover,
             } => Self::Audio {
                 src,
                 origin,
                 artist,
                 title,
                 genre,
+                cover,
             },
         }
     }
@@ -498,14 +537,19 @@ impl Serialize for Attachment {
                 artist,
                 title,
                 genre,
+                cover,
             } => {
-                let mut out = serializer.serialize_struct("Attachment", 6)?;
+                let len = if cover.is_some() { 7 } else { 6 };
+                let mut out = serializer.serialize_struct("Attachment", len)?;
                 out.serialize_field("type", "audio")?;
                 out.serialize_field("src", src)?;
                 out.serialize_field("origin", origin)?;
                 out.serialize_field("artist", artist)?;
                 out.serialize_field("title", title)?;
                 out.serialize_field("genre", genre)?;
+                if let Some(cover) = cover {
+                    out.serialize_field("cover", cover)?;
+                }
                 out.end()
             }
             Self::Unknown(raw) => raw.serialize(serializer),
@@ -782,14 +826,77 @@ mod tests {
                 artist,
                 title,
                 genre,
+                cover,
             } => {
                 assert_eq!(src, "https://www.youtube.com/watch?v=x");
                 assert_eq!(origin, "youtube");
                 assert_eq!(artist, "A");
                 assert_eq!(title, "T");
                 assert_eq!(genre, "electronic");
+                assert!(cover.is_none(), "a YouTube track carries no cover");
             }
             other => panic!("expected Audio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_latex_track_decodes_with_its_cover_and_round_trips() {
+        // v0.9.0 § Create Entry: website uploads carry `origin: "latex"`, a
+        // direct MP3 `src` and a `cover` image URL.
+        let raw = r#"{"type":"audio","src":"https://bunker.cyberspace.online/a.mp3","origin":"latex","cover":"https://bunker.cyberspace.online/a.jpg","artist":"A","title":"T","genre":"ambient"}"#;
+        let a: Attachment = serde_json::from_str(raw).unwrap();
+        let Attachment::Audio { origin, cover, .. } = &a else {
+            panic!("expected Audio, got {a:?}");
+        };
+        assert_eq!(origin, AUDIO_ORIGIN_LATEX);
+        assert_eq!(
+            cover.as_deref(),
+            Some("https://bunker.cyberspace.online/a.jpg")
+        );
+        let back = serde_json::to_value(&a).unwrap();
+        assert_eq!(
+            back,
+            serde_json::from_str::<serde_json::Value>(raw).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_youtube_track_serializes_without_a_cover_key() {
+        let a = Attachment::audio("https://youtu.be/abc", "A", "T", "g");
+        let v = serde_json::to_value(&a).unwrap();
+        assert!(!v.as_object().unwrap().contains_key("cover"));
+    }
+
+    #[test]
+    fn a_latex_track_is_refused_on_the_write_path() {
+        // The API accepts YouTube only, so re-sending a website upload would be
+        // a 400. The edit screen leaves such a track out of the patch instead.
+        let a = Attachment::Audio {
+            src: "https://bunker.cyberspace.online/a.mp3".into(),
+            origin: AUDIO_ORIGIN_LATEX.into(),
+            artist: "A".into(),
+            title: "T".into(),
+            genre: "ambient".into(),
+            cover: Some("https://bunker.cyberspace.online/a.jpg".into()),
+        };
+        assert!(validate_write_attachments(&[a]).is_err());
+    }
+
+    #[test]
+    fn entry_content_warning_decodes_and_blank_means_none() {
+        let e: Entry = serde_json::from_str(
+            r#"{"postId":"p","authorId":"a","authorUsername":"u","content":"c","contentWarning":"  spiders "}"#,
+        )
+        .unwrap();
+        assert_eq!(e.cw(), Some("spiders"));
+
+        for raw in [
+            r#"{"postId":"p","authorId":"a","authorUsername":"u","content":"c"}"#,
+            r#"{"postId":"p","authorId":"a","authorUsername":"u","content":"c","contentWarning":null}"#,
+            r#"{"postId":"p","authorId":"a","authorUsername":"u","content":"c","contentWarning":"  "}"#,
+        ] {
+            let e: Entry = serde_json::from_str(raw).unwrap();
+            assert_eq!(e.cw(), None, "{raw}");
         }
     }
 

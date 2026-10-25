@@ -65,6 +65,23 @@ pub struct PostHit {
     pub slug: Option<String>,
     #[serde(default)]
     pub topics: Vec<String>,
+    /// The entry's content warning (v0.9.0 § Create Entry). § Search does not
+    /// list it among a post hit's fields; it is read when the server sends it
+    /// so a warned post is never previewed unmasked in the results.
+    #[serde(default)]
+    pub content_warning: Option<String>,
+}
+
+impl PostHit {
+    /// The hit's content warning, trimmed, or `None` when it has none. Same
+    /// rule as [`Entry::cw`](crate::Entry::cw).
+    #[must_use]
+    pub fn cw(&self) -> Option<&str> {
+        self.content_warning
+            .as_deref()
+            .map(str::trim)
+            .filter(|cw| !cw.is_empty())
+    }
 }
 
 /// A reply search hit.

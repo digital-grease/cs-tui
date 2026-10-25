@@ -1,6 +1,6 @@
 //! Bookmarks screen.
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use cs_api::{Bookmark, BookmarkKind};
+use cs_api::{Bookmark, BookmarkKind, Entry};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, ListItem, Paragraph};
@@ -153,11 +153,10 @@ impl BookmarksScreen {
     /// Bookmarks embed the referenced content, so a jukebox track is reachable
     /// without a separate fetch. `None` for a deleted target (no inline).
     fn selected_attachments(&self) -> Option<&[cs_api::Attachment]> {
-        let b = self.list.items.get(self.list.selected)?;
-        b.post
-            .as_ref()
-            .map(|p| p.attachments.as_slice())
-            .or_else(|| b.reply.as_ref().map(|r| r.attachments.as_slice()))
+        self.list
+            .items
+            .get(self.list.selected)
+            .and_then(listed_attachments)
     }
 
     /// Optimistically remove a bookmark from local state.
@@ -210,6 +209,16 @@ impl Default for BookmarksScreen {
     }
 }
 
+/// The attachments `p`, `o` and the `[jukebox]` marker may act on for a
+/// bookmark: the inlined post's (none while a content warning masks it, see
+/// [`super::cw`]) or the inlined reply's.
+fn listed_attachments(b: &Bookmark) -> Option<&[cs_api::Attachment]> {
+    b.post
+        .as_ref()
+        .map(super::cw::listed_attachments)
+        .or_else(|| b.reply.as_ref().map(|r| r.attachments.as_slice()))
+}
+
 fn bookmark_item(b: &Bookmark, theme: &Theme) -> ListItem<'static> {
     let (kind_label, author, snippet, when) = match (b.kind, &b.post, &b.reply) {
         (BookmarkKind::Post, Some(p), _) => (
@@ -252,17 +261,17 @@ fn bookmark_item(b: &Bookmark, theme: &Theme) -> ListItem<'static> {
         Span::styled(format!(" · {when_str}"), theme.muted_style()),
     ];
     // Flag a jukebox attachment so it's discoverable as playable from the list.
-    let has_jukebox = b
-        .post
-        .as_ref()
-        .map(|p| p.attachments.as_slice())
-        .or_else(|| b.reply.as_ref().map(|r| r.attachments.as_slice()))
-        .is_some_and(|a| super::audio::jukebox_url(a).is_some());
+    let has_jukebox = listed_attachments(b).is_some_and(|a| super::audio::jukebox_url(a).is_some());
     if has_jukebox {
         header_spans.push(Span::styled(" · [jukebox]", theme.accent_style()));
     }
     let header = Line::from(header_spans);
-    let body = Line::from(Span::styled(snippet, theme.base()));
+    // v0.9.0: a bookmarked post behind a content warning shows the warning,
+    // not its first line.
+    let body = match b.post.as_ref().and_then(Entry::cw) {
+        Some(cw) if b.kind == BookmarkKind::Post => super::cw::cw_line(cw, 160, theme),
+        _ => Line::from(Span::styled(snippet, theme.base())),
+    };
     let mut lines = vec![header, body];
     if !crate::config::get().compact {
         lines.push(Line::from(""));
@@ -309,7 +318,7 @@ fn status_line<'a>(s: &'a BookmarksScreen, theme: &Theme) -> Paragraph<'a> {
 mod tests {
     use super::*;
     use crossterm::event::{KeyEventKind, KeyEventState};
-    use cs_api::{Entry, Reply};
+    use cs_api::Reply;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent {
@@ -387,6 +396,7 @@ mod tests {
             artist: "Art of Noise".into(),
             title: "Paranoimia".into(),
             genre: "electronic".into(),
+            cover: None,
         }
     }
 
@@ -403,6 +413,39 @@ mod tests {
             }
             other => panic!("expected PlayJukebox(Some), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_warned_post_bookmark_shows_the_warning_and_plays_nothing() {
+        let mut s = BookmarksScreen::new();
+        let mut b = post_bookmark("b1", "p1");
+        {
+            let post = b.post.as_mut().unwrap();
+            post.attachments = vec![audio()];
+            post.content_warning = Some("spiders".into());
+        }
+        let item = bookmark_item(&b, &Theme::cyber());
+        let backend = ratatui::backend::TestBackend::new(80, 3);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| f.render_widget(ratatui::widgets::List::new(vec![item]), f.area()))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("CW: spiders"), "{text}");
+        assert!(!text.contains("[jukebox]"), "{text}");
+
+        s.apply_initial(Ok((vec![b], None)));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('p'))),
+            BookmarksIntent::PlayJukebox(None)
+        );
+        assert_eq!(s.handle_key(key(KeyCode::Char('o'))), BookmarksIntent::None);
     }
 
     #[test]

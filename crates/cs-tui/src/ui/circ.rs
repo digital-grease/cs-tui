@@ -27,7 +27,7 @@ use cs_api::{
     CircRoom, CircRoomUser, MessageExtras,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, ListItem, Paragraph};
 use ratatui::Frame;
@@ -47,7 +47,7 @@ use super::composer::{self, Composer};
 use super::flag::FlagPromptKey;
 use super::list::{self, TabState};
 use super::mention;
-use super::theme::Theme;
+use super::theme::{ColorMode, Theme};
 
 const MAX_OUTGOING_ROWS: usize = 4;
 
@@ -410,6 +410,49 @@ pub struct CircScreen {
     /// Skipped by `Debug`: `Protocol` does not implement it, and a screenful of
     /// encoded pixel data is not something a debug dump wants anyway.
     image_protocols: RefCell<HashMap<String, (Protocol, Size)>>,
+    /// How speakers' names are coloured, from the `colorNicknames` setting.
+    nick_colors: NickColors,
+}
+
+/// The reader's local hour and minute, when this client knows them: only once
+/// `timezone` is set in config.toml, since the UTC default is not anyone's
+/// clock in particular. Feeds [`super::commands::complete_localtime`].
+fn local_clock() -> Option<(u8, u8)> {
+    let rt = crate::config::get();
+    if !rt.tz_configured {
+        return None;
+    }
+    let now = time::OffsetDateTime::now_utc().to_offset(rt.tz_offset);
+    Some((now.hour(), now.minute()))
+}
+
+/// How cIRC colours a speaker's name: the message header, the roster and the
+/// select-mode footer all go through this, so one person reads as one colour
+/// across the room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NickColors {
+    /// cs-tui's own six-colour ANSI palette, which adapts to the terminal
+    /// theme. What a reader gets with `colorNicknames` off, the website's
+    /// default, so nothing changes for anyone who never turns it on.
+    #[default]
+    Palette,
+    /// The website's colours (v0.9.0 § Settings, `colorNicknames` on): the hue
+    /// from a 32-bit FNV-1a hash of the lower-cased name, the lightness picked
+    /// to suit the theme background, fitted to what this terminal can show.
+    Website(ColorMode),
+}
+
+impl NickColors {
+    /// The colour for `username` under this mode.
+    #[must_use]
+    pub fn color(self, username: &str, theme: &Theme) -> Color {
+        match self {
+            Self::Palette => avatar_color(username),
+            Self::Website(mode) => {
+                super::theme::hue_color(cs_api::nickname_hue(username), theme, mode)
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for CircScreen {
@@ -424,6 +467,7 @@ impl std::fmt::Debug for CircScreen {
             .field("viewer_user_id", &self.viewer_user_id)
             .field("stream_state", &self.stream_state)
             .field("mention_cycle", &self.mention_cycle)
+            .field("nick_colors", &self.nick_colors)
             .field("images_cached", &self.image_bytes.borrow().len())
             .finish_non_exhaustive()
     }
@@ -449,7 +493,19 @@ impl CircScreen {
             image_failed: RefCell::new(HashSet::new()),
             image_dims: RefCell::new(HashMap::new()),
             image_protocols: RefCell::new(HashMap::new()),
+            nick_colors: NickColors::default(),
         }
+    }
+
+    /// Apply the `colorNicknames` setting (v0.9.0 § Settings).
+    pub fn set_nick_colors(&mut self, nick_colors: NickColors) {
+        self.nick_colors = nick_colors;
+    }
+
+    /// The nick colouring in effect, for the shell's tests.
+    #[cfg(test)]
+    pub fn nick_colors(&self) -> NickColors {
+        self.nick_colors
     }
 
     /// A room's composer is always focused (instant messaging), so any open room
@@ -1221,17 +1277,18 @@ impl CircScreen {
         }
 
         if ctrl && key.code == KeyCode::Char('r') {
-            let contents: Vec<String> = self
-                .outgoing
-                .iter()
-                .filter(|o| o.failed)
-                .map(|o| o.content.clone())
-                .collect();
+            // A `/localtime` restates the time it is now rather than the time
+            // it was first sent at, and the pending copy is updated to match so
+            // the success that comes back still finds it.
+            let clock = local_clock();
+            let mut contents = Vec::new();
+            for o in self.outgoing.iter_mut().filter(|o| o.failed) {
+                o.content = super::commands::refresh_localtime(&o.content, clock);
+                o.failed = false;
+                contents.push(o.content.clone());
+            }
             if contents.is_empty() {
                 return CircIntent::None;
-            }
-            for o in self.outgoing.iter_mut().filter(|o| o.failed) {
-                o.failed = false;
             }
             return CircIntent::RetryFailed { room_id, contents };
         }
@@ -1307,6 +1364,16 @@ impl CircScreen {
                     self.append_notice(&room_id, &format!("unknown command: {word}"));
                     return CircIntent::None;
                 }
+                // A bare `/localtime` carries no time, and the server cannot see
+                // the reader's clock (§ Commands), so fill it in or say why not.
+                // The draft is kept on a refusal for the same reason as above.
+                let content = match super::commands::complete_localtime(&content, local_clock()) {
+                    Ok(content) => content,
+                    Err(msg) => {
+                        self.append_notice(&room_id, msg);
+                        return CircIntent::None;
+                    }
+                };
                 self.outgoing.push(Outgoing {
                     content: content.clone(),
                     failed: false,
@@ -1943,7 +2010,7 @@ impl CircScreen {
             .iter()
             .map(|&i| {
                 let m = &messages.items[i];
-                circ_message_height(m, theme, layout_of(m))
+                circ_message_height(m, theme, layout_of(m), self.nick_colors)
             })
             .collect();
         let content_rows: usize = heights.iter().map(|&h| h as usize).sum();
@@ -1974,7 +2041,7 @@ impl CircScreen {
             &visible,
             "no messages yet — start typing",
             |pos, m| {
-                let mut lines = circ_message_lines(m, theme, layout_of(m));
+                let mut lines = circ_message_lines(m, theme, layout_of(m), self.nick_colors);
                 // Top first, then bottom: both counts are against the message's
                 // own rows, so trimming the head before the tail keeps a message
                 // that is cut at *both* ends (one taller than the pane) honest.
@@ -2147,7 +2214,7 @@ impl CircScreen {
             selected,
         );
         if let Some(roster_area) = roster_area {
-            render_roster(frame, roster_area, theme, roster);
+            render_roster(frame, roster_area, theme, roster, self.nick_colors);
         }
     }
 
@@ -2253,7 +2320,12 @@ impl CircScreen {
                 Some(!m.user_id.is_empty() && m.user_id == viewer)
             });
             (
-                vec![select_status_line(selected, select, theme)],
+                vec![select_status_line(
+                    selected,
+                    select,
+                    theme,
+                    self.nick_colors,
+                )],
                 select_hint(selected, mine),
             )
         } else {
@@ -2295,6 +2367,7 @@ fn select_status_line(
     selected: Option<&CircMessage>,
     select: &SelectState,
     theme: &Theme,
+    nicks: NickColors,
 ) -> Line<'static> {
     let mut spans = vec![Span::styled("▌ select ", theme.accent_style())];
     if let Some(m) = selected {
@@ -2305,7 +2378,7 @@ fn select_status_line(
         };
         spans.push(Span::styled(
             format!("@{name}"),
-            Style::default().fg(avatar_color(&m.username)),
+            Style::default().fg(nicks.color(&m.username, theme)),
         ));
         let preview = if m.extras.deleted {
             chat::TOMBSTONE.to_string()
@@ -2372,7 +2445,13 @@ fn select_hint(selected: Option<&CircMessage>, mine: Option<bool>) -> String {
 /// Staleness and idleness are both evaluated here, on every frame, because the
 /// spec asks for them on a timer: an entry going stale or idle produces no event
 /// of its own.
-fn render_roster(frame: &mut Frame<'_>, area: Rect, theme: &Theme, roster: &Roster) {
+fn render_roster(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    theme: &Theme,
+    roster: &Roster,
+    nicks: NickColors,
+) {
     let block = Block::default()
         .borders(Borders::LEFT)
         .border_style(theme.border_style());
@@ -2411,7 +2490,10 @@ fn render_roster(frame: &mut Frame<'_>, area: Rect, theme: &Theme, roster: &Rost
         };
         let mut spans = vec![
             Span::styled(" ", theme.muted_style()),
-            Span::styled(name, Style::default().fg(avatar_color(&person.username))),
+            Span::styled(
+                name,
+                Style::default().fg(nicks.color(&person.username, theme)),
+            ),
         ];
         if person.is_chat_admin {
             spans.push(Span::styled(" ★", theme.warning_style()));
@@ -2597,6 +2679,7 @@ fn circ_message_lines(
     m: &CircMessage,
     theme: &Theme,
     layout: BodyLayout<'_>,
+    nicks: NickColors,
 ) -> Vec<Line<'static>> {
     if is_local_notice(m) {
         return notice_lines(&m.content, theme, layout);
@@ -2604,7 +2687,7 @@ fn circ_message_lines(
     let for_me = layout
         .mention
         .is_some_and(|handle| chat::mentions(ChatMessage::from(m), handle));
-    let mut lines = vec![circ_message_header(m, theme, for_me)];
+    let mut lines = vec![circ_message_header(m, theme, for_me, nicks)];
     lines.extend(chat::body_lines(ChatMessage::from(m), layout, theme));
     lines
 }
@@ -2629,8 +2712,13 @@ fn circ_message_lines(
 /// total that was too large. Same agreement bug as `body_height` had for image
 /// gaps, in a path added after that lesson, which is why it now goes through one
 /// function instead of two that merely ought to match.
-fn circ_message_height(m: &CircMessage, theme: &Theme, layout: BodyLayout<'_>) -> u16 {
-    u16::try_from(circ_message_lines(m, theme, layout).len()).unwrap_or(u16::MAX)
+fn circ_message_height(
+    m: &CircMessage,
+    theme: &Theme,
+    layout: BodyLayout<'_>,
+    nicks: NickColors,
+) -> u16 {
+    u16::try_from(circ_message_lines(m, theme, layout, nicks).len()).unwrap_or(u16::MAX)
 }
 
 /// A local notice: `*** text`, no speaker row, no timestamp.
@@ -2666,7 +2754,12 @@ fn notice_lines(text: &str, theme: &Theme, layout: BodyLayout<'_>) -> Vec<Line<'
     rows
 }
 
-fn circ_message_header(m: &CircMessage, theme: &Theme, for_me: bool) -> Line<'static> {
+fn circ_message_header(
+    m: &CircMessage,
+    theme: &Theme,
+    for_me: bool,
+    nicks: NickColors,
+) -> Line<'static> {
     // A chat log wants a clock, not "3h": see `format_chat_timestamp`.
     let when = format_chat_timestamp(m.timestamp);
     let name = if m.username.is_empty() {
@@ -2680,13 +2773,13 @@ fn circ_message_header(m: &CircMessage, theme: &Theme, for_me: bool) -> Line<'st
         Span::styled("  ", theme.muted_style())
     };
     // Each speaker's name gets their stable per-user colour so a busy room is
-    // easy to scan; a ★ marks chat admins.
+    // easy to scan; a ★ marks chat admins. Which colours is `colorNicknames`.
     let mut header = vec![
         gutter,
         Span::styled(
             name,
             Style::default()
-                .fg(avatar_color(&m.username))
+                .fg(nicks.color(&m.username, theme))
                 .add_modifier(Modifier::BOLD),
         ),
     ];
@@ -2743,6 +2836,37 @@ mod tests {
             timestamp: ts,
             extras: MessageExtras::default(),
         }
+    }
+
+    #[test]
+    fn the_header_takes_the_palette_colour_by_default() {
+        let theme = Theme::cyber();
+        let m = message("m1", "neo", "hi", 0);
+        let header = circ_message_header(&m, &theme, false, NickColors::Palette);
+        assert_eq!(header.spans[1].style.fg, Some(avatar_color("neo")));
+    }
+
+    #[test]
+    fn color_nicknames_uses_the_website_hue() {
+        // v0.9.0 § Settings: hue = FNV-1a(lower-cased name) % 360.
+        let theme = Theme::cyber();
+        let m = message("m1", "Neo", "hi", 0);
+        let nicks = NickColors::Website(ColorMode::Full);
+        let header = circ_message_header(&m, &theme, false, nicks);
+        let expected =
+            super::super::theme::hue_color(cs_api::nickname_hue("neo"), &theme, ColorMode::Full);
+        assert_eq!(header.spans[1].style.fg, Some(expected));
+        // Case does not change a person's colour.
+        assert_eq!(nicks.color("NEO", &theme), nicks.color("neo", &theme));
+    }
+
+    #[test]
+    fn color_nicknames_respects_a_monochrome_terminal() {
+        let theme = Theme::cyber();
+        assert_eq!(
+            NickColors::Website(ColorMode::Monochrome).color("neo", &theme),
+            Color::Reset
+        );
     }
 
     fn full(m: CircMessage) -> CircMessageUpdate {
@@ -3889,17 +4013,17 @@ mod tests {
         let layout = BodyLayout::new(40);
         let notice = local_notice("*** something happened", 1);
         assert_eq!(
-            circ_message_height(&notice, &theme, layout) as usize,
-            circ_message_lines(&notice, &theme, layout).len(),
+            circ_message_height(&notice, &theme, layout, NickColors::Palette) as usize,
+            circ_message_lines(&notice, &theme, layout, NickColors::Palette).len(),
         );
         let normal = message("m1", "trinity", "an ordinary line", 1);
         assert_eq!(
-            circ_message_height(&normal, &theme, layout) as usize,
-            circ_message_lines(&normal, &theme, layout).len(),
+            circ_message_height(&normal, &theme, layout, NickColors::Palette) as usize,
+            circ_message_lines(&normal, &theme, layout, NickColors::Palette).len(),
         );
         assert!(
-            circ_message_height(&notice, &theme, layout)
-                < circ_message_height(&normal, &theme, layout),
+            circ_message_height(&notice, &theme, layout, NickColors::Palette)
+                < circ_message_height(&normal, &theme, layout, NickColors::Palette),
             "a notice really is shorter, which is what the old measurement missed",
         );
     }
@@ -4356,6 +4480,7 @@ mod tests {
             artist: "Boards".into(),
             title: "Roygbiv".into(),
             genre: None,
+            cover: None,
         });
         let mut s = selecting(vec![track]);
         assert_eq!(
@@ -5198,7 +5323,7 @@ mod tests {
         let select = SelectState::default();
         let theme = Theme::cyber();
 
-        let rendered: String = select_status_line(Some(&m), &select, &theme)
+        let rendered: String = select_status_line(Some(&m), &select, &theme, NickColors::Palette)
             .spans
             .iter()
             .map(|s| s.content.as_ref())

@@ -402,20 +402,22 @@ impl Notification {
     }
 }
 
-/// Result of [`Client::unread_notification_count`] (API v0.8.10 § Unread Count).
+/// Result of [`Client::unread_notification_count`] (API v0.9.0 § Unread Count).
 ///
 /// The count covers the same filtered set `GET /v1/notifications` returns, so a
 /// badge built on it matches the list the user then opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UnreadCount {
-    /// Unread notifications, capped at 100 when `exact` is false.
+    /// Unread notifications. The server stops counting at 100.
     #[serde(default)]
     pub count: u32,
 
-    /// Whether `count` is the true total. It is false once more than 100 are
-    /// unread, where the server counts only the 100 most recent, and the spec
-    /// says to render "99+" rather than the number. See [`UnreadCount::badge`].
+    /// Whether `count` is the true total rather than a lower bound. v0.9.0
+    /// narrowed the badge rule: "99+" only when this is false *and* `count`
+    /// is 100; any other count is shown as the number, whatever this says.
+    /// Notifications the user has switched off never make it false. See
+    /// [`UnreadCount::badge`].
     ///
     /// Defaults to `true` when the field is absent: a server that predates
     /// v0.8.6 answers with a plain exact count, and defaulting a bare `bool` to
@@ -425,21 +427,29 @@ pub struct UnreadCount {
     pub exact: bool,
 }
 
+/// Where the server stops counting unread notifications (§ Unread Count:
+/// "`count` stops at 100").
+const UNREAD_COUNT_CAP: u32 = 100;
+
 /// See [`UnreadCount::exact`]: an omitted flag means an exact count.
 fn exact_by_default() -> bool {
     true
 }
 
 impl UnreadCount {
-    /// The badge text § Unread Count prescribes: the number, or `"99+"` once
-    /// the count is capped. One implementation so every screen showing the
-    /// badge shows the same thing.
+    /// The badge text § Unread Count prescribes: `"99+"` when the count is a
+    /// lower bound sitting at the 100 cap, otherwise the number. One
+    /// implementation so every screen showing the badge shows the same thing.
+    ///
+    /// Both conditions are needed (v0.9.0). An inexact count below 100 is
+    /// still shown as the number rather than inflated to "99+" over an inbox
+    /// that may hold only a handful.
     #[must_use]
     pub fn badge(&self) -> String {
-        if self.exact {
-            self.count.to_string()
-        } else {
+        if !self.exact && self.count >= UNREAD_COUNT_CAP {
             "99+".to_string()
+        } else {
+            self.count.to_string()
         }
     }
 
@@ -1044,12 +1054,26 @@ mod tests {
         assert_eq!(exact.badge(), "7");
         assert!(exact.any());
 
-        // Over 100 unread the server counts only the 100 most recent, and
-        // § Unread Count asks for "99+" rather than the capped figure.
+        // Over 100 unread the server stops counting, and § Unread Count asks
+        // for "99+" rather than the capped figure.
         let capped: UnreadCount = serde_json::from_str(r#"{"count":100,"exact":false}"#).unwrap();
         assert_eq!(capped.count, 100);
         assert!(!capped.exact);
         assert_eq!(capped.badge(), "99+");
+
+        // Muted notifications never affect `exact` (v0.9.0 § Unread Count).
+        let muted_pile: UnreadCount = serde_json::from_str(r#"{"count":2,"exact":true}"#).unwrap();
+        assert_eq!(muted_pile.badge(), "2");
+    }
+
+    #[test]
+    fn an_inexact_count_below_the_cap_shows_the_number() {
+        // v0.9.0: "99+" only when `exact` is false *and* `count` is 100.
+        let r = UnreadCount {
+            count: 12,
+            exact: false,
+        };
+        assert_eq!(r.badge(), "12");
     }
 
     #[test]

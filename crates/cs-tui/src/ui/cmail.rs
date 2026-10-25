@@ -3185,6 +3185,7 @@ mod tests {
             artist: "Art of Noise".into(),
             title: "Paranoimia".into(),
             genre: None,
+            cover: None,
         };
         let mut s = open_with_messages(
             vec![message_with(
