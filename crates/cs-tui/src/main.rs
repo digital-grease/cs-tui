@@ -1,10 +1,11 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use cs_api::Client;
 
 mod config;
+mod mouse;
 mod prefs;
 mod session;
 mod ui;
@@ -16,8 +17,15 @@ use session::Session;
 use ui::{theme::ThemeKind, App};
 
 #[derive(Debug, Parser)]
-#[command(version, about = "TUI client for cyberspace.online")]
+#[command(
+    about = "TUI client for cyberspace.online",
+    disable_version_flag = true
+)]
 struct Cli {
+    /// Print version, and a newer release if an earlier update check found one.
+    #[arg(short = 'V', long)]
+    version: bool,
+
     /// Run against the in-memory mock client (no network). Not yet implemented.
     #[arg(long)]
     mock: bool,
@@ -75,6 +83,11 @@ fn main() -> Result<()> {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
 
+    if cli.version {
+        println!("{}", version_line(cli.config.as_deref()));
+        return Ok(());
+    }
+
     init_tracing(cli.debug);
 
     if cli.mock {
@@ -102,7 +115,7 @@ async fn run() -> Result<()> {
     } else {
         Config::write_template_if_absent(&config_path);
     }
-    let cfg = Config::load_from(&config_path);
+    let (cfg, config_warning) = Config::load_reporting(&config_path);
     config::init(cfg.to_runtime());
     config::set_config_path(config_path.clone());
     let custom_theme = cfg.custom_theme();
@@ -212,6 +225,11 @@ async fn run() -> Result<()> {
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
     let mut app = App::with_theme(client, prefill_email, theme_kind, custom_theme);
     app.set_image_picker(picker);
+    // On screen, not only in the log: a setting that silently did not apply
+    // (a privacy opt-out, say) is worth a moment of the reader's attention.
+    if let Some(warning) = config_warning {
+        app.warn_at_startup(warning);
+    }
     if has_session {
         app.enter_feed_initial();
     }
@@ -222,16 +240,41 @@ async fn run() -> Result<()> {
     // notch); text selection then needs Shift+drag.
     let capture_mouse = cli.mouse || cfg.mouse.unwrap_or(false);
     if capture_mouse {
-        set_mouse_scroll_reporting(true);
+        mouse::set_captured(true);
     }
     let run_result = app.run(terminal).await;
     if capture_mouse {
-        set_mouse_scroll_reporting(false);
+        mouse::set_captured(false);
     }
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
     ratatui::restore();
 
-    run_result
+    // After the restore, so the line lands in the shell's scrollback instead of
+    // on an alternate screen that is about to vanish.
+    if let Some(release) = run_result? {
+        eprintln!(
+            "cs-tui {} is available (you have {}): {}",
+            release.version,
+            update::current_version(),
+            release.url
+        );
+    }
+    Ok(())
+}
+
+/// The `--version` line. Read from disk only, so it never touches the network,
+/// writes nothing (not even the starter config), and says nothing about a newer
+/// release when `update_check = false`.
+fn version_line(config: Option<&Path>) -> String {
+    let checks = config
+        .map(Path::to_path_buf)
+        .or_else(Config::default_path)
+        .filter(|p| p.exists())
+        .map_or(true, |p| {
+            Config::load_reporting(&p).0.to_runtime().update_check
+        });
+    let last_seen = checks.then(|| Prefs::peek().last_seen_version).flatten();
+    update::version_line(update::current_version(), last_seen.as_deref())
 }
 
 /// Chain a panic hook (over the one `ratatui::init()` installed) that resets the
@@ -244,25 +287,11 @@ fn install_terminal_cleanup_panic_hook() {
         use std::io::Write;
         let mut out = std::io::stdout();
         let _ = crossterm::execute!(out, crossterm::event::DisableBracketedPaste);
-        // Mirror set_mouse_scroll_reporting(false) (modes 1006/1000).
+        // Mirror mouse::write_reporting(false) (modes 1006/1000).
         let _ = out.write_all(b"\x1b[?1006l\x1b[?1000l");
         let _ = out.flush();
         prev(info);
     }));
-}
-
-/// Toggle xterm button + SGR mouse reporting (modes 1000/1006). Crossterm's
-/// `EnableMouseCapture` also enables motion tracking, which we don't want.
-fn set_mouse_scroll_reporting(on: bool) {
-    use std::io::Write;
-    let seq: &[u8] = if on {
-        b"\x1b[?1000h\x1b[?1006h"
-    } else {
-        b"\x1b[?1006l\x1b[?1000l"
-    };
-    let mut out = std::io::stdout();
-    let _ = out.write_all(seq);
-    let _ = out.flush();
 }
 
 fn init_tracing(verbose: bool) {

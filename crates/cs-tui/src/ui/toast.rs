@@ -126,18 +126,27 @@ impl Toast {
     }
 }
 
-/// Draw the toast as a bordered box pinned to the bottom-right of `area`.
-pub fn render(frame: &mut Frame<'_>, area: Rect, toast: &Toast, theme: &Theme) {
-    let label = toast.label();
-    let w = (label.chars().count() as u16 + 2).min(area.width);
+/// Where [`render`] draws `toast` inside `area`, or `None` when there is no
+/// room. Exposed so the shell knows which cells an overlay covered.
+#[must_use]
+pub fn rect(area: Rect, toast: &Toast) -> Option<Rect> {
+    let w = (toast.label().chars().count() as u16 + 2).min(area.width);
     let h = 3u16.min(area.height);
     if w == 0 || h == 0 {
-        return;
+        return None;
     }
     // Bottom-right with a one-cell margin (clamped on tiny terminals).
     let x = area.x + area.width.saturating_sub(w).saturating_sub(1);
     let y = area.y + area.height.saturating_sub(h).saturating_sub(1);
-    let rect = Rect::new(x, y, w, h);
+    Some(Rect::new(x, y, w, h))
+}
+
+/// Draw the toast as a bordered box pinned to the bottom-right of `area`.
+pub fn render(frame: &mut Frame<'_>, area: Rect, toast: &Toast, theme: &Theme) {
+    let Some(rect) = rect(area, toast) else {
+        return;
+    };
+    let label = toast.label();
 
     let style = toast.style(theme);
     let block = Block::default()

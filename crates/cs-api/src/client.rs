@@ -513,9 +513,10 @@ impl Client {
     /// so the bearer token must never be attached. The response size is capped.
     pub async fn fetch_image(&self, url: &str) -> Result<Vec<u8>> {
         let mut req = self.inner.http.get(url);
-        // Attach auth only for cyberspace-owned hosts (e.g. bunker.cyberspace.online),
-        // where uploads may be gated. Never send the token to third-party hosts.
-        if is_cyberspace_url(url) {
+        // Attach auth only for the site's own image host, where uploads may be
+        // gated. Never send the token to third-party hosts. See
+        // `wants_session_token` for why that is one host, over https only.
+        if wants_session_token(url) {
             let token = self.tokens().await.id_token;
             if !token.is_empty() {
                 req = req.bearer_auth(token);
@@ -547,27 +548,47 @@ impl Client {
 /// request, on top of the one the 401 already took, and an unearned refund is
 /// allowance the server never granted.
 ///
-/// Every server-side refusal of a refresh means the same thing, the session is
-/// over and the user has to sign in again, so they all become `Unauthorized`.
-/// Transport and decode failures pass through untouched: they say nothing about
-/// the session, and telling "offline" from "signed out" is exactly what the UI
-/// uses them for. `RateLimited` passes through for the same reason, it carries a
-/// retry hint worth showing and no caller treats it as an uncharged rejection.
+/// Every server-side *refusal* of a refresh, a 4xx, means the same thing: the
+/// session is over and the user has to sign in again, so they all become
+/// `Unauthorized`.
+///
+/// A 5xx is not a refusal. The server (or a proxy in front of it) failed to
+/// answer, which says nothing about whether the refresh token is still good, so
+/// it passes through as the error it is. Recasting it used to log the user out
+/// and delete the saved session over a passing outage.
+///
+/// Transport and decode failures pass through untouched for the same reason:
+/// telling "offline" from "signed out" is exactly what the UI uses them for.
+/// `RateLimited` passes through too, it carries a retry hint worth showing and
+/// no caller treats it as an uncharged rejection.
 fn refresh_failure(e: ApiError) -> ApiError {
     match e {
-        ApiError::Api { .. } | ApiError::Unauthorized => ApiError::Unauthorized,
+        ApiError::Api { status, .. } if (400..500).contains(&status) => ApiError::Unauthorized,
+        ApiError::Unauthorized => ApiError::Unauthorized,
         other => other,
     }
 }
 
-/// Whether a URL points at a cyberspace.online-owned host (so it's safe to
-/// attach the bearer token).
-fn is_cyberspace_url(url: &str) -> bool {
-    Url::parse(url)
-        .ok()
-        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
-        .map(|h| h == "cyberspace.online" || h.ends_with(".cyberspace.online"))
-        .unwrap_or(false)
+/// The one host the site serves images from (§ Create Entry: images travel as
+/// `![alt](https://bunker.cyberspace.online/...)`).
+const IMAGE_HOST: &str = "bunker.cyberspace.online";
+
+/// Whether an image fetch of `url` may carry the session's bearer token.
+///
+/// Only `https://bunker.cyberspace.online` on its default port. Image URLs come
+/// from other people's posts and messages, so this is the whole defence of the
+/// token, and it used to accept any `*.cyberspace.online` URL on any scheme:
+/// - `http://` sent the token in cleartext to anyone on the reader's network;
+/// - the API host itself meant a picture in a post could make every reader
+///   send authenticated requests to API endpoints of the poster's choosing,
+///   outside the client's rate limiter and against the reader's budgets.
+fn wants_session_token(url: &str) -> bool {
+    Url::parse(url).ok().is_some_and(|u| {
+        u.scheme() == "https"
+            && u.port().is_none()
+            && u.host_str()
+                .is_some_and(|h| h.eq_ignore_ascii_case(IMAGE_HOST))
+    })
 }
 
 /// Record any rate-limit metadata a `429` carried, at debug level.
@@ -629,6 +650,15 @@ fn parse_error_body(status: StatusCode, body: &[u8]) -> ApiError {
             message: env.error.message,
             status: status.as_u16(),
         };
+    }
+    // A 401 with no API envelope comes from something in front of the API (a
+    // gateway, a CDN, another auth layer). The status alone says the token was
+    // not accepted, so it is treated the way the API's own 401 is: refreshed,
+    // and reported as a sign-in problem. As `Api{Unknown, 401}` it was neither,
+    // and every request failed until a restart. A 401 that does carry an
+    // envelope keeps its own code above, so a login refusal still says why.
+    if status == StatusCode::UNAUTHORIZED {
+        return ApiError::Unauthorized;
     }
     let message = std::str::from_utf8(body)
         .map(ToOwned::to_owned)
@@ -859,6 +889,47 @@ mod tests {
     }
 
     #[test]
+    fn only_the_image_host_over_https_gets_the_token() {
+        assert!(wants_session_token(
+            "https://bunker.cyberspace.online/a.png"
+        ));
+        assert!(wants_session_token(
+            "https://BUNKER.cyberspace.online/a.png"
+        ));
+        for url in [
+            // Cleartext: the token would cross the network readable.
+            "http://bunker.cyberspace.online/a.png",
+            // The API: a picture must not be able to drive authenticated calls.
+            "https://api.cyberspace.online/v1/search?q=x",
+            "https://cyberspace.online/a.png",
+            "https://other.cyberspace.online/a.png",
+            "https://bunker.cyberspace.online:8443/a.png",
+            "https://bunker.cyberspace.online.evil.test/a.png",
+            "https://evil.test/?u=https://bunker.cyberspace.online/a.png",
+            "not a url",
+        ] {
+            assert!(!wants_session_token(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn a_401_without_an_envelope_is_still_unauthorized() {
+        for body in [&b"<html>401 Authorization Required</html>"[..], b"", b"{}"] {
+            let err = parse_error_body(StatusCode::UNAUTHORIZED, body);
+            assert!(matches!(err, ApiError::Unauthorized), "{body:?}: {err:?}");
+        }
+        // An envelope with its own code keeps it, so a reason is not lost.
+        let err = parse_error_body(
+            StatusCode::UNAUTHORIZED,
+            br#"{"error":{"code":"VALIDATION_ERROR","message":"bad password"}}"#,
+        );
+        assert!(
+            matches!(&err, ApiError::Api { message, .. } if message == "bad password"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
     fn parse_error_body_falls_back_to_raw_text() {
         let err = parse_error_body(StatusCode::BAD_GATEWAY, b"<html>nginx</html>");
         match err {
@@ -947,6 +1018,39 @@ mod tests {
             Duration::ZERO,
             "the one attempt that went out was refunded exactly once"
         );
+    }
+
+    #[tokio::test]
+    async fn a_server_error_on_refresh_does_not_end_the_session() {
+        // The refresh hits a 503 from a proxy, or a 500 from the server. That
+        // is an outage, not a verdict on the refresh token, so it must not
+        // become `Unauthorized`, which the TUI answers by logging out and
+        // deleting the saved session.
+        for (status, body) in [
+            (
+                "500 Internal Server Error",
+                r#"{"error":{"code":"INTERNAL_ERROR","message":"boom"}}"#,
+            ),
+            ("503 Service Unavailable", "upstream unavailable"),
+        ] {
+            let c = client_served_by(vec![unauthorized(), response(status, &[], body)]).await;
+            let err = c
+                .send_with_refresh::<()>(
+                    EndpointKey::EntriesGet,
+                    None,
+                    Method::GET,
+                    "/v1/posts/p1",
+                    &[],
+                    None,
+                )
+                .await
+                .unwrap_err();
+            assert!(!err.is_unauthorized(), "{status}: {err:?}");
+            assert!(
+                matches!(err, ApiError::Api { status: s, .. } if s >= 500),
+                "{status}: {err:?}"
+            );
+        }
     }
 
     #[tokio::test]

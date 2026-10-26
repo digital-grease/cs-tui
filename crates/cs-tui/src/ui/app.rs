@@ -44,7 +44,7 @@ use super::menu::{MenuIntent, MenuOverlay};
 use super::nav::{render_tab_bar, RootKind, TabBarStatus};
 use super::notifications::{NotificationsIntent, NotificationsScreen};
 use super::post_detail::{PostDetailIntent, PostDetailScreen};
-use super::profile::{ProfileIntent, ProfileScreen, ProfileTab};
+use super::profile::{ProfileIntent, ProfileScreen, ProfileTab, ProfileTarget};
 use super::programs::{ProgramsIntent, ProgramsScreen};
 use super::search::{SearchIntent, SearchScreen};
 use super::settings_screen::{SettingsIntent, SettingsScreen};
@@ -460,7 +460,10 @@ pub enum BgEvent {
         complete: bool,
     },
     /// The user's followed/muted topic slugs, fetched from settings.
-    TopicPrefsLoaded(Result<(Vec<String>, Vec<String>), String>),
+    TopicPrefsLoaded {
+        epoch: u64,
+        result: Result<(Vec<String>, Vec<String>), String>,
+    },
     /// Result of a follow/mute PATCH; on failure we resync from the server.
     TopicPrefsSaved(Result<(), String>),
     TopicFeedInitial {
@@ -502,28 +505,42 @@ pub enum BgEvent {
     /// badge has to read "99+" instead of the figure, which `count` alone
     /// cannot say.
     UnreadCount(u64, UnreadCount),
-    ProfileUser(Result<User, String>),
+    ProfileUser {
+        target: ProfileTarget,
+        result: Result<User, String>,
+    },
     ProfilePosts {
+        target: ProfileTarget,
         more: bool,
         result: Result<(Vec<Entry>, Option<String>), String>,
     },
     ProfileReplies {
+        target: ProfileTarget,
         more: bool,
         result: Result<(Vec<Reply>, Option<String>), String>,
     },
     ProfileFollowers {
+        target: ProfileTarget,
         more: bool,
         result: Result<(Vec<Follow>, Option<String>), String>,
     },
     ProfileFollowing {
+        target: ProfileTarget,
         more: bool,
         result: Result<(Vec<Follow>, Option<String>), String>,
     },
     /// Every guild the viewed profile's owner is in (v0.8.6 § List a User's
     /// Guilds). No `more` flag and no cursor: the endpoint answers with at most
     /// six rows and never paginates, so each result replaces the tab outright.
-    ProfileGuilds(Result<Vec<UserGuild>, String>),
-    ProfileFollowToggled(Result<Option<String>, String>), // Ok(Some(follow_id)) on follow, Ok(None) on unfollow
+    ProfileGuilds {
+        target: ProfileTarget,
+        result: Result<Vec<UserGuild>, String>,
+    },
+    /// `Ok(Some(follow_id))` on follow, `Ok(None)` on unfollow.
+    ProfileFollowToggled {
+        target: ProfileTarget,
+        result: Result<Option<String>, String>,
+    },
     ProfileUpdated(Result<User, String>),
     /// Ok carries (post_id, final slug) — the server may suffix the slug on
     /// collision, so we echo what was actually stored.
@@ -571,7 +588,8 @@ pub enum BgEvent {
     },
     NoteCreated(Result<String, String>),
     NoteUpdated(Result<String, String>),
-    NoteDeleted,
+    /// A journal note delete finished. `Err` carries the message to show.
+    NoteDeleted(Result<(), String>),
     SettingsLoaded(Result<Settings, String>),
     SettingsSaved(Result<Settings, String>),
     GuildsInitial(Result<(Vec<Guild>, Option<String>), String>),
@@ -893,6 +911,7 @@ enum Action {
     ProfileSelectTab {
         tab: ProfileTab,
         username: String,
+        user_id: Option<String>,
     },
     ProfileLoadMore {
         tab: ProfileTab,
@@ -1178,6 +1197,9 @@ pub struct App {
     /// otherwise skip cells (e.g. the background fill) it believes unchanged,
     /// leaving the editor's blank screen showing through.
     force_clear: bool,
+    /// The cells the menu, help and toast overlays covered in the last frame
+    /// drawn. See [`Self::note_overlays`].
+    overlay_rects: Vec<Rect>,
     /// Session cache of the signed-in account's own guilds (v0.8.6 § List a
     /// User's Guilds): the badge guild plus any apprenticeships, at most six
     /// rows. Read once at login and again after every membership write, and
@@ -1232,6 +1254,10 @@ pub struct App {
     topic_mutes: Vec<String>,
     /// True once we've fetched the follow/mute prefs (reset to retry on failure).
     topic_prefs_loaded: bool,
+    /// Bumped at logout. A prefs load carries the value it started under, so
+    /// one still in flight from the previous account is dropped rather than
+    /// landing as the next account's lists.
+    topic_prefs_epoch: u64,
     /// What the terminal can render (truecolor / 256 / NO_COLOR), detected once
     /// at startup; every resolved theme is adapted to it.
     color_mode: ColorMode,
@@ -1351,6 +1377,7 @@ impl App {
             cmail_unread_initialized: false,
             input_paused: Arc::new(AtomicBool::new(false)),
             force_clear: false,
+            overlay_rects: Vec::new(),
             own_guilds: None,
             topics_cache: Vec::new(),
             topics_complete: false,
@@ -1362,6 +1389,7 @@ impl App {
             topic_follows: Vec::new(),
             topic_mutes: Vec::new(),
             topic_prefs_loaded: false,
+            topic_prefs_epoch: 0,
             color_mode,
             now_playing: None,
             mpv_available: None,
@@ -1379,6 +1407,12 @@ impl App {
 
     /// Install the terminal image picker (detected at startup). `None` leaves
     /// image rendering disabled.
+    /// Show `msg` as a warning toast on the first frame (a config problem the
+    /// reader should know about before anything else).
+    pub fn warn_at_startup(&mut self, msg: String) {
+        self.toast = Some(Toast::warning(msg));
+    }
+
     pub fn set_image_picker(&mut self, picker: Option<Picker>) {
         self.picker = picker;
     }
@@ -1527,7 +1561,13 @@ impl App {
         }
     }
 
-    pub async fn run(mut self, mut terminal: DefaultTerminal) -> Result<()> {
+    /// Run until the user quits. Hands back the newer release the update check
+    /// found, if any, so the caller can mention it once the terminal is back to
+    /// normal and the line will stay in the scrollback.
+    pub async fn run(
+        mut self,
+        mut terminal: DefaultTerminal,
+    ) -> Result<Option<crate::update::Release>> {
         // Kicked off before the first draw but never awaited, so a slow or dead
         // network cannot delay startup by a single frame.
         self.spawn_update_check();
@@ -1627,6 +1667,8 @@ impl App {
             // needs an await, so it happens here rather than in the sync bg
             // handler.
             self.apply_pending_logout().await;
+            let size = terminal.size().context("terminal size")?;
+            self.note_overlays(Rect::new(0, 0, size.width, size.height));
             if self.force_clear {
                 terminal.clear().context("terminal clear")?;
                 self.force_clear = false;
@@ -1640,7 +1682,7 @@ impl App {
         // Quitting withdraws what we publish about the user, bounded so a
         // wedged connection can never hold the client open.
         self.broadcast_teardown().await;
-        Ok(())
+        Ok(self.update_available.take())
     }
 
     /// Whether the 1s heartbeat is worth running. It animates the toast
@@ -1728,6 +1770,7 @@ impl App {
                     cmail_unread_count: self.cmail_unread_count,
                     can_go_back: !self.back_stack.is_empty(),
                     offline: self.offline,
+                    update: self.update_available.as_ref().map(|r| r.version.as_str()),
                 },
                 &self.theme,
             );
@@ -1805,6 +1848,56 @@ impl App {
         // at one picture, and anything drawn over it would be drawn over pixels
         // rather than over cells.
         self.render_image_modal(frame, full_area);
+    }
+
+    /// Whether inline images go out in a graphics protocol, drawn by the
+    /// terminal over cells ratatui skips. Halfblocks are ordinary cells.
+    fn draws_pixel_images(&self) -> bool {
+        self.images_on
+            && self.picker.as_ref().is_some_and(|p| {
+                p.protocol_type() != ratatui_image::picker::ProtocolType::Halfblocks
+            })
+    }
+
+    /// The cells the menu, help and toast overlays cover in a frame of `area`,
+    /// computed by the same functions that draw them.
+    fn overlay_rects_in(&self, area: Rect) -> Vec<Rect> {
+        let mut rects = Vec::new();
+        if let Some(toast) = &self.toast {
+            rects.extend(super::toast::rect(area, toast));
+        }
+        if let Some(menu) = &self.menu {
+            rects.push(menu.card(area));
+        }
+        if let Some(help) = &self.help {
+            rects.extend(help.card(area, &self.theme));
+        }
+        rects
+    }
+
+    /// Ask for a full repaint when an overlay leaves cells it covered, while
+    /// anything is drawn into cells ratatui skips.
+    ///
+    /// ratatui repaints only cells whose contents changed. Two things put their
+    /// whole content in one cell and mark the rest "skip": an inline image in a
+    /// graphics protocol (kitty, sixel, iTerm2), and an OSC 8 hyperlink. So when
+    /// the menu, help or a toast closes over a picture or the tail of a link,
+    /// the skipped cells are never redrawn and part of the overlay stays painted
+    /// on top. The image modal has the same problem and the same cure.
+    ///
+    /// Halfblocks images are ordinary cells the diff handles, so they do not
+    /// count, and with neither in use nothing is cleared (no flicker spent).
+    fn note_overlays(&mut self, area: Rect) {
+        let now = self.overlay_rects_in(area);
+        if overlay_needs_repaint(
+            &self.overlay_rects,
+            &now,
+            self.draws_pixel_images(),
+            crate::config::get().hyperlinks,
+        ) {
+            self.force_clear = true;
+        }
+        self.overlay_rects = now;
     }
 
     /// The bytes of `url`, if a screen has already fetched it and we could
@@ -2144,6 +2237,7 @@ impl App {
                     ),
                 },
                 PostDetailIntent::ContentWarningToggled => Action::PostDetailFetchImages,
+                PostDetailIntent::Warn(msg) => Action::Warn(msg),
                 PostDetailIntent::DeleteEntryConfirmed => Action::DeleteEntry {
                     post_id: s.entry.post_id.clone(),
                 },
@@ -2236,7 +2330,12 @@ impl App {
                         .clone()
                         .or_else(|| s.user.as_ref().map(|u| u.username.clone()))
                         .unwrap_or_default();
-                    Action::ProfileSelectTab { tab, username }
+                    let user_id = s.user.as_ref().map(|u| u.id.clone());
+                    Action::ProfileSelectTab {
+                        tab,
+                        username,
+                        user_id,
+                    }
                 }
                 ProfileIntent::LoadMoreCurrentTab => {
                     let username = s
@@ -2903,6 +3002,7 @@ impl App {
                 content,
             } => {
                 if self.block_write_if_offline() {
+                    self.refuse_cmail_sends(&conversation_id, std::iter::once(content));
                     return;
                 }
                 // Sending clears the flag server-side (§ Typing Indicator), so
@@ -2915,6 +3015,7 @@ impl App {
                 contents,
             } => {
                 if self.block_write_if_offline() {
+                    self.refuse_cmail_sends(&conversation_id, contents);
                     return;
                 }
                 for content in contents {
@@ -2952,12 +3053,14 @@ impl App {
             }
             Action::CircSend { room_id, content } => {
                 if self.block_write_if_offline() {
+                    self.refuse_circ_sends(&room_id, std::iter::once(content));
                     return;
                 }
                 self.spawn_circ_send(room_id, content);
             }
             Action::CircRetry { room_id, contents } => {
                 if self.block_write_if_offline() {
+                    self.refuse_circ_sends(&room_id, contents);
                     return;
                 }
                 for content in contents {
@@ -3157,8 +3260,21 @@ impl App {
                 self.spawn_open_post_detail_by_id(post_id, highlight_reply_id);
             }
             Action::PopScreen => self.pop_screen(),
-            Action::ProfileSelectTab { tab, username } => {
-                self.spawn_profile_tab_fetch(tab, username, None, None);
+            Action::ProfileSelectTab {
+                tab,
+                username,
+                user_id,
+            } => {
+                // Followers and Following are keyed by user id, and § List
+                // Followers defaults a missing one to *your own*. So on someone
+                // else's profile they wait for the profile to load, whose
+                // arrival fetches the tab that is open (see `ProfileUser`),
+                // rather than showing your lists under their name.
+                let target = self.current_profile_target();
+                if tab_waits_for_user_id(tab, user_id.as_deref(), &target) {
+                    return;
+                }
+                self.spawn_profile_tab_fetch(tab, username, user_id, None, target);
             }
             Action::ProfileLoadMore {
                 tab,
@@ -3166,7 +3282,8 @@ impl App {
                 user_id,
                 cursor,
             } => {
-                self.spawn_profile_tab_fetch(tab, username, user_id, cursor);
+                let target = self.current_profile_target();
+                self.spawn_profile_tab_fetch(tab, username, user_id, cursor, target);
             }
             Action::ProfileRefresh {
                 tab,
@@ -3204,7 +3321,8 @@ impl App {
                         }
                     }
                 }
-                self.spawn_profile_tab_fetch(tab, username, user_id, None);
+                let target = self.current_profile_target();
+                self.spawn_profile_tab_fetch(tab, username, user_id, None, target);
             }
             Action::ProfileToggleFollow { user_id, follow_id } => {
                 if self.block_write_if_offline() {
@@ -3418,6 +3536,10 @@ impl App {
                 self.spawn_note_revisions(note_id);
             }
             Action::DeleteNote { note_id } => {
+                // Before the optimistic removal, like every other write.
+                if self.block_write_if_offline() {
+                    return;
+                }
                 if let Screen::Journal(s) = &mut self.screen {
                     s.remove_local(&note_id);
                 }
@@ -3810,6 +3932,11 @@ impl App {
                 reply,
                 result,
             } => {
+                // A command that answers inline posted nothing (§ Commands), so
+                // there is nothing new to reload. The reload is an initial load,
+                // which replaces the transcript wholesale, and it wiped the reply
+                // just appended a round trip after it appeared.
+                let posted_nothing = reply.is_some();
                 if let Some(reply) = reply {
                     // A slash command answered inline (§ Commands: /help and
                     // the /mute family post nothing and reply in the send
@@ -3838,7 +3965,7 @@ impl App {
                 if is_mute_command(&content) {
                     self.spawn_circ_muted_users(room_id.clone());
                 }
-                if reload {
+                if reload && !posted_nothing {
                     self.spawn_circ_messages(room_id, None);
                 }
             }
@@ -4182,7 +4309,10 @@ impl App {
                     }
                 }
             }
-            BgEvent::TopicPrefsLoaded(result) => match result {
+            BgEvent::TopicPrefsLoaded { epoch, .. } if epoch != self.topic_prefs_epoch => {
+                // Loaded for an account that has since logged out.
+            }
+            BgEvent::TopicPrefsLoaded { result, .. } => match result {
                 Ok((follows, mutes)) => {
                     self.topic_follows = follows;
                     self.topic_mutes = mutes;
@@ -4271,8 +4401,11 @@ impl App {
                     s.set_unread_count(n);
                 }
             }
-            BgEvent::ProfileUser(result) => {
+            BgEvent::ProfileUser { target, result } => {
                 if let Screen::Profile(s) = &mut self.screen {
+                    if !s.shows(&target) {
+                        return;
+                    }
                     s.apply_user(result);
                     // If the user just loaded and we're on a non-Info tab, kick off its fetch.
                     if let Some(u) = s.user.clone() {
@@ -4280,16 +4413,23 @@ impl App {
                         let user_id = Some(u.id.clone());
                         let tab = s.tab;
                         if tab != ProfileTab::Info {
-                            self.spawn_profile_tab_fetch(tab, username, user_id, None);
+                            self.spawn_profile_tab_fetch(tab, username, user_id, None, target);
                         }
                     }
                 }
             }
-            BgEvent::ProfilePosts { more, result } => {
+            BgEvent::ProfilePosts {
+                target,
+                more,
+                result,
+            } => {
                 if let Ok((entries, _)) = &result {
                     self.shuffle_pool.harvest(entries);
                 }
                 if let Screen::Profile(s) = &mut self.screen {
+                    if !s.shows(&target) {
+                        return;
+                    }
                     if more {
                         s.posts.apply_more(result);
                     } else {
@@ -4297,8 +4437,15 @@ impl App {
                     }
                 }
             }
-            BgEvent::ProfileReplies { more, result } => {
+            BgEvent::ProfileReplies {
+                target,
+                more,
+                result,
+            } => {
                 if let Screen::Profile(s) = &mut self.screen {
+                    if !s.shows(&target) {
+                        return;
+                    }
                     if more {
                         s.replies.apply_more(result);
                     } else {
@@ -4306,8 +4453,15 @@ impl App {
                     }
                 }
             }
-            BgEvent::ProfileFollowers { more, result } => {
+            BgEvent::ProfileFollowers {
+                target,
+                more,
+                result,
+            } => {
                 if let Screen::Profile(s) = &mut self.screen {
+                    if !s.shows(&target) {
+                        return;
+                    }
                     if more {
                         s.followers.apply_more(result);
                     } else {
@@ -4315,8 +4469,15 @@ impl App {
                     }
                 }
             }
-            BgEvent::ProfileFollowing { more, result } => {
+            BgEvent::ProfileFollowing {
+                target,
+                more,
+                result,
+            } => {
                 if let Screen::Profile(s) = &mut self.screen {
+                    if !s.shows(&target) {
+                        return;
+                    }
                     if more {
                         s.following.apply_more(result);
                     } else {
@@ -4324,13 +4485,21 @@ impl App {
                     }
                 }
             }
-            BgEvent::ProfileGuilds(result) => {
+            BgEvent::ProfileGuilds { target, result } => {
                 if let Screen::Profile(s) = &mut self.screen {
+                    if !s.shows(&target) {
+                        return;
+                    }
                     s.apply_guilds(result);
                 }
             }
-            BgEvent::ProfileFollowToggled(result) => {
+            BgEvent::ProfileFollowToggled { target, result } => {
                 if let Screen::Profile(s) = &mut self.screen {
+                    // Only on the profile it was for: anywhere else it would
+                    // hand that person's follow id to whoever is on screen.
+                    if !s.shows(&target) {
+                        return;
+                    }
                     s.follow_action_pending = false;
                     match result {
                         Ok(new_follow_id) => {
@@ -4360,7 +4529,12 @@ impl App {
                     if matches!(self.screen, Screen::EditProfile(_)) {
                         self.pop_screen();
                     }
+                    // Always the signed-in user's own record (an edit or a
+                    // pin), so it only ever replaces the own profile.
                     if let Screen::Profile(p) = &mut self.screen {
+                        if !p.is_self {
+                            return;
+                        }
                         p.user = Some(u);
                         p.loading_user = false;
                         p.user_error = None;
@@ -4576,8 +4750,21 @@ impl App {
                     }
                 }
             },
-            BgEvent::NoteDeleted => {
+            BgEvent::NoteDeleted(Ok(())) => {
                 // Already removed optimistically; no further action.
+            }
+            BgEvent::NoteDeleted(Err(msg)) => {
+                // The note was taken off the list before the request went out.
+                // A refusal used to be logged and nothing else, so the reader
+                // believed a private note was gone that still exists. Say so,
+                // and re-read the journal to put it back.
+                self.warn_toast_unless_signalled(&format!(
+                    "couldn't delete the note: {}",
+                    first_line(&msg)
+                ));
+                if matches!(self.screen, Screen::Journal(_)) {
+                    self.spawn_notes_initial();
+                }
             }
             BgEvent::SettingsLoaded(result) => {
                 if let Screen::Settings(s) = &mut self.screen {
@@ -4738,21 +4925,15 @@ impl App {
                         }
                         return;
                     }
-                    match (&owner, &self.screen) {
-                        (ImageOwner::Post(post_id), Screen::PostDetail(s))
-                            if s.entry.post_id == *post_id =>
-                        {
-                            s.cache_image_bytes(url, bytes);
-                        }
-
-                        (ImageOwner::CmailConversation(id), Screen::Cmail(s))
-                            if s.open_conversation_id() == Some(id.as_str()) =>
-                        {
-                            s.cache_image_bytes(url, bytes);
-                        }
-                        (ImageOwner::Feed, Screen::Feed(s)) => {
-                            s.cache_image_bytes(url, bytes);
-                        }
+                    // Wherever the owning screen is, on top or under a pushed
+                    // one: opening a post from the feed, or composing a reply
+                    // over a post, used to drop these bytes for good, since the
+                    // URL was already marked requested and is never offered
+                    // again, leaving a blank band.
+                    match self.image_owner_screen(&owner) {
+                        Some(Screen::PostDetail(s)) => s.cache_image_bytes(url, bytes),
+                        Some(Screen::Cmail(s)) => s.cache_image_bytes(url, bytes),
+                        Some(Screen::Feed(s)) => s.cache_image_bytes(url, bytes),
                         _ => {}
                     }
                 }
@@ -4769,21 +4950,32 @@ impl App {
                                 s.note_image_failed(&url);
                             }
                         }
-                        ImageOwner::CmailConversation(_) => {
-                            if let Screen::Cmail(s) = &self.screen {
-                                s.note_image_failed(&url);
-                            }
-                        }
-                        ImageOwner::Feed => {
-                            if let Screen::Feed(s) = &self.screen {
-                                s.note_image_failed(&url);
-                            }
-                        }
-                        ImageOwner::Post(_) => {}
+                        _ => match self.image_owner_screen(&owner) {
+                            Some(Screen::Cmail(s)) => s.note_image_failed(&url),
+                            Some(Screen::Feed(s)) => s.note_image_failed(&url),
+                            Some(Screen::PostDetail(s)) => s.note_image_failed(&url),
+                            _ => {}
+                        },
                     }
                 }
             },
         }
+    }
+
+    /// The screen an image fetch was made for, on top or anywhere in the back
+    /// stack. cIRC is not here: it goes through [`Self::circ_mut`], which also
+    /// reaches a room parked behind another section.
+    fn image_owner_screen(&self, owner: &ImageOwner) -> Option<&Screen> {
+        std::iter::once(&self.screen)
+            .chain(self.back_stack.iter().rev())
+            .find(|screen| match (owner, screen) {
+                (ImageOwner::Post(post_id), Screen::PostDetail(s)) => s.entry.post_id == *post_id,
+                (ImageOwner::CmailConversation(id), Screen::Cmail(s)) => {
+                    s.open_conversation_id() == Some(id.as_str())
+                }
+                (ImageOwner::Feed, Screen::Feed(_)) => true,
+                _ => false,
+            })
     }
 
     // Navigation helpers ------------------------------------------------------
@@ -4848,6 +5040,13 @@ impl App {
         self.topics_epoch.fetch_add(1, Ordering::SeqCst);
         self.topics_cache.clear();
         self.topics_complete = false;
+        // Follows and mutes are this account's. Kept, the next account's Topics
+        // screen showed them, never reloaded, and its first toggle PATCHed this
+        // account's whole list over its own.
+        self.topic_follows.clear();
+        self.topic_mutes.clear();
+        self.topic_prefs_loaded = false;
+        self.topic_prefs_epoch = self.topic_prefs_epoch.wrapping_add(1);
         let email = self.last_email.clone();
         self.screen = Screen::Login(LoginScreen::new(email));
     }
@@ -5345,6 +5544,40 @@ impl App {
     /// user instant feedback instead of an optimistic flicker that rolls back a
     /// few seconds later (or a hang until the request times out). Returns true
     /// when the caller should skip the action.
+    /// Report cIRC sends the offline gate refused as failed sends.
+    ///
+    /// The room has already moved each one out of the composer and into its
+    /// pending list by the time the gate runs, so stopping there left a
+    /// "sending…" row that no result would ever settle and that Ctrl+R (which
+    /// retries failed rows only) could not reach: the text was lost. Going
+    /// through the ordinary failure path marks each row failed, so it stays on
+    /// screen and Ctrl+R sends it once the connection is back.
+    fn refuse_circ_sends(&mut self, room_id: &str, contents: impl IntoIterator<Item = String>) {
+        for content in contents {
+            self.handle_bg_event(BgEvent::CircSent {
+                room_id: room_id.to_string(),
+                content,
+                reply: None,
+                result: Err("offline".to_string()),
+            });
+        }
+    }
+
+    /// [`Self::refuse_circ_sends`] for a C-Mail conversation.
+    fn refuse_cmail_sends(
+        &mut self,
+        conversation_id: &str,
+        contents: impl IntoIterator<Item = String>,
+    ) {
+        for content in contents {
+            self.handle_bg_event(BgEvent::CmailSent {
+                conversation_id: conversation_id.to_string(),
+                content,
+                result: Err("offline".to_string()),
+            });
+        }
+    }
+
     fn block_write_if_offline(&mut self) -> bool {
         if self.offline {
             self.toast = Some(Toast::warning(
@@ -6667,56 +6900,28 @@ impl App {
         });
     }
 
-    /// Ask GitHub whether a newer cs-tui exists, at most once a day.
+    /// Ask GitHub whether a newer cs-tui exists, at most once a day, for as
+    /// long as cs-tui runs.
     ///
     /// Fire and forget: nothing awaits this, no screen waits on it, and every
-    /// failure is silent. The stamp is written BEFORE the request so an offline
-    /// or rate-limited run waits out the interval like any other, instead of
-    /// retrying on every launch.
-    ///
-    /// Every prefs read and write for the update check lives here, so the event
-    /// handler stays a pure function of the message it receives.
+    /// failure is silent. The task wakes every [`crate::update::RECHECK_POLL`]
+    /// and asks only when the shared once-a-day stamp says a check is due, so a
+    /// session left open for a week still hears about a release, and several
+    /// copies running at once still ask GitHub once a day between them.
     fn spawn_update_check(&self) {
         if !crate::config::get().update_check {
             return;
         }
-        let now = now_millis() / 1_000;
-        let prefs = crate::prefs::Prefs::load();
-        let seen = prefs.last_seen_version.clone();
-        if !prefs.update_check_due(now) {
-            // Not due, but a release found on an earlier run may still be newer
-            // than this binary, and the menu entry is where the user goes for
-            // the link. Offer it without announcing it again.
-            if let Some(release) =
-                crate::update::remembered(seen.as_deref(), crate::update::current_version())
-            {
-                let _ = self.bg_tx.send(BgEvent::UpdateAvailable {
-                    release,
-                    announce: false,
-                });
-            }
-            return;
-        }
-        crate::prefs::Prefs::edit(|p| p.last_update_check = Some(now));
-
         let tx = self.bg_tx.clone();
         tokio::spawn(async move {
-            let Some(release) = crate::update::check(crate::update::current_version()).await else {
-                return;
-            };
-            // Mention a given version once, however many times cs-tui is
-            // started while it is the newest. The menu entry carries it from
-            // then on, so nothing is lost by staying quiet.
-            // Announce only if the "already told them" marker actually lands.
-            // If prefs cannot be written, a toast every launch is worse than no
-            // toast: the menu entry still carries the release, so nothing is
-            // lost, and the user is not nagged forever by a fault they cannot
-            // see.
-            let announce = seen.as_deref() != Some(release.version.as_str()) && {
-                let version = release.version.clone();
-                crate::prefs::Prefs::edit(|p| p.last_seen_version = Some(version))
-            };
-            let _ = tx.send(BgEvent::UpdateAvailable { release, announce });
+            loop {
+                if let Some(event) = update_check_once().await {
+                    if tx.send(event).is_err() {
+                        return; // run loop gone
+                    }
+                }
+                tokio::time::sleep(crate::update::RECHECK_POLL).await;
+            }
         });
     }
 
@@ -7288,6 +7493,16 @@ impl App {
         });
     }
 
+    /// The profile on screen, for tagging a request made from it. Anything
+    /// other than a profile screen tags as nobody in particular, so its answer
+    /// is dropped by every profile.
+    fn current_profile_target(&self) -> ProfileTarget {
+        match &self.screen {
+            Screen::Profile(s) => s.target(),
+            _ => ProfileTarget::User(String::new()),
+        }
+    }
+
     fn spawn_profile_user_me(&self) {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
@@ -7296,7 +7511,10 @@ impl App {
                 .get_own_profile()
                 .await
                 .map_err(|e| note_api_err(&tx, e));
-            let _ = tx.send(BgEvent::ProfileUser(result));
+            let _ = tx.send(BgEvent::ProfileUser {
+                target: ProfileTarget::Own,
+                result,
+            });
         });
     }
 
@@ -7308,7 +7526,10 @@ impl App {
                 .get_profile(&username)
                 .await
                 .map_err(|e| note_api_err(&tx, e));
-            let _ = tx.send(BgEvent::ProfileUser(result));
+            let _ = tx.send(BgEvent::ProfileUser {
+                target: ProfileTarget::User(username),
+                result,
+            });
         });
     }
 
@@ -7318,6 +7539,7 @@ impl App {
         username: String,
         user_id: Option<String>,
         cursor: Option<String>,
+        target: ProfileTarget,
     ) {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
@@ -7330,14 +7552,22 @@ impl App {
                         .list_user_posts(&username, cursor.as_deref(), None)
                         .await
                         .map_err(|e| note_api_err(&tx, e));
-                    let _ = tx.send(BgEvent::ProfilePosts { more, result });
+                    let _ = tx.send(BgEvent::ProfilePosts {
+                        target,
+                        more,
+                        result,
+                    });
                 }
                 ProfileTab::Replies => {
                     let result = client
                         .list_user_replies(&username, cursor.as_deref(), None)
                         .await
                         .map_err(|e| note_api_err(&tx, e));
-                    let _ = tx.send(BgEvent::ProfileReplies { more, result });
+                    let _ = tx.send(BgEvent::ProfileReplies {
+                        target,
+                        more,
+                        result,
+                    });
                 }
                 ProfileTab::Followers => {
                     let result = client
@@ -7349,7 +7579,11 @@ impl App {
                         )
                         .await
                         .map_err(|e| note_api_err(&tx, e));
-                    let _ = tx.send(BgEvent::ProfileFollowers { more, result });
+                    let _ = tx.send(BgEvent::ProfileFollowers {
+                        target,
+                        more,
+                        result,
+                    });
                 }
                 ProfileTab::Following => {
                     let result = client
@@ -7361,7 +7595,11 @@ impl App {
                         )
                         .await
                         .map_err(|e| note_api_err(&tx, e));
-                    let _ = tx.send(BgEvent::ProfileFollowing { more, result });
+                    let _ = tx.send(BgEvent::ProfileFollowing {
+                        target,
+                        more,
+                        result,
+                    });
                 }
                 ProfileTab::Guilds => {
                     // `cursor` and `more` mean nothing here: § List a User's
@@ -7371,7 +7609,7 @@ impl App {
                         .list_user_guilds(&username)
                         .await
                         .map_err(|e| note_api_err(&tx, e));
-                    let _ = tx.send(BgEvent::ProfileGuilds(result));
+                    let _ = tx.send(BgEvent::ProfileGuilds { target, result });
                 }
             }
         });
@@ -7380,6 +7618,7 @@ impl App {
     fn spawn_toggle_follow(&self, user_id: String, follow_id: Option<String>) {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
+        let target = self.current_profile_target();
         tokio::spawn(async move {
             if let Some(fid) = follow_id {
                 // Currently following — unfollow.
@@ -7388,7 +7627,7 @@ impl App {
                     .await
                     .map(|()| None)
                     .map_err(|e| note_api_err(&tx, e));
-                let _ = tx.send(BgEvent::ProfileFollowToggled(result));
+                let _ = tx.send(BgEvent::ProfileFollowToggled { target, result });
             } else {
                 // Not following — follow.
                 let result = client
@@ -7396,7 +7635,7 @@ impl App {
                     .await
                     .map(Some)
                     .map_err(|e| note_api_err(&tx, e));
-                let _ = tx.send(BgEvent::ProfileFollowToggled(result));
+                let _ = tx.send(BgEvent::ProfileFollowToggled { target, result });
             }
         });
     }
@@ -7802,6 +8041,7 @@ impl App {
     fn spawn_topic_prefs_load(&self) {
         let client = self.client.clone();
         let tx = self.bg_tx.clone();
+        let epoch = self.topic_prefs_epoch;
         tokio::spawn(async move {
             let result = client
                 .get_settings()
@@ -7813,7 +8053,7 @@ impl App {
                     )
                 })
                 .map_err(|e| note_api_err(&tx, e));
-            let _ = tx.send(BgEvent::TopicPrefsLoaded(result));
+            let _ = tx.send(BgEvent::TopicPrefsLoaded { epoch, result });
         });
     }
 
@@ -7838,11 +8078,12 @@ impl App {
         tokio::spawn(async move {
             match client.delete_note(&note_id).await {
                 Ok(()) => {
-                    let _ = tx.send(BgEvent::NoteDeleted);
+                    let _ = tx.send(BgEvent::NoteDeleted(Ok(())));
                 }
                 Err(e) => {
                     let msg = note_api_err(&tx, e);
                     tracing::warn!(error = %msg, note_id, "delete_note failed");
+                    let _ = tx.send(BgEvent::NoteDeleted(Err(msg)));
                 }
             }
         });
@@ -8261,6 +8502,44 @@ async fn cmail_stream_loop(
 /// Poll cadence when the stream is not demonstrably carrying: fast enough that
 /// the room reads as instant messaging with no stream at all.
 const FAST_POLL_SECS: u64 = 3;
+
+/// One pass of the update check, as the event to send, if any.
+///
+/// The stamp is written BEFORE the request so an offline or rate-limited run
+/// waits out the interval like any other, instead of retrying on every launch.
+///
+/// Every prefs read and write for the update check lives here, so the event
+/// handler stays a pure function of the message it receives.
+async fn update_check_once() -> Option<BgEvent> {
+    let now = now_millis() / 1_000;
+    let prefs = crate::prefs::Prefs::load();
+    let seen = prefs.last_seen_version.clone();
+    if !prefs.update_check_due(now) {
+        // Not due, but a release found on an earlier run may still be newer
+        // than this binary, and the badge and menu entry are where the user
+        // goes for it. Offer it without announcing it again.
+        let release = crate::update::remembered(seen.as_deref(), crate::update::current_version())?;
+        return Some(BgEvent::UpdateAvailable {
+            release,
+            announce: false,
+        });
+    }
+    crate::prefs::Prefs::edit(|p| p.last_update_check = Some(now));
+
+    let release = crate::update::check(crate::update::current_version()).await?;
+    // Mention a given version once, however many times cs-tui is started
+    // while it is the newest. The badge and menu entry carry it from then on,
+    // so nothing is lost by staying quiet.
+    // Announce only if the "already told them" marker actually lands. If prefs
+    // cannot be written, a toast every launch is worse than no toast: the badge
+    // still carries the release, so nothing is lost, and the user is not
+    // nagged forever by a fault they cannot see.
+    let announce = seen.as_deref() != Some(release.version.as_str()) && {
+        let version = release.version.clone();
+        crate::prefs::Prefs::edit(|p| p.last_seen_version = Some(version))
+    };
+    Some(BgEvent::UpdateAvailable { release, announce })
+}
 
 /// How long the cIRC REST poll waits, given when the stream was last heard from.
 ///
@@ -9094,6 +9373,25 @@ fn circ_delete_message_error(e: &ApiError) -> Option<String> {
     }
 }
 
+/// Whether a profile tab has to wait for the profile's user id before it can
+/// be fetched: Followers and Following on somebody else's profile, whose
+/// endpoint (§ List Followers) reads a missing `userId` as the caller's own.
+fn tab_waits_for_user_id(tab: ProfileTab, user_id: Option<&str>, target: &ProfileTarget) -> bool {
+    matches!(tab, ProfileTab::Followers | ProfileTab::Following)
+        && user_id.is_none()
+        && *target != ProfileTarget::Own
+}
+
+/// Whether a frame needs a full repaint because overlays that covered `was`
+/// now cover only `now`: some covered cell is uncovered, and something that
+/// draws into skipped cells (pixel images, OSC 8 links) may be under it.
+fn overlay_needs_repaint(was: &[Rect], now: &[Rect], pixel_images: bool, hyperlinks: bool) -> bool {
+    let uncovered = was
+        .iter()
+        .any(|w| !now.iter().any(|r| r.intersection(*w) == *w));
+    uncovered && (pixel_images || hyperlinks)
+}
+
 fn first_line(s: &str) -> String {
     let line = s.lines().next().unwrap_or("").trim();
     if line.chars().count() <= 100 {
@@ -9715,13 +10013,116 @@ mod tests {
     fn topic_prefs_loaded_populates_state() {
         let mut app = test_app();
         app.screen = Screen::Topics(TopicsScreen::new());
-        app.handle_bg_event(BgEvent::TopicPrefsLoaded(Ok((
-            vec!["music".into()],
-            vec!["spam".into()],
-        ))));
+        app.handle_bg_event(BgEvent::TopicPrefsLoaded {
+            epoch: app.topic_prefs_epoch,
+            result: Ok((vec!["music".into()], vec!["spam".into()])),
+        });
         assert_eq!(app.topic_follows, vec!["music".to_string()]);
         assert_eq!(app.topic_mutes, vec!["spam".to_string()]);
         assert!(app.topic_prefs_loaded);
+    }
+
+    #[test]
+    fn topic_prefs_loaded_for_a_previous_account_are_dropped() {
+        // Not through `logout()`: it deletes the saved session file, which in
+        // a test run is the developer's real one. Bumping the epoch is the part
+        // of logout this guards.
+        let mut app = test_app();
+        app.screen = Screen::Topics(TopicsScreen::new());
+        let stale = app.topic_prefs_epoch;
+        app.topic_prefs_epoch = app.topic_prefs_epoch.wrapping_add(1);
+        app.handle_bg_event(BgEvent::TopicPrefsLoaded {
+            epoch: stale,
+            result: Ok((vec!["theirs".into()], vec!["also-theirs".into()])),
+        });
+        assert!(app.topic_follows.is_empty());
+        assert!(app.topic_mutes.is_empty());
+        assert!(
+            !app.topic_prefs_loaded,
+            "the new account still loads its own"
+        );
+    }
+
+    #[test]
+    fn feed_image_bytes_reach_the_feed_under_an_open_post() {
+        // The feed hands out fetches, the reader opens a post before they
+        // land: the bytes belong to the feed, which is now in the back stack.
+        let mut app = test_app();
+        app.screen = Screen::Feed(FeedScreen::new());
+        app.push_screen(Screen::PostDetail(PostDetailScreen::new(test_entry("p1"))));
+        app.handle_bg_event(BgEvent::ImageFetched {
+            owner: ImageOwner::Feed,
+            url: "https://x/a.png".into(),
+            result: Ok(vec![1, 2, 3]),
+        });
+        let Some(Screen::Feed(feed)) = app.back_stack.last() else {
+            panic!("the feed is under the post");
+        };
+        assert_eq!(
+            feed.held_image_bytes("https://x/a.png"),
+            Some(vec![1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn a_failed_note_delete_says_so() {
+        // Off the journal, so no re-read is spawned (a plain test has no
+        // runtime); the toast is the part under test.
+        let mut app = test_app();
+        app.screen = Screen::Feed(FeedScreen::new());
+        app.current_root = Some(RootKind::Feed);
+        app.handle_bg_event(BgEvent::NoteDeleted(Err("forbidden".into())));
+        let text = render_to_string(&app);
+        assert!(text.contains("couldn't delete the note"), "{text}");
+    }
+
+    #[test]
+    fn a_help_reply_stays_in_the_transcript() {
+        // `/help` posts nothing and answers inline. The post-send reload is an
+        // initial load that replaces the transcript, and it used to wipe the
+        // reply about one round trip after it appeared. A plain `#[test]` has
+        // no runtime, so a reload spawned here would panic the test outright.
+        let mut app = test_app();
+        app.screen = Screen::Circ(circ_room_screen("general", Vec::new()));
+        app.current_root = Some(RootKind::Circ);
+        app.handle_bg_event(BgEvent::CircSent {
+            room_id: "general".into(),
+            content: "/help".into(),
+            reply: Some("Commands: /me /dice /8ball".into()),
+            result: Ok(()),
+        });
+        let text = render_to_string(&app);
+        assert!(text.contains("Commands: /me /dice /8ball"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn an_offline_circ_send_is_kept_as_failed_and_stays_retryable() {
+        // The room moves the message into its pending list before the offline
+        // gate runs. Stopping at the gate used to leave "sending…" forever,
+        // with the draft already cleared and Ctrl+R unable to reach it.
+        let mut app = test_app();
+        app.screen = Screen::Circ(circ_room_screen("general", Vec::new()));
+        app.current_root = Some(RootKind::Circ);
+        app.offline = true;
+
+        for c in "hello room".chars() {
+            app.handle_terminal_event(key_event(KeyCode::Char(c))).await;
+        }
+        app.handle_terminal_event(key_event(KeyCode::Enter)).await;
+        // The offline toast sits over the row; it is not what is under test.
+        app.toast = None;
+        let text = render_to_string(&app);
+        assert!(text.contains("hello room"), "the text is kept: {text}");
+        assert!(text.contains("not sent"), "and marked failed: {text}");
+        assert!(!text.contains("sending…"), "not left pending: {text}");
+
+        // A retry refused the same way stays failed rather than going pending.
+        app.handle_terminal_event(ctrl_key_event(KeyCode::Char('r')))
+            .await;
+        app.toast = None;
+        let text = render_to_string(&app);
+        assert!(text.contains("not sent"), "{text}");
+        assert!(!text.contains("sending…"), "{text}");
     }
 
     #[tokio::test]
@@ -11400,6 +11801,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closing_the_menu_over_inline_images_repaints_the_frame() {
+        // The reported bug: the feed draws an image behind where the Esc menu
+        // opens, and closing the menu left half of it painted over the image,
+        // because ratatui never repaints the cells an image occupies.
+        let mut app = test_app();
+        let mut feed = FeedScreen::new();
+        feed.apply_initial(Ok((vec![], None)));
+        app.screen = Screen::Feed(feed);
+        app.current_root = Some(RootKind::Feed);
+        app.set_image_picker(Some(ratatui_image::picker::Picker::halfblocks()));
+        let area = Rect::new(0, 0, 80, 24);
+
+        app.handle_terminal_event(key_event(KeyCode::Esc)).await;
+        assert!(app.menu.is_some(), "Esc opens the menu");
+        app.force_clear = false;
+        app.note_overlays(area);
+        assert!(
+            !app.force_clear,
+            "opening needs no repaint: the card covers"
+        );
+
+        app.handle_terminal_event(key_event(KeyCode::Esc)).await;
+        assert!(app.menu.is_none(), "Esc closes it again");
+        app.note_overlays(area);
+        assert!(app.force_clear, "the cells it covered are redrawn");
+
+        // Nothing covered any more, so the next frame costs no clear.
+        app.force_clear = false;
+        app.note_overlays(area);
+        assert!(!app.force_clear);
+    }
+
+    #[test]
+    fn a_repaint_is_spent_only_where_the_diff_can_miss_cells() {
+        let card = Rect::new(10, 5, 40, 10);
+        let closed: [Rect; 0] = [];
+        // Uncovered, over pixel images or links: the diff skips those cells.
+        assert!(overlay_needs_repaint(&[card], &closed, true, false));
+        assert!(
+            overlay_needs_repaint(&[card], &closed, false, true),
+            "an OSC 8 link keeps its tail in skipped cells too"
+        );
+        // Neither in use (no graphics, links off, or halfblocks, which are
+        // ordinary cells): a clear would only be flicker.
+        assert!(!overlay_needs_repaint(&[card], &closed, false, false));
+        // Still covered, or only just opened: nothing to repaint.
+        assert!(!overlay_needs_repaint(&[card], &[card], true, true));
+        assert!(!overlay_needs_repaint(&closed, &[card], true, true));
+        // A toast that shrinks uncovers a column.
+        let smaller = Rect::new(11, 5, 39, 10);
+        assert!(overlay_needs_repaint(&[card], &[smaller], true, false));
+    }
+
+    #[test]
+    fn halfblocks_images_are_not_pixel_images() {
+        // Most terminals without graphics fall back to halfblocks, which draw
+        // ordinary cells; with links off, closing the menu clears nothing.
+        let mut app = test_app();
+        assert!(!app.draws_pixel_images(), "no picker at all");
+        app.set_image_picker(Some(ratatui_image::picker::Picker::halfblocks()));
+        assert!(!app.draws_pixel_images());
+    }
+
+    #[test]
+    fn a_toast_that_expires_over_inline_images_repaints_the_frame() {
+        let mut app = test_app();
+        app.set_image_picker(Some(ratatui_image::picker::Picker::halfblocks()));
+        let area = Rect::new(0, 0, 80, 24);
+        app.toast = Some(Toast::confirmation("bookmarked"));
+        app.note_overlays(area);
+        app.force_clear = false;
+
+        app.toast = None;
+        app.note_overlays(area);
+        assert!(app.force_clear);
+    }
+
+    #[tokio::test]
     async fn a_key_that_closes_the_modal_does_nothing_else() {
         // The keystroke means "close this". Letting it also reach the screen
         // would delete a post or send a message the reader never intended.
@@ -12037,16 +12516,87 @@ mod tests {
     // v0.8.6 profile guilds tab ---------------------------------------------
 
     #[test]
+    fn a_profile_answer_for_someone_else_is_not_applied() {
+        // Opened bob, stepped back to carol's before bob's follow landed:
+        // carol must not get bob's follow id, or her `F` unfollows bob.
+        let mut app = test_app();
+        app.screen = Screen::Profile(ProfileScreen::new_for("carol".into()));
+        app.handle_bg_event(BgEvent::ProfileFollowToggled {
+            target: ProfileTarget::User("bob".into()),
+            result: Ok(Some("follow-of-bob".into())),
+        });
+        app.handle_bg_event(BgEvent::ProfileGuilds {
+            target: ProfileTarget::User("bob".into()),
+            result: Ok(vec![own_guild("bobs-guild", cs_api::GuildRole::Member)]),
+        });
+        let Screen::Profile(s) = &app.screen else {
+            panic!("expected the profile screen");
+        };
+        assert!(
+            s.guilds.items.is_empty(),
+            "bob's guilds stayed off carol's tab"
+        );
+
+        // Someone else's User never lands on your own profile either.
+        let mut app = test_app();
+        app.screen = Screen::Profile(ProfileScreen::new_own());
+        app.handle_bg_event(BgEvent::ProfileUser {
+            target: ProfileTarget::User("bob".into()),
+            result: Ok(serde_json::from_str(r#"{"id":"uid-bob","username":"bob"}"#)
+                .expect("a minimal user decodes")),
+        });
+        let Screen::Profile(s) = &app.screen else {
+            panic!("expected the profile screen");
+        };
+        assert!(s.user.is_none(), "your own profile kept its place");
+    }
+
+    #[test]
+    fn profile_matching_ignores_case_and_tells_own_from_others() {
+        let bob = ProfileScreen::new_for("Bob".into());
+        assert!(bob.shows(&ProfileTarget::User("bob".into())));
+        assert!(!bob.shows(&ProfileTarget::User("carol".into())));
+        assert!(!bob.shows(&ProfileTarget::Own));
+        let own = ProfileScreen::new_own();
+        assert!(own.shows(&ProfileTarget::Own));
+        assert!(!own.shows(&ProfileTarget::User("bob".into())));
+    }
+
+    #[test]
+    fn the_followers_tab_on_someone_else_waits_for_their_id() {
+        // § List Followers defaults a missing userId to the caller's own, so
+        // asking before bob's profile loaded showed your followers as his.
+        let bob = ProfileTarget::User("bob".into());
+        for tab in [ProfileTab::Followers, ProfileTab::Following] {
+            assert!(tab_waits_for_user_id(tab, None, &bob), "{tab:?}");
+            assert!(
+                !tab_waits_for_user_id(tab, Some("uid-bob"), &bob),
+                "{tab:?}"
+            );
+            // Your own lists are exactly what a missing id means.
+            assert!(
+                !tab_waits_for_user_id(tab, None, &ProfileTarget::Own),
+                "{tab:?}"
+            );
+        }
+        // Tabs keyed by username have nothing to wait for.
+        assert!(!tab_waits_for_user_id(ProfileTab::Posts, None, &bob));
+    }
+
+    #[test]
     fn the_profile_guilds_tab_is_filled_by_its_own_event() {
         let mut app = test_app();
         let mut profile = ProfileScreen::new_for("bob".into());
         profile.tab = ProfileTab::Guilds;
         app.screen = Screen::Profile(profile);
 
-        app.handle_bg_event(BgEvent::ProfileGuilds(Ok(vec![
-            own_guild("night-owls", cs_api::GuildRole::Member),
-            own_guild("deep-divers", cs_api::GuildRole::Apprentice),
-        ])));
+        app.handle_bg_event(BgEvent::ProfileGuilds {
+            target: ProfileTarget::User("bob".into()),
+            result: Ok(vec![
+                own_guild("night-owls", cs_api::GuildRole::Member),
+                own_guild("deep-divers", cs_api::GuildRole::Apprentice),
+            ]),
+        });
 
         let Screen::Profile(s) = &app.screen else {
             panic!("expected the profile screen");

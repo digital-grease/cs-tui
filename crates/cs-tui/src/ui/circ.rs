@@ -400,6 +400,12 @@ pub struct CircScreen {
     image_requested: RefCell<HashSet<String>>,
     /// URLs whose fetch failed; they fall back to a chip instead of a band.
     image_failed: RefCell<HashSet<String>>,
+    /// URLs whose bytes were evicted from the cache. Re-fetched only once they
+    /// are on screen again (see [`Self::image_urls_to_fetch`]), which bounds
+    /// the re-fetching to what the pane can show.
+    image_evicted: RefCell<HashSet<String>>,
+    /// The picture URLs in the window last drawn.
+    image_on_screen: RefCell<Vec<String>>,
     /// Pixel dimensions per URL, read from the header once the bytes arrive, so
     /// the reserved band can shrink from the fallback ceiling to what the
     /// picture actually needs. See `chat::fitted_image_rows`.
@@ -491,6 +497,8 @@ impl CircScreen {
             image_bytes: RefCell::new(HashMap::new()),
             image_requested: RefCell::new(HashSet::new()),
             image_failed: RefCell::new(HashSet::new()),
+            image_evicted: RefCell::new(HashSet::new()),
+            image_on_screen: RefCell::new(Vec::new()),
             image_dims: RefCell::new(HashMap::new()),
             image_protocols: RefCell::new(HashMap::new()),
             nick_colors: NickColors::default(),
@@ -1113,10 +1121,23 @@ impl CircScreen {
     /// Called from the render, where the set of URLs actually reachable on
     /// screen is known. Without it the caches were insert-only for the session
     /// and grew past whatever `MAX_HELD_MESSAGES` was holding back.
+    ///
+    /// A picture whose bytes go is marked evicted and handed back to the fetch
+    /// driver, so it is fetched again the next time it is on screen. Leaving it
+    /// marked as requested made it a permanent blank band: its gap was still
+    /// reserved, and a requested URL is never fetched again.
     fn evict_images(&self, keep: &[String]) {
-        super::images::evict_to_cap(&mut self.image_bytes.borrow_mut(), keep);
+        let dropped = super::images::evict_to_cap(&mut self.image_bytes.borrow_mut(), keep);
         super::images::evict_to_cap(&mut self.image_protocols.borrow_mut(), keep);
         super::images::evict_to_cap(&mut self.image_dims.borrow_mut(), keep);
+        if !dropped.is_empty() {
+            let mut requested = self.image_requested.borrow_mut();
+            let mut evicted = self.image_evicted.borrow_mut();
+            for url in dropped {
+                requested.remove(&url);
+                evicted.insert(url);
+            }
+        }
     }
 
     pub fn cache_image_bytes(&self, url: String, bytes: Vec<u8>) {
@@ -1126,6 +1147,7 @@ impl CircScreen {
         if let Some(dims) = super::images::probe_dimensions(&bytes) {
             self.image_dims.borrow_mut().insert(url.clone(), dims);
         }
+        self.image_evicted.borrow_mut().remove(&url);
         self.image_bytes.borrow_mut().insert(url, bytes);
     }
 
@@ -1145,10 +1167,16 @@ impl CircScreen {
         }
         let mut requested = self.image_requested.borrow_mut();
         let bytes = self.image_bytes.borrow();
+        let evicted = self.image_evicted.borrow();
+        let on_screen = self.image_on_screen.borrow();
         messages
             .items
             .iter()
             .filter_map(|m| chat::inline_image_url(&m.extras))
+            // An evicted picture comes back only when it is on screen again,
+            // or fetching would refill the cache it was just evicted from and
+            // loop.
+            .filter(|url| !evicted.contains(url) || on_screen.contains(url))
             // Three steps, and the order of all three matters. Skip what is
             // already held or already asked for, *then* cap the batch, and only
             // then mark. Capping before the skip would re-take the same URLs
@@ -2055,15 +2083,20 @@ impl CircScreen {
                 ListItem::new(lines)
             },
         );
-        // Keep only what the room still holds; a session's worth of decoded
-        // protocols is far more memory than the messages they belong to.
+        // Keep what is on screen; a session's worth of decoded protocols is
+        // far more memory than the messages they belong to. Keeping everything
+        // the room held made the cap drop arbitrary pictures, on-screen ones
+        // included.
         {
-            let keep: Vec<String> = messages
-                .items
+            let keep: Vec<String> = visible
                 .iter()
+                .skip(win.first)
+                .take(win.last.saturating_sub(win.first) + 1)
+                .filter_map(|&i| messages.items.get(i))
                 .filter_map(|m| chat::inline_image_url(&m.extras))
                 .collect();
             self.evict_images(&keep);
+            *self.image_on_screen.borrow_mut() = keep;
         }
 
         // Paint each reserved gap, now that the list has settled where every
@@ -2620,6 +2653,14 @@ fn trim_history(
     messages.items.drain(..drop);
     messages.selected = messages.selected.saturating_sub(shown_before);
     messages.shift_offset_back(shown_before);
+    // Scrolling back has to fetch exactly what was just dropped. The cursor
+    // still pointed before the *original* oldest message, so the next page
+    // skipped everything trimmed and left a silent gap. `before` is the oldest
+    // held message's timestamp (§ Read a Room), and it is right even when the
+    // whole history had been loaded: there is older history again now.
+    if let Some(oldest) = messages.items.iter().find(|m| !is_local_notice(m)) {
+        messages.next_cursor = Some(oldest.timestamp.to_string());
+    }
 }
 
 fn apply_older_messages(
@@ -2630,6 +2671,18 @@ fn apply_older_messages(
     messages.loading = false;
     match result {
         Ok((mut older, cursor)) => {
+            // Never a message already held. A poll that lands mid-load clears
+            // `loading`, so a second Up can ask for the same page again, and
+            // prepending it twice doubled the history (with patches and deletes
+            // then reaching only the first copy). Dropping known ids makes any
+            // repeat of a page harmless, however it was asked for.
+            let held: HashSet<&str> = messages
+                .items
+                .iter()
+                .map(|m| m.id.as_str())
+                .filter(|id| !id.is_empty())
+                .collect();
+            older.retain(|m| m.id.is_empty() || !held.contains(m.id.as_str()));
             // `selected` is a view index, so it shifts by however many of the
             // older messages are actually shown: a muted author's are not.
             let added = visible_indices(&older, muted).len();
@@ -2871,6 +2924,47 @@ mod tests {
 
     fn full(m: CircMessage) -> CircMessageUpdate {
         CircMessageUpdate::Full(m)
+    }
+
+    #[test]
+    fn trimming_history_points_scrollback_at_what_was_dropped() {
+        let mut messages: TabState<CircMessage> = TabState::loading();
+        let n = MAX_HELD_MESSAGES + 5;
+        let all: Vec<CircMessage> = (0..n)
+            .map(|i| {
+                let ts = 1_000 + i64::try_from(i).unwrap();
+                message(&format!("m{i}"), "neo", "x", ts)
+            })
+            .collect();
+        // The whole history loaded: no older page left to ask for.
+        messages.apply_initial(Ok((all, None)));
+        trim_history(&mut messages, None, true);
+        assert_eq!(messages.items.len(), MAX_HELD_MESSAGES);
+        let oldest = messages.items[0].timestamp;
+        assert_eq!(
+            messages.next_cursor,
+            Some(oldest.to_string()),
+            "the next page starts right before the oldest message still held"
+        );
+    }
+
+    #[test]
+    fn the_same_older_page_twice_is_not_held_twice() {
+        let mut messages: TabState<CircMessage> = TabState::loading();
+        messages.apply_initial(Ok((vec![message("m3", "neo", "newest", 3_000)], None)));
+        let page = || {
+            Ok((
+                vec![
+                    message("m1", "neo", "oldest", 1_000),
+                    message("m2", "neo", "older", 2_000),
+                ],
+                Some("1000".to_string()),
+            ))
+        };
+        apply_older_messages(&mut messages, page(), None);
+        apply_older_messages(&mut messages, page(), None);
+        let ids: Vec<&str> = messages.items.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["m1", "m2", "m3"]);
     }
 
     fn open(slug: &str) -> CircScreen {
@@ -4053,6 +4147,43 @@ mod tests {
         assert!(
             joined.contains("[image]"),
             "a terminal without graphics gets the chip it always had:\n{joined}",
+        );
+    }
+
+    #[test]
+    fn an_evicted_picture_is_fetched_again_once_it_is_back_on_screen() {
+        // Over the cache cap, pictures are evicted. One still reserving a gap
+        // but marked as requested was a permanent blank band.
+        let msgs: Vec<CircMessage> = (0..super::super::images::MAX_CACHED_IMAGES + 2)
+            .map(|i| {
+                let mut m = message(
+                    &format!("m{i}"),
+                    "trinity",
+                    "pic",
+                    i64::try_from(i).unwrap(),
+                );
+                m.extras.image_url = Some(format!("https://cdn.example/{i}.png"));
+                m
+            })
+            .collect();
+        let s = room_knowing_us(msgs);
+        let all = s.image_urls_to_fetch("general", 100);
+        for url in &all {
+            s.cache_image_bytes(url.clone(), vec![0]);
+        }
+        let on_screen = vec!["https://cdn.example/0.png".to_string()];
+        s.evict_images(&on_screen);
+        let evicted: Vec<String> = s.image_evicted.borrow().iter().cloned().collect();
+        assert_eq!(evicted.len(), 2);
+        // Off screen it stays evicted, or fetching would refill the cache it
+        // was just evicted from, round and round.
+        *s.image_on_screen.borrow_mut() = on_screen;
+        assert!(s.image_urls_to_fetch("general", 100).is_empty());
+        // Back on screen, it is fetched again.
+        *s.image_on_screen.borrow_mut() = vec![evicted[0].clone()];
+        assert_eq!(
+            s.image_urls_to_fetch("general", 100),
+            vec![evicted[0].clone()]
         );
     }
 

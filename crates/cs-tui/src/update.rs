@@ -40,6 +40,11 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// could plausibly matter.
 pub const CHECK_INTERVAL_SECS: i64 = 24 * 60 * 60;
 
+/// How often a running cs-tui looks at the once-a-day stamp. Reading a local
+/// file hourly costs nothing, and it bounds how late a long session hears
+/// about a release to an hour past the day.
+pub const RECHECK_POLL: Duration = Duration::from_secs(60 * 60);
+
 /// A published release newer than the running binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Release {
@@ -76,6 +81,16 @@ pub fn release_url(version: &str) -> String {
         "https://github.com/digital-grease/cs-tui/releases/tag/v{}",
         version.trim().trim_start_matches('v')
     )
+}
+
+/// What `--version` prints: the compiled version, plus the newer release an
+/// earlier update check recorded, if one is still newer.
+#[must_use]
+pub fn version_line(current: &str, last_seen: Option<&str>) -> String {
+    match remembered(last_seen, current) {
+        Some(r) => format!("cs-tui {current} ({} available: {})", r.version, r.url),
+        None => format!("cs-tui {current}"),
+    }
 }
 
 /// A release recorded on an earlier run that is still newer than this binary.
@@ -216,6 +231,22 @@ mod tests {
             parse_version(current_version()).is_some(),
             "current version {} is unparseable",
             current_version(),
+        );
+    }
+
+    #[test]
+    fn the_version_line_names_a_newer_recorded_release() {
+        assert_eq!(version_line("0.7.1", None), "cs-tui 0.7.1");
+        assert_eq!(
+            version_line("0.7.1", Some("0.7.1")),
+            "cs-tui 0.7.1",
+            "the release already running is not news"
+        );
+        assert_eq!(version_line("0.7.1", Some("0.7.0")), "cs-tui 0.7.1");
+        assert_eq!(
+            version_line("0.7.1", Some("0.8.0")),
+            "cs-tui 0.7.1 (0.8.0 available: \
+             https://github.com/digital-grease/cs-tui/releases/tag/v0.8.0)"
         );
     }
 

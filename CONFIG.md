@@ -8,6 +8,10 @@ changes apply on restart.
 Point at a different file with `--config <path>` or `$CS_TUI_CONFIG`. An
 explicit path must already exist; only the default location is auto-created.
 
+A setting with a value of the wrong type is skipped on its own, and cs-tui says
+which one at startup; everything else in the file still applies. A file that is
+not valid TOML at all falls back to the defaults, and cs-tui says that too.
+
 ## Appearance
 
 | Option | Default | Notes |
@@ -62,7 +66,7 @@ Cyberspace, and publishes nothing to anyone you talk to.
 
 | Option | Default | Notes |
 |---|---|---|
-| `update_check` | `true` | Ask GitHub, at most once a day and in the background, whether a newer cs-tui release exists, and mention it once if so. The release then stays listed in the Esc menu, which opens its page. The request tells GitHub your address and that you run cs-tui; it never touches the Cyberspace API, carries no session token, and nothing is ever downloaded or installed. Set to `false` to make no such request. |
+| `update_check` | `true` | Ask GitHub, at most once a day and in the background, whether a newer cs-tui release exists. A long session checks again each day. A newer release is announced once, then stays visible until you update: a `↑ 0.7.2` badge at the right of the tab bar, an Esc menu entry that opens its page, a line printed when you quit, and a note in `cs-tui --version`. The request tells GitHub your address and that you run cs-tui; it never touches the Cyberspace API, carries no session token, and nothing is ever downloaded or installed. Set to `false` to make no such request. |
 
 ## Input and rendering
 

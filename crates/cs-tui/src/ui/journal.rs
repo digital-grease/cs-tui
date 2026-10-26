@@ -100,11 +100,14 @@ impl JournalScreen {
             return self.handle_key_revisions(key);
         }
 
+        // No second page while one is in flight: two presses at the bottom
+        // (or key repeat) asked for the same cursor twice and appended the
+        // page twice.
         match super::list_nav::navigate(
             key.code,
             &mut self.selected,
             self.notes.len(),
-            self.next_cursor.is_some(),
+            self.next_cursor.is_some() && !self.loading,
         ) {
             super::list_nav::ListNav::LoadMore => {
                 self.loading = true;
@@ -481,6 +484,21 @@ mod tests {
             deleted: false,
             created_at: None,
         }
+    }
+
+    #[test]
+    fn a_second_load_more_waits_for_the_first() {
+        let mut s = JournalScreen::new();
+        s.apply_initial(Ok((vec![note("n1", "x")], Some("c1".into()))));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('j'))),
+            JournalIntent::LoadMore
+        );
+        assert_ne!(
+            s.handle_key(key(KeyCode::Char('j'))),
+            JournalIntent::LoadMore,
+            "the page is already on its way"
+        );
     }
 
     #[test]

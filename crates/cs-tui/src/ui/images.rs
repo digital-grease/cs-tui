@@ -103,23 +103,45 @@ pub const MAX_IMAGE_PIXELS: u64 = 40_000_000;
 /// encoded protocol included, which defeated the message-buffer cap entirely.
 pub const MAX_CACHED_IMAGES: usize = 24;
 
-/// Drop entries from an image cache until it is back under the cap.
+/// Drop entries from an image cache until it is back under the cap, returning
+/// the URLs dropped.
 ///
-/// Evicts anything not in `keep`, which the caller passes as the URLs currently
-/// reachable on screen, and only then falls back to dropping arbitrary entries.
-/// Cheap and approximate on purpose: this runs from a render, and a perfect LRU
-/// would cost more bookkeeping than the memory it saves.
-pub fn evict_to_cap<V>(cache: &mut std::collections::HashMap<String, V>, keep: &[String]) {
+/// Evicts entries not in `keep`, which the caller passes as the URLs on screen
+/// right now, and only as many as it takes, so pictures just off screen stay
+/// warm while there is room. Only if `keep` alone is over the cap does it drop
+/// from `keep` too. Cheap and approximate on purpose: this runs from a render,
+/// and a perfect LRU would cost more bookkeeping than the memory it saves.
+///
+/// The caller has to act on what comes back: a dropped picture that is still
+/// reserved a gap and never fetched again is a permanent blank band.
+pub fn evict_to_cap<V>(
+    cache: &mut std::collections::HashMap<String, V>,
+    keep: &[String],
+) -> Vec<String> {
+    let mut dropped = Vec::new();
     if cache.len() <= MAX_CACHED_IMAGES {
-        return;
+        return dropped;
     }
-    cache.retain(|url, _| keep.iter().any(|k| k == url));
+    let off_screen: Vec<String> = cache
+        .keys()
+        .filter(|url| !keep.iter().any(|k| k == *url))
+        .cloned()
+        .collect();
+    for url in off_screen {
+        if cache.len() <= MAX_CACHED_IMAGES {
+            break;
+        }
+        cache.remove(&url);
+        dropped.push(url);
+    }
     while cache.len() > MAX_CACHED_IMAGES {
         let Some(victim) = cache.keys().next().cloned() else {
             break;
         };
         cache.remove(&victim);
+        dropped.push(victim);
     }
+    dropped
 }
 
 /// Decode `bytes` into an image, refusing anything oversized.
@@ -168,6 +190,23 @@ pub fn probe_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eviction_drops_off_screen_pictures_first_and_only_as_many_as_needed() {
+        let mut cache: std::collections::HashMap<String, ()> = (0..MAX_CACHED_IMAGES + 3)
+            .map(|i| (format!("u{i}"), ()))
+            .collect();
+        let keep: Vec<String> = (0..5).map(|i| format!("u{i}")).collect();
+        let dropped = evict_to_cap(&mut cache, &keep);
+        assert_eq!(cache.len(), MAX_CACHED_IMAGES);
+        assert_eq!(dropped.len(), 3, "only what it took to get under the cap");
+        for k in &keep {
+            assert!(cache.contains_key(k), "{k} is on screen and stays");
+            assert!(!dropped.contains(k));
+        }
+        // Under the cap, nothing goes.
+        assert!(evict_to_cap(&mut cache, &keep).is_empty());
+    }
 
     fn entry(content: &str, attachments: Vec<Attachment>) -> Entry {
         Entry {

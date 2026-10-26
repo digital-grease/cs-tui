@@ -134,9 +134,10 @@ fn tab_window(
 /// next to their tabs. When the full bar doesn't fit, it scrolls horizontally to
 /// keep the current section in view, marking clipped ends with `‹`/`›`. When
 /// `offline` is set, a red marker replaces the right-hand hint so the connection
-/// loss is always visible.
+/// loss is always visible. Otherwise a newer release, when one is known, keeps a
+/// badge at the right-hand end for the whole session.
 #[derive(Debug, Clone, Copy)]
-pub struct TabBarStatus {
+pub struct TabBarStatus<'a> {
     pub current: RootKind,
     /// Unread notifications (API v0.8.6 § Unread Count). The whole figure, not
     /// just the number: past 100 the server counts only the 100 most recent and
@@ -151,6 +152,14 @@ pub struct TabBarStatus {
     pub circ_unread_count: usize,
     pub can_go_back: bool,
     pub offline: bool,
+    /// The version of a newer cs-tui release, when the update check found one.
+    pub update: Option<&'a str>,
+}
+
+/// The update badge's two sizes: the full one when the bar has room for it
+/// beside the hint, the short one otherwise.
+fn update_badges(version: &str) -> (String, String) {
+    (format!(" ↑ {version} available "), format!(" ↑ {version} "))
 }
 
 /// The parenthesised badge for a tab, or nothing when there is nothing to
@@ -164,7 +173,7 @@ fn badge(any: bool, text: &str) -> String {
     }
 }
 
-pub fn render_tab_bar(frame: &mut Frame<'_>, area: Rect, status: TabBarStatus, theme: &Theme) {
+pub fn render_tab_bar(frame: &mut Frame<'_>, area: Rect, status: TabBarStatus<'_>, theme: &Theme) {
     let kinds = RootKind::all();
     let tokens: Vec<String> = kinds
         .iter()
@@ -194,6 +203,21 @@ pub fn render_tab_bar(frame: &mut Frame<'_>, area: Rect, status: TabBarStatus, t
     };
     let hint_w = hint.chars().count();
     let cur = kinds.iter().position(|k| *k == status.current).unwrap_or(0);
+
+    // The update badge takes its width off the end before the tabs are laid
+    // out, so it never covers one. Offline wins the corner outright, and a bar
+    // too narrow for the badge and the current tab drops the badge.
+    let update_badge = status.update.filter(|_| !status.offline).and_then(|v| {
+        let (long, short) = update_badges(v);
+        let pick = if total + hint_w + long.chars().count() <= avail {
+            long
+        } else {
+            short
+        };
+        (pick.chars().count() + widths[cur] + 4 <= avail).then_some(pick)
+    });
+    let badge_w = update_badge.as_ref().map_or(0, |b| b.chars().count());
+    let avail = avail - badge_w;
 
     // Window of sections to show, and whether to append the hint.
     let (lo, hi, clip_l, clip_r) = if total <= avail {
@@ -231,6 +255,13 @@ pub fn render_tab_bar(frame: &mut Frame<'_>, area: Rect, status: TabBarStatus, t
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(marker, theme.error_style()))),
             mrect,
+        );
+    } else if let Some(badge) = update_badge {
+        let bw = badge_w as u16;
+        let brect = Rect::new(area.x + area.width - bw, area.y, bw, 1);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(badge, theme.warning_style()))),
+            brect,
         );
     }
 }
@@ -338,6 +369,74 @@ mod tests {
             assert_eq!(clip_l, lo > 0);
             assert_eq!(clip_r, hi < 8);
         }
+    }
+
+    fn bar_text(width: u16, status: TabBarStatus<'_>) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, 1);
+        let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+        let theme = Theme::default();
+        terminal
+            .draw(|f| render_tab_bar(f, f.area(), status, &theme))
+            .expect("draw");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    fn status(update: Option<&str>, offline: bool) -> TabBarStatus<'_> {
+        TabBarStatus {
+            current: RootKind::Feed,
+            unread_count: UnreadCount::default(),
+            cmail_unread_count: 0,
+            circ_unread_count: 0,
+            can_go_back: false,
+            offline,
+            update,
+        }
+    }
+
+    #[test]
+    fn a_known_update_badges_the_right_hand_end() {
+        let wide = bar_text(400, status(Some("9.9.9"), false));
+        assert!(
+            wide.trim_end().ends_with("↑ 9.9.9 available"),
+            "full badge at the end: {wide}"
+        );
+        assert!(
+            wide.contains("esc menu"),
+            "the hint stays beside it: {wide}"
+        );
+
+        let narrow = bar_text(60, status(Some("9.9.9"), false));
+        assert!(
+            narrow.trim_end().ends_with("↑ 9.9.9"),
+            "short badge when there is no room for the long one: {narrow}"
+        );
+        assert!(
+            narrow.contains("Feed"),
+            "the current tab is not covered: {narrow}"
+        );
+
+        let none = bar_text(400, status(None, false));
+        assert!(!none.contains('↑'), "no release, no badge: {none}");
+    }
+
+    #[test]
+    fn offline_takes_the_corner_from_the_update_badge() {
+        let bar = bar_text(400, status(Some("9.9.9"), true));
+        assert!(bar.contains("offline"), "{bar}");
+        assert!(!bar.contains('↑'), "{bar}");
+    }
+
+    #[test]
+    fn a_bar_too_narrow_for_the_badge_drops_it() {
+        let bar = bar_text(12, status(Some("9.9.9"), false));
+        assert!(!bar.contains('↑'), "{bar}");
+        assert!(bar.contains("Feed"), "{bar}");
     }
 
     #[test]

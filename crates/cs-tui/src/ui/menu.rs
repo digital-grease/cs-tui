@@ -154,14 +154,21 @@ impl MenuOverlay {
         MenuIntent::None
     }
 
-    pub fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
+    /// Where [`Self::render`] draws the card inside `area`. Exposed so the
+    /// shell knows which cells an overlay covered.
+    #[must_use]
+    pub fn card(&self, area: Rect) -> Rect {
         // Center a small modal: each item is one line plus borders + footer hint.
         let inner_height = self.items.len() as u16;
         let h = (inner_height + 4).min(area.height);
         let w = 48u16.min(area.width.saturating_sub(2));
         let x = area.x + area.width.saturating_sub(w) / 2;
         let y = area.y + area.height.saturating_sub(h) / 2;
-        let card = Rect::new(x, y, w, h);
+        Rect::new(x, y, w, h)
+    }
+
+    pub fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
+        let card = self.card(area);
 
         // Clear underlying content, then repaint the card with the current theme
         // background. `Clear` alone uses the terminal default, which makes the

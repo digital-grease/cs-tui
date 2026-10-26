@@ -70,6 +70,8 @@ pub enum PostDetailIntent {
     PlayJukebox(Option<super::audio::JukeboxTrack>),
     /// User confirmed deletion of the entry.
     DeleteEntryConfirmed,
+    /// Tell the reader something without acting (a toast).
+    Warn(String),
     /// `v` revealed or re-hid the post behind its content warning. The app
     /// fetches the post's image now: nothing behind a warning is fetched until
     /// the reader asks, so a reveal is the first moment it is wanted.
@@ -211,6 +213,10 @@ pub struct PostDetailScreen {
     /// title, body and attachments only on request, so this starts false and
     /// nothing behind the warning is drawn or fetched until it flips.
     cw_revealed: bool,
+    /// Image URLs whose fetch failed. A picture that will never arrive gets no
+    /// reserved gap and keeps its link in the text, or the reader is left an
+    /// unexplained blank hole with the URL hidden.
+    image_failed: RefCell<HashSet<String>>,
 }
 
 impl PostDetailScreen {
@@ -235,7 +241,19 @@ impl PostDetailScreen {
             requested: RefCell::new(HashSet::new()),
             image_slots: RefCell::new(Vec::new()),
             cw_revealed: false,
+            image_failed: RefCell::new(HashSet::new()),
         }
+    }
+
+    /// Record that `url` could not be fetched (see `image_failed`).
+    pub fn note_image_failed(&self, url: &str) {
+        self.image_failed.borrow_mut().insert(url.to_string());
+    }
+
+    /// Whether `url` is a picture that will be drawn inline: not one that
+    /// failed to arrive.
+    fn drawable(&self, url: &str) -> bool {
+        !self.image_failed.borrow().contains(url)
     }
 
     /// The warning the entry is currently masked behind, or `None` when it has
@@ -479,6 +497,14 @@ impl PostDetailScreen {
             // `p` plays the focused jukebox track (selected reply's, else the
             // post's); the app toggles pause when it's already playing.
             KeyCode::Char('p') => PostDetailIntent::PlayJukebox(self.focused_track()),
+            // `d` deletes the post, never a reply, so with a reply selected it
+            // refuses rather than arming a delete of the whole thread, which
+            // with `confirm_deletes = false` used to go through at once. Every
+            // other key here acts on the selected reply, so the reader has
+            // every reason to expect `d` to as well.
+            KeyCode::Char('d') if self.selected_reply.is_some() => PostDetailIntent::Warn(
+                "d deletes the whole post · select the post (K to the top) first".to_string(),
+            ),
             KeyCode::Char('d') => {
                 if crate::config::get().confirm_deletes {
                     self.confirming_delete = true;
@@ -520,7 +546,9 @@ impl PostDetailScreen {
                 self.scroll = self.max_scroll.get();
                 PostDetailIntent::None
             }
-            KeyCode::Char('n') if self.next_replies_cursor.is_some() => {
+            // The same in-flight guard the `j` path has: without it, two `n`s
+            // fetched the same page of replies twice.
+            KeyCode::Char('n') if self.next_replies_cursor.is_some() && !self.loading_replies => {
                 self.loading_replies = true;
                 PostDetailIntent::LoadMoreReplies
             }
@@ -1099,14 +1127,21 @@ impl PostDetailScreen {
             // When images are drawn inline, the image URL is hidden here (the graphic
             // appears in the reserved gap below); otherwise it's surfaced as text.
             // Links always surface their URL.
-            for md_line in render_markdown_with(&self.entry.content, theme, image_urls) {
+            // A picture that failed to arrive is a link again, not a hole.
+            let post_image = self.post_image_url().filter(|u| self.drawable(u));
+            let body_urls = if inline_images && post_image.is_none() {
+                ImageUrls::Show
+            } else {
+                image_urls
+            };
+            for md_line in render_markdown_with(&self.entry.content, theme, body_urls) {
                 lines.push(md_line);
             }
 
             // The post's own image (or, for a jukebox post, its cover art) drawn
             // inline right after the body it belongs to.
             if inline_images {
-                if let Some(url) = self.post_image_url() {
+                if let Some(url) = post_image {
                     slots.push(ImageSlot {
                         url,
                         start_line: lines.len(),
@@ -1179,7 +1214,17 @@ impl PostDetailScreen {
                 Span::styled(format!(" · {when}{parent}{edited}"), theme.muted_style()),
             ]));
             // Reply body — markdown-rendered. Highlight overrides via the loop below.
-            for md_line in render_markdown_with(&reply.content, theme, image_urls) {
+            // As for the post, a picture that failed to arrive keeps its link.
+            let reply_image = reply_image_urls(reply)
+                .into_iter()
+                .next()
+                .filter(|u| self.drawable(u));
+            let reply_urls = if inline_images && reply_image.is_none() {
+                ImageUrls::Show
+            } else {
+                image_urls
+            };
+            for md_line in render_markdown_with(&reply.content, theme, reply_urls) {
                 if highlight {
                     let restyled: Vec<Span<'_>> = md_line
                         .spans
@@ -1193,7 +1238,7 @@ impl PostDetailScreen {
             }
             // The reply's own image, drawn inline right after its text.
             if inline_images {
-                if let Some(url) = reply_image_urls(reply).into_iter().next() {
+                if let Some(url) = reply_image {
                     slots.push(ImageSlot {
                         url,
                         start_line: lines.len(),
@@ -1422,6 +1467,32 @@ mod tests {
             "image url surfaced as text: {body:?}"
         );
         assert!(s.image_slots.borrow().is_empty(), "no gap reserved");
+    }
+
+    #[test]
+    fn a_post_image_that_failed_shows_its_link_and_reserves_no_gap() {
+        let mut e = entry("p1");
+        e.content = "hero ![a cat](https://x/cat.png)".into();
+        let s = PostDetailScreen::new(e);
+        s.note_image_failed("https://x/cat.png");
+        let body = body_text_mode(&s, true).join("\n");
+        assert!(
+            body.contains("https://x/cat.png"),
+            "the link is back: {body:?}"
+        );
+        assert!(s.image_slots.borrow().is_empty(), "no blank band reserved");
+    }
+
+    #[test]
+    fn a_reply_image_that_failed_shows_its_link_and_reserves_no_gap() {
+        let mut s = PostDetailScreen::new(entry("p1"));
+        let mut r = reply("r1", "p1");
+        r.content = "look ![a dog](https://x/dog.png)".into();
+        s.apply_replies_initial(Ok((vec![r], None)));
+        s.note_image_failed("https://x/dog.png");
+        let body = body_text_mode(&s, true).join("\n");
+        assert!(body.contains("https://x/dog.png"), "{body:?}");
+        assert!(s.image_slots.borrow().is_empty());
     }
 
     #[test]
@@ -1718,6 +1789,38 @@ mod tests {
 
         s.handle_key(key(KeyCode::Char('v')));
         assert!(!body_text(&s).join("\n").contains("the hidden body"));
+    }
+
+    #[test]
+    fn a_second_n_waits_for_the_page_already_on_its_way() {
+        let mut s = PostDetailScreen::new(entry("p1"));
+        s.apply_replies_initial(Ok((vec![reply("r1", "p1")], Some("c1".into()))));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Char('n'))),
+            PostDetailIntent::LoadMoreReplies
+        );
+        assert_ne!(
+            s.handle_key(key(KeyCode::Char('n'))),
+            PostDetailIntent::LoadMoreReplies
+        );
+    }
+
+    #[test]
+    fn d_with_a_reply_selected_never_deletes_the_post() {
+        let mut s = PostDetailScreen::new(entry("p1"));
+        s.apply_replies_initial(Ok((vec![reply("r1", "p1")], None)));
+        s.handle_key(key(KeyCode::Char('J')));
+        assert_eq!(s.selected_reply, Some(0));
+        let intent = s.handle_key(key(KeyCode::Char('d')));
+        assert!(matches!(intent, PostDetailIntent::Warn(_)), "{intent:?}");
+        assert!(!s.confirming_delete, "no delete was armed");
+        // With the post itself selected, `d` arms the delete as before.
+        s.handle_key(key(KeyCode::Char('K')));
+        assert_eq!(s.selected_reply, None);
+        assert_ne!(
+            s.handle_key(key(KeyCode::Char('d'))),
+            PostDetailIntent::Warn(String::new())
+        );
     }
 
     #[test]

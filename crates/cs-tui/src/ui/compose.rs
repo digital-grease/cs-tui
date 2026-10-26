@@ -9,7 +9,7 @@
 //! so there is nothing for this screen to attach.
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1175,13 +1175,21 @@ pub fn launch_editor(initial: &str, suffix: &str) -> Result<String, ComposeError
         .clone()
         .unwrap_or_else(|| "nano".to_string());
     let path = tmp_compose_path(suffix);
-    fs::write(&path, initial)?;
+    write_private(&path, initial)?;
 
     suspend_terminal()?;
-    let status = Command::new(&editor).arg(&path).status();
+    let status = editor_command(&editor, &path).status();
     let restore_result = resume_terminal();
 
-    let status = status?;
+    let status = match status {
+        Ok(status) => status,
+        Err(e) => {
+            // Spawning failed (no such program): the draft file would
+            // otherwise be left behind in the temp directory.
+            let _ = fs::remove_file(&path);
+            return Err(e.into());
+        }
+    };
     restore_result?;
     if !status.success() {
         let _ = fs::remove_file(&path);
@@ -1191,6 +1199,36 @@ pub fn launch_editor(initial: &str, suffix: &str) -> Result<String, ComposeError
     let content = fs::read_to_string(&path)?;
     let _ = fs::remove_file(&path);
     Ok(content)
+}
+
+/// The command that opens `path` in `editor`.
+///
+/// Split on whitespace like the `browser` setting, so the template's own
+/// suggestions work: `code --wait` and `subl -w` used to be spawned as a
+/// program literally named `code --wait`, which never exists. There is no
+/// shell, so nothing else is interpreted. A blank value falls back to `nano`.
+fn editor_command(editor: &str, path: &Path) -> Command {
+    let mut parts = editor.split_whitespace();
+    let mut cmd = Command::new(parts.next().unwrap_or("nano"));
+    cmd.args(parts).arg(path);
+    cmd
+}
+
+/// Write the draft readable by its owner only.
+///
+/// It sits in the shared temp directory while the editor has it, and a draft
+/// (a private journal note, an unsent message) is nobody else's business.
+/// `create_new` also refuses to follow a file someone planted at the name.
+fn write_private(path: &Path, contents: &str) -> io::Result<()> {
+    use std::io::Write;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(contents.as_bytes())
 }
 
 fn tmp_compose_path(suffix: &str) -> PathBuf {
@@ -1207,6 +1245,10 @@ fn suspend_terminal() -> Result<(), io::Error> {
     // Hand the external editor a clean terminal: it manages its own bracketed
     // paste, and would otherwise leave ours in an unknown state on exit.
     execute!(out, crossterm::event::DisableBracketedPaste)?;
+    // Mouse reports would otherwise arrive in the editor as typed text.
+    if crate::mouse::is_captured() {
+        crate::mouse::write_reporting(false);
+    }
     execute!(out, LeaveAlternateScreen)?;
     disable_raw_mode()?;
     Ok(())
@@ -1220,6 +1262,10 @@ fn resume_terminal() -> Result<(), io::Error> {
     // otherwise silently break the app's multi-line paste handling for the rest
     // of the session.
     execute!(out, crossterm::event::EnableBracketedPaste)?;
+    // Back on, whatever the editor left behind on exit.
+    if crate::mouse::is_captured() {
+        crate::mouse::write_reporting(true);
+    }
     Ok(())
 }
 
@@ -1235,6 +1281,36 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::empty(),
         }
+    }
+
+    #[test]
+    fn an_editor_setting_with_arguments_is_split() {
+        let path = Path::new("/tmp/draft.md");
+        let cmd = editor_command("code --wait", path);
+        assert_eq!(cmd.get_program(), "code");
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args, vec!["--wait", "/tmp/draft.md"]);
+        let cmd = editor_command("   ", path);
+        assert_eq!(cmd.get_program(), "nano");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_draft_file_is_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("cs-tui-test-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("draft.md");
+        let _ = fs::remove_file(&path);
+        write_private(&path, "secret").unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(
+            write_private(&path, "again").is_err(),
+            "an existing file is never written through"
+        );
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
     }
 
     #[test]

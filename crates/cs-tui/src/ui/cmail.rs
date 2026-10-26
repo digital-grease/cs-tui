@@ -1664,6 +1664,16 @@ fn apply_older_messages(
     messages.loading = false;
     match result {
         Ok((mut older, cursor)) => {
+            // Never a message already held: a repeated page (a second load
+            // asked for while the first was in flight) must not double the
+            // history. See the cIRC twin of this function.
+            let held: std::collections::HashSet<&str> = messages
+                .items
+                .iter()
+                .map(|m| m.id.as_str())
+                .filter(|id| !id.is_empty())
+                .collect();
+            older.retain(|m| m.id.is_empty() || !held.contains(m.id.as_str()));
             let added = older.len();
             older.append(&mut messages.items);
             messages.items = older;
@@ -2235,6 +2245,25 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::empty(),
         }
+    }
+
+    #[test]
+    fn the_same_older_page_twice_is_not_held_twice() {
+        let mut messages: TabState<CmailMessage> = TabState::loading();
+        messages.apply_initial(Ok((vec![message("m3", "newest", 3_000)], None)));
+        let page = || {
+            Ok((
+                vec![
+                    message("m1", "oldest", 1_000),
+                    message("m2", "older", 2_000),
+                ],
+                Some("1000".to_string()),
+            ))
+        };
+        apply_older_messages(&mut messages, page());
+        apply_older_messages(&mut messages, page());
+        let ids: Vec<&str> = messages.items.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["m1", "m2", "m3"]);
     }
 
     fn open_with_messages(msgs: Vec<CmailMessage>, cursor: Option<String>) -> CmailScreen {

@@ -509,10 +509,20 @@ impl HelpOverlay {
     }
 
     /// Render the help overlay centered over `area`.
-    pub fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
+    /// Where [`Self::render`] draws the card inside `area`, or `None` when
+    /// there is no room for one. Exposed so the shell knows which cells an
+    /// overlay covered.
+    #[must_use]
+    pub fn card(&self, area: Rect, theme: &Theme) -> Option<Rect> {
+        self.layout(area, theme).map(|(card, _)| card)
+    }
+
+    /// The card and the lines it holds, computed once for both [`Self::card`]
+    /// and [`Self::render`] so the two cannot disagree.
+    fn layout(&self, area: Rect, theme: &Theme) -> Option<(Rect, Vec<Line<'static>>)> {
         let w = CARD_WIDTH.min(area.width.saturating_sub(2));
         if w == 0 || area.height == 0 {
-            return; // no room for a card at all
+            return None; // no room for a card at all
         }
         let desc_width = (w as usize).saturating_sub(2 + KEY_COL).max(8);
         let lines = help_lines(theme, desc_width);
@@ -520,7 +530,13 @@ impl HelpOverlay {
         let h = (lines.len() as u16).saturating_add(3).min(area.height);
         let x = area.x + area.width.saturating_sub(w) / 2;
         let y = area.y + area.height.saturating_sub(h) / 2;
-        let card = Rect::new(x, y, w, h);
+        Some((Rect::new(x, y, w, h), lines))
+    }
+
+    pub fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
+        let Some((card, lines)) = self.layout(area, theme) else {
+            return;
+        };
 
         // Clear the underlying content, then repaint the card in the theme's own
         // background: `Clear` alone leaves the terminal default showing through,

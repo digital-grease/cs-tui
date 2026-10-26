@@ -10,6 +10,13 @@
 //! something that is not a browser has pointed it there deliberately; a URL
 //! arriving in someone else's message still cannot reach it unless it is http
 //! or https.
+//!
+//! **No shell ever sees a URL.** Every opener is run directly with the URL as
+//! one argument. Windows used to go through `cmd /C start`, and cmd.exe reads
+//! `&`, `|` and `^` in its arguments however they are quoted, so a link in a
+//! chat message reading `https://x.example/&calc` ran `calc`. It now goes
+//! through `rundll32 url.dll,FileProtocolHandler`, the shell's own URL handler,
+//! with no command interpreter in between.
 use std::io;
 use std::process::{Command, Stdio};
 
@@ -44,12 +51,56 @@ pub fn open_url_with(url: &str, browser: Option<&str>) -> io::Result<()> {
             "refusing to open a non-http(s) url",
         ));
     }
-    command_for(url, browser)
+    let Some(url) = handler_safe(url) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to open a url with control characters in it",
+        ));
+    };
+    let mut child = command_for(&url, browser)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .map(|_| ())
+        .spawn()?;
+    // The opener exits as soon as it has handed the link over. Waiting on it
+    // from a throwaway thread reaps it; dropping the handle instead left a
+    // zombie process behind for every link opened, until cs-tui itself exited.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+/// `url` as it is handed to a handler: trimmed, with the few characters a
+/// well-formed URL never carries literally percent-encoded, or `None` when it
+/// holds control characters.
+///
+/// Encoding them is lossless, since `%20` and a space name the same resource,
+/// and it means no opener on any platform is handed a quote, a space or an
+/// angle bracket to interpret. `&`, `?`, `#` and `%` are left alone: they are
+/// ordinary URL syntax, and no shell is involved to misread them.
+fn handler_safe(url: &str) -> Option<String> {
+    let url = url.trim();
+    if url.chars().any(char::is_control) {
+        return None;
+    }
+    let mut out = String::with_capacity(url.len());
+    for c in url.chars() {
+        match c {
+            ' ' => out.push_str("%20"),
+            '"' => out.push_str("%22"),
+            '<' => out.push_str("%3C"),
+            '>' => out.push_str("%3E"),
+            '\\' => out.push_str("%5C"),
+            '^' => out.push_str("%5E"),
+            '`' => out.push_str("%60"),
+            '{' => out.push_str("%7B"),
+            '|' => out.push_str("%7C"),
+            '}' => out.push_str("%7D"),
+            c => out.push(c),
+        }
+    }
+    Some(out)
 }
 
 /// The command that will open `url`: the configured browser if there is a
@@ -103,17 +154,18 @@ pub fn is_openable(url: &str) -> bool {
     lower.starts_with("https://") || lower.starts_with("http://")
 }
 
-/// Build the platform-appropriate opener command: `open` on macOS, `cmd /C
-/// start` on Windows, `xdg-open` elsewhere. The URL is always the final
-/// argument. `cfg!` (not `#[cfg]`) keeps every branch compiling so the build
+/// Build the platform-appropriate opener command: `open` on macOS,
+/// `rundll32 url.dll,FileProtocolHandler` on Windows, `xdg-open` elsewhere. The
+/// URL is always the final argument, and none of them is a shell. `cfg!` (not `#[cfg]`) keeps every branch compiling so the build
 /// fails loudly if a target's opener is wrong, and so this stays unit-testable.
 fn opener_command(url: &str) -> Command {
     let (program, prefix_args): (&str, &[&str]) = if cfg!(target_os = "macos") {
         ("open", &[])
     } else if cfg!(target_os = "windows") {
-        // The empty "" is `start`'s window-title argument; without it a quoted
-        // URL would be mistaken for the title.
-        ("cmd", &["/C", "start", ""])
+        // Not `cmd /C start`: cmd.exe treats `&` and `|` in the URL as command
+        // separators. `FileProtocolHandler` hands the URL to the default
+        // browser via the shell's URL association, with no interpreter.
+        ("rundll32", &["url.dll,FileProtocolHandler"])
     } else {
         ("xdg-open", &[])
     };
@@ -213,6 +265,34 @@ mod tests {
         assert_eq!(args, vec![url]);
         let (_, args) = parts(&command_for(url, Some("qutebrowser %s")));
         assert_eq!(args, vec![url]);
+    }
+
+    #[test]
+    fn no_opener_is_a_command_interpreter() {
+        // The Windows opener used to be `cmd /C start`, which ran `calc` for a
+        // link reading `https://x.example/&calc`. Whatever platform the tests
+        // run on, the opener chosen must not be a shell.
+        let (prog, args) = parts(&opener_command("https://x.example/&calc"));
+        assert!(!["cmd", "cmd.exe", "sh", "bash", "powershell"].contains(&prog.as_str()));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("https://x.example/&calc")
+        );
+    }
+
+    #[test]
+    fn urls_are_made_handler_safe_without_changing_what_they_name() {
+        assert_eq!(
+            handler_safe("https://x.example/a b\"c<d>").as_deref(),
+            Some("https://x.example/a%20b%22c%3Cd%3E")
+        );
+        // Ordinary URL syntax is left alone.
+        let q = "https://x.example/p?a=1&b=2#frag%20x";
+        assert_eq!(handler_safe(q).as_deref(), Some(q));
+        // Control characters (a smuggled newline, an escape) are refused.
+        assert_eq!(handler_safe("https://x.example/\nrm"), None);
+        assert_eq!(handler_safe("https://x.example/\u{1b}]8"), None);
+        assert!(open_url_with("https://x.example/\r\nx", Some("firefox")).is_err());
     }
 
     #[test]

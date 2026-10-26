@@ -85,8 +85,9 @@ impl ImageSharpness {
 
 use crate::ui::theme::Theme;
 
-/// Parsed `config.toml`. Lenient: unknown keys are ignored and a parse error
-/// falls back to defaults (never blocks startup).
+/// Parsed `config.toml`. Lenient: unknown keys are ignored, a key with a bad
+/// value is dropped on its own, and only an unreadable file falls back to
+/// defaults (see [`Config::load_reporting`]). Never blocks startup.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -547,8 +548,10 @@ const TEMPLATE: &str = r##"# cs-tui configuration. Edit and restart cs-tui.
 
 # Check GitHub for a newer release of cs-tui.
 #   true  (default) at most once a day, in the background, cs-tui asks the
-#         project's release list whether a newer version exists and mentions it
-#         once. The request tells GitHub your address and that you run cs-tui.
+#         project's release list whether a newer version exists. A newer one
+#         is announced once, then shown as a badge at the right of the tab bar,
+#         in the Esc menu, on quit and in `cs-tui --version` until you update.
+#         The request tells GitHub your address and that you run cs-tui.
 #         It never touches the Cyberspace API, carries no session token, and
 #         nothing is ever downloaded or installed: you are told a version and a
 #         link, and updating stays your decision.
@@ -581,23 +584,68 @@ impl Config {
         Some(dirs.config_dir().join("config.toml"))
     }
 
-    /// Load config from `path`, falling back to defaults on a missing/unreadable
-    /// file or a parse error (the latter is logged).
-    pub fn load_from(path: &Path) -> Self {
+    /// Load config from `path`, falling back to defaults on a missing or
+    /// unreadable file, plus a one-line message for the reader when the file
+    /// had something wrong with it, to show on screen at startup.
+    ///
+    /// A bad value no longer costs every other setting. The whole file used to
+    /// fall back to defaults on one type error (`image_height = "20"`), noted
+    /// only in the log, which quietly undid the privacy opt-outs along with it:
+    /// `circ_presence = false`, `cmail_typing = false`, `update_check = false`.
+    /// Now each top-level key is checked on its own and only the ones that do
+    /// not fit are dropped, by name. A file TOML cannot read at all still means
+    /// defaults, but the reader is told.
+    pub fn load_reporting(path: &Path) -> (Self, Option<String>) {
         let Ok(text) = fs::read_to_string(path) else {
-            return Self::default(); // missing/unreadable → defaults
+            return (Self::default(), None); // missing/unreadable → defaults
         };
-        match toml::from_str(&text) {
-            Ok(cfg) => cfg,
+        let (cfg, warning) = Self::parse_reporting(&text);
+        if let Some(w) = &warning {
+            tracing::warn!(path = %path.display(), "{w}");
+        }
+        (cfg, warning)
+    }
+
+    /// The parsing half of [`Self::load_reporting`], split out for tests.
+    fn parse_reporting(text: &str) -> (Self, Option<String>) {
+        if let Ok(cfg) = toml::from_str::<Self>(text) {
+            return (cfg, None);
+        }
+        let table = match toml::from_str::<toml::Table>(text) {
+            Ok(table) => table,
             Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    path = %path.display(),
-                    "config.toml parse failed; using defaults"
+                let detail = e.to_string();
+                let first = detail.lines().next().unwrap_or("unreadable").trim();
+                return (
+                    Self::default(),
+                    Some(format!(
+                        "config.toml could not be read ({first}); using defaults"
+                    )),
                 );
-                Self::default()
+            }
+        };
+        let mut kept = toml::Table::new();
+        let mut dropped = Vec::new();
+        for (key, value) in table {
+            let mut single = toml::Table::new();
+            single.insert(key.clone(), value.clone());
+            if toml::Value::Table(single).try_into::<Self>().is_ok() {
+                kept.insert(key, value);
+            } else {
+                dropped.push(key);
             }
         }
+        let cfg = toml::Value::Table(kept)
+            .try_into::<Self>()
+            .unwrap_or_default();
+        dropped.sort();
+        let warning = (!dropped.is_empty()).then(|| {
+            format!(
+                "config.toml: ignored invalid {} (everything else applied)",
+                dropped.join(", ")
+            )
+        });
+        (cfg, warning)
     }
 
     /// Write the fully-commented template to `path` if it doesn't exist yet, so
@@ -773,6 +821,12 @@ pub fn parse_color(s: &str) -> Option<Color> {
         return s.parse::<u8>().ok().map(Color::Indexed);
     }
     let hex = s.strip_prefix('#').unwrap_or(&s);
+    // Hex digits only, checked before anything is sliced: the slices below are
+    // by byte, and `"aé123"` is six bytes with a two-byte `é` straddling the
+    // first cut, which panicked at startup with "not a char boundary".
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
     match hex.len() {
         6 => {
             let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
@@ -1363,5 +1417,48 @@ mod tests {
         assert_eq!(cfg.theme.as_deref(), Some("c64"));
         // bad time_format falls back to the default
         assert_eq!(cfg.to_runtime().time_format, TimeFormat::Relative);
+    }
+
+    #[test]
+    fn one_bad_value_does_not_cost_every_other_setting() {
+        // `image_height` wants a number. The privacy opt-outs beside it used
+        // to be dropped along with it, back on without a word.
+        let (cfg, warning) = Config::parse_reporting(
+            r#"
+            circ_presence = false
+            cmail_typing = false
+            update_check = false
+            image_height = "20"
+            "#,
+        );
+        assert_eq!(cfg.circ_presence, Some(false));
+        assert_eq!(cfg.cmail_typing, Some(false));
+        assert_eq!(cfg.update_check, Some(false));
+        assert_eq!(cfg.image_height, None, "the bad value falls back");
+        let warning = warning.expect("the reader is told");
+        assert!(warning.contains("image_height"), "{warning}");
+        assert!(!warning.contains("circ_presence"), "{warning}");
+    }
+
+    #[test]
+    fn a_file_toml_cannot_read_says_so() {
+        let (cfg, warning) = Config::parse_reporting("this is = = not toml");
+        assert!(cfg.theme.is_none());
+        assert!(warning.expect("told").contains("could not be read"));
+    }
+
+    #[test]
+    fn a_good_file_has_nothing_to_say() {
+        let (_, warning) = Config::parse_reporting(TEMPLATE);
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn a_non_ascii_colour_is_refused_rather_than_crashing() {
+        for bad in ["aé123", "#aé123", "é12", "ééé", "zzzzzz", "#12345g"] {
+            assert_eq!(parse_color(bad), None, "{bad}");
+        }
+        assert!(parse_color("#ff8800").is_some());
+        assert!(parse_color("f80").is_some());
     }
 }

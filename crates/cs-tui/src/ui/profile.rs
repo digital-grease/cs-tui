@@ -134,6 +134,16 @@ pub enum ProfileIntent {
     None,
 }
 
+/// Which profile a background request was made for, so its answer can be
+/// matched to the screen it belongs to (see [`ProfileScreen::shows`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileTarget {
+    /// The signed-in user's own profile.
+    Own,
+    /// Somebody's profile, by handle.
+    User(String),
+}
+
 #[derive(Debug)]
 pub struct ProfileScreen {
     /// The username being viewed. `None` means "me" — resolved after `user`
@@ -183,6 +193,45 @@ pub struct ProfileScreen {
 impl ProfileScreen {
     pub fn new_own() -> Self {
         Self::new_inner(None, true, true)
+    }
+
+    /// The profile this screen shows, for tagging the requests it makes.
+    #[must_use]
+    pub fn target(&self) -> ProfileTarget {
+        if self.is_self {
+            return ProfileTarget::Own;
+        }
+        let name = self
+            .username
+            .clone()
+            .or_else(|| self.user.as_ref().map(|u| u.username.clone()))
+            .unwrap_or_default();
+        ProfileTarget::User(name)
+    }
+
+    /// Whether an answer requested for `target` belongs on this screen.
+    ///
+    /// Profile results used to be applied to whatever profile was on top when
+    /// they landed. Opening someone and stepping back before their profile
+    /// loaded put their `User` over your own; a follow that answered after you
+    /// had moved on put its follow id on the next person, whose `F` then
+    /// unfollowed the first.
+    #[must_use]
+    pub fn shows(&self, target: &ProfileTarget) -> bool {
+        match target {
+            ProfileTarget::Own => self.is_self,
+            ProfileTarget::User(name) => {
+                !self.is_self
+                    && (self
+                        .username
+                        .as_deref()
+                        .is_some_and(|u| u.eq_ignore_ascii_case(name))
+                        || self
+                            .user
+                            .as_ref()
+                            .is_some_and(|u| u.username.eq_ignore_ascii_case(name)))
+            }
+        }
     }
 
     pub fn new_for(username: String) -> Self {

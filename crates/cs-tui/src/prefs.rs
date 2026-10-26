@@ -99,11 +99,26 @@ impl Prefs {
 impl Prefs {
     /// Canonical prefs path, creating the parent directory if needed.
     pub fn default_path() -> Result<PathBuf, SessionError> {
+        let path = Self::path()?;
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        Ok(path)
+    }
+
+    /// Canonical prefs path, without touching the disk.
+    fn path() -> Result<PathBuf, SessionError> {
         let dirs =
             ProjectDirs::from("online", "cyberspace", "cs-tui").ok_or(SessionError::NoHome)?;
-        let dir = dirs.config_dir();
-        fs::create_dir_all(dir)?;
-        Ok(dir.join("prefs.json"))
+        Ok(dirs.config_dir().join("prefs.json"))
+    }
+
+    /// Like [`Prefs::load`], but creates nothing, for a caller such as
+    /// `--version` that should leave no trace.
+    pub fn peek() -> Self {
+        Self::path()
+            .and_then(|p| Self::load_from(&p))
+            .unwrap_or_default()
     }
 
     /// Load prefs, falling back to defaults on any error (a missing or
