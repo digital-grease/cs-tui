@@ -17,7 +17,7 @@ tokio-util = { version = "0.7", default-features = false, features = ["io"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "gzip"] }
 url = "2.5"
-base64 = "0.22"
+base64 = "0.23"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
