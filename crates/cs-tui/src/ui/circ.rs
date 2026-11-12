@@ -160,8 +160,8 @@ pub enum CircIntent {
         /// Cursor timestamp, the oldest message we hold.
         before: Option<i64>,
     },
-    /// Hand the draft to the full editor (`Ctrl+E`), which is the only way to
-    /// compose the multi-line body `/art` needs.
+    /// Hand the draft to the full editor (`Ctrl+E`), the comfortable way to
+    /// compose a long message or the multi-line body `/art` needs.
     StartCompose {
         /// Room slug (`:roomId`).
         room_id: String,
@@ -226,6 +226,10 @@ pub enum CircIntent {
     PlayJukebox(JukeboxTrack),
     /// Leave the open room and go back to the room list.
     BackToRooms,
+    /// Raise a warning toast, the way C-Mail's `Warn` does. Used for a draft
+    /// over a message limit (see [`composer::length_limit_notice`]); a refused
+    /// command is a room notice instead (see `append_notice`).
+    Warn(String),
     /// Exit the app.
     Quit,
     /// Nothing to do.
@@ -364,6 +368,10 @@ pub struct CircScreen {
     /// Always-on inline composer for the open room (it's a chat channel, so the
     /// input is focused the whole time you're in a room).
     draft: Composer,
+    /// A multi-line styled draft the reader has already been warned will post
+    /// on one line, so the next Enter on exactly this draft sends it. See
+    /// [`STYLED_LINES_WARNING`].
+    styled_confirmed: Option<String>,
     /// Optimistic outgoing messages awaiting their server echo.
     outgoing: Vec<Outgoing>,
     /// Whether the roster pane is open. Kept on the screen rather than on the
@@ -487,6 +495,7 @@ impl CircScreen {
             rooms: TabState::loading(),
             mode: CircMode::Rooms,
             draft: Composer::default(),
+            styled_confirmed: None,
             outgoing: Vec::new(),
             roster_open: false,
             muted: HashMap::new(),
@@ -535,6 +544,12 @@ impl CircScreen {
         }
     }
 
+    /// Test helper: the current composer draft (C-Mail has the same).
+    #[cfg(test)]
+    pub fn draft_for_test(&self) -> &str {
+        &self.draft.text
+    }
+
     /// Insert bracketed-paste text into whichever field has the keyboard: the
     /// composer, or the flag-reason prompt. Select mode has no field, so a paste
     /// there is dropped rather than typed into the unfocused composer.
@@ -556,8 +571,9 @@ impl CircScreen {
 
     /// Set the composer text (used when the full editor hands its content back).
     ///
-    /// The editor is the only way to compose the multi-line body `/art` needs,
-    /// so returning from it always puts the keyboard back on the composer.
+    /// The draft comes back for a last look before Enter sends it, so returning
+    /// from the editor always puts the keyboard back on the composer, closing
+    /// the action menu if it was open.
     pub fn set_draft_and_focus(&mut self, content: String) {
         let CircMode::Room { select, .. } = &mut self.mode else {
             return;
@@ -587,6 +603,7 @@ impl CircScreen {
 
     fn reset_composer(&mut self) {
         self.draft.clear();
+        self.styled_confirmed = None;
         self.outgoing.clear();
     }
 
@@ -1338,9 +1355,10 @@ impl CircScreen {
         }
 
         // The composer is focused in a room: typed keys go to the draft, Enter
-        // sends, Ctrl+E expands to the editor, and the vertical keys scroll the
-        // history. The horizontal keys — ←/→, Home and End — belong to the
-        // composer's caret, the way they do in every other field in the client;
+        // sends, Alt+Enter or Ctrl+J starts a new line, Ctrl+E expands to the
+        // editor, and the vertical keys scroll the history. The horizontal
+        // keys — ←/→, Home and End — belong to the composer's caret, the way
+        // they do in every other field in the client;
         // jumping the history to its ends is the action menu's Home/End
         // (Ctrl+A), which has no text to move a caret through.
         // Tab cycles the mention preview and Space commits it; every other key
@@ -1369,6 +1387,12 @@ impl CircScreen {
         }
 
         match key.code {
+            // First, so `Alt+Enter` never falls through to the send arm below,
+            // which matches Enter whatever its modifiers.
+            _ if composer::is_newline_key(&key) => {
+                self.draft.insert('\n');
+                CircIntent::None
+            }
             KeyCode::Char('e') if ctrl => CircIntent::StartCompose {
                 room_id,
                 draft: self.draft.text.clone(),
@@ -1392,6 +1416,47 @@ impl CircScreen {
                     self.append_notice(&room_id, &format!("unknown command: {word}"));
                     return CircIntent::None;
                 }
+                // The limits on a message raise a warning rather than a room
+                // notice: they are about the draft, not a reply to anything,
+                // and the draft is kept for the same reason as a typo'd
+                // command. Each one the server would refuse is caught here
+                // because a refusal lands in the outgoing strip as a failure
+                // that a retry cannot fix. All are checked before `/localtime`
+                // is filled in, which only ever expands a bare, short command.
+                let art = is_art_draft(&content);
+                // The art canvas first: any picture inside it is under the
+                // length limit too, so for art it is the limit that was broken.
+                if art {
+                    if let Some(warning) = art_canvas_notice(&content) {
+                        return CircIntent::Warn(warning);
+                    }
+                }
+                if let Some(warning) = composer::length_limit_notice(&content) {
+                    return CircIntent::Warn(warning);
+                }
+                // Past ten lines the server runs the rest together rather than
+                // refusing (v0.9.1 § Send a Message). Art keeps its own canvas
+                // instead, checked above.
+                if !art {
+                    if let Some(warning) =
+                        composer::line_limit_notice(&content, super::commands::Surface::Circ)
+                    {
+                        return CircIntent::Warn(warning);
+                    }
+                }
+                // A styled message's line breaks become spaces (§ Send a
+                // Message, cIRC), so a draft the composer shows on several rows
+                // would post on one. Not a refusal, since nothing is lost but
+                // the layout: the first Enter warns, and a second on the same
+                // draft sends it as it is. Editing it in between warns again.
+                if content.contains('\n')
+                    && super::commands::is_styled(&content)
+                    && self.styled_confirmed.as_deref() != Some(content.as_str())
+                {
+                    self.styled_confirmed = Some(content.clone());
+                    return CircIntent::Warn(STYLED_LINES_WARNING.to_string());
+                }
+                self.styled_confirmed = None;
                 // A bare `/localtime` carries no time, and the server cannot see
                 // the reader's clock (§ Commands), so fill it in or say why not.
                 // The draft is kept on a refusal for the same reason as above.
@@ -1943,7 +2008,7 @@ impl CircScreen {
         // The composer input is always present: its rows, then one row of hints.
         // It grows as the draft wraps, but never past the point where the
         // conversation it belongs to would be squeezed out.
-        let cap = composer::MAX_ROWS
+        let cap = composer::max_rows(&self.draft.text)
             .min(
                 chat_area
                     .height
@@ -2592,14 +2657,15 @@ fn visible_indices(items: &[CircMessage], muted: Option<&HashSet<String>>) -> Ve
 
 /// The body to send for a composed draft.
 ///
-/// An ordinary message is trimmed, as it always was. An `/art` draft is not:
+/// An ordinary message is trimmed, as it always was, which takes blank lines off
+/// both ends but leaves the line breaks inside it alone: since v0.9.1 those are
+/// part of the message (§ Send a Message). An `/art` draft is not trimmed:
 /// § Commands says the picture goes on the lines after the command and is
 /// "stored as-is, leading spaces are preserved, because they're the picture", so
 /// trimming would eat the indentation of the first row and any trailing row that
-/// ends in spaces. Only the trailing newline the full editor leaves behind is
-/// removed, since that is an artefact of composing rather than part of the
-/// picture. Multi-line content can only arrive through the editor, so this is
-/// the one shape the inline composer never produces on its own.
+/// ends in spaces. Only trailing newlines are removed, since those are an
+/// artefact of composing (the full editor always leaves one) rather than part
+/// of the picture.
 fn send_content(draft: &str) -> String {
     if is_art_draft(draft) {
         return draft.trim_end_matches(['\n', '\r']).to_string();
@@ -2607,13 +2673,74 @@ fn send_content(draft: &str) -> String {
     draft.trim().to_string()
 }
 
+/// The warning a multi-line styled draft gets before it is sent (§ Send a
+/// Message, cIRC: "Line breaks in a styled message's text become spaces").
+/// Short, because a toast is only as wide as the terminal.
+const STYLED_LINES_WARNING: &str = "styled: line breaks become spaces. Enter again to send";
+
+/// What to tell the reader instead of sending an `/art` draft that does not fit
+/// the canvas, [`super::art::CANVAS_COLS`] by [`super::art::CANVAS_ROWS`]
+/// (§ Commands).
+///
+/// The server refuses such a picture with a `400` naming the limit, and left to
+/// it the refusal lands in the outgoing strip as a failed send that `Ctrl+R`
+/// can only fail again. Caught here, the draft stays in the composer and the
+/// warning names the limit the way the server would.
+///
+/// The picture is the lines after the command, which is where § Commands says
+/// it goes. Anything typed after `/art` on the command's own line is counted as
+/// a row too, since the spec does not say the server ignores it. Columns are
+/// counted in UTF-16 units, the cautious reading of a JavaScript server's
+/// `.length`, as the message length is (see [`cs_api::message_len`]).
+///
+/// `content` must be an art draft (see [`is_art_draft`]) as it will be sent.
+fn art_canvas_notice(content: &str) -> Option<String> {
+    let rest = content.get("/art".len()..)?;
+    let (command_line, below) = match rest.split_once('\n') {
+        Some((line, below)) => (line, Some(below)),
+        None => (rest, None),
+    };
+    let mut rows: Vec<&str> = Vec::new();
+    // Past the one separator that ends the command word.
+    let inline = command_line
+        .strip_prefix(char::is_whitespace)
+        .unwrap_or(command_line);
+    if !inline.trim().is_empty() {
+        rows.push(inline);
+    }
+    if let Some(below) = below {
+        rows.extend(below.split('\n'));
+    }
+    let (max_rows, max_cols) = (super::art::CANVAS_ROWS, super::art::CANVAS_COLS);
+    if rows.len() > max_rows {
+        return Some(format!("art too tall: {} of {max_rows} rows", rows.len()));
+    }
+    rows.iter().enumerate().find_map(|(i, row)| {
+        let cols = cs_api::message_len(row);
+        (cols > max_cols).then(|| {
+            format!(
+                "art too wide: row {} is {cols} of {max_cols} columns",
+                i + 1
+            )
+        })
+    })
+}
+
 /// Whether a draft is an `/art` post: the command has to start the content, and
 /// has to be the whole first word, so `/article` is ordinary text.
+///
+/// Case-insensitive, as [`super::commands::is_known`] is: it accepts `/ART` as
+/// a command, so treating it as text here would trim the picture's indentation
+/// and then refuse it as too many lines.
 fn is_art_draft(draft: &str) -> bool {
-    let Some(rest) = draft.strip_prefix("/art") else {
+    const ART: &str = "/art";
+    // `get` rather than slicing, so a multibyte character in the first four
+    // bytes is a mismatch rather than a panic.
+    let Some(head) = draft.get(..ART.len()) else {
         return false;
     };
-    rest.is_empty() || rest.starts_with(char::is_whitespace)
+    let rest = &draft[ART.len()..];
+    head.eq_ignore_ascii_case(ART) && (rest.is_empty() || rest.starts_with(char::is_whitespace))
 }
 
 /// Drop the oldest messages once a room has held more than [`MAX_HELD_MESSAGES`].
@@ -5326,7 +5453,6 @@ mod tests {
     #[test]
     fn editor_content_with_art_sends_untrimmed() {
         let mut s = open("general");
-        // Multi-line content can only arrive through the Ctrl+E editor.
         s.set_draft_and_focus("/art\n  /\\\n /  \\\n".to_string());
         assert_eq!(
             s.handle_key(key(KeyCode::Enter)),
@@ -5335,6 +5461,331 @@ mod tests {
                 content: "/art\n  /\\\n /  \\".into(),
             }
         );
+    }
+
+    fn alt(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::ALT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        }
+    }
+
+    #[test]
+    fn alt_enter_breaks_the_line_and_enter_sends_it_with_the_break() {
+        // v0.9.1 § Send a Message: a message may hold line breaks.
+        let mut s = open("general");
+        typed(&mut s, "one");
+        assert_eq!(
+            s.handle_key(alt(KeyCode::Enter)),
+            CircIntent::None,
+            "not sent"
+        );
+        typed(&mut s, "two");
+        assert_eq!(s.draft.text, "one\ntwo");
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            CircIntent::SendMessage {
+                room_id: "general".into(),
+                content: "one\ntwo".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn ctrl_j_breaks_the_line_at_the_caret() {
+        let mut s = open("general");
+        typed(&mut s, "onetwo");
+        for _ in 0..3 {
+            s.handle_key(key(KeyCode::Left));
+        }
+        s.handle_key(ctrl(KeyCode::Char('j')));
+        assert_eq!(s.draft.text, "one\ntwo");
+        assert_eq!(s.draft.cursor, 4, "the caret starts the new line");
+    }
+
+    #[test]
+    fn a_line_break_shows_as_a_new_composer_row() {
+        let mut s = open("general");
+        typed(&mut s, "one");
+        s.handle_key(alt(KeyCode::Enter));
+        typed(&mut s, "two");
+        let rows = render_rows_wide(&s, 60, 16);
+        let first = rows
+            .iter()
+            .position(|r| r.starts_with('›'))
+            .expect("composer row");
+        assert!(
+            rows[first].contains("one") && !rows[first].contains("two"),
+            "{rows:#?}"
+        );
+        assert!(rows[first + 1].contains("two"), "{rows:#?}");
+    }
+
+    #[test]
+    fn a_draft_past_ten_lines_is_refused_and_kept() {
+        // The server would run lines 11 on into line 10 rather than refuse, so
+        // the reader is told here, before anything is posted.
+        let mut s = open("general");
+        let draft = (1..=11)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        s.set_draft_and_focus(draft.clone());
+        let intent = s.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(&intent, CircIntent::Warn(msg) if msg.contains("too many lines: 11 of 10")),
+            "expected the line-limit warning, got {intent:?}",
+        );
+        assert!(s.outgoing.is_empty(), "nothing is queued");
+        assert_eq!(s.draft.text, draft, "the draft survives to be trimmed");
+    }
+
+    #[test]
+    fn a_draft_past_the_character_limit_warns_and_is_kept() {
+        // Sent anyway, the API crate refuses it and it sits in the outgoing
+        // strip as a failure whose `Ctrl+R` retry can never succeed.
+        let mut s = open("general");
+        let draft = "x".repeat(cs_api::MAX_MESSAGE_LEN + 1);
+        s.set_draft_and_focus(draft.clone());
+        let intent = s.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(&intent, CircIntent::Warn(msg)
+                if msg.contains("2049 of 2048 characters") && msg.contains("cut 1")),
+            "expected the length warning, got {intent:?}",
+        );
+        assert!(s.outgoing.is_empty(), "nothing is queued, so nothing fails");
+        assert_eq!(s.draft.text, draft, "the draft survives to be cut down");
+    }
+
+    #[test]
+    fn a_draft_at_the_character_limit_sends() {
+        let mut s = open("general");
+        s.set_draft_and_focus("x".repeat(cs_api::MAX_MESSAGE_LEN));
+        assert!(matches!(
+            s.handle_key(key(KeyCode::Enter)),
+            CircIntent::SendMessage { .. }
+        ));
+    }
+
+    #[test]
+    fn the_character_limit_is_measured_after_trimming() {
+        // The draft is trimmed before it is sent, so padding around a message
+        // at the limit must not push it over.
+        let mut s = open("general");
+        let padded = format!("  {}  \n", "x".repeat(cs_api::MAX_MESSAGE_LEN));
+        s.set_draft_and_focus(padded);
+        assert!(matches!(
+            s.handle_key(key(KeyCode::Enter)),
+            CircIntent::SendMessage { .. }
+        ));
+    }
+
+    #[test]
+    fn art_over_the_canvas_names_the_canvas_not_the_length() {
+        // Any picture inside 80×25 is under 2048 too, so for art the canvas
+        // is the limit that was broken, and the warning has to say so.
+        let mut s = open("general");
+        let picture = vec!["#".repeat(80); 26].join("\n");
+        s.set_draft_and_focus(format!("/art\n{picture}"));
+        // Named, not just `Warn(_)`: the line and length warnings would match
+        // that too.
+        let intent = s.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(&intent, CircIntent::Warn(msg) if msg == "art too tall: 26 of 25 rows"),
+            "expected the canvas warning, got {intent:?}",
+        );
+        assert!(s.outgoing.is_empty(), "nothing is queued");
+    }
+
+    /// Enter on an art draft of `rows`, returning what the screen asked for.
+    fn send_art(rows: &[String]) -> CircIntent {
+        let mut s = open("general");
+        s.set_draft_and_focus(format!("/art\n{}", rows.join("\n")));
+        s.handle_key(key(KeyCode::Enter))
+    }
+
+    #[test]
+    fn a_full_canvas_of_art_sends() {
+        let full = vec!["#".repeat(super::super::art::CANVAS_COLS); 25];
+        assert!(matches!(send_art(&full), CircIntent::SendMessage { .. }));
+    }
+
+    #[test]
+    fn art_one_column_too_wide_names_the_row() {
+        let mut rows = vec!["#".repeat(80); 5];
+        rows[2] = "#".repeat(81);
+        assert_eq!(
+            send_art(&rows),
+            CircIntent::Warn("art too wide: row 3 is 81 of 80 columns".into())
+        );
+    }
+
+    #[test]
+    fn an_emoji_is_two_columns_of_the_canvas() {
+        // UTF-16 units, as the message length is: 41 rockets is 82.
+        let rows = vec!["\u{1F680}".repeat(41)];
+        assert!(matches!(
+            send_art(&rows),
+            CircIntent::Warn(msg) if msg.contains("82 of 80 columns")
+        ));
+    }
+
+    #[test]
+    fn art_typed_on_the_command_line_counts_as_a_row() {
+        // Cautious: the spec does not say the server ignores it.
+        let mut s = open("general");
+        let below = vec!["#"; 25].join("\n");
+        s.set_draft_and_focus(format!("/art top\n{below}"));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            CircIntent::Warn("art too tall: 26 of 25 rows".into())
+        );
+    }
+
+    #[test]
+    fn a_multi_line_styled_draft_warns_once_then_sends_as_typed() {
+        // § Send a Message (cIRC): a styled message's line breaks become
+        // spaces, so the rows in the composer would post as one line.
+        let mut s = open("general");
+        s.set_draft_and_focus("/rainbow one\ntwo".into());
+        let intent = s.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(&intent, CircIntent::Warn(msg) if msg.contains("line breaks become spaces")),
+            "expected the styled warning, got {intent:?}",
+        );
+        assert!(s.outgoing.is_empty(), "the warning sends nothing");
+        assert_eq!(s.draft.text, "/rainbow one\ntwo", "and keeps the draft");
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            CircIntent::SendMessage {
+                room_id: "general".into(),
+                content: "/rainbow one\ntwo".into(),
+            },
+            "a second Enter sends it as it is"
+        );
+    }
+
+    #[test]
+    fn editing_a_warned_styled_draft_warns_again() {
+        let mut s = open("general");
+        s.set_draft_and_focus("/rainbow one\ntwo".into());
+        s.handle_key(key(KeyCode::Enter));
+        typed(&mut s, "!");
+        assert!(matches!(
+            s.handle_key(key(KeyCode::Enter)),
+            CircIntent::Warn(_)
+        ));
+    }
+
+    #[test]
+    fn a_styled_draft_on_one_line_sends_without_a_warning() {
+        let mut s = open("general");
+        typed(&mut s, "/rainbow hello");
+        assert!(matches!(
+            s.handle_key(key(KeyCode::Enter)),
+            CircIntent::SendMessage { .. }
+        ));
+    }
+
+    #[test]
+    fn a_paste_with_carriage_return_breaks_becomes_real_lines() {
+        // VTE terminals, Konsole and iTerm2 send a pasted line break as CR, and
+        // a Windows clipboard can carry CRLF. Left as CR, the lines drew on one
+        // row and the ten-line check counted them as one line.
+        let mut s = open("general");
+        s.paste_text("one\rtwo\r\nthree");
+        assert_eq!(s.draft.text, "one\ntwo\nthree");
+        assert_eq!(s.draft.cursor, s.draft.len(), "the caret follows the paste");
+    }
+
+    #[test]
+    fn a_carriage_return_paste_cannot_slip_past_the_line_limit() {
+        let mut s = open("general");
+        let pasted = (1..=11)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join("\r");
+        s.paste_text(&pasted);
+        let intent = s.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(&intent, CircIntent::Warn(msg) if msg.contains("too many lines: 11 of 10")),
+            "expected the line-limit warning, got {intent:?}",
+        );
+    }
+
+    #[test]
+    fn art_is_recognised_whatever_the_case_of_the_command() {
+        // `is_known` and `is_styled` match command names case-insensitively,
+        // so `/ART` is art to them; it has to be art here too, or a tall
+        // picture is trimmed and then refused as too many lines.
+        let mut s = open("general");
+        let picture = vec!["#"; 20].join("\n");
+        s.set_draft_and_focus(format!("/ART\n  {picture}"));
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            CircIntent::SendMessage {
+                room_id: "general".into(),
+                content: format!("/ART\n  {picture}"),
+            }
+        );
+    }
+
+    #[test]
+    fn every_reported_newline_chord_breaks_the_line() {
+        // Windows reports Ctrl+Enter and Shift+Enter with their modifiers, and
+        // builds Ctrl+J's letter from the layout, so Caps Lock makes it `J`.
+        for chord in [
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT),
+            KeyEvent::new(KeyCode::Char('J'), KeyModifiers::CONTROL),
+            KeyEvent::new(
+                KeyCode::Char('J'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        ] {
+            let mut s = open("general");
+            typed(&mut s, "a");
+            assert_eq!(
+                s.handle_key(chord),
+                CircIntent::None,
+                "{chord:?} must not send"
+            );
+            assert_eq!(s.draft.text, "a\n", "{chord:?}");
+        }
+    }
+
+    #[test]
+    fn a_ten_line_draft_can_be_read_back_whole_before_sending() {
+        // Four rows of a ten-line draft hid lines 1 to 6 with no way to scroll
+        // to them, where the old single-row marker showed them all.
+        let mut s = open("general");
+        let draft = (1..=10)
+            .map(|n| format!("line{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        s.set_draft_and_focus(draft);
+        let rows = render_rows_wide(&s, 60, 30);
+        for n in 1..=10 {
+            assert!(
+                rows.iter().any(|r| r.contains(&format!("line{n}"))),
+                "line{n} is on screen:\n{}",
+                rows.join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn art_taller_than_ten_lines_is_left_to_its_own_canvas() {
+        // § Commands: art has an 80×25 canvas, not the ten-line message rule.
+        let mut s = open("general");
+        let picture = vec!["#"; 20].join("\n");
+        s.set_draft_and_focus(format!("/art\n{picture}"));
+        assert!(matches!(
+            s.handle_key(key(KeyCode::Enter)),
+            CircIntent::SendMessage { .. }
+        ));
     }
 
     #[test]

@@ -39,6 +39,13 @@ use base64::Engine as _;
 /// and the raw content is the better answer.
 const CONTROL_BYTE_LIMIT: usize = 5;
 
+/// Widest row an `/art` picture may have (§ Commands: "max 80 columns × 25
+/// lines"; "going over returns a `400` telling you which limit you hit").
+pub const CANVAS_COLS: usize = 80;
+
+/// Most rows an `/art` picture may have. See [`CANVAS_COLS`].
+pub const CANVAS_ROWS: usize = 25;
+
 /// Decode the `content` of a `style: "art"` message into displayable text.
 ///
 /// Line breaks are preserved as `\n` and every leading space survives, so the

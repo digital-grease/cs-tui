@@ -1,5 +1,6 @@
 //! Optional message fields shared by cIRC and C-Mail (API v0.9.0, § Message
-//! fields under Commands).
+//! fields under Commands), and the line rule both surfaces apply to `content`
+//! since v0.9.1 (see [`MAX_MESSAGE_LINES`]).
 //!
 //! Both chat systems expand the same slash commands server-side, so both come
 //! back with the same optional extras beyond `content`: an attachment, a text
@@ -18,6 +19,83 @@
 use serde::{Deserialize, Deserializer};
 
 use crate::types::null_as_default;
+
+/// Most characters a cIRC or C-Mail message may hold (v0.9.1 § Send a Message,
+/// both surfaces, and the cIRC / C-Mail row of § Content Limits).
+///
+/// Unlike [`MAX_MESSAGE_LINES`] this crate enforces it: `send_circ_message` and
+/// `send_cmail_message` refuse a longer `content` before it goes out. The spec
+/// does not say what the server itself does with a longer one.
+///
+/// Measured with [`message_len`], in UTF-16 code units.
+pub const MAX_MESSAGE_LEN: usize = 2_048;
+
+/// The length of `content` as measured against [`MAX_MESSAGE_LEN`]: UTF-16
+/// code units, the `.length` a JavaScript server sees.
+///
+/// The spec does not name the unit. This is the cautious reading, the one
+/// [`crate::validate_content_warning`] takes for the same reason: the unit
+/// count is never smaller than the character count, so a message this passes
+/// cannot be one a server counting `.length` refuses. The two differ only for
+/// characters outside the Basic Multilingual Plane, most emoji among them,
+/// which are one character but two units. The price is that a message heavy
+/// with those is held to fewer characters than a server counting characters
+/// would allow. (The live probe in `tests/live_probes.rs` that settles the unit
+/// for program descriptions does not cover messages.)
+///
+/// ```
+/// use cs_api::message_len;
+/// assert_eq!(message_len("hi"), 2);
+/// assert_eq!(message_len("\u{1F680}"), 2, "an emoji is two units");
+/// ```
+#[must_use]
+pub fn message_len(content: &str) -> usize {
+    content.encode_utf16().count()
+}
+
+/// Most lines a cIRC or C-Mail message keeps (v0.9.1 § Send a Message, both
+/// surfaces).
+///
+/// `content` "may contain line breaks (`\n`), up to 10 lines and 2048
+/// characters". Past ten the spec does not have the server refuse the message:
+/// "lines past the tenth join it with spaces", and the result is posted. So
+/// nothing here rejects a longer message. A client that wants to stop the
+/// reader's line breaks from quietly disappearing compares
+/// [`message_line_count`] against this before sending.
+pub const MAX_MESSAGE_LINES: usize = 10;
+
+/// How many lines `content` counts as under the v0.9.1 line rule.
+///
+/// "Runs of blank lines collapse to one", so a run of them counts once however
+/// long it is. Empty content is zero lines. The text is counted as given, so a
+/// caller that trims before sending (as both chat screens do) should trim
+/// before counting too.
+///
+/// Two readings of the spec are taken here, since it does not spell them out:
+/// a line holding only whitespace counts as blank, and only `\n` breaks a line
+/// (the spec names no other). A caller that takes text from a paste should
+/// normalise CR and CRLF to `\n` first.
+///
+/// ```
+/// use cs_api::message_line_count;
+/// assert_eq!(message_line_count("one\n\n\n\ntwo"), 3);
+/// ```
+#[must_use]
+pub fn message_line_count(content: &str) -> usize {
+    if content.is_empty() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut previous_blank = false;
+    for line in content.split('\n') {
+        let blank = line.trim().is_empty();
+        if !(blank && previous_blank) {
+            count += 1;
+        }
+        previous_blank = blank;
+    }
+    count
+}
 
 /// A jukebox track attached with `/song` (§ Commands).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -244,6 +322,25 @@ impl MessageExtras {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_message_counts_its_lines_with_blank_runs_collapsed() {
+        assert_eq!(message_line_count(""), 0);
+        assert_eq!(message_line_count("hello"), 1);
+        assert_eq!(message_line_count("one\ntwo"), 2);
+        // One blank line between paragraphs is a line of its own...
+        assert_eq!(message_line_count("one\n\ntwo"), 3);
+        // ...and a longer run still counts once, whitespace-only lines included.
+        assert_eq!(message_line_count("one\n\n  \n\t\ntwo"), 3);
+        // A CRLF break counts the same as a bare LF.
+        assert_eq!(message_line_count("one\r\ntwo"), 2);
+        let ten = ["x"; MAX_MESSAGE_LINES].join("\n");
+        assert_eq!(message_line_count(&ten), MAX_MESSAGE_LINES);
+        assert_eq!(
+            message_line_count(&format!("{ten}\ny")),
+            MAX_MESSAGE_LINES + 1
+        );
+    }
 
     #[test]
     fn plain_message_has_no_extras() {

@@ -22,6 +22,20 @@ pub fn collapse_newlines(text: &str) -> String {
         .collect()
 }
 
+/// Turn every CRLF and every lone CR into a plain `\n`, for text that keeps
+/// its line breaks (the chat composers and the built-in editor).
+///
+/// A paste does not arrive with the line endings it was copied with. VTE
+/// terminals (GNOME Terminal and its kin), Konsole and iTerm2 send each pasted
+/// line break as a CR, which is what the Return key sends, and a Windows
+/// clipboard can carry CRLF. crossterm hands the bytes over as they came. Left
+/// alone, a CR is drawn as nothing, so the lines run together on one row, and
+/// it is not the `\n` the API counts as a line break.
+#[must_use]
+pub fn normalize_line_breaks(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 /// Byte offset of char index `at` in `s`, or `s.len()` when `at` is past the
 /// end (so it can address the position just after the last character).
 ///
@@ -76,6 +90,14 @@ mod tests {
             text.push_str(span.content.as_ref());
         }
         (text, caret_col)
+    }
+
+    #[test]
+    fn every_line_ending_becomes_a_plain_newline() {
+        assert_eq!(normalize_line_breaks("a\rb\r\nc\nd"), "a\nb\nc\nd");
+        // CRLF is one break, not two: the pair is replaced before lone CRs.
+        assert_eq!(normalize_line_breaks("a\r\n\r\nb"), "a\n\nb");
+        assert_eq!(normalize_line_breaks("plain"), "plain");
     }
 
     #[test]

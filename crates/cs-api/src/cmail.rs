@@ -18,13 +18,12 @@ use serde_json::{Map, Value};
 use crate::client::Client;
 use crate::endpoint::EndpointKey;
 use crate::error::{ApiError, Result};
-use crate::message::MessageExtras;
+use crate::message::{message_len, MessageExtras, MAX_MESSAGE_LEN};
 use crate::rtdb::SseEventKind;
 use crate::types::null_as_default;
 
 const DEFAULT_MESSAGE_LIMIT: u32 = 50;
 const MAX_MESSAGE_LIMIT: u32 = 100;
-const MAX_MESSAGE_LEN: usize = 2_048;
 
 /// Refresh interval used only when the server omits `heartbeatMs`. The spec's
 /// documented value, not a hard-coded cadence: § Typing Indicator wants the
@@ -501,6 +500,11 @@ impl Client {
     /// `/me`, the emotes, `/dice`, `/8ball`, `/fortune`, `/gif`, `/song`, the
     /// text styles and `/help`; `/art` and the `/mute` family are cIRC-only and
     /// come back as a `400` from the server.
+    ///
+    /// `content` may carry line breaks since v0.9.1, up to
+    /// [`crate::MAX_MESSAGE_LINES`]. The server folds anything past that into
+    /// the last line rather than refusing it, so the line count is not checked
+    /// here; see [`crate::message_line_count`].
     pub async fn send_cmail_message(
         &self,
         conversation_id: &str,
@@ -772,7 +776,7 @@ fn validate_cmail_content(content: &str) -> Result<()> {
     if content.trim().is_empty() {
         return Err(ApiError::Config("C-Mail message cannot be empty".into()));
     }
-    if content.chars().count() > MAX_MESSAGE_LEN {
+    if message_len(content) > MAX_MESSAGE_LEN {
         return Err(ApiError::Config(format!(
             "C-Mail message exceeds {MAX_MESSAGE_LEN} characters"
         )));
@@ -1459,5 +1463,12 @@ mod tests {
             validate_cmail_content(&long),
             Err(ApiError::Config(_))
         ));
+    }
+
+    #[test]
+    fn validate_counts_an_emoji_as_two() {
+        let half = "\u{1F680}".repeat(MAX_MESSAGE_LEN / 2);
+        assert!(validate_cmail_content(&half).is_ok());
+        assert!(validate_cmail_content(&format!("{half}x")).is_err());
     }
 }

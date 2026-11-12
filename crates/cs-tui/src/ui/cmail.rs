@@ -43,10 +43,21 @@ use super::theme::Theme;
 /// Maximum optimistic-outgoing lines shown before collapsing to a "+N more".
 const MAX_OUTGOING_ROWS: usize = 4;
 
+/// Collapse a (possibly multi-line) string onto one line: every run of
+/// whitespace, line breaks included, becomes a single space.
+///
+/// For text drawn into a one-row slot. ratatui drops a newline from a span
+/// rather than breaking on it, so a multi-line message drawn as-is would run
+/// the last word of each line straight into the first word of the next. A
+/// message can hold line breaks since v0.9.1 (§ Send a Message).
+pub(crate) fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Collapse a (possibly multi-line) string to a single truncated line for a
 /// compact preview.
 pub(crate) fn one_line_preview(s: &str, max_chars: usize) -> String {
-    let flat: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let flat = one_line(s);
     if flat.chars().count() > max_chars {
         let head: String = flat.chars().take(max_chars.saturating_sub(1)).collect();
         format!("{head}…")
@@ -600,9 +611,11 @@ impl CmailScreen {
             q.push_str(&super::input::collapse_newlines(text));
             self.conversations.selected = 0;
         } else if self.composing && matches!(self.mode, CmailMode::Conversation { .. }) {
-            // Preserve newlines in a pasted message body (the composer collapses
-            // them for display but sends the full text).
-            self.draft.push_str(text);
+            // A pasted message body keeps its line breaks: since v0.9.1 they are
+            // part of the message, and the composer shows them as rows. As
+            // `\n`, whatever the terminal pasted them as.
+            self.draft
+                .push_str(&super::input::normalize_line_breaks(text));
         }
     }
 
@@ -1028,7 +1041,7 @@ impl CmailScreen {
         // The composer grows as the draft soft-wraps, but never past the point
         // where the conversation it belongs to would be squeezed out. One row
         // of hints sits under it either way.
-        let cap = composer::MAX_ROWS
+        let cap = composer::max_rows(&self.draft)
             .min(
                 inner
                     .height
@@ -1378,9 +1391,8 @@ impl CmailScreen {
                 .split(area);
             // Soft-wrapped over the rows reserved for it, exactly as cIRC's
             // composer is: a draft wider than the pane flows onto further rows
-            // instead of running off the right edge. Newlines (from a paste or
-            // the expanded editor) stay the inline marker they have always
-            // been; the full text is still sent.
+            // instead of running off the right edge, and a line break (typed,
+            // pasted or from the expanded editor) starts a row of its own.
             let view = composer::layout(
                 &self.draft,
                 self.draft.chars().count(),
@@ -1391,7 +1403,7 @@ impl CmailScreen {
             frame.render_widget(Paragraph::new(composer::lines(&view, theme)), rows[0]);
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
-                    "enter send · ctrl+e editor · esc unfocus",
+                    "enter send · alt+enter new line · ctrl+e editor · esc unfocus",
                     theme.muted_style(),
                 ))),
                 rows[1],
@@ -1470,6 +1482,12 @@ impl CmailScreen {
         ctrl: bool,
     ) -> CmailIntent {
         match key.code {
+            // A line break (v0.9.1 § Send a Message). First, so `Alt+Enter`
+            // never reaches the send arm below, which takes any Enter.
+            _ if composer::is_newline_key(&key) => {
+                self.draft.push('\n');
+                self.typing_signal(conversation_id)
+            }
             // Expand into the full editor, prefilled with the current draft.
             KeyCode::Char('e') if ctrl => CmailIntent::StartCompose {
                 conversation_id: conversation_id.to_string(),
@@ -1487,6 +1505,22 @@ impl CmailScreen {
                 if !super::commands::is_known(&content, super::commands::Surface::Cmail) {
                     let word = super::commands::command_word(&content).to_string();
                     return CmailIntent::Warn(format!("unknown command: {word}"));
+                }
+                // The two message limits (v0.9.1 § Send a Message), each a
+                // warning with the draft kept. Length first: over 2048
+                // characters the API refuses the send outright, and it would
+                // land in the outgoing strip as a failure a retry cannot fix.
+                if let Some(warning) = composer::length_limit_notice(&content) {
+                    return CmailIntent::Warn(warning);
+                }
+                // Past ten lines the server runs the rest together rather than
+                // refusing. No `/art` exemption: it is cIRC-only, refused above.
+                // No exemption for a styled message either: only cIRC's section
+                // says its line breaks become spaces.
+                if let Some(notice) =
+                    composer::line_limit_notice(&content, super::commands::Surface::Cmail)
+                {
+                    return CmailIntent::Warn(notice);
                 }
                 // Show it immediately; the echo/reload replaces it.
                 self.outgoing.push(Outgoing {
@@ -1782,11 +1816,12 @@ fn conversation_item(c: &CmailConversation, theme: &Theme) -> ListItem<'static> 
     // The same content rules the message body applies (§ Message fields): a
     // caption that merely repeats its attachment URL is skipped, and a message
     // that is nothing but an attachment previews as its chip rather than as a
-    // blank row.
+    // blank row. Flattened, since the preview has one row and the message may
+    // have several lines (v0.9.1).
     let preview = c
         .last_message
         .as_ref()
-        .map(|m| chat::summary_text(&m.extras, &m.content))
+        .map(|m| one_line(&chat::summary_text(&m.extras, &m.content)))
         .unwrap_or_else(|| "no messages yet".to_string());
     // Header: avatar + display name, with the @handle muted alongside when a
     // separate display name is set.
@@ -3324,5 +3359,177 @@ mod tests {
         let mut s = open_with_messages(vec![message("m1", "hi", 1_000)], None);
         assert_eq!(s.handle_key(key(KeyCode::Char('i'))), CmailIntent::None);
         assert!(!s.is_text_input(), "it must not focus the composer");
+    }
+
+    fn alt(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::ALT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        }
+    }
+
+    #[test]
+    fn the_newline_keys_break_the_line_and_enter_sends_it_with_the_breaks() {
+        // v0.9.1 § Send a Message: a C-Mail message may hold line breaks.
+        let mut s = open_with_messages(vec![], None);
+        composed(&mut s, "one");
+        assert!(
+            !matches!(
+                s.handle_key(alt(KeyCode::Enter)),
+                CmailIntent::SendMessage { .. }
+            ),
+            "Alt+Enter must not send"
+        );
+        for c in "two".chars() {
+            s.handle_key(key(KeyCode::Char(c)));
+        }
+        s.handle_key(ctrl(KeyCode::Char('j')));
+        for c in "three".chars() {
+            s.handle_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            s.handle_key(key(KeyCode::Enter)),
+            CmailIntent::SendMessage {
+                conversation_id: "c1".into(),
+                content: "one\ntwo\nthree".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_line_break_in_the_draft_starts_a_new_composer_row() {
+        let mut s = open_with_messages(vec![], None);
+        composed(&mut s, "one");
+        s.handle_key(alt(KeyCode::Enter));
+        for c in "two".chars() {
+            s.handle_key(key(KeyCode::Char(c)));
+        }
+        let rows = render_rows(&s, 60, 14);
+        let first = rows
+            .iter()
+            .position(|r| r.starts_with('›'))
+            .expect("composer row");
+        assert_eq!(rows[first].trim_end(), "› one", "{rows:#?}");
+        assert!(rows[first + 1].contains("two"), "{rows:#?}");
+    }
+
+    #[test]
+    fn a_paste_with_carriage_return_breaks_becomes_real_lines_in_a_conversation() {
+        let mut s = open_with_messages(vec![], None);
+        s.handle_key(key(KeyCode::Char('c')));
+        s.paste_text("one\rtwo\r\nthree");
+        assert_eq!(s.draft, "one\ntwo\nthree");
+    }
+
+    #[test]
+    fn a_styled_conversation_message_is_not_exempt_from_the_line_limit() {
+        // Only cIRC's § Send a Message says a styled message's line breaks
+        // become spaces; C-Mail's does not, so its ten-line rule still applies.
+        let mut s = open_with_messages(vec![], None);
+        s.handle_key(key(KeyCode::Char('c')));
+        let lines = (1..=11)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        s.paste_text(&format!("/rainbow {lines}"));
+        let intent = s.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(&intent, CmailIntent::Warn(msg) if msg.contains("too many lines")),
+            "expected the line-limit warning, got {intent:?}",
+        );
+    }
+
+    #[test]
+    fn a_ten_line_conversation_draft_can_be_read_back_whole() {
+        // The caret is pinned to the end here and the arrows scroll the thread,
+        // so rows the composer does not show cannot be reached at all.
+        let mut s = open_with_messages(vec![], None);
+        s.handle_key(key(KeyCode::Char('c')));
+        let draft = (1..=10)
+            .map(|n| format!("line{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        s.paste_text(&draft);
+        let rows = render_rows(&s, 60, 30);
+        for n in 1..=10 {
+            assert!(
+                rows.iter().any(|r| r.contains(&format!("line{n}"))),
+                "line{n} is on screen:\n{}",
+                rows.join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn a_conversation_past_ten_lines_is_refused_and_the_draft_kept() {
+        let mut s = open_with_messages(vec![], None);
+        s.handle_key(key(KeyCode::Char('c')));
+        let draft = (1..=11)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        s.paste_text(&draft);
+        let intent = s.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(&intent, CmailIntent::Warn(msg) if msg.contains("11 of 10")),
+            "expected the line-limit warning, got {intent:?}",
+        );
+        assert!(s.outgoing.is_empty());
+        assert_eq!(s.draft, draft);
+    }
+
+    #[test]
+    fn a_conversation_draft_past_the_character_limit_warns_and_is_kept() {
+        let mut s = open_with_messages(vec![], None);
+        s.handle_key(key(KeyCode::Char('c')));
+        let draft = "x".repeat(cs_api::MAX_MESSAGE_LEN + 10);
+        s.paste_text(&draft);
+        let intent = s.handle_key(key(KeyCode::Enter));
+        assert!(
+            matches!(&intent, CmailIntent::Warn(msg)
+                if msg.contains("2058 of 2048 characters") && msg.contains("cut 10")),
+            "expected the length warning, got {intent:?}",
+        );
+        assert!(s.outgoing.is_empty(), "nothing is queued, so nothing fails");
+        assert_eq!(s.draft, draft, "the draft survives to be cut down");
+    }
+
+    #[test]
+    fn a_conversation_draft_at_the_character_limit_sends() {
+        let mut s = open_with_messages(vec![], None);
+        s.handle_key(key(KeyCode::Char('c')));
+        s.paste_text(&"x".repeat(cs_api::MAX_MESSAGE_LEN));
+        assert!(matches!(
+            s.handle_key(key(KeyCode::Enter)),
+            CmailIntent::SendMessage { .. }
+        ));
+    }
+
+    #[test]
+    fn a_multi_line_last_message_previews_on_one_row_with_its_words_apart() {
+        // ratatui drops a newline from a span, so drawn as-is this would read
+        // "heyhow are you".
+        let mut s = CmailScreen::new();
+        let mut c = convo("c1", "alice");
+        c.last_message = Some(message("m1", "hey\nhow are you", 1_000));
+        s.apply_conversations(Ok(vec![c]));
+        let joined = render_rows(&s, 60, 10).join("\n");
+        assert!(joined.contains("hey how are you"), "{joined}");
+        assert!(!joined.contains("heyhow"), "{joined}");
+    }
+
+    #[test]
+    fn a_multi_line_message_renders_on_its_own_rows_in_the_thread() {
+        // "Clients should render line breaks" (v0.9.1 § Send a Message).
+        let s = open_with_messages(vec![message("m1", "first line\nsecond line", 1_000)], None);
+        let rows = render_rows(&s, 60, 14);
+        let at = rows
+            .iter()
+            .position(|r| r.contains("first line"))
+            .expect("the first line is drawn");
+        assert!(!rows[at].contains("second"), "{rows:#?}");
+        assert!(rows[at + 1].contains("second line"), "{rows:#?}");
     }
 }

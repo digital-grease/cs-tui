@@ -60,11 +60,12 @@ pub struct TextBuffer {
 }
 
 impl TextBuffer {
-    /// Build from initial text: split on `\n`, strip every `\r` (so CRLF and a
-    /// lone CR both normalize). Empty input yields one empty line. The cursor
-    /// starts at the END of the buffer, ready to keep typing after a prefill.
+    /// Build from initial text: CRLF and a lone CR both become `\n` (see
+    /// [`super::input::normalize_line_breaks`]), then split on `\n`. Empty input
+    /// yields one empty line. The cursor starts at the END of the buffer, ready
+    /// to keep typing after a prefill.
     pub fn new(initial: &str) -> Self {
-        let cleaned: String = initial.chars().filter(|&c| c != '\r').collect();
+        let cleaned = super::input::normalize_line_breaks(initial);
         let lines: Vec<Vec<char>> = cleaned.split('\n').map(|l| l.chars().collect()).collect();
         // `split('\n')` always yields at least one segment.
         let cursor_row = lines.len() - 1;
@@ -160,10 +161,11 @@ impl TextBuffer {
         }
     }
 
-    /// Insert arbitrary text at the cursor. `\n` splits lines; `\r` is dropped so
-    /// CRLF pastes cleanly. The cursor ends just after the inserted text.
+    /// Insert arbitrary text at the cursor. A line break of any kind (`\n`,
+    /// CRLF, or the lone CR many terminals paste) splits the line. The cursor
+    /// ends just after the inserted text.
     pub fn paste(&mut self, text: &str) {
-        let cleaned: String = text.chars().filter(|&c| c != '\r').collect();
+        let cleaned = super::input::normalize_line_breaks(text);
         let segs: Vec<&str> = cleaned.split('\n').collect();
         if segs.len() == 1 {
             for c in segs[0].chars() {
@@ -765,6 +767,16 @@ mod tests {
         let b = TextBuffer::new("a\r\nb");
         assert_eq!(b.content(), "a\nb");
         assert!(b.lines.iter().all(|l| !l.contains(&'\r')));
+    }
+
+    #[test]
+    fn a_lone_carriage_return_is_a_line_break_not_nothing() {
+        // VTE terminals, Konsole and iTerm2 turn a pasted LF into CR. Dropping
+        // the CR, as this used to, glued every pasted line onto the one above.
+        assert_eq!(TextBuffer::new("a\rb\r\nc").content(), "a\nb\nc");
+        let mut b = TextBuffer::new("");
+        b.paste("one\rtwo");
+        assert_eq!(b.content(), "one\ntwo");
     }
 
     #[test]

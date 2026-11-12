@@ -31,9 +31,7 @@ use std::collections::HashSet;
 pub enum Surface {
     /// A cIRC room.
     Circ,
-    /// A C-Mail conversation. Not yet wired to a caller: C-Mail sends still go
-    /// unchecked, and closing that is the natural follow-up to the cIRC gate.
-    #[allow(dead_code)]
+    /// A C-Mail conversation.
     Cmail,
 }
 
@@ -149,6 +147,31 @@ pub fn refresh_localtime(content: &str, clock: Option<(u8, u8)>) -> String {
     }
 }
 
+/// Whether `draft` is a text-styled message: its command word is one of the
+/// styles, or a chain of them (`/comic+rainbow`).
+///
+/// Matters for line breaks in a cIRC room: since v0.9.1 "line breaks in a
+/// styled message's text become spaces" (§ Send a Message, cIRC), so a styled
+/// draft posts there as one line however many it was typed on. C-Mail's
+/// section says nothing of the kind. Only the names are checked, as
+/// [`is_known`] does; whether the chain is a legal one is its business.
+///
+/// ```ignore
+/// assert!(commands::is_styled("/rainbow hello"));
+/// assert!(!commands::is_styled("/me waves"));
+/// ```
+#[must_use]
+pub fn is_styled(draft: &str) -> bool {
+    if !looks_like_command(draft) {
+        return false;
+    }
+    let Some(name) = command_word(draft).strip_prefix('/') else {
+        return false;
+    };
+    let name = name.to_lowercase();
+    !name.is_empty() && name.split('+').all(|part| STYLES.contains(&part))
+}
+
 /// Whether a `+`-joined name is a legal style chain.
 ///
 /// Every part has to be a style, and `spoiler` may not be one of them unless it
@@ -195,6 +218,32 @@ mod tests {
             );
             assert!(is_known(name, Surface::Cmail), "{name} works in C-Mail too");
         }
+    }
+
+    #[test]
+    fn a_styled_draft_is_told_apart_from_other_commands_and_text() {
+        for style in STYLES {
+            assert!(is_styled(&format!("/{style} hi")), "/{style}");
+        }
+        assert!(is_styled("/comic+rainbow two\nlines"));
+        assert!(
+            is_styled("/RAINBOW shouting"),
+            "names match case-insensitively"
+        );
+        for draft in [
+            "/me waves",
+            "/art\n /\\",
+            "/rainbowz hi",
+            "rainbow",
+            "/",
+            "",
+        ] {
+            assert!(!is_styled(draft), "{draft:?}");
+        }
+        assert!(
+            !is_styled("/rainbow+me hi"),
+            "every link in a chain is a style"
+        );
     }
 
     #[test]

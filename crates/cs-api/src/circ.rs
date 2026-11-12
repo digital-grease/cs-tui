@@ -33,13 +33,12 @@ use crate::client::Client;
 use crate::endpoint::EndpointKey;
 use crate::envelope::Cursor;
 use crate::error::{ApiError, Result};
-use crate::message::{AudioAttachment, MessageExtras, MessageStyle};
+use crate::message::{message_len, AudioAttachment, MessageExtras, MessageStyle, MAX_MESSAGE_LEN};
 use crate::rtdb::SseEventKind;
 use crate::types::{null_as_default, validate_flag_reason, FlagBody, FlagResponse};
 
 const DEFAULT_MESSAGE_LIMIT: u32 = 50;
 const MAX_MESSAGE_LIMIT: u32 = 100;
-const MAX_MESSAGE_LEN: usize = 2_048;
 
 /// Documented presence cadence (§ Announce Your Presence), used only as a
 /// fallback when a response omits the value or sends a non-positive one. Read
@@ -710,6 +709,13 @@ impl Client {
     }
 
     /// `POST /v1/circ/:roomId`: send a message (or run a slash command).
+    ///
+    /// `content` may carry line breaks since v0.9.1, up to
+    /// [`crate::MAX_MESSAGE_LINES`]. The server folds anything past that into
+    /// the last line rather than refusing it, so the line count is not checked
+    /// here; see [`crate::message_line_count`]. A text-styled message has its
+    /// line breaks turned into spaces, and `/art` keeps its own 80×25 canvas
+    /// (§ Commands).
     pub async fn send_circ_message(
         &self,
         room_id: &str,
@@ -1186,7 +1192,7 @@ fn validate_circ_content(content: &str) -> Result<()> {
     if content.trim().is_empty() {
         return Err(ApiError::Config("cIRC message cannot be empty".into()));
     }
-    if content.chars().count() > MAX_MESSAGE_LEN {
+    if message_len(content) > MAX_MESSAGE_LEN {
         return Err(ApiError::Config(format!(
             "cIRC message exceeds {MAX_MESSAGE_LEN} characters"
         )));
@@ -2106,6 +2112,14 @@ mod tests {
             validate_circ_content(&long),
             Err(ApiError::Config(_))
         ));
+    }
+
+    #[test]
+    fn validate_counts_an_emoji_as_two() {
+        // UTF-16 units, the `.length` a JavaScript server sees.
+        let half = "\u{1F680}".repeat(MAX_MESSAGE_LEN / 2);
+        assert!(validate_circ_content(&half).is_ok());
+        assert!(validate_circ_content(&format!("{half}x")).is_err());
     }
 
     #[test]

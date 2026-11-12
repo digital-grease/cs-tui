@@ -2104,6 +2104,7 @@ impl App {
                     Action::CircLoadOlder { room_id, before }
                 }
                 CircIntent::BackToRooms => Action::CircBackToRooms,
+                CircIntent::Warn(msg) => Action::Warn(msg),
                 CircIntent::StartCompose { room_id, draft } => {
                     Action::CircCompose { room_id, draft }
                 }
@@ -11722,6 +11723,31 @@ mod tests {
         circ.open_room("general");
         app.screen = Screen::Circ(circ);
         app
+    }
+
+    #[tokio::test]
+    async fn an_over_long_circ_draft_pops_a_warning_instead_of_failing_to_send() {
+        // Before this, the draft went out, the API crate refused it, and it sat
+        // in the outgoing strip as a failed send offering a retry that could
+        // never succeed.
+        let mut app = app_in_a_room();
+        let draft = "x".repeat(cs_api::MAX_MESSAGE_LEN + 1);
+        if let Screen::Circ(s) = &mut app.screen {
+            s.set_draft_and_focus(draft.clone());
+        }
+        app.handle_terminal_event(key_event(KeyCode::Enter)).await;
+
+        let toast = format!("{:?}", app.toast);
+        assert!(toast.contains("Warning"), "a warning toast pops: {toast}");
+        assert!(toast.contains("2049 of 2048 characters"), "{toast}");
+        let Screen::Circ(s) = &app.screen else {
+            panic!("still in the room");
+        };
+        assert_eq!(
+            s.draft_for_test(),
+            draft,
+            "the draft is kept to be cut down"
+        );
     }
 
     #[tokio::test]

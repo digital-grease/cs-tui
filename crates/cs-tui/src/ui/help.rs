@@ -253,6 +253,10 @@ const PROGRAMS: &[Row] = &[
     },
 ];
 
+/// The line-break key, which cIRC and C-Mail share (see
+/// [`super::composer::is_newline_key`]).
+const NEW_LINE: &str = "while typing a message, start a new line; a message holds up to 10 lines. Ctrl+J does the same where Alt+Enter is taken (Windows Terminal, WezTerm, macOS unless Option is set to Meta), and on Windows so do Ctrl+Enter and Shift+Enter";
+
 const CIRC: &[Row] = &[
     Row {
         keys: "",
@@ -261,6 +265,10 @@ const CIRC: &[Row] = &[
     Row {
         keys: "Enter",
         desc: "send",
+    },
+    Row {
+        keys: "Alt+Enter",
+        desc: NEW_LINE,
     },
     Row {
         keys: "Ctrl+E",
@@ -336,6 +344,10 @@ const CIRC_SELECT: &[Row] = &[
 ];
 
 const CMAIL: &[Row] = &[
+    Row {
+        keys: "Alt+Enter",
+        desc: NEW_LINE,
+    },
     Row {
         keys: "o",
         desc: "open the image or GIF, or play the track",

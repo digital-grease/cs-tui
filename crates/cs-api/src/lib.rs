@@ -52,7 +52,10 @@ pub use entries::{
 pub use error::{ApiError, ErrorCode, Result};
 pub use follows::{Follow, FollowsDirection};
 pub use guilds::{Guild, GuildMembership, GuildRole, GuildThread, JoinedGuild, PromotedGuild};
-pub use message::{AudioAttachment, MessageExtras, MessageStyle};
+pub use message::{
+    message_len, message_line_count, AudioAttachment, MessageExtras, MessageStyle, MAX_MESSAGE_LEN,
+    MAX_MESSAGE_LINES,
+};
 pub use notes::{Note, NoteRevision};
 pub use notifications::{
     Notification, NotificationMetadata, NotificationType, NotificationsFilter, UnreadCount,
@@ -77,7 +80,7 @@ pub use users::{PokeResponse, User, UserGuild};
 pub use watch::Watch;
 
 /// Spec version this client targets.
-pub const API_VERSION: &str = "v0.8.10";
+pub const API_VERSION: &str = "v0.9.1";
 /// Production API host, used unless [`ClientBuilder`] is given another.
 pub const DEFAULT_BASE_URL: &str = "https://api.cyberspace.online";
 
@@ -87,7 +90,7 @@ mod tests {
 
     #[test]
     fn constants_present() {
-        assert_eq!(API_VERSION, "v0.8.10");
+        assert_eq!(API_VERSION, "v0.9.1");
         assert!(DEFAULT_BASE_URL.starts_with("https://"));
     }
 

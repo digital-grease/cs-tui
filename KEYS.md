@@ -36,6 +36,7 @@ digits reach the screen you are on.
 | Guild | `J` then `y` | Join (member if you are not in a guild yet, apprentice otherwise) |
 | Guild | `P` then `y` | Make this guild your profile badge |
 | Guild | `L` then `y` | Leave, an apprenticeship included (founders leave on the web) |
+| cIRC room, C-Mail composer | `Alt+Enter` or `Ctrl+J` | Start a new line in the message ([up to 10](#line-breaks-in-chat)) |
 | cIRC room | `Ctrl+U` | Show / hide the room roster |
 | cIRC room | `Ctrl+A` | Open the action menu for the message under the cursor |
 | cIRC room | `↑` / `↓` | Move through the room history (`PgUp` / `PgDn` too) |
@@ -64,6 +65,44 @@ In a cIRC room the composer always has focus, so every letter you type goes into
 the message. That is why the room's own actions are chords, and why deleting or
 flagging a message goes through the `Ctrl+A` menu: while the menu is up it owns
 the keyboard, and `Ctrl+A` is the only key in a room that is not typed.
+
+### Line breaks in chat
+
+A cIRC or C-Mail message can run to 10 lines. `Enter` sends, and `Alt+Enter`
+or `Ctrl+J` starts a new line. Which of those reaches cs-tui depends on the
+terminal:
+
+- Windows Terminal, WezTerm and mintty keep `Alt+Enter` for full screen, so use
+  `Ctrl+J` there. On Windows, `Ctrl+Enter` and `Shift+Enter` start a new line
+  too.
+- On macOS, Option is only Alt when the terminal is set to use it as Meta.
+  Otherwise Option+Return is a plain Return and sends, so use `Ctrl+J`.
+- Elsewhere, `Shift+Enter` and `Ctrl+Enter` usually arrive as a plain `Enter`
+  and send.
+
+Pasting several lines keeps them as separate lines. The exception is Windows,
+where a paste reaches cs-tui as typed keys and each line break sends what came
+before it. To paste several lines there, open the editor with `Ctrl+E`, paste
+into it, and close it to bring the text back.
+
+A draft longer than 10 lines is not sent. The server would not refuse it, it
+would run the extra lines into the tenth, so cs-tui says so and keeps the draft
+for you to trim. A run of blank lines counts as one line, since the server
+collapses those runs. In C-Mail that is the whole rule. In a cIRC room two
+things are exempt:
+
+- `/art`, which has its own canvas of 80 columns by 25 rows. cs-tui checks a
+  picture against it before sending and names the limit it breaks, rather
+  than leaving the server to refuse it.
+- A text style like `/rainbow`, whose line breaks the server turns into spaces.
+  A styled draft written on several lines gets a warning first; press `Enter`
+  again to send it as one line.
+
+A message also holds at most 2,048 characters, with no exemptions. A longer
+draft is not sent either: a warning says how many characters to cut, and the
+draft stays where it is. The count is cautious: it uses the units a JavaScript
+server counts, in which most emoji count as two, so a message full of them
+holds about half as many.
 
 ### Masked and rewritten messages
 
